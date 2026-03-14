@@ -1,0 +1,13 @@
+[package]
+name = "homura"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+melior = { path = "/data2/edgar/melior/melior" }
+
+[patch.crates-io]
+mlir-sys = { path = "/home/edgar/data/mlir-sys" }
+
+[[example]]
+name = "add"
