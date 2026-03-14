@@ -21,6 +21,7 @@ use melior::{
 };
 
 use crate::{
+    DType,
     op::{NodeId, Op},
     runtime::CompiledGraph,
     trace::Trace,
@@ -33,10 +34,10 @@ pub enum CompileError {
     Verification,
     /// A lowering pass failed.
     Pass(melior::Error),
-    /// Unsupported trace shape (e.g. rank != 1).
-    UnsupportedShape(String),
     /// Trace contains no ops.
     EmptyTrace,
+    /// No output nodes specified.
+    NoOutputs,
     /// Failed to parse an MLIR attribute string.
     AttributeParse(String),
 }
@@ -46,8 +47,8 @@ impl std::fmt::Display for CompileError {
         match self {
             Self::Verification => write!(f, "MLIR module verification failed"),
             Self::Pass(e) => write!(f, "lowering pass failed: {e}"),
-            Self::UnsupportedShape(s) => write!(f, "unsupported shape: {s}"),
             Self::EmptyTrace => write!(f, "trace is empty"),
+            Self::NoOutputs => write!(f, "no output nodes specified"),
             Self::AttributeParse(s) => write!(f, "failed to parse MLIR attribute: {s}"),
         }
     }
@@ -69,7 +70,7 @@ impl Compiler {
             return Err(CompileError::EmptyTrace);
         }
         if outputs.is_empty() {
-            return Err(CompileError::EmptyTrace);
+            return Err(CompileError::NoOutputs);
         }
 
         // ---- Analyse the trace ------------------------------------------------
@@ -97,21 +98,11 @@ impl Compiler {
 
         let num_inputs = input_ops.len();
 
-        // For now: single output, rank-1 only.
+        // Single output.
         let output_id = outputs[0];
         let output_op = trace.get(output_id);
         let output_shape = output_op.shape().clone();
         let output_dtype = output_op.dtype();
-
-        // Validate all shapes are rank-1.
-        for op in trace.ops() {
-            if op.shape().rank() != 1 {
-                return Err(CompileError::UnsupportedShape(format!(
-                    "rank-{} shapes are not supported (only rank-1)",
-                    op.shape().rank()
-                )));
-            }
-        }
 
         // ---- Create MLIR context and module ------------------------------------
 
@@ -122,7 +113,6 @@ impl Compiler {
         // ---- Build the func.func @compute -------------------------------------
         {
             let elem_type = output_dtype.to_mlir_type(&context);
-            let num_elems = output_shape.num_elements();
 
             // Build arg types: inputs first, then one output.
             let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
@@ -130,16 +120,13 @@ impl Compiler {
                 let Op::Input { shape, dtype, .. } = op else {
                     unreachable!()
                 };
-                let mref = MemRefType::new(
-                    dtype.to_mlir_type(&context),
-                    &[shape.0[0] as i64],
-                    None,
-                    None,
-                );
+                let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
+                let mref = MemRefType::new(dtype.to_mlir_type(&context), &dims, None, None);
                 arg_types.push((mref.into(), location));
             }
-            // Output memref.
-            let out_mref = MemRefType::new(elem_type, &[num_elems as i64], None, None);
+            // Output memref — N-D shape.
+            let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
+            let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
             arg_types.push((out_mref.into(), location));
 
             // func.func type: all memrefs -> ()
@@ -149,12 +136,10 @@ impl Compiler {
             // Create the function body block.
             let body_block = Block::new(&arg_types);
 
-            // Emit tensor ops: bufferization.to_tensor for inputs, linalg.generic
-            // for compute ops, bufferization.to_buffer + memref.copy for the output.
+            // Emit tensor ops.
             emit_tensor_ops(
                 trace,
                 output_id,
-                &input_ops,
                 num_inputs,
                 &body_block,
                 location,
@@ -187,7 +172,6 @@ impl Compiler {
         }
 
         // ---- Run lowering passes ----------------------------------------------
-        // register_all_passes() is required before parse_pass_pipeline.
         register_all_passes();
         let pass_manager = pass::PassManager::new(&context);
         parse_pass_pipeline(
@@ -196,6 +180,7 @@ impl Compiler {
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 convert-linalg-to-loops,\
                 convert-scf-to-cf,\
+                convert-math-to-llvm,\
                 finalize-memref-to-llvm,\
                 convert-arith-to-llvm,\
                 convert-index-to-llvm,\
@@ -219,16 +204,6 @@ impl Compiler {
         ))
     }
 
-    /// Print the MLIR IR for a trace before lowering (for debugging).
-    pub fn print_mlir(trace: &Trace, outputs: &[NodeId]) {
-        // We compile up to the verification step and print.
-        // Re-use a quick build that ignores errors, so just call compile and
-        // intercept the printed module inside compile. For simplicity, run
-        // compile fully and note this is just debug output.
-        // Instead: build the module and print it before lowering.
-        let _ = (trace, outputs);
-        eprintln!("(use Compiler::compile with MLIR_PRINT_IR=1 or add debug logging)");
-    }
 }
 
 /// Create an MLIR context with all dialects and LLVM translations registered.
@@ -246,24 +221,657 @@ fn create_context() -> Context {
     context
 }
 
+// ── Helper: build a RankedTensorType for an arbitrary shape ──────────────────
+
+fn make_ranked_tensor_type<'c>(
+    context: &'c Context,
+    shape: &[u64],
+    dtype: DType,
+) -> melior::ir::Type<'c> {
+    RankedTensorType::new(shape, dtype.to_mlir_type(context), None).into()
+}
+
+// ── Helper: build an identity affine map for `rank` dimensions ───────────────
+//
+// rank 1 → affine_map<(d0) -> (d0)>
+// rank 2 → affine_map<(d0, d1) -> (d0, d1)>
+
+fn make_identity_map<'c>(context: &'c Context, rank: usize) -> Result<Attribute<'c>, CompileError> {
+    let dims: Vec<String> = (0..rank).map(|i| format!("d{i}")).collect();
+    let dim_list = dims.join(", ");
+    let map_str = format!("affine_map<({dim_list}) -> ({dim_list})>");
+    Attribute::parse(context, &map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {map_str}")))
+}
+
+// ── Helper: build a broadcast affine map for an operand vs output shape ──────
+//
+// Examples:
+//   operand [3]    vs output [2, 3]    → affine_map<(d0, d1) -> (d1)>
+//   operand [2, 1] vs output [2, 3]    → affine_map<(d0, d1) -> (d0, 0)>
+//   operand [1, 3] vs output [4, 2, 3] → affine_map<(d0, d1, d2) -> (0, d2)>
+//   operand [2, 3] vs output [2, 3]    → affine_map<(d0, d1) -> (d0, d1)> (identity)
+
+fn make_broadcast_map<'c>(
+    context: &'c Context,
+    operand_shape: &[u64],
+    output_shape: &[u64],
+) -> Result<Attribute<'c>, CompileError> {
+    let out_rank = output_shape.len();
+    let op_rank = operand_shape.len();
+
+    let dim_vars: Vec<String> = (0..out_rank).map(|i| format!("d{i}")).collect();
+    let dims_str = dim_vars.join(", ");
+
+    // Right-align: operand dim i maps to output position (offset + i).
+    let offset = out_rank - op_rank;
+    let mut result_exprs = Vec::new();
+    for i in 0..op_rank {
+        let out_idx = offset + i;
+        if operand_shape[i] == 1 && output_shape[out_idx] != 1 {
+            result_exprs.push("0".to_string());
+        } else {
+            result_exprs.push(dim_vars[out_idx].clone());
+        }
+    }
+    let result_str = result_exprs.join(", ");
+
+    let map_str = format!("affine_map<({dims_str}) -> ({result_str})>");
+    Attribute::parse(context, &map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {map_str}")))
+}
+
+// ── Helper: build N parallel iterator types ──────────────────────────────────
+
+fn make_iterator_types<'c>(context: &'c Context, count: usize) -> Result<Attribute<'c>, CompileError> {
+    let entries: Vec<&str> = vec!["#linalg.iterator_type<parallel>"; count];
+    let attr_str = format!("[{}]", entries.join(", "));
+    Attribute::parse(context, &attr_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {attr_str}")))
+}
+
+// ── Helper: emit a binary element-wise linalg.generic ────────────────────────
+
+fn emit_binary_elementwise<'c, F>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    lhs: NodeId,
+    rhs: NodeId,
+    lhs_shape: &[u64],
+    rhs_shape: &[u64],
+    output_shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+    body_fn: F,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError>
+where
+    F: FnOnce(&Block<'c>, melior::ir::Value<'c, 'c>, melior::ir::Value<'c, 'c>) -> melior::ir::Value<'c, 'c>,
+{
+    let elem_type = dtype.to_mlir_type(context);
+    let tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+    let rank = output_shape.len();
+
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+
+    // tensor.empty() for the output slot.
+    let init_val = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg body: 3 block args (lhs_elem, rhs_elem, out_elem).
+    let linalg_region = {
+        let linalg_block = Block::new(&[
+            (elem_type, location),
+            (elem_type, location),
+            (elem_type, location),
+        ]);
+        let lhs_elem = linalg_block.argument(0).unwrap().into();
+        let rhs_elem = linalg_block.argument(1).unwrap().into();
+
+        let result = body_fn(&linalg_block, lhs_elem, rhs_elem);
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[result])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    // lhs and rhs maps account for broadcast; output map is always identity.
+    let lhs_map = make_broadcast_map(context, lhs_shape, output_shape)?;
+    let rhs_map = make_broadcast_map(context, rhs_shape, output_shape)?;
+    let out_map = make_identity_map(context, rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[lhs_map, rhs_map, out_map]);
+    let iterator_types = make_iterator_types(context, rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
+    })?;
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[lhs_val, rhs_val, init_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[
+                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit a unary element-wise linalg.generic ─────────────────────────
+
+fn emit_unary_elementwise<'c, F>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    input: NodeId,
+    shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+    body_fn: F,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError>
+where
+    F: FnOnce(&Block<'c>, melior::ir::Value<'c, 'c>) -> melior::ir::Value<'c, 'c>,
+{
+    let elem_type = dtype.to_mlir_type(context);
+    let tensor_type = make_ranked_tensor_type(context, shape, dtype);
+    let rank = shape.len();
+
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    // tensor.empty() for the output slot.
+    let init_val = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg body: 2 block args (in_elem, out_elem).
+    let linalg_region = {
+        let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let in_elem = linalg_block.argument(0).unwrap().into();
+
+        let result = body_fn(&linalg_block, in_elem);
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[result])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    // 2 identity maps: in, out.
+    let identity_map = make_identity_map(context, rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[identity_map, identity_map]);
+    let iterator_types = make_iterator_types(context, rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
+    })?;
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[input_val, init_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[
+                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit linalg.matmul for [M,K] x [K,N] -> [M,N] ───────────────────
+
+fn emit_matmul<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    lhs: NodeId,
+    rhs: NodeId,
+    output_shape: &[u64],  // [M, N]
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let elem_type = dtype.to_mlir_type(context);
+    let tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+
+    // tensor.empty() for the [M, N] accumulator.
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Zero constant for the fill.
+    let zero_val: melior::ir::Value = match dtype {
+        DType::F32 | DType::F64 => body_block
+            .append_operation(arith::constant(
+                context,
+                FloatAttribute::new(context, elem_type, 0.0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into(),
+        DType::I32 | DType::I64 => body_block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(elem_type, 0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into(),
+    };
+
+    // linalg.fill: fill the init tensor with zero.
+    // Named linalg ops require a region with one block. The block takes
+    // scalar element args (ins scalar + out scalar) and yields the fill value.
+    // operand_segment_sizes = [1 ins, 1 outs].
+    let segment_fill = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse linalg.fill segment sizes".into())
+    })?;
+    let fill_region = {
+        let fill_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let fill_in = fill_block.argument(0).unwrap().into();
+        fill_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[fill_in])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+        let r = Region::new();
+        r.append_block(fill_block);
+        r
+    };
+    let filled_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero_val, init_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[(
+                    Identifier::new(context, "operand_segment_sizes"),
+                    segment_fill,
+                )])
+                .add_regions([fill_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg.matmul: 2 ins (lhs, rhs), 1 out (filled accumulator).
+    // Named linalg op — region with one block taking (lhs_elem, rhs_elem, acc_elem)
+    // and yielding the updated accumulator: acc + lhs * rhs.
+    // operand_segment_sizes = [2 ins, 1 outs].
+    let segment_matmul = Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse linalg.matmul segment sizes".into())
+    })?;
+    let matmul_region = {
+        let matmul_block = Block::new(&[
+            (elem_type, location),
+            (elem_type, location),
+            (elem_type, location),
+        ]);
+        let lhs_elem: melior::ir::Value = matmul_block.argument(0).unwrap().into();
+        let rhs_elem: melior::ir::Value = matmul_block.argument(1).unwrap().into();
+        let acc_elem: melior::ir::Value = matmul_block.argument(2).unwrap().into();
+        let mul_val: melior::ir::Value = match dtype {
+            DType::F32 | DType::F64 => matmul_block
+                .append_operation(arith::mulf(lhs_elem, rhs_elem, location))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 | DType::I64 => matmul_block
+                .append_operation(arith::muli(lhs_elem, rhs_elem, location))
+                .result(0)
+                .unwrap()
+                .into(),
+        };
+        let add_val: melior::ir::Value = match dtype {
+            DType::F32 | DType::F64 => matmul_block
+                .append_operation(arith::addf(acc_elem, mul_val, location))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 | DType::I64 => matmul_block
+                .append_operation(arith::addi(acc_elem, mul_val, location))
+                .result(0)
+                .unwrap()
+                .into(),
+        };
+        matmul_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[add_val])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+        let r = Region::new();
+        r.append_block(matmul_block);
+        r
+    };
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.matmul", location)
+                .add_operands(&[lhs_val, rhs_val, filled_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[(
+                    Identifier::new(context, "operand_segment_sizes"),
+                    segment_matmul,
+                )])
+                .add_regions([matmul_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit a reduction linalg.generic (ReduceSum or ReduceMax) ─────────
+
+#[allow(clippy::too_many_arguments)]
+fn emit_reduction<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    input: NodeId,
+    input_shape: &[u64],   // shape of the INPUT tensor
+    output_shape: &[u64],  // shape of the OUTPUT tensor
+    dim: usize,
+    keepdim: bool,
+    dtype: DType,
+    location: Location<'c>,
+    is_max: bool,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let elem_type = dtype.to_mlir_type(context);
+    let output_tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    // tensor.empty() for the output accumulator.
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[output_tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Build the identity constant for fill.
+    let identity_val: melior::ir::Value = if is_max {
+        match dtype {
+            DType::F32 | DType::F64 => body_block
+                .append_operation(arith::constant(
+                    context,
+                    FloatAttribute::new(context, elem_type, f64::NEG_INFINITY).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 => body_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(elem_type, i32::MIN as i64).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I64 => body_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(elem_type, i64::MIN).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+        }
+    } else {
+        // ReduceSum: identity is zero.
+        match dtype {
+            DType::F32 | DType::F64 => body_block
+                .append_operation(arith::constant(
+                    context,
+                    FloatAttribute::new(context, elem_type, 0.0).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 | DType::I64 => body_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(elem_type, 0).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+        }
+    };
+
+    // linalg.fill: fill the init tensor with the identity value.
+    let segment_fill = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse linalg.fill segment sizes".into())
+    })?;
+    let fill_region = {
+        let fill_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let fill_in = fill_block.argument(0).unwrap().into();
+        fill_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[fill_in])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+        let r = Region::new();
+        r.append_block(fill_block);
+        r
+    };
+    let filled_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[identity_val, init_val])
+                .add_results(&[output_tensor_type])
+                .add_attributes(&[(
+                    Identifier::new(context, "operand_segment_sizes"),
+                    segment_fill,
+                )])
+                .add_regions([fill_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Build iterator types: all "parallel" except the reduction dim.
+    let input_rank = input_shape.len();
+    let iters: Vec<&str> = (0..input_rank)
+        .map(|i| {
+            if i == dim {
+                "#linalg.iterator_type<reduction>"
+            } else {
+                "#linalg.iterator_type<parallel>"
+            }
+        })
+        .collect();
+    let iter_str = format!("[{}]", iters.join(", "));
+    let iterator_types = Attribute::parse(context, &iter_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {iter_str}")))?;
+
+    // Build affine maps.
+    // Input map: identity over input_rank dimensions.
+    let input_map = make_identity_map(context, input_rank)?;
+
+    // Output map: project away or zero out the reduction dim.
+    let dim_vars: Vec<String> = (0..input_rank).map(|i| format!("d{i}")).collect();
+    let dims_str = dim_vars.join(", ");
+    let mut result_exprs: Vec<String> = Vec::new();
+    for i in 0..input_rank {
+        if i == dim {
+            if keepdim {
+                result_exprs.push("0".to_string());
+            }
+            // if !keepdim, skip this dim entirely
+        } else {
+            result_exprs.push(dim_vars[i].clone());
+        }
+    }
+    let result_str = result_exprs.join(", ");
+    let output_map_str = format!("affine_map<({dims_str}) -> ({result_str})>");
+    let output_map = Attribute::parse(context, &output_map_str).ok_or_else(|| {
+        CompileError::AttributeParse(format!("failed to parse {output_map_str}"))
+    })?;
+
+    let indexing_maps = ArrayAttribute::new(context, &[input_map, output_map]);
+    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
+    })?;
+
+    // linalg.generic body: 2 args (in_elem, acc_elem).
+    let linalg_region = {
+        let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let in_elem: melior::ir::Value = linalg_block.argument(0).unwrap().into();
+        let acc_elem: melior::ir::Value = linalg_block.argument(1).unwrap().into();
+
+        let result: melior::ir::Value = if is_max {
+            match dtype {
+                DType::F32 | DType::F64 => linalg_block
+                    .append_operation(arith::maxnumf(in_elem, acc_elem, location))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                DType::I32 | DType::I64 => linalg_block
+                    .append_operation(arith::maxsi(in_elem, acc_elem, location))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+            }
+        } else {
+            // ReduceSum
+            match dtype {
+                DType::F32 | DType::F64 => linalg_block
+                    .append_operation(arith::addf(in_elem, acc_elem, location))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                DType::I32 | DType::I64 => linalg_block
+                    .append_operation(arith::addi(in_elem, acc_elem, location))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+            }
+        };
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[result])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[input_val, filled_val])
+                .add_results(&[output_tensor_type])
+                .add_attributes(&[
+                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
 /// Walk the trace linearly, emitting tensor-level ops into `body_block`.
 ///
 /// For each `Input` op: emits `bufferization.to_tensor` with `restrict`.
-/// For each `Add` op: emits `tensor.empty` + `linalg.generic`.
+/// For each compute op: emits `tensor.empty` + `linalg.generic`.
 /// After all ops: emits `bufferization.to_buffer` + `memref.copy` for the output.
 fn emit_tensor_ops<'c>(
     trace: &Trace,
     output_id: NodeId,
-    input_ops: &[(NodeId, &Op)],
     num_inputs: usize,
     body_block: &Block<'c>,
     location: Location<'c>,
     context: &'c Context,
 ) -> Result<(), CompileError> {
-    let _ = input_ops; // arg_index from Op::Input is the authoritative mapping
 
     // NodeId -> SSA tensor Value for each op emitted so far.
-    let mut values: HashMap<NodeId, melior::ir::Value<'c, '_>> = HashMap::new();
+    let mut values: HashMap<NodeId, melior::ir::Value<'c, 'c>> = HashMap::new();
 
     for (i, op) in trace.ops().iter().enumerate() {
         let node_id = NodeId(i as u32);
@@ -274,9 +882,7 @@ fn emit_tensor_ops<'c>(
                 shape,
                 dtype,
             } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[shape.0[0] as u64], elem_type, None).into();
+                let tensor_type = make_ranked_tensor_type(context, &shape.0, *dtype);
                 let memref_arg = body_block.argument(*arg_index as usize).unwrap();
 
                 let tensor_val = body_block
@@ -298,701 +904,207 @@ fn emit_tensor_ops<'c>(
                 values.insert(node_id, tensor_val);
             }
 
-            Op::Add {
-                lhs,
-                rhs,
-                shape,
-                dtype,
-            } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
-
-                let lhs_val = *values.get(lhs).expect("lhs node not yet emitted");
-                let rhs_val = *values.get(rhs).expect("rhs node not yet emitted");
-
-                // tensor.empty() — the initial output buffer for linalg.generic.
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                // Build the linalg.generic body region.
-                // The block has 3 args: lhs_elem, rhs_elem, out_elem (required by linalg ABI).
-                let linalg_region = {
-                    let linalg_block = Block::new(&[
-                        (elem_type, location),
-                        (elem_type, location),
-                        (elem_type, location),
-                    ]);
-                    let lhs_elem = linalg_block.argument(0).unwrap();
-                    let rhs_elem = linalg_block.argument(1).unwrap();
-
-                    // arith.addf or arith.addi depending on dtype.
-                    let sum_val = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => linalg_block
-                            .append_operation(arith::addf(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                        crate::DType::I32 | crate::DType::I64 => linalg_block
-                            .append_operation(arith::addi(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                    };
-
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[sum_val])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
-
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                // Identity affine map for rank-1: affine_map<(d0) -> (d0)>.
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                // 3 maps: lhs, rhs, out — all identity for element-wise ops.
-                let indexing_maps =
-                    ArrayAttribute::new(context, &[identity_map, identity_map, identity_map]);
-
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-
-                // operand_segment_sizes: 2 ins + 1 outs.
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[lhs_val, rhs_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+            Op::Add { lhs, rhs, shape, dtype } => {
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                let result_val = emit_binary_elementwise(
+                    context, body_block, &values, *lhs, *rhs,
+                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    |block, lhs_elem, rhs_elem| match dtype {
+                        DType::F32 | DType::F64 => block
+                            .append_operation(arith::addf(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                        DType::I32 | DType::I64 => block
+                            .append_operation(arith::addi(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                    },
+                )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Sub {
-                lhs,
-                rhs,
-                shape,
-                dtype,
-            } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
-
-                let lhs_val = *values.get(lhs).expect("lhs node not yet emitted");
-                let rhs_val = *values.get(rhs).expect("rhs node not yet emitted");
-
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                let linalg_region = {
-                    let linalg_block = Block::new(&[
-                        (elem_type, location),
-                        (elem_type, location),
-                        (elem_type, location),
-                    ]);
-                    let lhs_elem = linalg_block.argument(0).unwrap();
-                    let rhs_elem = linalg_block.argument(1).unwrap();
-
-                    let result = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => linalg_block
-                            .append_operation(arith::subf(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                        crate::DType::I32 | crate::DType::I64 => linalg_block
-                            .append_operation(arith::subi(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                    };
-
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[result])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
-
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                let indexing_maps =
-                    ArrayAttribute::new(context, &[identity_map, identity_map, identity_map]);
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[lhs_val, rhs_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+            Op::Sub { lhs, rhs, shape, dtype } => {
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                let result_val = emit_binary_elementwise(
+                    context, body_block, &values, *lhs, *rhs,
+                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    |block, lhs_elem, rhs_elem| match dtype {
+                        DType::F32 | DType::F64 => block
+                            .append_operation(arith::subf(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                        DType::I32 | DType::I64 => block
+                            .append_operation(arith::subi(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                    },
+                )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Mul {
-                lhs,
-                rhs,
-                shape,
-                dtype,
-            } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
-
-                let lhs_val = *values.get(lhs).expect("lhs node not yet emitted");
-                let rhs_val = *values.get(rhs).expect("rhs node not yet emitted");
-
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                let linalg_region = {
-                    let linalg_block = Block::new(&[
-                        (elem_type, location),
-                        (elem_type, location),
-                        (elem_type, location),
-                    ]);
-                    let lhs_elem = linalg_block.argument(0).unwrap();
-                    let rhs_elem = linalg_block.argument(1).unwrap();
-
-                    let result = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => linalg_block
-                            .append_operation(arith::mulf(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                        crate::DType::I32 | crate::DType::I64 => linalg_block
-                            .append_operation(arith::muli(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                    };
-
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[result])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
-
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                let indexing_maps =
-                    ArrayAttribute::new(context, &[identity_map, identity_map, identity_map]);
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[lhs_val, rhs_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+            Op::Mul { lhs, rhs, shape, dtype } => {
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                let result_val = emit_binary_elementwise(
+                    context, body_block, &values, *lhs, *rhs,
+                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    |block, lhs_elem, rhs_elem| match dtype {
+                        DType::F32 | DType::F64 => block
+                            .append_operation(arith::mulf(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                        DType::I32 | DType::I64 => block
+                            .append_operation(arith::muli(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                    },
+                )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Div {
-                lhs,
-                rhs,
-                shape,
-                dtype,
-            } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
-
-                let lhs_val = *values.get(lhs).expect("lhs node not yet emitted");
-                let rhs_val = *values.get(rhs).expect("rhs node not yet emitted");
-
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                let linalg_region = {
-                    let linalg_block = Block::new(&[
-                        (elem_type, location),
-                        (elem_type, location),
-                        (elem_type, location),
-                    ]);
-                    let lhs_elem = linalg_block.argument(0).unwrap();
-                    let rhs_elem = linalg_block.argument(1).unwrap();
-
-                    let result = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => linalg_block
-                            .append_operation(arith::divf(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                        crate::DType::I32 | crate::DType::I64 => linalg_block
-                            .append_operation(arith::divsi(
-                                lhs_elem.into(),
-                                rhs_elem.into(),
-                                location,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                    };
-
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[result])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
-
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                let indexing_maps =
-                    ArrayAttribute::new(context, &[identity_map, identity_map, identity_map]);
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[lhs_val, rhs_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+            Op::Div { lhs, rhs, shape, dtype } => {
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                let result_val = emit_binary_elementwise(
+                    context, body_block, &values, *lhs, *rhs,
+                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    |block, lhs_elem, rhs_elem| match dtype {
+                        DType::F32 | DType::F64 => block
+                            .append_operation(arith::divf(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                        DType::I32 | DType::I64 => block
+                            .append_operation(arith::divsi(lhs_elem, rhs_elem, location))
+                            .result(0).unwrap().into(),
+                    },
+                )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Neg {
-                input,
-                shape,
-                dtype,
-            } => {
+            Op::Neg { input, shape, dtype } => {
                 let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
-
-                let input_val = *values.get(input).expect("input node not yet emitted");
-
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                let linalg_region = {
-                    let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
-                    let in_elem = linalg_block.argument(0).unwrap();
-
-                    let result = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => linalg_block
-                            .append_operation(arith::negf(in_elem.into(), location))
-                            .result(0)
-                            .unwrap()
-                            .into(),
-                        crate::DType::I32 | crate::DType::I64 => {
-                            let zero = linalg_block
+                let result_val = emit_unary_elementwise(
+                    context, body_block, &values, *input,
+                    &shape.0, *dtype, location,
+                    |block, in_elem| match dtype {
+                        DType::F32 | DType::F64 => block
+                            .append_operation(arith::negf(in_elem, location))
+                            .result(0).unwrap().into(),
+                        DType::I32 | DType::I64 => {
+                            let zero = block
                                 .append_operation(arith::constant(
                                     context,
                                     IntegerAttribute::new(elem_type, 0).into(),
                                     location,
                                 ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            linalg_block
-                                .append_operation(arith::subi(zero, in_elem.into(), location))
-                                .result(0)
-                                .unwrap()
-                                .into()
+                                .result(0).unwrap().into();
+                            block
+                                .append_operation(arith::subi(zero, in_elem, location))
+                                .result(0).unwrap().into()
                         }
-                    };
-
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[result])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
-
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                // Unary: 2 maps (in, out).
-                let indexing_maps = ArrayAttribute::new(context, &[identity_map, identity_map]);
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-                // Unary: 1 ins + 1 outs.
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[input_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+                    },
+                )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Relu {
-                input,
-                shape,
-                dtype,
-            } => {
+            Op::Exp { input, shape, dtype } => {
                 let elem_type = dtype.to_mlir_type(context);
-                let num_elems = shape.0[0] as u64;
-                let tensor_type: melior::ir::Type =
-                    RankedTensorType::new(&[num_elems], elem_type, None).into();
+                let result_val = emit_unary_elementwise(
+                    context, body_block, &values, *input,
+                    &shape.0, *dtype, location,
+                    |block, in_elem| {
+                        block
+                            .append_operation(
+                                OperationBuilder::new("math.exp", location)
+                                    .add_operands(&[in_elem])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .expect("failed to build math.exp"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    },
+                )?;
+                values.insert(node_id, result_val);
+            }
 
-                let input_val = *values.get(input).expect("input node not yet emitted");
+            Op::Tanh { input, shape, dtype } => {
+                let elem_type = dtype.to_mlir_type(context);
+                let result_val = emit_unary_elementwise(
+                    context, body_block, &values, *input,
+                    &shape.0, *dtype, location,
+                    |block, in_elem| {
+                        block
+                            .append_operation(
+                                OperationBuilder::new("math.tanh", location)
+                                    .add_operands(&[in_elem])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .expect("failed to build math.tanh"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    },
+                )?;
+                values.insert(node_id, result_val);
+            }
 
-                let init_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
+            Op::Matmul { lhs, rhs, shape, dtype } => {
+                let result_val = emit_matmul(
+                    context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
+                )?;
+                values.insert(node_id, result_val);
+            }
 
-                let linalg_region = {
-                    let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
-                    let in_elem = linalg_block.argument(0).unwrap();
-
-                    let result = match dtype {
-                        crate::DType::F32 | crate::DType::F64 => {
-                            let zero = linalg_block
+            Op::Relu { input, shape, dtype } => {
+                let elem_type = dtype.to_mlir_type(context);
+                let result_val = emit_unary_elementwise(
+                    context, body_block, &values, *input,
+                    &shape.0, *dtype, location,
+                    |block, in_elem| match dtype {
+                        DType::F32 | DType::F64 => {
+                            let zero = block
                                 .append_operation(arith::constant(
                                     context,
                                     FloatAttribute::new(context, elem_type, 0.0).into(),
                                     location,
                                 ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            linalg_block
-                                .append_operation(arith::maxnumf(in_elem.into(), zero, location))
-                                .result(0)
-                                .unwrap()
-                                .into()
+                                .result(0).unwrap().into();
+                            block
+                                .append_operation(arith::maxnumf(in_elem, zero, location))
+                                .result(0).unwrap().into()
                         }
-                        crate::DType::I32 | crate::DType::I64 => {
-                            let zero = linalg_block
+                        DType::I32 | DType::I64 => {
+                            let zero = block
                                 .append_operation(arith::constant(
                                     context,
                                     IntegerAttribute::new(elem_type, 0).into(),
                                     location,
                                 ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            linalg_block
-                                .append_operation(arith::maxsi(in_elem.into(), zero, location))
-                                .result(0)
-                                .unwrap()
-                                .into()
+                                .result(0).unwrap().into();
+                            block
+                                .append_operation(arith::maxsi(in_elem, zero, location))
+                                .result(0).unwrap().into()
                         }
-                    };
+                    },
+                )?;
+                values.insert(node_id, result_val);
+            }
 
-                    linalg_block.append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[result])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    );
+            Op::ReduceSum { input, dim, keepdim, shape, dtype } => {
+                let input_shape = trace.get(*input).shape();
+                let result_val = emit_reduction(
+                    context, body_block, &values, *input,
+                    &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                    false,
+                )?;
+                values.insert(node_id, result_val);
+            }
 
-                    let r = Region::new();
-                    r.append_block(linalg_block);
-                    r
-                };
-
-                let identity_map = Attribute::parse(context, "affine_map<(d0) -> (d0)>")
-                    .ok_or_else(|| {
-                        CompileError::AttributeParse(
-                            "failed to parse affine_map<(d0) -> (d0)>".into(),
-                        )
-                    })?;
-                // Unary: 2 maps (in, out).
-                let indexing_maps = ArrayAttribute::new(context, &[identity_map, identity_map]);
-                let iterator_types: Attribute = Attribute::parse(
-                    context,
-                    "[#linalg.iterator_type<parallel>]",
-                )
-                .ok_or_else(|| {
-                    CompileError::AttributeParse("failed to parse iterator_types attribute".into())
-                })?;
-                // Unary: 1 ins + 1 outs.
-                let segment_sizes =
-                    Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
-                        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-                    })?;
-
-                let result_val = body_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.generic", location)
-                            .add_operands(&[input_val, init_val])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[
-                                (
-                                    Identifier::new(context, "indexing_maps"),
-                                    indexing_maps.into(),
-                                ),
-                                (Identifier::new(context, "iterator_types"), iterator_types),
-                                (
-                                    Identifier::new(context, "operand_segment_sizes"),
-                                    segment_sizes,
-                                ),
-                            ])
-                            .add_regions([linalg_region])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
+            Op::ReduceMax { input, dim, keepdim, shape, dtype } => {
+                let input_shape = trace.get(*input).shape();
+                let result_val = emit_reduction(
+                    context, body_block, &values, *input,
+                    &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                    true,
+                )?;
                 values.insert(node_id, result_val);
             }
         }
@@ -1001,12 +1113,11 @@ fn emit_tensor_ops<'c>(
     // ---- Output boundary: bufferization.to_buffer + memref.copy ---------------
     let result_tensor = *values.get(&output_id).expect("output node not emitted");
 
-    // Recover the output tensor's type so we can build the matching memref type.
     let output_op = trace.get(output_id);
     let out_elem_type = output_op.dtype().to_mlir_type(context);
-    let num_elems = output_op.shape().0[0] as i64;
+    let dims: Vec<i64> = output_op.shape().0.iter().map(|&d| d as i64).collect();
     let out_memref_type: melior::ir::Type =
-        MemRefType::new(out_elem_type, &[num_elems], None, None).into();
+        MemRefType::new(out_elem_type, &dims, None, None).into();
 
     let result_memref = body_block
         .append_operation(
@@ -1152,6 +1263,43 @@ mod tests {
         begin_trace();
         let a = Tensor::new(&[4], DType::I32);
         let b = a.relu();
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[b.id]);
+        assert!(result.is_ok(), "compile failed: {:?}", result.err());
+    }
+
+    // ── Rank-2 and rank-3 compile tests ──────────────────────────────────────
+
+    #[test]
+    fn compile_add_rank2() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[2, 3], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[c.id]);
+        assert!(result.is_ok(), "compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn compile_add_rank3() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3, 4], DType::F32);
+        let b = Tensor::new(&[2, 3, 4], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[c.id]);
+        assert!(result.is_ok(), "compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn compile_neg_rank2() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = -&a;
         let trace = take_trace();
 
         let result = Compiler::compile(&trace, &[b.id]);

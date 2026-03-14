@@ -54,6 +54,41 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Element-wise exponential (e^x).
+    Exp {
+        input: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise hyperbolic tangent.
+    Tanh {
+        input: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Matrix multiplication: [M, K] x [K, N] -> [M, N].
+    Matmul {
+        lhs: NodeId,
+        rhs: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Reduce by summing along a dimension.
+    ReduceSum {
+        input: NodeId,
+        dim: usize,
+        keepdim: bool,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Reduce by taking max along a dimension.
+    ReduceMax {
+        input: NodeId,
+        dim: usize,
+        keepdim: bool,
+        shape: Shape,
+        dtype: DType,
+    },
 }
 
 impl Op {
@@ -66,6 +101,11 @@ impl Op {
             Op::Div { shape, .. } => shape,
             Op::Neg { shape, .. } => shape,
             Op::Relu { shape, .. } => shape,
+            Op::Exp { shape, .. } => shape,
+            Op::Tanh { shape, .. } => shape,
+            Op::Matmul { shape, .. } => shape,
+            Op::ReduceSum { shape, .. } => shape,
+            Op::ReduceMax { shape, .. } => shape,
         }
     }
 
@@ -78,6 +118,11 @@ impl Op {
             Op::Div { dtype, .. } => *dtype,
             Op::Neg { dtype, .. } => *dtype,
             Op::Relu { dtype, .. } => *dtype,
+            Op::Exp { dtype, .. } => *dtype,
+            Op::Tanh { dtype, .. } => *dtype,
+            Op::Matmul { dtype, .. } => *dtype,
+            Op::ReduceSum { dtype, .. } => *dtype,
+            Op::ReduceMax { dtype, .. } => *dtype,
         }
     }
 }

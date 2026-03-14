@@ -9,7 +9,7 @@ pub mod trace;
 pub use compiler::Compiler;
 pub use dtype::DType;
 pub use op::NodeId;
-pub use runtime::CompiledGraph;
+pub use runtime::{Buffer, CompiledGraph};
 pub use shape::Shape;
 pub use tensor::Tensor;
 pub use trace::{begin_trace, take_trace};

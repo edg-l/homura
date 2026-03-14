@@ -1,4 +1,4 @@
-use homura::{Compiler, DType, Tensor, begin_trace, take_trace};
+use homura::{Buffer, Compiler, DType, Tensor, begin_trace, take_trace};
 
 fn main() {
     println!("homura: a + b demo");
@@ -18,13 +18,15 @@ fn main() {
     // Execute.
     let a_data = [1.0f32, 2.0, 3.0, 4.0];
     let b_data = [5.0f32, 6.0, 7.0, 8.0];
-    let result = compiled.run(&[&a_data, &b_data]);
+    let a_buf = Buffer::from_slice::<f32>(&a_data, &[4], DType::F32);
+    let b_buf = Buffer::from_slice::<f32>(&b_data, &[4], DType::F32);
+    let result = compiled.run(&[&a_buf, &b_buf]);
 
     println!("a      = {:?}", a_data);
     println!("b      = {:?}", b_data);
-    println!("a + b  = {:?}", result);
+    println!("a + b  = {:?}", result.as_slice::<f32>());
 
-    assert_eq!(result, vec![6.0, 8.0, 10.0, 12.0]);
+    assert_eq!(result.as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
     println!("Result verified.");
 
     // Demonstrate chained add: a + b + c
@@ -36,12 +38,11 @@ fn main() {
     let trace2 = take_trace();
 
     let compiled2 = Compiler::compile(&trace2, &[out.id()]).expect("chained compile failed");
-    let result2 = compiled2.run(&[
-        &[1.0, 2.0, 3.0, 4.0],
-        &[10.0, 20.0, 30.0, 40.0],
-        &[100.0, 200.0, 300.0, 400.0],
-    ]);
-    println!("x + y + z = {:?}", result2);
-    assert_eq!(result2, vec![111.0, 222.0, 333.0, 444.0]);
+    let x_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+    let y_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+    let z_buf = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
+    let result2 = compiled2.run(&[&x_buf, &y_buf, &z_buf]);
+    println!("x + y + z = {:?}", result2.as_slice::<f32>());
+    assert_eq!(result2.as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
     println!("Chained result verified.");
 }
