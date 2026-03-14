@@ -172,15 +172,28 @@ impl Compiler {
         }
 
         // ---- Run lowering passes ----------------------------------------------
+        // TOSA passes (func-level) run first, then bufferize → LLVM (module-level).
+        // TOSA passes are no-ops when no TOSA ops are present, so this pipeline
+        // handles both pure-linalg and pure-TOSA (and mixed) modules.
+        // expand-strided-metadata is required for the tensor.expand_shape used in
+        // promote_rank_with_reshape (binary op rank promotion for broadcast).
         register_all_passes();
         let pass_manager = pass::PassManager::new(&context);
         parse_pass_pipeline(
             pass_manager.as_operation_pass_manager(),
             "builtin.module(\
+                func.func(\
+                    tosa-make-broadcastable,\
+                    tosa-to-linalg-named,\
+                    tosa-to-linalg,\
+                    tosa-to-arith,\
+                    tosa-to-tensor\
+                ),\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 convert-linalg-to-loops,\
                 convert-scf-to-cf,\
                 convert-math-to-llvm,\
+                expand-strided-metadata,\
                 finalize-memref-to-llvm,\
                 convert-arith-to-llvm,\
                 convert-index-to-llvm,\
@@ -204,6 +217,99 @@ impl Compiler {
         ))
     }
 
+    /// Build the MLIR module for a trace and return its text representation
+    /// **before** any lowering passes are applied.
+    ///
+    /// This is a test-only helper for IR verification (task 2.10).
+    #[cfg(test)]
+    pub fn build_ir_string(trace: &Trace, outputs: &[NodeId]) -> Result<String, CompileError> {
+        if trace.ops().is_empty() {
+            return Err(CompileError::EmptyTrace);
+        }
+        if outputs.is_empty() {
+            return Err(CompileError::NoOutputs);
+        }
+
+        let mut input_ops: Vec<(NodeId, &Op)> = trace
+            .ops()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                if matches!(op, Op::Input { .. }) {
+                    Some((NodeId(i as u32), op))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        input_ops.sort_by_key(|(_, op)| {
+            if let Op::Input { arg_index, .. } = op {
+                *arg_index
+            } else {
+                unreachable!()
+            }
+        });
+
+        let num_inputs = input_ops.len();
+        let output_id = outputs[0];
+        let output_op = trace.get(output_id);
+        let output_shape = output_op.shape().clone();
+        let output_dtype = output_op.dtype();
+
+        let context = create_context();
+        let location = Location::unknown(&context);
+        let module = Module::new(location);
+
+        {
+            let elem_type = output_dtype.to_mlir_type(&context);
+
+            let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
+            for (_, op) in &input_ops {
+                let Op::Input { shape, dtype, .. } = op else {
+                    unreachable!()
+                };
+                let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
+                let mref = MemRefType::new(dtype.to_mlir_type(&context), &dims, None, None);
+                arg_types.push((mref.into(), location));
+            }
+            let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
+            let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
+            arg_types.push((out_mref.into(), location));
+
+            let func_arg_types: Vec<melior::ir::Type> =
+                arg_types.iter().map(|(t, _)| *t).collect();
+            let function_type = FunctionType::new(&context, &func_arg_types, &[]);
+
+            let body_block = Block::new(&arg_types);
+
+            emit_tensor_ops(trace, output_id, num_inputs, &body_block, location, &context)?;
+
+            body_block.append_operation(func::r#return(&[], location));
+
+            let func_region = Region::new();
+            func_region.append_block(body_block);
+
+            let function = func::func(
+                &context,
+                StringAttribute::new(&context, "compute"),
+                TypeAttribute::new(function_type.into()),
+                func_region,
+                &[(
+                    Identifier::new(&context, "llvm.emit_c_interface"),
+                    Attribute::unit(&context),
+                )],
+                location,
+            );
+
+            module.body().append_operation(function);
+        }
+
+        if !module.as_operation().verify() {
+            return Err(CompileError::Verification);
+        }
+
+        Ok(module.as_operation().to_string())
+    }
 }
 
 /// Create an MLIR context with all dialects and LLVM translations registered.
@@ -383,10 +489,303 @@ where
     Ok(result_val)
 }
 
-// ── Helper: emit a unary element-wise linalg.generic ─────────────────────────
+// ── Helper: emit a tosa.const scalar tensor ───────────────────────────────────
+//
+// Emits `tosa.const() {values = dense<VAL> : tensor<TYPE>}` for scalar (rank-0)
+// tensors used as zero-point or shift operands in TOSA ops.
+//
+// `dense_attr_str` is the full `dense<…> : tensor<…>` attribute string,
+// e.g. `"dense<0> : tensor<i8>"` or `"dense<0.0> : tensor<f32>"`.
+
+fn emit_tosa_const_scalar<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    dense_attr_str: &str,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let values_attr = Attribute::parse(context, dense_attr_str)
+        .ok_or_else(|| CompileError::AttributeParse(dense_attr_str.to_string()))?;
+
+    // The result type mirrors the tensor type embedded in the dense attribute.
+    // We derive it by stripping `dense<…> : ` and using the rest as the type.
+    let type_str = dense_attr_str
+        .split_once(':')
+        .map(|(_, s)| s.trim())
+        .unwrap_or("tensor<i8>");
+    let result_type = melior::ir::Type::parse(context, type_str)
+        .ok_or_else(|| CompileError::AttributeParse(type_str.to_string()))?;
+
+    let val = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.const", location)
+                .add_results(&[result_type])
+                .add_attributes(&[(Identifier::new(context, "values"), values_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(val)
+}
+
+// ── Helper: emit tosa.const_shape + tosa.reshape ─────────────────────────────
+//
+// Emits a `tosa.const_shape` with the given target shape (producing a
+// `!tosa.shape<N>` value) followed by a `tosa.reshape` that reshapes
+// `input` to `target_shape`. Returns the reshaped tensor value.
 
 #[allow(clippy::too_many_arguments)]
-fn emit_unary_elementwise<'c, F>(
+fn emit_tosa_reshape<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    input: melior::ir::Value<'c, 'c>,
+    target_shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let n = target_shape.len();
+
+    // Build the !tosa.shape<N> type.
+    let shape_type_str = format!("!tosa.shape<{n}>");
+    let shape_type = melior::ir::Type::parse(context, &shape_type_str)
+        .ok_or_else(|| CompileError::AttributeParse(shape_type_str.clone()))?;
+
+    // Build `dense<[d0, d1, ...]> : tensor<Nxindex>` for the values attribute.
+    let dims_str = target_shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dense_attr_str = format!("dense<[{dims_str}]> : tensor<{n}xindex>");
+    let values_attr = Attribute::parse(context, &dense_attr_str)
+        .ok_or_else(|| CompileError::AttributeParse(dense_attr_str.clone()))?;
+
+    // tosa.const_shape {values = dense<[...]> : tensor<Nxindex>} : () -> !tosa.shape<N>
+    let const_shape_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.const_shape", location)
+                .add_results(&[shape_type])
+                .add_attributes(&[(Identifier::new(context, "values"), values_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // tosa.reshape %input, %const_shape : (...) -> tensor<d0xd1x...xT>
+    let result_type = make_ranked_tensor_type(context, target_shape, dtype);
+    let reshaped: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.reshape", location)
+                .add_operands(&[input, const_shape_val])
+                .add_results(&[result_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(reshaped)
+}
+
+// ── Helper: promote a tensor to a target rank by prepending size-1 dims ───────
+//
+// If `val` has rank < `target_rank`, emits a `tosa.reshape` to prepend size-1
+// dimensions. Returns the (possibly reshaped) value with the promoted type.
+// This mirrors what `tosa-make-broadcastable` does, but at IR-build time so
+// that the module verifies before passes run.
+
+fn promote_rank_with_reshape<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    val: melior::ir::Value<'c, 'c>,
+    val_shape: &[u64],
+    target_rank: usize,
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<(melior::ir::Value<'c, 'c>, Vec<u64>), CompileError> {
+    let current_rank = val_shape.len();
+    if current_rank == target_rank {
+        return Ok((val, val_shape.to_vec()));
+    }
+
+    // Prepend (target_rank - current_rank) ones.
+    let prefix = target_rank - current_rank;
+    let mut new_shape: Vec<u64> = vec![1u64; prefix];
+    new_shape.extend_from_slice(val_shape);
+
+    let new_tensor_type = make_ranked_tensor_type(context, &new_shape, dtype);
+
+    // Use tensor.expand_shape to prepend size-1 dimensions.
+    // The reassociation attribute groups old dims into new dims.
+    // Each existing dim of `val` maps to one new dim; the `prefix` new
+    // leading dimensions are grouped with the first existing dim (or, if
+    // val_shape is empty, all prefix dims form a single group).
+    //
+    // Example: val_shape=[3], target_rank=2, prefix=1
+    //   reassociation = [[0, 1]]   (old dim 0 → new dims 0,1 = [1, 3])
+    //
+    // Example: val_shape=[2,3], target_rank=3, prefix=1
+    //   reassociation = [[0, 1], [2]]
+    //
+    // General pattern: group all prefix new dims with old dim 0,
+    // then map each remaining old dim 1-to-1.
+
+    let reassoc_parts: Vec<String> = (0..current_rank)
+        .map(|old_i| {
+            if old_i == 0 {
+                // This group covers the prefix new dims plus the new dim at index `prefix`.
+                let new_dims: Vec<String> = (0..=prefix).map(|j| j.to_string()).collect();
+                format!("[{}]", new_dims.join(", "))
+            } else {
+                // One-to-one: old dim i -> new dim (prefix + i).
+                format!("[{}]", prefix + old_i)
+            }
+        })
+        .collect();
+    let reassoc_str = format!("[{}]", reassoc_parts.join(", "));
+
+    let reassoc_attr = Attribute::parse(context, &reassoc_str)
+        .ok_or_else(|| CompileError::AttributeParse(reassoc_str.clone()))?;
+
+    // static_output_shape: array<i64: d0, d1, ...>
+    let n = new_shape.len();
+    let dims_str = new_shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let static_shape_attr_str = format!("array<i64: {dims_str}>");
+    let static_shape_attr = Attribute::parse(context, &static_shape_attr_str)
+        .ok_or_else(|| CompileError::AttributeParse(static_shape_attr_str.clone()))?;
+    let _ = n;
+
+    let expanded = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.expand_shape", location)
+                .add_operands(&[val])
+                .add_results(&[new_tensor_type])
+                .add_attributes(&[
+                    (Identifier::new(context, "reassociation"), reassoc_attr),
+                    (Identifier::new(context, "static_output_shape"), static_shape_attr),
+                ])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok((expanded, new_shape))
+}
+
+// ── Helper: emit tosa.add or tosa.sub ────────────────────────────────────────
+//
+// Promotes operands to matching rank (via tosa.reshape) before emitting.
+// `tosa.add` and `tosa.sub` require equal-rank operands.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_binary<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    op_name: &str,
+    lhs: NodeId,
+    rhs: NodeId,
+    lhs_shape: &[u64],
+    rhs_shape: &[u64],
+    output_shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+
+    // Promote to matching rank if needed (tosa.add/sub/mul require equal ranks).
+    let target_rank = output_shape.len();
+    let (lhs_val, _) = promote_rank_with_reshape(
+        context, body_block, lhs_val, lhs_shape, target_rank, dtype, location,
+    )?;
+    let (rhs_val, _) = promote_rank_with_reshape(
+        context, body_block, rhs_val, rhs_shape, target_rank, dtype, location,
+    )?;
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new(op_name, location)
+                .add_operands(&[lhs_val, rhs_val])
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit tosa.mul ─────────────────────────────────────────────────────
+//
+// `tosa.mul` takes 3 operands: (input1, input2, shift : tensor<1xi8>).
+// For float types the shift operand must still be present with value 0.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_mul<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    lhs: NodeId,
+    rhs: NodeId,
+    lhs_shape: &[u64],
+    rhs_shape: &[u64],
+    output_shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+
+    // Promote to matching rank if needed.
+    let target_rank = output_shape.len();
+    let (lhs_val, _) = promote_rank_with_reshape(
+        context, body_block, lhs_val, lhs_shape, target_rank, dtype, location,
+    )?;
+    let (rhs_val, _) = promote_rank_with_reshape(
+        context, body_block, rhs_val, rhs_shape, target_rank, dtype, location,
+    )?;
+
+    // shift is a rank-1 size-1 tensor<1xi8> with value 0 (required even for float mul).
+    let shift_val =
+        emit_tosa_const_scalar(context, body_block, "dense<0> : tensor<1xi8>", location)?;
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.mul", location)
+                .add_operands(&[lhs_val, rhs_val, shift_val])
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit tosa.negate ──────────────────────────────────────────────────
+//
+// `tosa.negate` takes 3 operands: (input, input1_zp, output_zp).
+// For unquantized (float/int) use, both zero-point tensors are 0.
+
+fn emit_tosa_negate<'c>(
     context: &'c Context,
     body_block: &Block<'c>,
     values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
@@ -394,73 +793,191 @@ fn emit_unary_elementwise<'c, F>(
     shape: &[u64],
     dtype: DType,
     location: Location<'c>,
-    body_fn: F,
-) -> Result<melior::ir::Value<'c, 'c>, CompileError>
-where
-    F: FnOnce(&Block<'c>, melior::ir::Value<'c, 'c>) -> melior::ir::Value<'c, 'c>,
-{
-    let elem_type = dtype.to_mlir_type(context);
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     let tensor_type = make_ranked_tensor_type(context, shape, dtype);
-    let rank = shape.len();
-
     let input_val = *values.get(&input).expect("input node not yet emitted");
 
-    // tensor.empty() for the output slot.
-    let init_val = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // linalg body: 2 block args (in_elem, out_elem).
-    let linalg_region = {
-        let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
-        let in_elem = linalg_block.argument(0).unwrap().into();
-
-        let result = body_fn(&linalg_block, in_elem);
-
-        linalg_block.append_operation(
-            OperationBuilder::new("linalg.yield", location)
-                .add_operands(&[result])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        );
-
-        let r = Region::new();
-        r.append_block(linalg_block);
-        r
+    // zero-point tensors: rank-1 size-1 tensor<1xT> matching the element type.
+    let zp_dense = match dtype {
+        DType::F32 => "dense<0.0> : tensor<1xf32>",
+        DType::F64 => "dense<0.0> : tensor<1xf64>",
+        DType::I32 => "dense<0> : tensor<1xi32>",
+        DType::I64 => "dense<0> : tensor<1xi64>",
     };
-
-    // 2 identity maps: in, out.
-    let identity_map = make_identity_map(context, rank)?;
-    let indexing_maps = ArrayAttribute::new(context, &[identity_map, identity_map]);
-    let iterator_types = make_iterator_types(context, rank)?;
-    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
-        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-    })?;
+    let zp1 = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+    let zp2 = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
 
     let result_val = body_block
         .append_operation(
-            OperationBuilder::new("linalg.generic", location)
-                .add_operands(&[input_val, init_val])
+            OperationBuilder::new("tosa.negate", location)
+                .add_operands(&[input_val, zp1, zp2])
                 .add_results(&[tensor_type])
-                .add_attributes(&[
-                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
-                    (Identifier::new(context, "iterator_types"), iterator_types),
-                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
-                ])
-                .add_regions([linalg_region])
                 .build()
                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
         )
         .result(0)
         .unwrap()
         .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit tosa.exp or tosa.tanh (simple 1-operand TOSA unary ops) ─────
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_unary_simple<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    op_name: &str,
+    input: NodeId,
+    shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let tensor_type = make_ranked_tensor_type(context, shape, dtype);
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new(op_name, location)
+                .add_operands(&[input_val])
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit tosa.clamp (used for relu: clamp(input, 0, max)) ─────────────
+//
+// `tosa.clamp` in MLIR 21 takes attributes `min_val` and `max_val`
+// (each a single IntegerAttr or FloatAttr matching the element type).
+
+fn emit_tosa_clamp<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    input: NodeId,
+    shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let tensor_type = make_ranked_tensor_type(context, shape, dtype);
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+    let elem_type = dtype.to_mlir_type(context);
+
+    let (min_val_attr, max_val_attr): (Attribute<'c>, Attribute<'c>) = match dtype {
+        DType::F32 => (
+            FloatAttribute::new(context, elem_type, 0.0).into(),
+            FloatAttribute::new(context, elem_type, f32::MAX as f64).into(),
+        ),
+        DType::F64 => (
+            FloatAttribute::new(context, elem_type, 0.0).into(),
+            FloatAttribute::new(context, elem_type, f64::MAX).into(),
+        ),
+        DType::I32 => (
+            IntegerAttribute::new(elem_type, 0).into(),
+            IntegerAttribute::new(elem_type, i32::MAX as i64).into(),
+        ),
+        DType::I64 => (
+            IntegerAttribute::new(elem_type, 0).into(),
+            IntegerAttribute::new(elem_type, i64::MAX).into(),
+        ),
+    };
+
+    let result_val = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.clamp", location)
+                .add_operands(&[input_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[
+                    (Identifier::new(context, "min_val"), min_val_attr),
+                    (Identifier::new(context, "max_val"), max_val_attr),
+                ])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit tosa.matmul for float [M,K] x [K,N] -> [M,N] ───────────────
+//
+// tosa.matmul requires 3-D inputs [B, M, K] x [B, K, N] -> [B, M, N].
+// For 2-D inputs we wrap with tosa.const_shape + tosa.reshape to add a batch
+// dim of 1, call tosa.matmul, then tosa.const_shape + tosa.reshape to remove
+// it again.
+//
+// tosa.matmul takes 4 operands: (a, b, a_zp, b_zp) where a_zp and b_zp are
+// scalar zero-point tensors (0.0 for float unquantized use).
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_matmul<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    lhs: NodeId,
+    rhs: NodeId,
+    lhs_shape: &[u64],  // [M, K]
+    rhs_shape: &[u64],  // [K, N]
+    output_shape: &[u64],  // [M, N]
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+
+    let m = lhs_shape[0];
+    let k = lhs_shape[1];
+    let n = rhs_shape[1];
+
+    // Promote 2D [M,K] -> 3D [1,M,K] via tosa.reshape.
+    let lhs_3d_shape = [1u64, m, k];
+    let rhs_3d_shape = [1u64, k, n];
+    let out_3d_shape = [1u64, m, n];
+
+    let out_3d_type = make_ranked_tensor_type(context, &out_3d_shape, dtype);
+
+    // tosa.reshape lhs [M,K] -> [1,M,K]
+    let lhs_3d = emit_tosa_reshape(context, body_block, lhs_val, &lhs_3d_shape, dtype, location)?;
+
+    // tosa.reshape rhs [K,N] -> [1,K,N]
+    let rhs_3d = emit_tosa_reshape(context, body_block, rhs_val, &rhs_3d_shape, dtype, location)?;
+
+    // Zero-point tensors for a_zp and b_zp: must be rank-1 size-1 (tensor<1xT>).
+    // TOSA ScalarIntOrFloatTensor requires rank 1 with all dims = 1.
+    let zp_dense = match dtype {
+        DType::F32 => "dense<0.0> : tensor<1xf32>",
+        DType::F64 => "dense<0.0> : tensor<1xf64>",
+        DType::I32 => "dense<0> : tensor<1xi32>",
+        DType::I64 => "dense<0> : tensor<1xi64>",
+    };
+    let a_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+    let b_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+
+    // tosa.matmul [1,M,K] x [1,K,N] -> [1,M,N]
+    let out_3d: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.matmul", location)
+                .add_operands(&[lhs_3d, rhs_3d, a_zp, b_zp])
+                .add_results(&[out_3d_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // tosa.reshape [1,M,N] -> [M,N]
+    let result_val = emit_tosa_reshape(context, body_block, out_3d, output_shape, dtype, location)?;
 
     Ok(result_val)
 }
@@ -859,6 +1376,81 @@ fn emit_reduction<'c>(
     Ok(result_val)
 }
 
+// ── Helper: emit tosa.reduce_sum or tosa.reduce_max ──────────────────────────
+//
+// tosa.reduce_sum / tosa.reduce_max take a single input and an `axis` attribute
+// (i32). They KEEP the same rank as input — the reduced dimension becomes size 1
+// (i.e., they always behave like keepdim=true).
+//
+// For keepdim=true: TOSA output is the final output (shape matches).
+// For keepdim=false: we emit tosa.reshape afterwards to remove the
+// size-1 dimension at position `dim`.
+//
+// tosa.reduce_max also requires a `nan_mode` attribute ("PROPAGATE").
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_reduce<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    op_name: &str,  // "tosa.reduce_sum" or "tosa.reduce_max"
+    input: NodeId,
+    input_shape: &[u64],
+    output_shape: &[u64],  // final output shape (keepdim already reflected)
+    dim: usize,
+    keepdim: bool,
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    // TOSA reduction output: same rank as input, with dim set to 1.
+    let mut tosa_out_shape: Vec<u64> = input_shape.to_vec();
+    tosa_out_shape[dim] = 1;
+    let tosa_out_type = make_ranked_tensor_type(context, &tosa_out_shape, dtype);
+
+    // axis attribute: i32
+    let axis_attr = IntegerAttribute::new(
+        melior::ir::r#type::IntegerType::new(context, 32).into(),
+        dim as i64,
+    );
+
+    let mut attrs: Vec<(Identifier<'c>, Attribute<'c>)> =
+        vec![(Identifier::new(context, "axis"), axis_attr.into())];
+
+    // tosa.reduce_max requires nan_mode = "PROPAGATE"
+    if op_name == "tosa.reduce_max" {
+        let nan_mode_attr = Attribute::parse(context, "\"PROPAGATE\"")
+            .ok_or_else(|| CompileError::AttributeParse("nan_mode PROPAGATE".into()))?;
+        attrs.push((Identifier::new(context, "nan_mode"), nan_mode_attr));
+    }
+
+    let reduced: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new(op_name, location)
+                .add_operands(&[input_val])
+                .add_results(&[tosa_out_type])
+                .add_attributes(&attrs)
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    if keepdim {
+        // TOSA output already has the size-1 dim at position `dim` — matches output_shape.
+        return Ok(reduced);
+    }
+
+    // keepdim=false: use tosa.const_shape + tosa.reshape to remove the size-1 dim
+    // at position `dim`. tosa_out_shape has rank = input_rank; output_shape has
+    // rank = input_rank - 1 (the size-1 dim at `dim` has been removed).
+    let result_val = emit_tosa_reshape(context, body_block, reduced, output_shape, dtype, location)?;
+
+    Ok(result_val)
+}
+
 /// Walk the trace linearly, emitting tensor-level ops into `body_block`.
 ///
 /// For each `Input` op: emits `bufferization.to_tensor` with `restrict`.
@@ -910,17 +1502,9 @@ fn emit_tensor_ops<'c>(
             Op::Add { lhs, rhs, shape, dtype } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
-                let result_val = emit_binary_elementwise(
-                    context, body_block, &values, *lhs, *rhs,
-                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
-                    |block, lhs_elem, rhs_elem| match dtype {
-                        DType::F32 | DType::F64 => block
-                            .append_operation(arith::addf(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                        DType::I32 | DType::I64 => block
-                            .append_operation(arith::addi(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                    },
+                let result_val = emit_tosa_binary(
+                    context, body_block, &values, "tosa.add",
+                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
@@ -928,17 +1512,9 @@ fn emit_tensor_ops<'c>(
             Op::Sub { lhs, rhs, shape, dtype } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
-                let result_val = emit_binary_elementwise(
-                    context, body_block, &values, *lhs, *rhs,
-                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
-                    |block, lhs_elem, rhs_elem| match dtype {
-                        DType::F32 | DType::F64 => block
-                            .append_operation(arith::subf(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                        DType::I32 | DType::I64 => block
-                            .append_operation(arith::subi(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                    },
+                let result_val = emit_tosa_binary(
+                    context, body_block, &values, "tosa.sub",
+                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
@@ -946,17 +1522,9 @@ fn emit_tensor_ops<'c>(
             Op::Mul { lhs, rhs, shape, dtype } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
-                let result_val = emit_binary_elementwise(
-                    context, body_block, &values, *lhs, *rhs,
-                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
-                    |block, lhs_elem, rhs_elem| match dtype {
-                        DType::F32 | DType::F64 => block
-                            .append_operation(arith::mulf(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                        DType::I32 | DType::I64 => block
-                            .append_operation(arith::muli(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
-                    },
+                let result_val = emit_tosa_mul(
+                    context, body_block, &values,
+                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
@@ -980,134 +1548,81 @@ fn emit_tensor_ops<'c>(
             }
 
             Op::Neg { input, shape, dtype } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let result_val = emit_unary_elementwise(
-                    context, body_block, &values, *input,
-                    &shape.0, *dtype, location,
-                    |block, in_elem| match dtype {
-                        DType::F32 | DType::F64 => block
-                            .append_operation(arith::negf(in_elem, location))
-                            .result(0).unwrap().into(),
-                        DType::I32 | DType::I64 => {
-                            let zero = block
-                                .append_operation(arith::constant(
-                                    context,
-                                    IntegerAttribute::new(elem_type, 0).into(),
-                                    location,
-                                ))
-                                .result(0).unwrap().into();
-                            block
-                                .append_operation(arith::subi(zero, in_elem, location))
-                                .result(0).unwrap().into()
-                        }
-                    },
+                let result_val = emit_tosa_negate(
+                    context, body_block, &values,
+                    *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
             Op::Exp { input, shape, dtype } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let result_val = emit_unary_elementwise(
-                    context, body_block, &values, *input,
-                    &shape.0, *dtype, location,
-                    |block, in_elem| {
-                        block
-                            .append_operation(
-                                OperationBuilder::new("math.exp", location)
-                                    .add_operands(&[in_elem])
-                                    .add_results(&[elem_type])
-                                    .build()
-                                    .expect("failed to build math.exp"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into()
-                    },
+                let result_val = emit_tosa_unary_simple(
+                    context, body_block, &values, "tosa.exp",
+                    *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
             Op::Tanh { input, shape, dtype } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let result_val = emit_unary_elementwise(
-                    context, body_block, &values, *input,
-                    &shape.0, *dtype, location,
-                    |block, in_elem| {
-                        block
-                            .append_operation(
-                                OperationBuilder::new("math.tanh", location)
-                                    .add_operands(&[in_elem])
-                                    .add_results(&[elem_type])
-                                    .build()
-                                    .expect("failed to build math.tanh"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into()
-                    },
+                let result_val = emit_tosa_unary_simple(
+                    context, body_block, &values, "tosa.tanh",
+                    *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
             Op::Matmul { lhs, rhs, shape, dtype } => {
-                let result_val = emit_matmul(
-                    context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
-                )?;
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                let result_val = match dtype {
+                    DType::F32 | DType::F64 => emit_tosa_matmul(
+                        context, body_block, &values,
+                        *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    )?,
+                    DType::I32 | DType::I64 => emit_matmul(
+                        context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
+                    )?,
+                };
                 values.insert(node_id, result_val);
             }
 
             Op::Relu { input, shape, dtype } => {
-                let elem_type = dtype.to_mlir_type(context);
-                let result_val = emit_unary_elementwise(
+                let result_val = emit_tosa_clamp(
                     context, body_block, &values, *input,
                     &shape.0, *dtype, location,
-                    |block, in_elem| match dtype {
-                        DType::F32 | DType::F64 => {
-                            let zero = block
-                                .append_operation(arith::constant(
-                                    context,
-                                    FloatAttribute::new(context, elem_type, 0.0).into(),
-                                    location,
-                                ))
-                                .result(0).unwrap().into();
-                            block
-                                .append_operation(arith::maxnumf(in_elem, zero, location))
-                                .result(0).unwrap().into()
-                        }
-                        DType::I32 | DType::I64 => {
-                            let zero = block
-                                .append_operation(arith::constant(
-                                    context,
-                                    IntegerAttribute::new(elem_type, 0).into(),
-                                    location,
-                                ))
-                                .result(0).unwrap().into();
-                            block
-                                .append_operation(arith::maxsi(in_elem, zero, location))
-                                .result(0).unwrap().into()
-                        }
-                    },
                 )?;
                 values.insert(node_id, result_val);
             }
 
             Op::ReduceSum { input, dim, keepdim, shape, dtype } => {
                 let input_shape = trace.get(*input).shape();
-                let result_val = emit_reduction(
-                    context, body_block, &values, *input,
-                    &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
-                    false,
-                )?;
+                let result_val = match dtype {
+                    DType::F32 | DType::F64 => emit_tosa_reduce(
+                        context, body_block, &values, "tosa.reduce_sum",
+                        *input, &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                    )?,
+                    DType::I32 | DType::I64 => emit_reduction(
+                        context, body_block, &values, *input,
+                        &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        false,
+                    )?,
+                };
                 values.insert(node_id, result_val);
             }
 
             Op::ReduceMax { input, dim, keepdim, shape, dtype } => {
                 let input_shape = trace.get(*input).shape();
-                let result_val = emit_reduction(
-                    context, body_block, &values, *input,
-                    &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
-                    true,
-                )?;
+                let result_val = match dtype {
+                    DType::F32 | DType::F64 => emit_tosa_reduce(
+                        context, body_block, &values, "tosa.reduce_max",
+                        *input, &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                    )?,
+                    DType::I32 | DType::I64 => emit_reduction(
+                        context, body_block, &values, *input,
+                        &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        true,
+                    )?,
+                };
                 values.insert(node_id, result_val);
             }
         }
@@ -1307,5 +1822,645 @@ mod tests {
 
         let result = Compiler::compile(&trace, &[b.id]);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
+    }
+
+    // ── TOSA spike tests (milestone 2, task 1.2) ──────────────────────────────
+    //
+    // These tests validate that the TOSA → linalg → LLVM → JIT pipeline works
+    // end-to-end. They build MLIR modules by hand (not via the trace compiler)
+    // to keep the TOSA lowering path isolated from the existing linalg path.
+    //
+    // Pass pipeline (TOSA lowering prepended to the existing chain):
+    //   tosa-make-broadcastable, tosa-to-linalg-named, tosa-to-linalg,
+    //   tosa-to-arith, tosa-to-tensor,
+    //   one-shot-bufferize{…}, convert-linalg-to-loops, convert-scf-to-cf,
+    //   convert-math-to-llvm, finalize-memref-to-llvm, convert-arith-to-llvm,
+    //   convert-index-to-llvm, convert-cf-to-llvm, convert-func-to-llvm,
+    //   reconcile-unrealized-casts
+
+    /// Build and run the TOSA lowering pass pipeline on a module.
+    ///
+    /// Returns `Err(String)` with the pass error message if any pass fails.
+    fn run_tosa_pipeline(module: &mut Module, context: &Context) -> Result<(), String> {
+        register_all_passes();
+        let pm = pass::PassManager::new(context);
+        parse_pass_pipeline(
+            pm.as_operation_pass_manager(),
+            "builtin.module(\
+                func.func(\
+                    tosa-make-broadcastable,\
+                    tosa-to-linalg-named,\
+                    tosa-to-linalg,\
+                    tosa-to-arith,\
+                    tosa-to-tensor\
+                ),\
+                one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+                convert-linalg-to-loops,\
+                convert-scf-to-cf,\
+                convert-math-to-llvm,\
+                expand-strided-metadata,\
+                finalize-memref-to-llvm,\
+                convert-arith-to-llvm,\
+                convert-index-to-llvm,\
+                convert-cf-to-llvm,\
+                convert-func-to-llvm,\
+                reconcile-unrealized-casts\
+            )",
+        )
+        .map_err(|e| format!("pipeline parse failed: {e}"))?;
+        pm.run(module).map_err(|e| format!("pass failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Execute a compiled module's `compute` function with the given flat f32
+    /// input slices and return the flat f32 output.
+    ///
+    /// All buffers must have the same flat element count `n`.
+    unsafe fn jit_run_f32(
+        engine: &melior::ExecutionEngine,
+        inputs: &[&[f32]],
+        n: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            use crate::runtime::build_memref_descriptor;
+
+            let shape = vec![n as i64];
+            let strides = vec![1i64];
+
+            // Build input descriptors (treat &[f32] data as *mut u8).
+            let mut input_data_vecs: Vec<Vec<f32>> =
+                inputs.iter().map(|s| s.to_vec()).collect();
+            let mut input_descs: Vec<Vec<u8>> = input_data_vecs
+                .iter_mut()
+                .map(|v| build_memref_descriptor(v.as_mut_ptr() as *mut u8, &shape, &strides))
+                .collect();
+
+            // Allocate output buffer.
+            let mut output_data: Vec<f32> = vec![0.0f32; n];
+            let mut output_desc =
+                build_memref_descriptor(output_data.as_mut_ptr() as *mut u8, &shape, &strides);
+
+            // Build args array: &mut ptr_to_desc for each descriptor.
+            let mut desc_ptrs: Vec<*mut u8> =
+                input_descs.iter_mut().map(|d| d.as_mut_ptr()).collect();
+            let mut out_desc_ptr = output_desc.as_mut_ptr();
+
+            let mut args: Vec<*mut ()> = desc_ptrs
+                .iter_mut()
+                .map(|p| p as *mut *mut u8 as *mut ())
+                .collect();
+            args.push(&mut out_desc_ptr as *mut *mut u8 as *mut ());
+
+            engine
+                .invoke_packed("compute", &mut args)
+                .expect("JIT invocation failed");
+
+            output_data
+        }
+    }
+
+    // ── spike_tosa_add_pipeline ───────────────────────────────────────────────
+    //
+    // Validates that:
+    //   - A hand-built MLIR module using tosa.add compiles through the TOSA
+    //     lowering pipeline without errors.
+    //   - The JIT-executed result matches the expected element-wise sum.
+    //
+    // IR shape:
+    //   func @compute(%a: memref<4xf32>, %b: memref<4xf32>, %out: memref<4xf32>)
+    //     %ta = bufferization.to_tensor %a restrict : memref<4xf32>
+    //     %tb = bufferization.to_tensor %b restrict : memref<4xf32>
+    //     %tc = tosa.add %ta, %tb : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+    //     %mc = bufferization.to_buffer %tc : tensor<4xf32> -> memref<4xf32>
+    //     memref.copy %mc, %out : memref<4xf32> to memref<4xf32>
+    //     return
+    #[test]
+    fn spike_tosa_add_pipeline() {
+        let context = create_context();
+        let location = Location::unknown(&context);
+        let mut module = Module::new(location);
+
+        let f32_type = melior::ir::r#type::IntegerType::new(&context, 32);
+        // Use f32 — obtain via DType helper.
+        let f32_mlir = DType::F32.to_mlir_type(&context);
+        let tensor_type: melior::ir::Type =
+            RankedTensorType::new(&[4u64], f32_mlir, None).into();
+        let memref_type: melior::ir::Type =
+            MemRefType::new(f32_mlir, &[4i64], None, None).into();
+        let _ = f32_type; // silence unused warning
+
+        {
+            // Function: (%a: memref<4xf32>, %b: memref<4xf32>, %out: memref<4xf32>) -> ()
+            let arg_types = [
+                (memref_type, location),
+                (memref_type, location),
+                (memref_type, location),
+            ];
+            let function_type =
+                FunctionType::new(&context, &[memref_type, memref_type, memref_type], &[]);
+
+            let body_block = Block::new(&arg_types);
+
+            // bufferization.to_tensor %a restrict
+            let ta: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("bufferization.to_tensor", location)
+                        .add_operands(&[body_block.argument(0).unwrap().into()])
+                        .add_results(&[tensor_type])
+                        .add_attributes(&[(
+                            Identifier::new(&context, "restrict"),
+                            Attribute::unit(&context),
+                        )])
+                        .build()
+                        .expect("bufferization.to_tensor a"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // bufferization.to_tensor %b restrict
+            let tb: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("bufferization.to_tensor", location)
+                        .add_operands(&[body_block.argument(1).unwrap().into()])
+                        .add_results(&[tensor_type])
+                        .add_attributes(&[(
+                            Identifier::new(&context, "restrict"),
+                            Attribute::unit(&context),
+                        )])
+                        .build()
+                        .expect("bufferization.to_tensor b"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // tosa.add %ta, %tb
+            let tc: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("tosa.add", location)
+                        .add_operands(&[ta, tb])
+                        .add_results(&[tensor_type])
+                        .build()
+                        .expect("tosa.add"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // bufferization.to_buffer %tc
+            let mc: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("bufferization.to_buffer", location)
+                        .add_operands(&[tc])
+                        .add_results(&[memref_type])
+                        .build()
+                        .expect("bufferization.to_buffer"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // memref.copy %mc, %out
+            body_block.append_operation(
+                OperationBuilder::new("memref.copy", location)
+                    .add_operands(&[mc, body_block.argument(2).unwrap().into()])
+                    .build()
+                    .expect("memref.copy"),
+            );
+
+            body_block.append_operation(func::r#return(&[], location));
+
+            let region = Region::new();
+            region.append_block(body_block);
+
+            let function = func::func(
+                &context,
+                StringAttribute::new(&context, "compute"),
+                TypeAttribute::new(function_type.into()),
+                region,
+                &[(
+                    Identifier::new(&context, "llvm.emit_c_interface"),
+                    Attribute::unit(&context),
+                )],
+                location,
+            );
+            module.body().append_operation(function);
+        }
+
+        assert!(
+            module.as_operation().verify(),
+            "MLIR module verification failed before passes"
+        );
+
+        run_tosa_pipeline(&mut module, &context)
+            .expect("TOSA pipeline failed");
+
+        // JIT execute: [1,2,3,4] + [10,20,30,40] = [11,22,33,44]
+        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [10.0f32, 20.0, 30.0, 40.0];
+        let result = unsafe { jit_run_f32(&engine, &[&a, &b], 4) };
+        assert_eq!(result, vec![11.0f32, 22.0, 33.0, 44.0]);
+    }
+
+    // ── spike_tosa_mixed_pipeline ─────────────────────────────────────────────
+    //
+    // Validates that tosa.add and linalg.generic can coexist in the same
+    // module and both lower correctly through the mixed pipeline.
+    //
+    // IR shape:
+    //   func @compute(%a: memref<4xf32>, %b: memref<4xf32>,
+    //                 %c: memref<4xf32>, %out: memref<4xf32>)
+    //     %ta = bufferization.to_tensor %a restrict
+    //     %tb = bufferization.to_tensor %b restrict
+    //     %tc = bufferization.to_tensor %c restrict
+    //     %tsum = tosa.add %ta, %tb          -- tosa op
+    //     %tdiv = linalg.generic(%tsum, %tc) -- divide sum by c
+    //     %mc = bufferization.to_buffer %tdiv
+    //     memref.copy %mc, %out
+    //     return
+    //
+    // Input: a=[2,4,6,8], b=[0,0,0,0] (so tosa.add gives [2,4,6,8]),
+    //        c=[1,2,3,4] (linalg div gives [2,2,2,2]).
+    #[test]
+    fn spike_tosa_mixed_pipeline() {
+        let context = create_context();
+        let location = Location::unknown(&context);
+        let mut module = Module::new(location);
+
+        let f32_mlir = DType::F32.to_mlir_type(&context);
+        let tensor_type: melior::ir::Type =
+            RankedTensorType::new(&[4u64], f32_mlir, None).into();
+        let memref_type: melior::ir::Type =
+            MemRefType::new(f32_mlir, &[4i64], None, None).into();
+
+        {
+            // Function: (%a, %b, %c, %out : all memref<4xf32>) -> ()
+            let arg_types = [
+                (memref_type, location),
+                (memref_type, location),
+                (memref_type, location),
+                (memref_type, location),
+            ];
+            let function_type = FunctionType::new(
+                &context,
+                &[memref_type, memref_type, memref_type, memref_type],
+                &[],
+            );
+
+            let body_block = Block::new(&arg_types);
+
+            // bufferization.to_tensor for each input
+            let to_tensor = |arg_idx: usize| -> melior::ir::Value {
+                body_block
+                    .append_operation(
+                        OperationBuilder::new("bufferization.to_tensor", location)
+                            .add_operands(&[body_block.argument(arg_idx).unwrap().into()])
+                            .add_results(&[tensor_type])
+                            .add_attributes(&[(
+                                Identifier::new(&context, "restrict"),
+                                Attribute::unit(&context),
+                            )])
+                            .build()
+                            .expect("bufferization.to_tensor"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            };
+
+            let ta = to_tensor(0);
+            let tb = to_tensor(1);
+            let tc = to_tensor(2);
+
+            // tosa.add %ta, %tb  -> %tsum
+            let tsum: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("tosa.add", location)
+                        .add_operands(&[ta, tb])
+                        .add_results(&[tensor_type])
+                        .build()
+                        .expect("tosa.add"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // linalg.generic: divf(%tsum, %tc) -> %tdiv
+            // tensor.empty for the output slot
+            let init_val: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("tensor.empty", location)
+                        .add_results(&[tensor_type])
+                        .build()
+                        .expect("tensor.empty"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            let identity_map = make_identity_map(&context, 1).expect("identity map");
+            let indexing_maps =
+                ArrayAttribute::new(&context, &[identity_map, identity_map, identity_map]);
+            let iterator_types = make_iterator_types(&context, 1).expect("iterator types");
+            let segment_sizes = Attribute::parse(&context, "array<i32: 2, 1>")
+                .expect("segment sizes");
+
+            let linalg_region = {
+                let linalg_block = Block::new(&[
+                    (f32_mlir, location),
+                    (f32_mlir, location),
+                    (f32_mlir, location),
+                ]);
+                let lhs_elem: melior::ir::Value =
+                    linalg_block.argument(0).unwrap().into();
+                let rhs_elem: melior::ir::Value =
+                    linalg_block.argument(1).unwrap().into();
+                let div_val: melior::ir::Value = linalg_block
+                    .append_operation(arith::divf(lhs_elem, rhs_elem, location))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                linalg_block
+                    .append_operation(
+                        OperationBuilder::new("linalg.yield", location)
+                            .add_operands(&[div_val])
+                            .build()
+                            .expect("linalg.yield"),
+                    );
+                let r = Region::new();
+                r.append_block(linalg_block);
+                r
+            };
+
+            let tdiv: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("linalg.generic", location)
+                        .add_operands(&[tsum, tc, init_val])
+                        .add_results(&[tensor_type])
+                        .add_attributes(&[
+                            (
+                                Identifier::new(&context, "indexing_maps"),
+                                indexing_maps.into(),
+                            ),
+                            (Identifier::new(&context, "iterator_types"), iterator_types),
+                            (
+                                Identifier::new(&context, "operand_segment_sizes"),
+                                segment_sizes,
+                            ),
+                        ])
+                        .add_regions([linalg_region])
+                        .build()
+                        .expect("linalg.generic"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // bufferization.to_buffer %tdiv
+            let mc: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("bufferization.to_buffer", location)
+                        .add_operands(&[tdiv])
+                        .add_results(&[memref_type])
+                        .build()
+                        .expect("bufferization.to_buffer"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            // memref.copy %mc, %out
+            body_block.append_operation(
+                OperationBuilder::new("memref.copy", location)
+                    .add_operands(&[mc, body_block.argument(3).unwrap().into()])
+                    .build()
+                    .expect("memref.copy"),
+            );
+
+            body_block.append_operation(func::r#return(&[], location));
+
+            let region = Region::new();
+            region.append_block(body_block);
+
+            let function = func::func(
+                &context,
+                StringAttribute::new(&context, "compute"),
+                TypeAttribute::new(function_type.into()),
+                region,
+                &[(
+                    Identifier::new(&context, "llvm.emit_c_interface"),
+                    Attribute::unit(&context),
+                )],
+                location,
+            );
+            module.body().append_operation(function);
+        }
+
+        assert!(
+            module.as_operation().verify(),
+            "MLIR module verification failed before passes"
+        );
+
+        run_tosa_pipeline(&mut module, &context)
+            .expect("TOSA mixed pipeline failed");
+
+        // JIT execute: a=[2,4,6,8], b=[0,0,0,0] -> tosa.add=[2,4,6,8]
+        //              c=[1,2,3,4] -> linalg div=[2,2,2,2]
+        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let a = [2.0f32, 4.0, 6.0, 8.0];
+        let b = [0.0f32, 0.0, 0.0, 0.0];
+        let c = [1.0f32, 2.0, 3.0, 4.0];
+        let result = unsafe {
+            use crate::runtime::build_memref_descriptor;
+            let shape = vec![4i64];
+            let strides = vec![1i64];
+
+            let mut a_data = a.to_vec();
+            let mut b_data = b.to_vec();
+            let mut c_data = c.to_vec();
+            let mut out_data = vec![0.0f32; 4];
+
+            let mut a_desc = build_memref_descriptor(a_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut b_desc = build_memref_descriptor(b_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut c_desc = build_memref_descriptor(c_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut out_desc = build_memref_descriptor(out_data.as_mut_ptr() as *mut u8, &shape, &strides);
+
+            let mut a_ptr = a_desc.as_mut_ptr();
+            let mut b_ptr = b_desc.as_mut_ptr();
+            let mut c_ptr = c_desc.as_mut_ptr();
+            let mut out_ptr = out_desc.as_mut_ptr();
+
+            let mut args: Vec<*mut ()> = vec![
+                &mut a_ptr as *mut *mut u8 as *mut (),
+                &mut b_ptr as *mut *mut u8 as *mut (),
+                &mut c_ptr as *mut *mut u8 as *mut (),
+                &mut out_ptr as *mut *mut u8 as *mut (),
+            ];
+            engine
+                .invoke_packed("compute", &mut args)
+                .expect("JIT invocation failed");
+            out_data
+        };
+        assert_eq!(result, vec![2.0f32, 2.0, 2.0, 2.0]);
+    }
+
+    // ── IR verification tests (task 2.10) ─────────────────────────────────────
+    //
+    // Verify that the emitted MLIR IR (before lowering) contains TOSA ops
+    // for the migrated operations, and does NOT contain linalg.generic for them.
+
+    #[test]
+    fn ir_tosa_add() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.add"), "expected tosa.add in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_sub() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a - &b;
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.sub"), "expected tosa.sub in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_mul() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a * &b;
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.mul"), "expected tosa.mul in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_negate() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = -&a;
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.negate"), "expected tosa.negate in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_relu() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = a.relu();
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.clamp"), "expected tosa.clamp in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_exp() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = a.exp();
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.exp"), "expected tosa.exp in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_tanh() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = a.tanh();
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.tanh"), "expected tosa.tanh in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_div_keeps_linalg_generic() {
+        // Div is intentionally kept as linalg.generic (TOSA has no float div).
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a / &b;
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("linalg.generic"), "expected linalg.generic for div in IR:\n{ir}");
+        assert!(!ir.contains("tosa.div"), "unexpected tosa.div in IR:\n{ir}");
+    }
+
+    // ── Task 3.6: IR verification tests for matmul and reductions ─────────────
+
+    #[test]
+    fn ir_tosa_matmul_f32() {
+        // Float matmul should emit tosa.matmul (with tosa.reshape for batch dim).
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = Tensor::new(&[4, 5], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
+        assert!(ir.contains("tosa.const_shape"), "expected tosa.const_shape in IR:\n{ir}");
+        assert!(ir.contains("tosa.reshape"), "expected tosa.reshape in IR:\n{ir}");
+        assert!(!ir.contains("tensor.expand_shape"), "unexpected tensor.expand_shape in IR:\n{ir}");
+        assert!(!ir.contains("tensor.collapse_shape"), "unexpected tensor.collapse_shape in IR:\n{ir}");
+        assert!(!ir.contains("linalg.matmul"), "unexpected linalg.matmul in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_matmul_i32_keeps_linalg() {
+        // Integer matmul must keep linalg.matmul (tosa.matmul is float-only).
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::I32);
+        let b = Tensor::new(&[4, 5], DType::I32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("linalg.matmul"), "expected linalg.matmul in IR:\n{ir}");
+        assert!(!ir.contains("tosa.matmul"), "unexpected tosa.matmul in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_reduce_sum() {
+        // Float reduce_sum should emit tosa.reduce_sum.
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = a.reduce_sum(1, false);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.reduce_sum"), "expected tosa.reduce_sum in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_tosa_reduce_max_keepdim() {
+        // Float reduce_max with keepdim=true should emit tosa.reduce_max.
+        // TOSA reduce_max natively keeps rank (size-1 at the reduced dim),
+        // so no tosa.reshape is needed for keepdim=true.
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = a.reduce_max(1, true);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.reduce_max"), "expected tosa.reduce_max in IR:\n{ir}");
+        // Output type should reflect keepdim: tensor<3x1xf32>
+        assert!(ir.contains("tensor<3x1xf32>"), "expected tensor<3x1xf32> output shape in IR:\n{ir}");
+        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
     }
 }

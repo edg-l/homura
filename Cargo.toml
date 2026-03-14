@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main" }
+melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main", features = ["ods-dialects"] }
 
 [patch.crates-io]
 mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
