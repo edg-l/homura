@@ -256,7 +256,9 @@ The generated function takes `memref` arguments (matching the JIT's C ABI) but u
 
 ### One linalg.generic per operation
 
-Each `Op::Add` becomes its own `linalg.generic`. For `a + b + c`, that's two separate operations. MLIR's fusion passes can merge them later, but the compiler doesn't try to be clever — it emits the simplest correct IR and lets the MLIR pass pipeline optimize.
+Each op becomes its own `linalg.generic`. For `a + b + c`, that's two separate operations. MLIR's fusion passes can merge them later, but the compiler doesn't try to be clever — it emits the simplest correct IR and lets the MLIR pass pipeline optimize.
+
+Binary ops (Add, Sub, Mul, Div) use 3 affine maps, 2 `ins` operands, and a 3-arg body block. Unary ops (Neg, Relu) use 2 affine maps, 1 `ins` operand, and a 2-arg body block. The only difference between ops within each category is the arith operation inside the body.
 
 ## Source Layout
 
@@ -265,14 +267,15 @@ src/
 ├── lib.rs          Public API re-exports
 ├── dtype.rs        DType enum (F32, F64, I32, I64) with MLIR type conversion
 ├── shape.rs        Shape wrapper over Vec<u64>
-├── op.rs           NodeId (u32 index) and Op enum (Input, Add)
+├── op.rs           NodeId (u32 index) and Op enum (Input, Add, Sub, Mul, Div, Neg, Relu)
 ├── trace.rs        Thread-local Trace context, begin_trace/take_trace/record
-├── tensor.rs       Tensor handle with operator overloads (Add)
+├── tensor.rs       Tensor handle with operator overloads (Add, Sub, Mul, Div, Neg) and .relu()
 ├── compiler.rs     Trace → MLIR IR emission, pass pipeline, ExecutionEngine
 └── runtime.rs      MemRefDescriptor1D, CompiledGraph::run() with JIT marshalling
 
 examples/
-└── add.rs          a + b demo (simple and chained)
+├── add.rs          a + b demo (simple and chained)
+└── ops.rs          all ops demo (sub, mul, div, neg, relu)
 ```
 
 ## Dependencies
@@ -284,16 +287,16 @@ examples/
 ## Current Limitations
 
 - **Rank-1 tensors only** — all shapes must be 1D
-- **Element-wise add only** — no sub, mul, div, matmul, or activations
+- **Element-wise ops only** — no matmul, convolution, or reductions
 - **CPU JIT only** — no GPU backend
 - **Single output** — `compile()` accepts only one output node
 - **F32 execution only** — `run()` only handles `f32` data (other dtypes compile but can't execute)
+- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, which raises SIGFPE. Callers must ensure non-zero divisors.
 - **No autograd** — forward pass only, no gradient computation
 
 ## Roadmap
 
-1. **More element-wise ops** (Sub, Mul, Div, Neg, Relu) — mechanical additions to `Op` enum + `linalg.generic` body
-2. **N-D tensors** — add dimensions to affine maps and generalize `MemRefDescriptor`
-3. **Matmul** via `linalg.matmul` or `linalg.generic` with contraction iterator types
-4. **`Tensor::eval()` sugar** — one-call API wrapping trace/compile/run
-5. **GPU backend** — swap `convert-linalg-to-loops` for GPU tiling passes
+1. **N-D tensors** — add dimensions to affine maps and generalize `MemRefDescriptor`
+2. **Matmul** via `linalg.matmul` or `linalg.generic` with contraction iterator types
+3. **`Tensor::eval()` sugar** — one-call API wrapping trace/compile/run
+4. **GPU backend** — swap `convert-linalg-to-loops` for GPU tiling passes

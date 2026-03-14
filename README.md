@@ -8,12 +8,12 @@ use homura::{Tensor, DType, begin_trace, take_trace, Compiler};
 begin_trace();
 let a = Tensor::new(&[4], DType::F32);
 let b = Tensor::new(&[4], DType::F32);
-let c = &a + &b;
+let c = (&a + &b).relu();
 let trace = take_trace();
 
 let compiled = Compiler::compile(&trace, &[c.id()]).unwrap();
-let result = compiled.run(&[&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]]);
-assert_eq!(result, vec![6.0, 8.0, 10.0, 12.0]);
+let result = compiled.run(&[&[1.0, -2.0, 3.0, -4.0], &[5.0, 6.0, -7.0, 8.0]]);
+assert_eq!(result, vec![6.0, 4.0, 0.0, 4.0]);
 ```
 
 ## How it works
@@ -40,18 +40,20 @@ cargo build
 
 ```sh
 cargo run --example add    # element-wise add demo
-cargo test                 # 16 tests
+cargo run --example ops    # all ops demo (sub, mul, div, neg, relu)
+cargo test                 # 30 tests
 ```
 
 ## Current status
 
-- Rank-1 tensors, element-wise add, F32/F64/I32/I64
+- Rank-1 tensors, F32/F64/I32/I64
+- Element-wise ops: Add, Sub, Mul, Div, Neg, Relu
 - CPU JIT via MLIR ExecutionEngine
 - `linalg.generic`-based codegen (GPU-ready IR)
 
 ## What's next
 
-- More ops: Sub, Mul, Div, Neg, Relu
 - N-D tensors
 - Matmul via `linalg.matmul`
+- `Tensor::eval()` sugar
 - GPU backend
