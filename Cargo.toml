@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-melior = { path = "/data2/edgar/melior/melior" }
+melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main" }
 
 [patch.crates-io]
-mlir-sys = { path = "/home/edgar/data/mlir-sys" }
+mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
 
 [[example]]
 name = "add"

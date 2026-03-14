@@ -296,7 +296,31 @@ examples/
 
 ## Roadmap
 
-1. **N-D tensors** — add dimensions to affine maps and generalize `MemRefDescriptor`
-2. **Matmul** via `linalg.matmul` or `linalg.generic` with contraction iterator types
-3. **`Tensor::eval()` sugar** — one-call API wrapping trace/compile/run
-4. **GPU backend** — swap `convert-linalg-to-loops` for GPU tiling passes
+### Milestone 1: Run a hand-coded MLP
+
+The minimum to express `relu(x @ W + b)` stacked into layers.
+
+1. **N-D tensors** — add dimensions to affine maps, generalize `MemRefDescriptor` beyond 1D
+2. **Matmul** — `linalg.matmul` or `linalg.generic` with `"reduction"` iterator type
+3. **Broadcast** — bias add (`[batch, features] + [features]`)
+4. **Softmax, tanh** — needed for output layers and activations beyond relu
+5. **`Tensor::eval()` sugar** — one-call API wrapping trace/compile/run
+
+### Milestone 2: Run a real pre-trained model
+
+The step from "toy" to "useful." Load a model someone else trained and run inference.
+
+6. **Model loading** — ONNX import or safetensors weight loading. This is what makes Homura usable in practice — nobody hand-codes weight matrices.
+7. **More ops** — Conv2d, layer norm, transpose, reshape, concat. A transformer needs ~15-20 ops; a CNN needs Conv2d + pooling at minimum.
+8. **Multiple outputs** — extend `compile()` to accept multiple output nodes
+9. **GPU backend** — swap `convert-linalg-to-loops` for GPU tiling passes (`linalg` → `gpu.launch`)
+
+### Milestone 3: Production-grade
+
+Competitive with ONNX Runtime / candle for real workloads.
+
+10. **Graph optimizations** — op fusion (merge adjacent `linalg.generic`), constant folding, dead code elimination
+11. **Dynamic shapes** — support variable batch sizes without recompilation
+12. **Training** — reverse-mode automatic differentiation (walk trace backwards, emit gradient ops)
+13. **Memory planning** — buffer reuse, allocation hoisting, minimize peak memory
+14. **Multi-device** — distribute across multiple GPUs

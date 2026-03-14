@@ -51,9 +51,12 @@ cargo test                 # 30 tests
 - CPU JIT via MLIR ExecutionEngine
 - `linalg.generic`-based codegen (GPU-ready IR)
 
-## What's next
+## Roadmap
 
-- N-D tensors
-- Matmul via `linalg.matmul`
-- `Tensor::eval()` sugar
-- GPU backend
+**Milestone 1** — N-D tensors, matmul, broadcast, softmax, eval sugar → run a hand-coded MLP
+
+**Milestone 2** — ONNX/safetensors loading, conv2d, layer norm, GPU → run a real pre-trained model
+
+**Milestone 3** — graph optimizations, dynamic shapes, autograd, memory planning → production-grade
+
+See [docs/design.md](docs/design.md) for details.
