@@ -54,7 +54,7 @@ impl Buffer {
             data.len(),
             num_elems,
         );
-        let num_bytes = data.len() * std::mem::size_of::<T>();
+        let num_bytes = std::mem::size_of_val(data);
         let raw = unsafe { slice::from_raw_parts(data.as_ptr() as *const u8, num_bytes) };
         Self {
             data: raw.to_vec(),

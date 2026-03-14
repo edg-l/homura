@@ -266,9 +266,9 @@ fn make_broadcast_map<'c>(
     // Right-align: operand dim i maps to output position (offset + i).
     let offset = out_rank - op_rank;
     let mut result_exprs = Vec::new();
-    for i in 0..op_rank {
+    for (i, &op_dim) in operand_shape.iter().enumerate() {
         let out_idx = offset + i;
-        if operand_shape[i] == 1 && output_shape[out_idx] != 1 {
+        if op_dim == 1 && output_shape[out_idx] != 1 {
             result_exprs.push("0".to_string());
         } else {
             result_exprs.push(dim_vars[out_idx].clone());
@@ -292,6 +292,7 @@ fn make_iterator_types<'c>(context: &'c Context, count: usize) -> Result<Attribu
 
 // ── Helper: emit a binary element-wise linalg.generic ────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn emit_binary_elementwise<'c, F>(
     context: &'c Context,
     body_block: &Block<'c>,
@@ -384,6 +385,7 @@ where
 
 // ── Helper: emit a unary element-wise linalg.generic ─────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn emit_unary_elementwise<'c, F>(
     context: &'c Context,
     body_block: &Block<'c>,
@@ -465,6 +467,7 @@ where
 
 // ── Helper: emit linalg.matmul for [M,K] x [K,N] -> [M,N] ───────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn emit_matmul<'c>(
     context: &'c Context,
     body_block: &Block<'c>,
@@ -767,14 +770,14 @@ fn emit_reduction<'c>(
     let dim_vars: Vec<String> = (0..input_rank).map(|i| format!("d{i}")).collect();
     let dims_str = dim_vars.join(", ");
     let mut result_exprs: Vec<String> = Vec::new();
-    for i in 0..input_rank {
+    for (i, var) in dim_vars.iter().enumerate() {
         if i == dim {
             if keepdim {
                 result_exprs.push("0".to_string());
             }
             // if !keepdim, skip this dim entirely
         } else {
-            result_exprs.push(dim_vars[i].clone());
+            result_exprs.push(var.clone());
         }
     }
     let result_str = result_exprs.join(", ");
