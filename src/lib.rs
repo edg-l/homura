@@ -1,5 +1,6 @@
 mod compiler;
 pub mod dtype;
+pub mod onnx;
 pub mod op;
 mod runtime;
 pub mod shape;

@@ -7,6 +7,7 @@ use crate::{
 
 /// A handle to a traced tensor. This is not a real tensor — it is just a
 /// reference to a node in the active trace.
+#[derive(Clone)]
 pub struct Tensor {
     pub(crate) id: NodeId,
     pub(crate) shape: Shape,
@@ -229,6 +230,40 @@ impl std::ops::Neg for Tensor {
 }
 
 impl Tensor {
+    pub fn gemm(
+        &self,
+        rhs: &Tensor,
+        bias: Option<&Tensor>,
+        alpha: f64,
+        beta: f64,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Tensor {
+        assert_eq!(self.shape.rank(), 2, "gemm requires rank-2 lhs");
+        assert_eq!(rhs.shape.rank(), 2, "gemm requires rank-2 rhs");
+        assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in gemm");
+
+        // self shape: [M, K] or [K, M] if trans_a
+        // rhs shape:  [K, N] or [N, K] if trans_b
+        let m = if trans_a { self.shape.0[1] } else { self.shape.0[0] };
+        let n = if trans_b { rhs.shape.0[0] } else { rhs.shape.0[1] };
+        let output_shape = Shape(vec![m, n]);
+
+        let op = Op::Gemm {
+            lhs: self.id,
+            rhs: rhs.id,
+            bias: bias.map(|b| b.id),
+            alpha,
+            beta,
+            trans_a,
+            trans_b,
+            shape: output_shape.clone(),
+            dtype: self.dtype,
+        };
+        let id = trace::record(op);
+        Tensor { id, shape: output_shape, dtype: self.dtype }
+    }
+
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.shape.rank(), 2, "matmul requires rank-2 tensors");
         assert_eq!(rhs.shape.rank(), 2, "matmul requires rank-2 tensors");
@@ -380,6 +415,71 @@ mod tests {
         assert_eq!(a.id.0, 0);
         assert_eq!(trace.input_count(), 1);
         assert_eq!(trace.ops().len(), 1);
+    }
+
+    // ── Gemm trace tests (task 6.3) ───────────────────────────────────────────
+
+    #[test]
+    fn gemm_records_gemm_op() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let c = a.gemm(&b, None, 1.0, 1.0, false, false);
+        let trace = take_trace();
+        // ops: Input(a), Input(b), Gemm
+        assert_eq!(trace.ops().len(), 3);
+        assert_eq!(trace.input_count(), 2);
+        let op = &trace.ops()[c.id.0 as usize];
+        match op {
+            Op::Gemm { alpha, beta, trans_a, trans_b, bias, shape, dtype, .. } => {
+                assert_eq!(*alpha, 1.0);
+                assert_eq!(*beta, 1.0);
+                assert!(!trans_a);
+                assert!(!trans_b);
+                assert!(bias.is_none());
+                assert_eq!(shape.0, vec![2, 4]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::Gemm, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn gemm_records_trans_flags() {
+        begin_trace();
+        let a = Tensor::new(&[3, 2], DType::F32); // [K, M], transA makes it [M, K] = [2, 3]
+        let b = Tensor::new(&[4, 3], DType::F32); // [N, K], transB makes it [K, N] = [3, 4]
+        let c = a.gemm(&b, None, 1.0, 1.0, true, true);
+        let trace = take_trace();
+        let op = &trace.ops()[c.id.0 as usize];
+        match op {
+            Op::Gemm { trans_a, trans_b, shape, .. } => {
+                assert!(*trans_a);
+                assert!(*trans_b);
+                // output [M, N] = [2, 4]
+                assert_eq!(shape.0, vec![2, 4]);
+            }
+            _ => panic!("expected Op::Gemm"),
+        }
+    }
+
+    #[test]
+    fn gemm_records_bias_and_scaling() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let bias = Tensor::new(&[4], DType::F32);
+        let c = a.gemm(&b, Some(&bias), 2.0, 0.5, false, false);
+        let trace = take_trace();
+        let op = &trace.ops()[c.id.0 as usize];
+        match op {
+            Op::Gemm { alpha, beta, bias: bias_id, .. } => {
+                assert_eq!(*alpha, 2.0);
+                assert_eq!(*beta, 0.5);
+                assert!(bias_id.is_some());
+            }
+            _ => panic!("expected Op::Gemm"),
+        }
     }
 
     #[test]

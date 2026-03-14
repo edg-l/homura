@@ -1451,6 +1451,144 @@ fn emit_tosa_reduce<'c>(
     Ok(result_val)
 }
 
+// ── Helper: emit tosa.transpose with a permutation attribute ─────────────────
+//
+// In MLIR 21 tosa, tosa.transpose takes a single operand (the input tensor)
+// and a `perms` attribute (array<i32: ...>). For a 2-D swap the perm is [1, 0].
+
+fn emit_tosa_transpose_2d<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    input: melior::ir::Value<'c, 'c>,
+    input_shape: &[u64],  // [rows, cols] before transpose
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // Output shape is the transpose: [cols, rows].
+    let out_shape = [input_shape[1], input_shape[0]];
+    let result_type = make_ranked_tensor_type(context, &out_shape, dtype);
+
+    // Permutation attribute: array<i32: 1, 0>
+    let perms_attr = Attribute::parse(context, "array<i32: 1, 0>")
+        .ok_or_else(|| CompileError::AttributeParse("array<i32: 1, 0>".into()))?;
+
+    let transposed: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.transpose", location)
+                .add_operands(&[input])
+                .add_results(&[result_type])
+                .add_attributes(&[(Identifier::new(context, "perms"), perms_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(transposed)
+}
+
+// ── Helper: emit a tosa scalar-constant tensor for alpha/beta scaling ─────────
+//
+// Emits a tosa.const filled with `scalar` (matching dtype) for use in tosa.mul.
+// Returns a tensor<1xT> so tosa.mul can broadcast over the matrix.
+
+fn emit_tosa_scalar_const<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    scalar: f64,
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // MLIR requires a decimal point in float literals (e.g. "2.0" not "2").
+    let dense_str = match dtype {
+        DType::F32 => format!("dense<{scalar:.1}> : tensor<1xf32>"),
+        DType::F64 => format!("dense<{scalar:.1}> : tensor<1xf64>"),
+        DType::I32 => format!("dense<{}> : tensor<1xi32>", scalar as i64),
+        DType::I64 => format!("dense<{}> : tensor<1xi64>", scalar as i64),
+    };
+    emit_tosa_const_scalar(context, body_block, &dense_str, location)
+}
+
+// ── Helper: emit tosa.mul of a matrix by a scalar constant tensor ─────────────
+//
+// Scales `mat` (shape `mat_shape`) by a rank-1 tensor<1xT> holding `scalar`.
+// tosa.mul requires equal-rank operands, so we reshape the scalar to match
+// the matrix rank by prepending size-1 dimensions.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_scale<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    mat: melior::ir::Value<'c, 'c>,
+    mat_shape: &[u64],
+    scalar: f64,
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let scalar_val = emit_tosa_scalar_const(context, body_block, scalar, dtype, location)?;
+
+    // Reshape scalar tensor<1xT> to match matrix rank: [1, 1] for rank-2.
+    let rank = mat_shape.len();
+    let scalar_shape: Vec<u64> = vec![1u64; rank];
+    let scalar_reshaped = emit_tosa_reshape(context, body_block, scalar_val, &scalar_shape, dtype, location)?;
+
+    // shift operand required by tosa.mul (zero for float/int unquantized)
+    let shift_val = emit_tosa_const_scalar(context, body_block, "dense<0> : tensor<1xi8>", location)?;
+
+    let result_type = make_ranked_tensor_type(context, mat_shape, dtype);
+    let result: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.mul", location)
+                .add_operands(&[mat, scalar_reshaped, shift_val])
+                .add_results(&[result_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result)
+}
+
+// ── Helper: emit tosa.add for bias (with optional beta scaling) ───────────────
+//
+// Adds `bias` (shape `bias_shape`) to `mat` (shape `mat_shape`). Promotes bias
+// rank to match matrix rank before adding.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_add_bias<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    mat: melior::ir::Value<'c, 'c>,
+    mat_shape: &[u64],
+    bias: melior::ir::Value<'c, 'c>,
+    bias_shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let target_rank = mat_shape.len();
+    let (bias_promoted, _) = promote_rank_with_reshape(
+        context, body_block, bias, bias_shape, target_rank, dtype, location,
+    )?;
+
+    let result_type = make_ranked_tensor_type(context, mat_shape, dtype);
+    let result: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.add", location)
+                .add_operands(&[mat, bias_promoted])
+                .add_results(&[result_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result)
+}
+
 /// Walk the trace linearly, emitting tensor-level ops into `body_block`.
 ///
 /// For each `Input` op: emits `bufferization.to_tensor` with `restrict`.
@@ -1625,6 +1763,108 @@ fn emit_tensor_ops<'c>(
                 };
                 values.insert(node_id, result_val);
             }
+
+            Op::Gemm { lhs, rhs, bias, alpha, beta, trans_a, trans_b, shape: _, dtype } => {
+                let lhs_shape = trace.get(*lhs).shape().0.clone();
+                let rhs_shape = trace.get(*rhs).shape().0.clone();
+
+                // Step 1: get lhs/rhs SSA values
+                let mut lhs_val = *values.get(lhs).expect("lhs not yet emitted");
+                let mut rhs_val = *values.get(rhs).expect("rhs not yet emitted");
+                let mut lhs_eff_shape = lhs_shape.clone();
+                let mut rhs_eff_shape = rhs_shape.clone();
+
+                // Step 2: optional transpose of lhs (A)
+                if *trans_a {
+                    lhs_val = emit_tosa_transpose_2d(
+                        context, body_block, lhs_val, &lhs_shape, *dtype, location,
+                    )?;
+                    lhs_eff_shape = vec![lhs_shape[1], lhs_shape[0]];
+                }
+
+                // Step 3: optional transpose of rhs (B)
+                if *trans_b {
+                    rhs_val = emit_tosa_transpose_2d(
+                        context, body_block, rhs_val, &rhs_shape, *dtype, location,
+                    )?;
+                    rhs_eff_shape = vec![rhs_shape[1], rhs_shape[0]];
+                }
+
+                // Step 4: optional alpha scaling (skip when alpha == 1.0)
+                if (*alpha - 1.0f64).abs() > f64::EPSILON {
+                    lhs_val = emit_tosa_scale(
+                        context, body_block, lhs_val, &lhs_eff_shape, *alpha, *dtype, location,
+                    )?;
+                }
+
+                // Step 5 & 6: tosa.matmul via existing helper (handles 2D→3D→2D)
+                let m = lhs_eff_shape[0];
+                let k = lhs_eff_shape[1];
+                let n = rhs_eff_shape[1];
+                let _ = k;
+
+                // Build a temporary values map with the (possibly transposed/scaled) lhs/rhs.
+                // We insert under fresh node IDs that won't clash: use the current node_id as
+                // the lhs slot and a sentinel for rhs. Instead, we call the lower-level
+                // emit_tosa_matmul variant that accepts raw values directly.
+                let lhs_matmul_shape = [m, lhs_eff_shape[1]];
+                let rhs_matmul_shape = [rhs_eff_shape[0], n];
+                let out_shape = [m, n];
+
+                // Inline the matmul: reshape 2D→3D, call tosa.matmul, reshape 3D→2D.
+                let lhs_3d = emit_tosa_reshape(
+                    context, body_block, lhs_val,
+                    &[1, lhs_matmul_shape[0], lhs_matmul_shape[1]], *dtype, location,
+                )?;
+                let rhs_3d = emit_tosa_reshape(
+                    context, body_block, rhs_val,
+                    &[1, rhs_matmul_shape[0], rhs_matmul_shape[1]], *dtype, location,
+                )?;
+
+                let zp_dense = match dtype {
+                    DType::F32 => "dense<0.0> : tensor<1xf32>",
+                    DType::F64 => "dense<0.0> : tensor<1xf64>",
+                    DType::I32 => "dense<0> : tensor<1xi32>",
+                    DType::I64 => "dense<0> : tensor<1xi64>",
+                };
+                let a_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+                let b_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+
+                let out_3d_type = make_ranked_tensor_type(context, &[1, m, n], *dtype);
+                let out_3d: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.matmul", location)
+                            .add_operands(&[lhs_3d, rhs_3d, a_zp, b_zp])
+                            .add_results(&[out_3d_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                let mut result_val = emit_tosa_reshape(
+                    context, body_block, out_3d, &out_shape, *dtype, location,
+                )?;
+
+                // Step 7: optional bias add (with optional beta scaling)
+                if let Some(bias_id) = bias {
+                    let mut bias_val = *values.get(bias_id).expect("bias not yet emitted");
+                    let bias_shape = trace.get(*bias_id).shape().0.clone();
+
+                    if (*beta - 1.0f64).abs() > f64::EPSILON {
+                        bias_val = emit_tosa_scale(
+                            context, body_block, bias_val, &bias_shape, *beta, *dtype, location,
+                        )?;
+                    }
+
+                    result_val = emit_tosa_add_bias(
+                        context, body_block, result_val, &out_shape, bias_val, &bias_shape, *dtype, location,
+                    )?;
+                }
+
+                values.insert(node_id, result_val);
+            }
         }
     }
 
@@ -1666,6 +1906,7 @@ mod tests {
     use super::*;
     use crate::{
         DType,
+        runtime::Buffer,
         tensor::Tensor,
         trace::{begin_trace, take_trace},
     };
@@ -2462,5 +2703,173 @@ mod tests {
         // Output type should reflect keepdim: tensor<3x1xf32>
         assert!(ir.contains("tensor<3x1xf32>"), "expected tensor<3x1xf32> output shape in IR:\n{ir}");
         assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+    }
+
+    // ── Gemm IR verification tests (task 6.5) ─────────────────────────────────
+
+    #[test]
+    fn ir_gemm_no_transpose_has_matmul() {
+        // Standard gemm without transpose flags: should emit tosa.matmul but no
+        // tosa.transpose.
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let c = a.gemm(&b, None, 1.0, 1.0, false, false);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
+        assert!(!ir.contains("tosa.transpose"), "unexpected tosa.transpose in IR:\n{ir}");
+        assert!(!ir.contains("tosa.mul"), "unexpected tosa.mul (alpha=1.0) in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_gemm_trans_b_has_transpose() {
+        // transB=true: should emit tosa.transpose for the rhs.
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[4, 3], DType::F32); // will be transposed to [3, 4]
+        let c = a.gemm(&b, None, 1.0, 1.0, false, true);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
+        assert!(ir.contains("tosa.transpose"), "expected tosa.transpose in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_gemm_trans_a_has_transpose() {
+        // transA=true: should emit tosa.transpose for the lhs.
+        begin_trace();
+        let a = Tensor::new(&[3, 2], DType::F32); // will be transposed to [2, 3]
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let c = a.gemm(&b, None, 1.0, 1.0, true, false);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
+        assert!(ir.contains("tosa.transpose"), "expected tosa.transpose in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_gemm_alpha_1_no_mul() {
+        // alpha=1.0 and beta=1.0: no tosa.mul should be emitted for scaling.
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let bias = Tensor::new(&[4], DType::F32);
+        let c = a.gemm(&b, Some(&bias), 1.0, 1.0, false, false);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        // No tosa.mul for alpha=1 or beta=1; bias add should use tosa.add.
+        assert!(!ir.contains("tosa.mul"), "unexpected tosa.mul when alpha=1.0/beta=1.0:\n{ir}");
+        assert!(ir.contains("tosa.add"), "expected tosa.add (bias) in IR:\n{ir}");
+    }
+
+    #[test]
+    fn ir_gemm_alpha_scaling_has_mul() {
+        // alpha != 1.0: tosa.mul should be emitted for the lhs scaling.
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let c = a.gemm(&b, None, 2.0, 1.0, false, false);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(ir.contains("tosa.mul"), "expected tosa.mul (alpha scaling) in IR:\n{ir}");
+    }
+
+    // ── Gemm execution tests (task 6.6) ──────────────────────────────────────
+
+    /// Helper: run a gemm trace and return the output f32 slice as Vec.
+    fn run_gemm_f32(
+        a_data: &[f32], a_shape: &[u64],
+        b_data: &[f32], b_shape: &[u64],
+        bias_data: Option<(&[f32], &[u64])>,
+        alpha: f64, beta: f64,
+        trans_a: bool, trans_b: bool,
+    ) -> Vec<f32> {
+        begin_trace();
+        let a = Tensor::new(a_shape, DType::F32);
+        let b = Tensor::new(b_shape, DType::F32);
+        let bias_tensor;
+        let bias_ref = if let Some((_, bshape)) = bias_data {
+            bias_tensor = Tensor::new(bshape, DType::F32);
+            Some(&bias_tensor)
+        } else {
+            None
+        };
+        let c = a.gemm(&b, bias_ref, alpha, beta, trans_a, trans_b);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+
+        let a_buf = Buffer::from_slice::<f32>(a_data, a_shape, DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(b_data, b_shape, DType::F32);
+
+        let result = if let Some((bdata, bshape)) = bias_data {
+            let bias_buf = Buffer::from_slice::<f32>(bdata, bshape, DType::F32);
+            compiled.run(&[&a_buf, &b_buf, &bias_buf])
+        } else {
+            compiled.run(&[&a_buf, &b_buf])
+        };
+
+        result.as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn run_gemm_standard() {
+        // Standard [2,3] @ [3,4] + [4] = [2,4], alpha=1, beta=1
+        // A = [[1,2,3],[4,5,6]], B = [[1,2,3,4],[5,6,7,8],[9,10,11,12]], bias=[1,1,1,1]
+        // A@B = [[38,44,50,56],[83,98,113,128]], + bias = [[39,45,51,57],[84,99,114,129]]
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let bias = [1.0f32, 1.0, 1.0, 1.0];
+        let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], Some((&bias, &[4])), 1.0, 1.0, false, false);
+        assert_eq!(out, &[39.0, 45.0, 51.0, 57.0, 84.0, 99.0, 114.0, 129.0]);
+    }
+
+    #[test]
+    fn run_gemm_trans_b() {
+        // transB=true: A [2,3] @ B^T where B is stored as [4,3].
+        // B [4,3] = [[1,2,3],[4,5,6],[7,8,9],[10,11,12]]
+        // B^T [3,4] = [[1,4,7,10],[2,5,8,11],[3,6,9,12]]
+        // A [2,3] = [[1,2,3],[4,5,6]]
+        // A @ B^T:
+        //   row0: [1*1+2*2+3*3, 1*4+2*5+3*6, 1*7+2*8+3*9, 1*10+2*11+3*12] = [14, 32, 50, 68]
+        //   row1: [4*1+5*2+6*3, 4*4+5*5+6*6, 4*7+5*8+6*9, 4*10+5*11+6*12] = [32, 77, 122, 167]
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]; // shape [4,3]
+        let out = run_gemm_f32(&a, &[2, 3], &b, &[4, 3], None, 1.0, 1.0, false, true);
+        assert_eq!(out, &[14.0, 32.0, 50.0, 68.0, 32.0, 77.0, 122.0, 167.0]);
+    }
+
+    #[test]
+    fn run_gemm_trans_a() {
+        // transA: [3,2]^T @ [3,4] = [2,3] @ [3,4]
+        // A stored as [3,2] = [[1,4],[2,5],[3,6]]  (i.e. A^T = [[1,2,3],[4,5,6]])
+        // A^T @ B = [[1,2,3],[4,5,6]] @ B_standard = [[38,44,50,56],[83,98,113,128]]
+        let a_col_major = [1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0]; // shape [3, 2]
+        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let out = run_gemm_f32(&a_col_major, &[3, 2], &b, &[3, 4], None, 1.0, 1.0, true, false);
+        assert_eq!(out, &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]);
+    }
+
+    #[test]
+    fn run_gemm_alpha_beta_scaling() {
+        // alpha=2.0, beta=0.5: 2*(A@B) + 0.5*C
+        // A@B = [[38,44,50,56],[83,98,113,128]]
+        // 2*(A@B) = [[76,88,100,112],[166,196,226,256]]
+        // C = [2,2,2,2], 0.5*C = [1,1,1,1]
+        // result = [[77,89,101,113],[167,197,227,257]]
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let bias = [2.0f32, 2.0, 2.0, 2.0];
+        let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], Some((&bias, &[4])), 2.0, 0.5, false, false);
+        assert_eq!(out, &[77.0, 89.0, 101.0, 113.0, 167.0, 197.0, 227.0, 257.0]);
+    }
+
+    #[test]
+    fn run_gemm_no_bias() {
+        // No bias: just A@B = [[38,44,50,56],[83,98,113,128]]
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], None, 1.0, 1.0, false, false);
+        assert_eq!(out, &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]);
     }
 }

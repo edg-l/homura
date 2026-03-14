@@ -8,7 +8,7 @@ use crate::{DType, Shape};
 
 /// A type-erased, owned tensor buffer. Stores raw bytes with an associated
 /// shape, dtype, and row-major strides.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
     pub(crate) data: Vec<u8>,
     shape: Shape,
@@ -92,6 +92,11 @@ impl Buffer {
 
     pub fn strides(&self) -> &[i64] {
         &self.strides
+    }
+
+    /// Mutable access to the raw byte storage.
+    pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.data
     }
 }
 

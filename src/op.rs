@@ -89,6 +89,20 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// General matrix multiply: alpha * (A @ B) + beta * C.
+    ///
+    /// Equivalent to the ONNX Gemm op. The output shape is [M, N].
+    Gemm {
+        lhs: NodeId,          // A matrix
+        rhs: NodeId,          // B matrix
+        bias: Option<NodeId>, // C vector (optional)
+        alpha: f64,           // scaling for A@B
+        beta: f64,            // scaling for C
+        trans_a: bool,
+        trans_b: bool,
+        shape: Shape,         // output shape [M, N]
+        dtype: DType,
+    },
 }
 
 impl Op {
@@ -106,6 +120,7 @@ impl Op {
             Op::Matmul { shape, .. } => shape,
             Op::ReduceSum { shape, .. } => shape,
             Op::ReduceMax { shape, .. } => shape,
+            Op::Gemm { shape, .. } => shape,
         }
     }
 
@@ -123,6 +138,7 @@ impl Op {
             Op::Matmul { dtype, .. } => *dtype,
             Op::ReduceSum { dtype, .. } => *dtype,
             Op::ReduceMax { dtype, .. } => *dtype,
+            Op::Gemm { dtype, .. } => *dtype,
         }
     }
 }

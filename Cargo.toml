@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main", features = ["ods-dialects"] }
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+protobuf-src = "2"
 
 [patch.crates-io]
 mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
@@ -14,3 +19,6 @@ name = "add"
 
 [[example]]
 name = "ops"
+
+[[example]]
+name = "mlp"
