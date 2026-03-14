@@ -21,6 +21,39 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Element-wise subtraction.
+    Sub {
+        lhs: NodeId,
+        rhs: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise multiplication.
+    Mul {
+        lhs: NodeId,
+        rhs: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise division.
+    Div {
+        lhs: NodeId,
+        rhs: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise negation.
+    Neg {
+        input: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise relu (max(0, x)).
+    Relu {
+        input: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
 }
 
 impl Op {
@@ -28,6 +61,11 @@ impl Op {
         match self {
             Op::Input { shape, .. } => shape,
             Op::Add { shape, .. } => shape,
+            Op::Sub { shape, .. } => shape,
+            Op::Mul { shape, .. } => shape,
+            Op::Div { shape, .. } => shape,
+            Op::Neg { shape, .. } => shape,
+            Op::Relu { shape, .. } => shape,
         }
     }
 
@@ -35,6 +73,11 @@ impl Op {
         match self {
             Op::Input { dtype, .. } => *dtype,
             Op::Add { dtype, .. } => *dtype,
+            Op::Sub { dtype, .. } => *dtype,
+            Op::Mul { dtype, .. } => *dtype,
+            Op::Div { dtype, .. } => *dtype,
+            Op::Neg { dtype, .. } => *dtype,
+            Op::Relu { dtype, .. } => *dtype,
         }
     }
 }

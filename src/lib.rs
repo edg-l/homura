@@ -1,10 +1,10 @@
+mod compiler;
 pub mod dtype;
 pub mod op;
+mod runtime;
 pub mod shape;
 pub mod tensor;
 pub mod trace;
-mod compiler;
-mod runtime;
 
 pub use compiler::Compiler;
 pub use dtype::DType;

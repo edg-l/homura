@@ -36,7 +36,11 @@ fn main() {
     let trace2 = take_trace();
 
     let compiled2 = Compiler::compile(&trace2, &[out.id()]).expect("chained compile failed");
-    let result2 = compiled2.run(&[&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0], &[100.0, 200.0, 300.0, 400.0]]);
+    let result2 = compiled2.run(&[
+        &[1.0, 2.0, 3.0, 4.0],
+        &[10.0, 20.0, 30.0, 40.0],
+        &[100.0, 200.0, 300.0, 400.0],
+    ]);
     println!("x + y + z = {:?}", result2);
     assert_eq!(result2, vec![111.0, 222.0, 333.0, 444.0]);
     println!("Chained result verified.");

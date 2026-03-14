@@ -1,9 +1,6 @@
 use melior::{
     Context,
-    ir::{
-        Type,
-        r#type::IntegerType,
-    },
+    ir::{Type, r#type::IntegerType},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

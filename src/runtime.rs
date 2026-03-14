@@ -125,7 +125,11 @@ impl CompiledGraph {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Compiler, DType, trace::{begin_trace, take_trace}, tensor::Tensor};
+    use crate::{
+        Compiler, DType,
+        tensor::Tensor,
+        trace::{begin_trace, take_trace},
+    };
 
     #[test]
     fn run_add() {
@@ -186,5 +190,82 @@ mod tests {
 
         let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
         compiled.run(&[&[1.0, 2.0, 3.0, 4.0]]); // missing second input
+    }
+
+    #[test]
+    fn run_sub() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a - &b;
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let result = compiled.run(&[&[1.0, 2.0, 3.0, 4.0], &[4.0, 3.0, 2.0, 1.0]]);
+        assert_eq!(result, vec![-3.0, -1.0, 1.0, 3.0]);
+    }
+
+    #[test]
+    fn run_mul() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a * &b;
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let result = compiled.run(&[&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]]);
+        assert_eq!(result, vec![5.0, 12.0, 21.0, 32.0]);
+    }
+
+    #[test]
+    fn run_div() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a / &b;
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let result = compiled.run(&[&[10.0, 20.0, 30.0, 40.0], &[2.0, 4.0, 5.0, 8.0]]);
+        assert_eq!(result, vec![5.0, 5.0, 6.0, 5.0]);
+    }
+
+    #[test]
+    fn run_neg() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = -&a;
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let result = compiled.run(&[&[1.0, -2.0, 3.0, -4.0]]);
+        assert_eq!(result, vec![-1.0, 2.0, -3.0, 4.0]);
+    }
+
+    #[test]
+    fn run_relu() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = a.relu();
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let result = compiled.run(&[&[-1.0, 2.0, -3.0, 4.0]]);
+        assert_eq!(result, vec![0.0, 2.0, 0.0, 4.0]);
+    }
+
+    #[test]
+    fn run_chained_relu() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = (&a + &b).relu();
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        // [1,-5,3,-7] + [2,3,-4,5] = [3,-2,-1,-2] -> relu -> [3,0,0,0]
+        let result = compiled.run(&[&[1.0, -5.0, 3.0, -7.0], &[2.0, 3.0, -4.0, 5.0]]);
+        assert_eq!(result, vec![3.0, 0.0, 0.0, 0.0]);
     }
 }

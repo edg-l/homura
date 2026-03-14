@@ -11,3 +11,6 @@ mlir-sys = { path = "/home/edgar/data/mlir-sys" }
 
 [[example]]
 name = "add"
+
+[[example]]
+name = "ops"

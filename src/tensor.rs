@@ -82,6 +82,178 @@ impl std::ops::Add<&Tensor> for Tensor {
     }
 }
 
+impl std::ops::Sub for &Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: &Tensor) -> Tensor {
+        assert_eq!(self.shape, rhs.shape, "shape mismatch in Sub");
+        assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Sub");
+        let id = trace::record(Op::Sub {
+            lhs: self.id,
+            rhs: rhs.id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl std::ops::Sub for Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: Tensor) -> Tensor {
+        &self - &rhs
+    }
+}
+
+impl std::ops::Sub<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: Tensor) -> Tensor {
+        self - &rhs
+    }
+}
+
+impl std::ops::Sub<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn sub(self, rhs: &Tensor) -> Tensor {
+        &self - rhs
+    }
+}
+
+impl std::ops::Mul for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Tensor {
+        assert_eq!(self.shape, rhs.shape, "shape mismatch in Mul");
+        assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Mul");
+        let id = trace::record(Op::Mul {
+            lhs: self.id,
+            rhs: rhs.id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl std::ops::Mul for Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: Tensor) -> Tensor {
+        &self * &rhs
+    }
+}
+
+impl std::ops::Mul<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: Tensor) -> Tensor {
+        self * &rhs
+    }
+}
+
+impl std::ops::Mul<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn mul(self, rhs: &Tensor) -> Tensor {
+        &self * rhs
+    }
+}
+
+impl std::ops::Div for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: &Tensor) -> Tensor {
+        assert_eq!(self.shape, rhs.shape, "shape mismatch in Div");
+        assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Div");
+        let id = trace::record(Op::Div {
+            lhs: self.id,
+            rhs: rhs.id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl std::ops::Div for Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: Tensor) -> Tensor {
+        &self / &rhs
+    }
+}
+
+impl std::ops::Div<Tensor> for &Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: Tensor) -> Tensor {
+        self / &rhs
+    }
+}
+
+impl std::ops::Div<&Tensor> for Tensor {
+    type Output = Tensor;
+
+    fn div(self, rhs: &Tensor) -> Tensor {
+        &self / rhs
+    }
+}
+
+impl std::ops::Neg for &Tensor {
+    type Output = Tensor;
+
+    fn neg(self) -> Tensor {
+        let id = trace::record(Op::Neg {
+            input: self.id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl std::ops::Neg for Tensor {
+    type Output = Tensor;
+
+    fn neg(self) -> Tensor {
+        -&self
+    }
+}
+
+impl Tensor {
+    pub fn relu(&self) -> Tensor {
+        let id = trace::record(Op::Relu {
+            input: self.id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
