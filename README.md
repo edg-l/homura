@@ -22,8 +22,16 @@ let result = c.eval(&[a_buf, b_buf]);
 use homura::Model;
 
 let model = Model::load("model.onnx").unwrap();
-let input = Buffer::from_slice::<f32>(&input_data, &[1, 784], DType::F32);
+let input = Buffer::from_slice::<f32>(&input_data, &[1, 1, 28, 28], DType::F32);
 let output = model.run(&[&input]).unwrap();
+```
+
+### CLI
+
+```sh
+homura info model.onnx                     # inspect model graph
+homura run model.onnx                      # run with zero input
+homura run model.onnx --input data.bin --shape 1,1,28,28  # run with data
 ```
 
 ## How it works
@@ -51,10 +59,13 @@ cargo build
 ## Running
 
 ```sh
-cargo run --example add    # element-wise add demo
-cargo run --example ops    # all ops demo
-cargo run --example mlp    # hand-coded MLP
-cargo test                 # 146 tests
+cargo run -- info tests/fixtures/mnist-12.onnx    # inspect ONNX model
+cargo run -- run tests/fixtures/mnist-12.onnx     # run inference
+cargo run --example onnx_mnist -- digit.png       # classify a digit image
+cargo run --example add                           # element-wise add demo
+cargo run --example ops                           # all ops demo
+cargo run --example mlp                           # hand-coded MLP
+cargo test                                        # 241 tests
 ```
 
 ## Current status
@@ -62,18 +73,22 @@ cargo test                 # 146 tests
 - N-D tensors, F32/F64/I32/I64 with broadcasting
 - Element-wise ops: Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh
 - Matmul, Gemm (general matrix multiply with transpose/scaling)
+- Conv2d (NCHW layout, padding, stride, dilation)
+- MaxPool2d (NCHW layout, padding, stride)
 - Reductions: ReduceSum, ReduceMax (with keepdim)
-- Reshape (with -1 dimension inference)
+- Reshape (with -1 dimension inference), Flatten
 - Softmax (composed from reductions + exp)
 - TOSA-based codegen (with linalg.generic fallback)
 - ONNX model loading and inference (`Model::load` / `Model::run`)
+- CLI: `homura info` / `homura run`
+- MNIST CNN end-to-end (mnist-12.onnx classifies digits correctly)
 - CPU JIT via MLIR ExecutionEngine
 
 ## Roadmap
 
 **Milestone 1** (complete) — N-D tensors, matmul, broadcast, softmax, eval sugar. Runs a hand-coded MLP.
 
-**Milestone 2** (in progress) — TOSA backend, ONNX loading, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. Target: run MNIST CNN and ResNet-18.
+**Milestone 2** (in progress) — TOSA backend, ONNX loading, Conv2d, MaxPool2d, MNIST CNN (done). BatchNorm, GlobalAvgPool, ResNet-18 (remaining).
 
 **Milestone 3** — GPU backend (swap linalg-to-loops for GPU tiling passes)
 

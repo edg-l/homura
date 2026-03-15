@@ -156,6 +156,7 @@ builtin.module(
         unknown-type-conversion=identity-layout-map},
     convert-linalg-to-loops,
     convert-scf-to-cf,
+    lower-affine,
     convert-math-to-llvm,
     expand-strided-metadata,
     finalize-memref-to-llvm,
@@ -192,6 +193,8 @@ The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Archite
 | Matmul (f)  | tosa.matmul          | 3D only; 2D wraps with tosa.reshape    |
 | Gemm        | tosa.matmul + add    | optional transpose via tosa.transpose  |
 | Reshape     | tosa.reshape         | target shape via tosa.const_shape      |
+| Conv2d      | tosa.conv2d          | NCHW↔NHWC transpose at boundary       |
+| MaxPool2d   | tosa.max_pool2d      | NCHW↔NHWC; tosa.slice for floor-div   |
 | ReduceSum   | tosa.reduce_sum      | keepdim=false adds tosa.reshape after  |
 | ReduceMax   | tosa.reduce_max      | keepdim=false adds tosa.reshape after  |
 | Div         | linalg.generic       | TOSA has no float div                  |
@@ -205,6 +208,9 @@ The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Archite
 | `tosa.negate`  | single operand          | 3 operands (input, input1_zp, output_zp)    |
 | `tosa.clamp`   | separate fp/int attrs   | unified min_val/max_val attributes           |
 | `tosa.reshape` | shape is attribute      | shape is operand via `tosa.const_shape`      |
+| `tosa.slice`   | start/size as attrs     | 3 operands: input, start, size via `tosa.const_shape` |
+| `tosa.conv2d`  | 3 operands              | 5 operands: input, weight, bias, input_zp, weight_zp; requires `acc_type` |
+| `tosa.max_pool2d` | no `acc_type`        | requires `acc_type` attribute; strict divisibility |
 
 ## ONNX Support
 
@@ -228,7 +234,11 @@ CompiledGraph + weights → Model { compiled, weights, num_dynamic_inputs }
 
 The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. ONNX initializers become weight inputs; graph inputs become dynamic inputs. The `Model` struct owns the weights and prepends them to user-provided dynamic inputs at run time.
 
-**Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, MatMul, Gemm, Softmax, Clip, Reshape.
+**Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Conv (with auto_pad=SAME_UPPER), MaxPool.
+
+**NCHW ↔ NHWC layout handling:** Homura uses NCHW layout internally (matching ONNX). TOSA spatial ops require NHWC. The compiler emits `tosa.transpose([0,2,3,1])` before and `tosa.transpose([0,3,1,2])` after each spatial op. For Conv kernels: OIHW → OHWI via `tosa.transpose([0,2,3,1])`.
+
+**MaxPool floor-division compatibility:** ONNX allows incomplete last windows (floor division). TOSA requires exact divisibility of `(H + pad - K) / stride`. The compiler adds right/bottom padding to satisfy TOSA, then `tosa.slice` to crop back to the ONNX-expected output size.
 
 ## How Chained Operations Work
 
@@ -280,13 +290,15 @@ src/
 ├── lib.rs          Public API re-exports
 ├── dtype.rs        DType enum (F32, F64, I32, I64) with MLIR type conversion
 ├── shape.rs        Shape wrapper over Vec<u64> with broadcast
+├── main.rs         CLI: `homura info` (model inspector) and `homura run` (inference)
 ├── op.rs           NodeId and Op enum (Input, Add, Sub, Mul, Div, Neg, Relu,
-│                   Exp, Tanh, Matmul, ReduceSum, ReduceMax, Reshape, Gemm)
+│                   Exp, Tanh, Matmul, ReduceSum, ReduceMax, Reshape, Gemm,
+│                   Conv2d, MaxPool2d)
 ├── trace.rs        Thread-local Trace context, begin_trace/take_trace/record
-├── tensor.rs       Tensor handle with operator overloads, matmul, gemm, reshape,
-│                   reductions, softmax, eval sugar
+├── tensor.rs       Tensor handle with operator overloads, matmul, gemm, conv2d,
+│                   max_pool2d, reshape, reductions, softmax, eval sugar
 ├── compiler.rs     Trace → MLIR IR emission (TOSA + linalg), pass pipeline,
-│                   ExecutionEngine
+│                   ExecutionEngine, N-D transpose helper
 ├── runtime.rs      N-D MemRefDescriptor, Buffer, CompiledGraph::run()
 └── onnx/
     ├── mod.rs      Public API: Model struct (load/run)
@@ -302,7 +314,12 @@ build.rs            prost-build compilation of .proto files
 examples/
 ├── add.rs          Element-wise add demo
 ├── ops.rs          All element-wise ops demo
-└── mlp.rs          Hand-coded MLP demo
+├── mlp.rs          Hand-coded MLP demo
+└── onnx_mnist.rs   MNIST digit classifier (loads image, runs model)
+
+tests/fixtures/
+├── mnist-12.onnx   Real ONNX Model Zoo MNIST CNN
+└── digit7.png      Test image for end-to-end test
 ```
 
 ## Dependencies
@@ -311,6 +328,9 @@ examples/
 - **mlir-sys** — Low-level FFI bindings to `libMLIR-C.so`. Patched to support shared LLVM/MLIR libraries.
 - **prost** / **prost-build** — Protobuf compilation for ONNX model parsing.
 - **protobuf-src** — Vendored protoc compiler (no system dependency).
+- **clap** — CLI argument parsing (`homura info` / `homura run`).
+- **libc** — dlopen for `libmlir_c_runner_utils.so` (needed by conv2d pad lowering).
+- **image** (dev-dependency) — Image loading for the MNIST example and e2e test.
 - Requires **LLVM 21** with MLIR C API support.
 
 ## Current Limitations
@@ -329,7 +349,7 @@ N-D tensors, matmul, broadcast, softmax, eval sugar.
 
 ### Milestone 2: Run real ONNX models (in progress)
 
-TOSA backend migration, ONNX parsing, Gemm, Reshape (done). Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool, MNIST CNN, ResNet-18 (remaining).
+TOSA backend, ONNX parsing, Gemm, Reshape, Conv2d, MaxPool2d, MNIST CNN (done). BatchNorm, GlobalAvgPool, ResNet-18 (remaining).
 
 ### Milestone 3: GPU backend
 
