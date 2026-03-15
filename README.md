@@ -109,8 +109,12 @@ cargo test                                        # 261 tests
 
 **Milestone 2** (complete) — TOSA backend, ONNX loading, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
 
-**Milestone 3** — GPU backend (swap linalg-to-loops for GPU tiling passes)
+**Milestone 3** — Transformer ops + compilation cache. GPT-2 on CPU with fixed seq_len.
 
-**Milestone 4** — Graph optimizations, dynamic shapes, autograd, memory planning
+**Milestone 4** — GPU backend (CUDA/Vulkan via MLIR gpu passes)
+
+**Milestone 5** — Dynamic shapes + KV cache. Interactive chat speed.
+
+**Milestone 6** — Quantization, graph optimizations, multi-model, multi-GPU
 
 See [docs/design.md](docs/design.md) for details.

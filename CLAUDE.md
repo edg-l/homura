@@ -117,8 +117,14 @@ N-D tensors, matmul, broadcast, softmax, eval sugar.
 ### Milestone 2: Run real ONNX models (complete)
 TOSA backend, ONNX loading, Gemm, Reshape, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
 
-### Milestone 3: GPU backend
-Swap `convert-linalg-to-loops` for GPU tiling passes. The TOSA/linalg IR is already GPU-ready.
+### Milestone 3: Run a transformer on CPU
+Add transformer ops, prove GPT-2 runs end-to-end. Ops: Gather (embedding), LayerNorm, GELU, Transpose (user-facing), comparison/Where, Concat, Split, Unsqueeze, Cast. Compilation cache (hash model → cached LLVM bitcode) to avoid recompiling on every load. BPE tokenizer integration. Demo: GPT-2 small with fixed seq_len, full-sequence recompute per token.
 
-### Milestone 4: Production-grade
-Graph optimizations (op fusion, constant folding), dynamic shapes, autograd, memory planning, multi-device execution.
+### Milestone 4: GPU backend
+Swap `convert-linalg-to-loops` for GPU tiling/mapping passes. Target CUDA (`gpu-to-nvvm`) or Vulkan (`gpu-to-spirv`). GPU memory management. Goal: GPT-2 at ~0.5-1s/token without KV cache.
+
+### Milestone 5: Dynamic shapes + KV cache
+Dynamic/symbolic dimensions in Shape, Trace, Compiler. KV cache with stateful model runs. Goal: GPT-2 at ~50ms/token on GPU — fast enough for interactive chat.
+
+### Milestone 6: Production-grade
+Quantization (int8/int4), graph optimizations (op fusion, constant folding), memory planning, multi-model support (LLaMA, Mistral, Phi), streaming output, multi-GPU.
