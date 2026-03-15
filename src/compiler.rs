@@ -73,103 +73,11 @@ impl Compiler {
             return Err(CompileError::NoOutputs);
         }
 
-        // ---- Analyse the trace ------------------------------------------------
-
-        // Collect input ops in arg_index order.
-        let mut input_ops: Vec<(NodeId, &Op)> = trace
-            .ops()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, op)| {
-                if matches!(op, Op::Input { .. }) {
-                    Some((NodeId(i as u32), op))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        input_ops.sort_by_key(|(_, op)| {
-            if let Op::Input { arg_index, .. } = op {
-                *arg_index
-            } else {
-                unreachable!()
-            }
-        });
-
-        let num_inputs = input_ops.len();
-
-        // Single output.
-        let output_id = outputs[0];
-        let output_op = trace.get(output_id);
-        let output_shape = output_op.shape().clone();
-        let output_dtype = output_op.dtype();
-
-        // ---- Create MLIR context and module ------------------------------------
-
         let context = create_context();
         let location = Location::unknown(&context);
         let mut module = Module::new(location);
-
-        // ---- Build the func.func @compute -------------------------------------
-        {
-            let elem_type = output_dtype.to_mlir_type(&context);
-
-            // Build arg types: inputs first, then one output.
-            let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
-            for (_, op) in &input_ops {
-                let Op::Input { shape, dtype, .. } = op else {
-                    unreachable!()
-                };
-                let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
-                let mref = MemRefType::new(dtype.to_mlir_type(&context), &dims, None, None);
-                arg_types.push((mref.into(), location));
-            }
-            // Output memref — N-D shape.
-            let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
-            let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
-            arg_types.push((out_mref.into(), location));
-
-            // func.func type: all memrefs -> ()
-            let func_arg_types: Vec<melior::ir::Type> = arg_types.iter().map(|(t, _)| *t).collect();
-            let function_type = FunctionType::new(&context, &func_arg_types, &[]);
-
-            // Create the function body block.
-            let body_block = Block::new(&arg_types);
-
-            // Emit tensor ops.
-            emit_tensor_ops(
-                trace,
-                output_id,
-                num_inputs,
-                &body_block,
-                location,
-                &context,
-            )?;
-
-            body_block.append_operation(func::r#return(&[], location));
-
-            let func_region = Region::new();
-            func_region.append_block(body_block);
-
-            let function = func::func(
-                &context,
-                StringAttribute::new(&context, "compute"),
-                TypeAttribute::new(function_type.into()),
-                func_region,
-                &[(
-                    Identifier::new(&context, "llvm.emit_c_interface"),
-                    Attribute::unit(&context),
-                )],
-                location,
-            );
-
-            module.body().append_operation(function);
-        }
-
-        // ---- Verify -----------------------------------------------------------
-        if !module.as_operation().verify() {
-            return Err(CompileError::Verification);
-        }
+        let (num_inputs, output_shape, output_dtype) =
+            build_module(&context, &module, trace, outputs)?;
 
         // ---- Run lowering passes ----------------------------------------------
         // TOSA passes (func-level) run first, then bufferize → LLVM (module-level).
@@ -230,84 +138,10 @@ impl Compiler {
             return Err(CompileError::NoOutputs);
         }
 
-        let mut input_ops: Vec<(NodeId, &Op)> = trace
-            .ops()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, op)| {
-                if matches!(op, Op::Input { .. }) {
-                    Some((NodeId(i as u32), op))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        input_ops.sort_by_key(|(_, op)| {
-            if let Op::Input { arg_index, .. } = op {
-                *arg_index
-            } else {
-                unreachable!()
-            }
-        });
-
-        let num_inputs = input_ops.len();
-        let output_id = outputs[0];
-        let output_op = trace.get(output_id);
-        let output_shape = output_op.shape().clone();
-        let output_dtype = output_op.dtype();
-
         let context = create_context();
         let location = Location::unknown(&context);
         let module = Module::new(location);
-
-        {
-            let elem_type = output_dtype.to_mlir_type(&context);
-
-            let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
-            for (_, op) in &input_ops {
-                let Op::Input { shape, dtype, .. } = op else {
-                    unreachable!()
-                };
-                let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
-                let mref = MemRefType::new(dtype.to_mlir_type(&context), &dims, None, None);
-                arg_types.push((mref.into(), location));
-            }
-            let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
-            let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
-            arg_types.push((out_mref.into(), location));
-
-            let func_arg_types: Vec<melior::ir::Type> =
-                arg_types.iter().map(|(t, _)| *t).collect();
-            let function_type = FunctionType::new(&context, &func_arg_types, &[]);
-
-            let body_block = Block::new(&arg_types);
-
-            emit_tensor_ops(trace, output_id, num_inputs, &body_block, location, &context)?;
-
-            body_block.append_operation(func::r#return(&[], location));
-
-            let func_region = Region::new();
-            func_region.append_block(body_block);
-
-            let function = func::func(
-                &context,
-                StringAttribute::new(&context, "compute"),
-                TypeAttribute::new(function_type.into()),
-                func_region,
-                &[(
-                    Identifier::new(&context, "llvm.emit_c_interface"),
-                    Attribute::unit(&context),
-                )],
-                location,
-            );
-
-            module.body().append_operation(function);
-        }
-
-        if !module.as_operation().verify() {
-            return Err(CompileError::Verification);
-        }
-
+        build_module(&context, &module, trace, outputs)?;
         Ok(module.as_operation().to_string())
     }
 }
@@ -325,6 +159,99 @@ fn create_context() -> Context {
     context.load_all_available_dialects();
     register_all_llvm_translations(&context);
     context
+}
+
+// ── Shared module builder ─────────────────────────────────────────────────────
+//
+// Populates `module` with the `@compute` func body for the given trace and
+// verifies it. Returns `(num_inputs, output_shape, output_dtype)`.
+//
+// `context` and `module` are caller-owned so their lifetimes do not cross a
+// function boundary (which would require a self-referential return).
+
+fn build_module<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    trace: &Trace,
+    outputs: &[NodeId],
+) -> Result<(usize, crate::Shape, DType), CompileError> {
+    // Collect input ops in arg_index order.
+    let mut input_ops: Vec<(NodeId, &Op)> = trace
+        .ops()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| {
+            if matches!(op, Op::Input { .. }) {
+                Some((NodeId(i as u32), op))
+            } else {
+                None
+            }
+        })
+        .collect();
+    input_ops.sort_by_key(|(_, op)| {
+        if let Op::Input { arg_index, .. } = op {
+            *arg_index
+        } else {
+            unreachable!()
+        }
+    });
+
+    let num_inputs = input_ops.len();
+    let output_id = outputs[0];
+    let output_op = trace.get(output_id);
+    let output_shape = output_op.shape().clone();
+    let output_dtype = output_op.dtype();
+
+    let location = Location::unknown(context);
+
+    {
+        let elem_type = output_dtype.to_mlir_type(context);
+
+        let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
+        for (_, op) in &input_ops {
+            let Op::Input { shape, dtype, .. } = op else {
+                unreachable!()
+            };
+            let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
+            let mref = MemRefType::new(dtype.to_mlir_type(context), &dims, None, None);
+            arg_types.push((mref.into(), location));
+        }
+        let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
+        let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
+        arg_types.push((out_mref.into(), location));
+
+        let func_arg_types: Vec<melior::ir::Type> = arg_types.iter().map(|(t, _)| *t).collect();
+        let function_type = FunctionType::new(context, &func_arg_types, &[]);
+
+        let body_block = Block::new(&arg_types);
+
+        emit_tensor_ops(trace, output_id, num_inputs, &body_block, location, context)?;
+
+        body_block.append_operation(func::r#return(&[], location));
+
+        let func_region = Region::new();
+        func_region.append_block(body_block);
+
+        let function = func::func(
+            context,
+            StringAttribute::new(context, "compute"),
+            TypeAttribute::new(function_type.into()),
+            func_region,
+            &[(
+                Identifier::new(context, "llvm.emit_c_interface"),
+                Attribute::unit(context),
+            )],
+            location,
+        );
+
+        module.body().append_operation(function);
+    }
+
+    if !module.as_operation().verify() {
+        return Err(CompileError::Verification);
+    }
+
+    Ok((num_inputs, output_shape, output_dtype))
 }
 
 // ── Helper: build a RankedTensorType for an arbitrary shape ──────────────────
@@ -935,25 +862,42 @@ fn emit_tosa_matmul<'c>(
     let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
     let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
 
+    // Delegate to the value-based helper.
+    emit_tosa_matmul_2d_values(
+        context, body_block, lhs_val, rhs_val, lhs_shape, rhs_shape, output_shape, dtype, location,
+    )
+}
+
+// ── Helper: 2D tosa matmul accepting raw SSA values ───────────────────────────
+//
+// Shared implementation for Op::Matmul and Op::Gemm (which needs to pass
+// pre-processed — transposed / scaled — values rather than raw node-ID lookups).
+// Takes raw tensor Values for lhs [M,K] and rhs [K,N], returns a 2-D [M,N]
+// result via the same 2D→3D→tosa.matmul→2D reshaping pattern.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_matmul_2d_values<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    lhs_val: melior::ir::Value<'c, 'c>,
+    rhs_val: melior::ir::Value<'c, 'c>,
+    lhs_shape: &[u64],  // [M, K]
+    rhs_shape: &[u64],  // [K, N]
+    output_shape: &[u64],  // [M, N]
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     let m = lhs_shape[0];
     let k = lhs_shape[1];
     let n = rhs_shape[1];
 
-    // Promote 2D [M,K] -> 3D [1,M,K] via tosa.reshape.
-    let lhs_3d_shape = [1u64, m, k];
-    let rhs_3d_shape = [1u64, k, n];
-    let out_3d_shape = [1u64, m, n];
+    let lhs_3d = emit_tosa_reshape(
+        context, body_block, lhs_val, &[1, m, k], dtype, location,
+    )?;
+    let rhs_3d = emit_tosa_reshape(
+        context, body_block, rhs_val, &[1, k, n], dtype, location,
+    )?;
 
-    let out_3d_type = make_ranked_tensor_type(context, &out_3d_shape, dtype);
-
-    // tosa.reshape lhs [M,K] -> [1,M,K]
-    let lhs_3d = emit_tosa_reshape(context, body_block, lhs_val, &lhs_3d_shape, dtype, location)?;
-
-    // tosa.reshape rhs [K,N] -> [1,K,N]
-    let rhs_3d = emit_tosa_reshape(context, body_block, rhs_val, &rhs_3d_shape, dtype, location)?;
-
-    // Zero-point tensors for a_zp and b_zp: must be rank-1 size-1 (tensor<1xT>).
-    // TOSA ScalarIntOrFloatTensor requires rank 1 with all dims = 1.
     let zp_dense = match dtype {
         DType::F32 => "dense<0.0> : tensor<1xf32>",
         DType::F64 => "dense<0.0> : tensor<1xf64>",
@@ -963,7 +907,7 @@ fn emit_tosa_matmul<'c>(
     let a_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
     let b_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
 
-    // tosa.matmul [1,M,K] x [1,K,N] -> [1,M,N]
+    let out_3d_type = make_ranked_tensor_type(context, &[1, m, n], dtype);
     let out_3d: melior::ir::Value = body_block
         .append_operation(
             OperationBuilder::new("tosa.matmul", location)
@@ -976,9 +920,7 @@ fn emit_tosa_matmul<'c>(
         .unwrap()
         .into();
 
-    // tosa.reshape [1,M,N] -> [M,N]
     let result_val = emit_tosa_reshape(context, body_block, out_3d, output_shape, dtype, location)?;
-
     Ok(result_val)
 }
 
@@ -1488,6 +1430,21 @@ fn emit_tosa_transpose_2d<'c>(
     Ok(transposed)
 }
 
+// ── Helper: format a float value for MLIR dense attribute literals ────────────
+//
+// MLIR requires a decimal point or exponent in float literals (e.g. "2.0" not
+// "2"). Rust's default Display for f64 omits the decimal for whole numbers, so
+// we append ".0" when necessary.
+
+fn format_float(v: f64) -> String {
+    let s = format!("{v}");
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{v}.0")
+    }
+}
+
 // ── Helper: emit a tosa scalar-constant tensor for alpha/beta scaling ─────────
 //
 // Emits a tosa.const filled with `scalar` (matching dtype) for use in tosa.mul.
@@ -1502,8 +1459,8 @@ fn emit_tosa_scalar_const<'c>(
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     // MLIR requires a decimal point in float literals (e.g. "2.0" not "2").
     let dense_str = match dtype {
-        DType::F32 => format!("dense<{scalar:.1}> : tensor<1xf32>"),
-        DType::F64 => format!("dense<{scalar:.1}> : tensor<1xf64>"),
+        DType::F32 => format!("dense<{}> : tensor<1xf32>", format_float(scalar)),
+        DType::F64 => format!("dense<{}> : tensor<1xf64>", format_float(scalar)),
         DType::I32 => format!("dense<{}> : tensor<1xi32>", scalar as i64),
         DType::I64 => format!("dense<{}> : tensor<1xi64>", scalar as i64),
     };
@@ -1801,50 +1758,15 @@ fn emit_tensor_ops<'c>(
                 let m = lhs_eff_shape[0];
                 let k = lhs_eff_shape[1];
                 let n = rhs_eff_shape[1];
-                let _ = k;
+                debug_assert_eq!(k, rhs_eff_shape[0], "Gemm inner dimension mismatch");
 
-                // Build a temporary values map with the (possibly transposed/scaled) lhs/rhs.
-                // We insert under fresh node IDs that won't clash: use the current node_id as
-                // the lhs slot and a sentinel for rhs. Instead, we call the lower-level
-                // emit_tosa_matmul variant that accepts raw values directly.
                 let lhs_matmul_shape = [m, lhs_eff_shape[1]];
                 let rhs_matmul_shape = [rhs_eff_shape[0], n];
                 let out_shape = [m, n];
 
-                // Inline the matmul: reshape 2D→3D, call tosa.matmul, reshape 3D→2D.
-                let lhs_3d = emit_tosa_reshape(
-                    context, body_block, lhs_val,
-                    &[1, lhs_matmul_shape[0], lhs_matmul_shape[1]], *dtype, location,
-                )?;
-                let rhs_3d = emit_tosa_reshape(
-                    context, body_block, rhs_val,
-                    &[1, rhs_matmul_shape[0], rhs_matmul_shape[1]], *dtype, location,
-                )?;
-
-                let zp_dense = match dtype {
-                    DType::F32 => "dense<0.0> : tensor<1xf32>",
-                    DType::F64 => "dense<0.0> : tensor<1xf64>",
-                    DType::I32 => "dense<0> : tensor<1xi32>",
-                    DType::I64 => "dense<0> : tensor<1xi64>",
-                };
-                let a_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
-                let b_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
-
-                let out_3d_type = make_ranked_tensor_type(context, &[1, m, n], *dtype);
-                let out_3d: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tosa.matmul", location)
-                            .add_operands(&[lhs_3d, rhs_3d, a_zp, b_zp])
-                            .add_results(&[out_3d_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-
-                let mut result_val = emit_tosa_reshape(
-                    context, body_block, out_3d, &out_shape, *dtype, location,
+                let mut result_val = emit_tosa_matmul_2d_values(
+                    context, body_block, lhs_val, rhs_val,
+                    &lhs_matmul_shape, &rhs_matmul_shape, &out_shape, *dtype, location,
                 )?;
 
                 // Step 7: optional bias add (with optional beta scaling)
@@ -2871,5 +2793,51 @@ mod tests {
         let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
         let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], None, 1.0, 1.0, false, false);
         assert_eq!(out, &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]);
+    }
+
+    // ── Regression: Issue 1 — format_float helper ────────────────────────────
+
+    #[test]
+    fn format_float_adds_decimal_for_integer_values() {
+        // Rust Display formats 1.0 as "1" (no decimal point). MLIR rejects bare
+        // integers in float dense attributes, so format_float must append ".0".
+        assert_eq!(format_float(1.0), "1.0");
+        assert_eq!(format_float(2.0), "2.0");
+        assert_eq!(format_float(0.0), "0.0");
+    }
+
+    #[test]
+    fn format_float_preserves_non_integer_precision() {
+        // Non-integer values already have a decimal point and must not be truncated.
+        assert_eq!(format_float(0.123456), "0.123456");
+        assert_eq!(format_float(0.5), "0.5");
+        // 1e-10 is formatted by Rust as "0.0000000001" (has decimal) — passes through.
+        let s = format_float(1e-10);
+        assert!(s.contains('.') || s.contains('e') || s.contains('E'));
+    }
+
+    // ── Regression: Issue 1 — Gemm with non-trivial alpha compiles and runs ───
+
+    #[test]
+    fn run_gemm_fractional_alpha() {
+        // alpha=0.123456 must not be truncated to 0.1.
+        // A=[1,0; 0,1] (identity), B=[1,0; 0,1] (identity)
+        // alpha * (A @ B) = alpha * I = [[alpha, 0], [0, alpha]]
+        let alpha = 0.123456_f64;
+        let a = [1.0f32, 0.0, 0.0, 1.0]; // 2x2 identity
+        let b = [1.0f32, 0.0, 0.0, 1.0]; // 2x2 identity
+        let out = run_gemm_f32(&a, &[2, 2], &b, &[2, 2], None, alpha, 1.0, false, false);
+        // result = alpha * [[1,0],[0,1]] = [[alpha, 0],[0, alpha]]
+        let expected_diag = alpha as f32;
+        assert!(
+            (out[0] - expected_diag).abs() < 1e-5,
+            "expected {expected_diag}, got {} (alpha precision truncated?)", out[0]
+        );
+        assert!((out[1]).abs() < 1e-5);
+        assert!((out[2]).abs() < 1e-5);
+        assert!(
+            (out[3] - expected_diag).abs() < 1e-5,
+            "expected {expected_diag}, got {} (alpha precision truncated?)", out[3]
+        );
     }
 }

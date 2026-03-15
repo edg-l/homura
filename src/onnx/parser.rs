@@ -74,6 +74,14 @@ pub enum OnnxError {
     UnsupportedOp(String),
     /// An edge name referenced by a node was never produced by any prior node or input.
     MissingEdge(String),
+    /// MLIR compilation of the traced graph failed.
+    CompileError(String),
+    /// Caller passed the wrong number of dynamic inputs to `Model::run`.
+    WrongInputCount { expected: usize, got: usize },
+    /// A TensorProto's raw_data byte count doesn't match its declared shape.
+    RawDataLengthMismatch { got: usize, expected: usize },
+    /// Model has more than one output (not yet supported).
+    MultipleOutputs(usize),
 }
 
 impl std::fmt::Display for OnnxError {
@@ -91,6 +99,16 @@ impl std::fmt::Display for OnnxError {
             }
             OnnxError::UnsupportedOp(op) => write!(f, "unsupported ONNX op: {op}"),
             OnnxError::MissingEdge(name) => write!(f, "edge '{name}' not found in value map"),
+            OnnxError::CompileError(msg) => write!(f, "compile error: {msg}"),
+            OnnxError::WrongInputCount { expected, got } => {
+                write!(f, "wrong input count: expected {expected}, got {got}")
+            }
+            OnnxError::RawDataLengthMismatch { got, expected } => {
+                write!(f, "raw_data length {got} != expected {expected}")
+            }
+            OnnxError::MultipleOutputs(n) => {
+                write!(f, "model has {n} outputs; only a single output is supported")
+            }
         }
     }
 }
@@ -187,23 +205,28 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
 /// Priority: if `raw_data` is non-empty, use it directly.
 /// Otherwise fall back to the typed field (`float_data`, `double_data`, etc.).
 fn tensor_proto_to_buffer(t: &proto::TensorProto) -> Result<Buffer, OnnxError> {
-    let shape: Vec<u64> = t.dims.iter().map(|&d| d as u64).collect();
+    let mut shape: Vec<u64> = Vec::with_capacity(t.dims.len());
+    for &d in &t.dims {
+        if d < 0 {
+            return Err(OnnxError::DynamicShape(format!(
+                "tensor '{}' has negative dim {d}",
+                t.name
+            )));
+        }
+        shape.push(d as u64);
+    }
     let dtype = onnx_dtype(t.data_type)?;
 
     let buf = if !t.raw_data.is_empty() {
         // raw_data: byte array — copy directly into a Buffer.
         let num_elems: u64 = if shape.is_empty() { 1 } else { shape.iter().product() };
         let expected_bytes = num_elems as usize * dtype.size_bytes();
-        // Tolerate raw_data that exactly matches (extra bytes would be a malformed file).
-        assert_eq!(
-            t.raw_data.len(),
-            expected_bytes,
-            "raw_data length {} != expected {} for shape {:?} dtype {:?}",
-            t.raw_data.len(),
-            expected_bytes,
-            shape,
-            dtype,
-        );
+        if t.raw_data.len() != expected_bytes {
+            return Err(OnnxError::RawDataLengthMismatch {
+                got: t.raw_data.len(),
+                expected: expected_bytes,
+            });
+        }
         Buffer::from_raw_bytes(&t.raw_data, &shape, dtype)
     } else {
         match dtype {
@@ -709,5 +732,66 @@ mod tests {
 
         let result = parse_bytes(&encode(&model));
         assert!(matches!(result, Err(OnnxError::DynamicShape(_))));
+    }
+
+    // ── Regression: Issue 4 — raw_data length mismatch returns error ──────────
+
+    #[test]
+    fn raw_data_wrong_length_returns_error() {
+        // Shape [4] F32 expects 4 * 4 = 16 bytes; supply only 8 bytes.
+        let tensor = TensorProto {
+            name: "W".into(),
+            dims: vec![4],
+            data_type: 1, // FLOAT
+            raw_data: vec![0u8; 8], // too short
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                initializer: vec![tensor],
+                output: vec![],
+                node: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = parse_bytes(&encode(&model));
+        assert!(
+            matches!(result, Err(OnnxError::RawDataLengthMismatch { got: 8, expected: 16 })),
+            "expected RawDataLengthMismatch{{8, 16}}, got {result:?}"
+        );
+    }
+
+    // ── Regression: Issue 7 — negative dim returns error ─────────────────────
+
+    #[test]
+    fn negative_dim_in_initializer_returns_error() {
+        let tensor = TensorProto {
+            name: "W".into(),
+            dims: vec![-1i64], // negative dim
+            data_type: 1,
+            float_data: vec![1.0],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                initializer: vec![tensor],
+                output: vec![],
+                node: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = parse_bytes(&encode(&model));
+        assert!(
+            matches!(result, Err(OnnxError::DynamicShape(_))),
+            "expected DynamicShape error for negative dim, got {result:?}"
+        );
     }
 }

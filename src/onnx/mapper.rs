@@ -19,7 +19,18 @@ use super::parser::{OnnxAttribute, OnnxError, OnnxModel, OnnxNode};
 ///   followed by weights (in this vec's order).
 pub fn map_graph(model: &OnnxModel) -> Result<(Trace, Vec<NodeId>, Vec<Buffer>), OnnxError> {
     begin_trace();
+    match map_graph_inner(model) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            // Ensure the trace is cleaned up even when an error occurs, so that
+            // subsequent calls do not see a stale active trace.
+            let _ = take_trace();
+            Err(e)
+        }
+    }
+}
 
+fn map_graph_inner(model: &OnnxModel) -> Result<(Trace, Vec<NodeId>, Vec<Buffer>), OnnxError> {
     let mut tensors: HashMap<String, Tensor> = HashMap::new();
 
     // 1. Dynamic inputs first, in graph.input order.
@@ -42,16 +53,14 @@ pub fn map_graph(model: &OnnxModel) -> Result<(Trace, Vec<NodeId>, Vec<Buffer>),
     }
 
     // 4. Collect output NodeIds.
-    let output_ids: Vec<NodeId> = model
-        .outputs
-        .iter()
-        .map(|name| {
-            tensors
-                .get(name)
-                .unwrap_or_else(|| panic!("output edge '{name}' not found in value map"))
-                .id()
-        })
-        .collect();
+    let mut output_ids: Vec<NodeId> = Vec::with_capacity(model.outputs.len());
+    for name in &model.outputs {
+        let id = tensors
+            .get(name)
+            .ok_or_else(|| OnnxError::MissingEdge(name.clone()))?
+            .id();
+        output_ids.push(id);
+    }
 
     let trace = take_trace();
     Ok((trace, output_ids, weights))
@@ -184,9 +193,15 @@ fn map_node(node: &OnnxNode, tensors: &mut HashMap<String, Tensor>) -> Result<()
             tensors.insert(node.outputs[0].clone(), result);
         }
         "Clip" => {
-            // In opset 11+, min/max are inputs (not attributes).
-            // Map Clip(x, min=0, no-max) → relu for the common activation pattern.
-            // TODO: handle general Clip with arbitrary min/max inputs.
+            // In opset 11+, min/max are optional inputs (not attributes).
+            // Map Clip(x) with exactly 1 input → relu (x clipped to [0, ∞)).
+            // Clip with min/max inputs cannot be safely mapped to relu without
+            // inspecting the constant values, so reject it for now.
+            if node.inputs.len() > 1 && node.inputs[1..].iter().any(|s| !s.is_empty()) {
+                return Err(OnnxError::UnsupportedOp(
+                    "Clip with non-zero bounds (min/max inputs present)".to_string(),
+                ));
+            }
             let a = get_tensor(tensors, &node.inputs[0])?;
             let result = a.relu();
             tensors.insert(node.outputs[0].clone(), result);
@@ -590,5 +605,73 @@ mod tests {
             "expected Clip to map to Op::Relu, got {:?}",
             trace.get(out_id)
         );
+    }
+
+    // ── Regression: Issue 2 — output edge name not found returns MissingEdge ──
+
+    #[test]
+    fn output_edge_not_found_returns_missing_edge() {
+        // Model declares "Z" as the output but no node produces "Z".
+        let model = OnnxModel {
+            nodes: vec![make_node("Relu", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Z".to_string()], // "Z" is never produced
+        };
+
+        let result = map_graph(&model);
+        match result {
+            Err(OnnxError::MissingEdge(ref name)) if name == "Z" => {}
+            Err(other) => panic!("expected MissingEdge(\"Z\"), got Err({other})"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    // ── Regression: Issue 3 — Clip with min/max inputs returns UnsupportedOp ──
+
+    #[test]
+    fn clip_with_min_max_inputs_returns_unsupported() {
+        // Clip with 3 inputs (tensor, min, max) should not silently map to relu.
+        let model = OnnxModel {
+            nodes: vec![make_node("Clip", &["X", "min", "max"], &["Y"], vec![])],
+            initializers: vec![
+                make_weight("min", &[0.0], &[1]),
+                make_weight("max", &[6.0], &[1]),
+            ],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+
+        let result = map_graph(&model);
+        match result {
+            Err(OnnxError::UnsupportedOp(_)) => {}
+            Err(other) => panic!("expected UnsupportedOp, got Err({other})"),
+            Ok(_) => panic!("expected Err for Clip with bounds, got Ok"),
+        }
+    }
+
+    // ── Regression: Issue 5 — trace leak: error then success does not panic ───
+
+    #[test]
+    fn trace_cleaned_up_after_error_so_second_call_succeeds() {
+        // First call: model with an unsupported op → returns error.
+        let bad_model = OnnxModel {
+            nodes: vec![make_node("LSTM", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let result = map_graph(&bad_model);
+        assert!(result.is_err(), "expected error from bad model");
+
+        // Second call: valid model — must succeed without panicking.
+        let good_model = OnnxModel {
+            nodes: vec![make_node("Relu", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let result = map_graph(&good_model);
+        assert!(result.is_ok(), "second call should succeed but got an error");
     }
 }

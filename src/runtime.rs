@@ -190,16 +190,6 @@ impl CompiledGraph {
             self.num_inputs,
             inputs.len()
         );
-        for (i, buf) in inputs.iter().enumerate() {
-            assert_eq!(
-                buf.dtype(),
-                self.output_dtype,
-                "input {} dtype {:?} does not match graph dtype {:?}",
-                i,
-                buf.dtype(),
-                self.output_dtype,
-            );
-        }
 
         // Allocate output buffer (must exist before descriptor is built).
         let mut output = Buffer::new(self.output_shape.0.as_slice(), self.output_dtype);
