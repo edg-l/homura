@@ -598,7 +598,7 @@ impl Tensor {
     /// Dynamic reshape: shape comes from a traced tensor at runtime.
     ///
     /// `shape_tensor` is a 1-D I64 tensor whose values are the output dimensions.
-    /// `output_shape` is the statically-inferred output shape (may contain DIM_DYNAMIC).
+    /// `output_shape` is the statically-inferred output shape (may contain crate::shape::DIM_DYNAMIC).
     pub fn reshape_with_tensor(&self, shape_tensor: &Tensor, output_shape: Shape) -> Tensor {
         let id = trace::record(Op::Reshape {
             input: self.id,
@@ -636,7 +636,7 @@ impl Tensor {
     /// Create a tensor filled with `fill_value` with shape described by `shape_tensor`.
     ///
     /// `shape_tensor` is a 1-D I64 tensor whose elements give the output shape at runtime.
-    /// `output_shape` is the statically-inferred output shape (may contain DIM_DYNAMIC).
+    /// `output_shape` is the statically-inferred output shape (may contain crate::shape::DIM_DYNAMIC).
     /// `dtype` is the element type of the output tensor.
     pub fn constant_of_shape(
         shape_tensor: &Tensor,
@@ -660,7 +660,7 @@ impl Tensor {
     /// Create an arange tensor: [start, start+delta, ...) up to (not including) limit.
     ///
     /// `start`, `limit`, `delta` are scalar (1-element) tensors with the same dtype.
-    /// `output_shape` is typically `[DIM_DYNAMIC]` when inputs are non-constant.
+    /// `output_shape` is typically `[crate::shape::DIM_DYNAMIC]` when inputs are non-constant.
     pub fn range(
         start: &Tensor,
         limit: &Tensor,
@@ -953,7 +953,12 @@ impl Tensor {
             };
             assert!(ax >= 0 && ax < rank as i64, "slice: axis {} out of range", norm_axes[i]);
             norm_axes[i] = ax;
-            let dim_size = self.shape.0[ax as usize] as i64;
+            let dim_val = self.shape.0[ax as usize];
+            // Skip normalization for dynamic dims — can't clamp at trace time.
+            if dim_val == crate::shape::DIM_DYNAMIC {
+                continue;
+            }
+            let dim_size = dim_val as i64;
             // Normalize negative start.
             if norm_starts[i] < 0 {
                 norm_starts[i] = (norm_starts[i] + dim_size).max(0);
@@ -972,6 +977,10 @@ impl Tensor {
         let mut out_dims: Vec<u64> = self.shape.0.clone();
         for i in 0..norm_axes.len() {
             let ax = norm_axes[i] as usize;
+            // If this axis is dynamic, output stays dynamic.
+            if out_dims[ax] == crate::shape::DIM_DYNAMIC {
+                continue;
+            }
             let step = steps[i];
             assert!(step > 0, "slice: only positive steps are supported");
             let len = (norm_ends[i] - norm_starts[i]).max(0);
@@ -984,6 +993,44 @@ impl Tensor {
             starts: norm_starts,
             ends: norm_ends,
             axes: norm_axes,
+            steps: steps.to_vec(),
+            shape: out_shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: out_shape,
+            dtype: self.dtype,
+        }
+    }
+
+    /// Slice `self` along specified axes with dynamic start/end tensors.
+    ///
+    /// Used when `starts` or `ends` come from traced ops at runtime (e.g. from
+    /// a Shape chain).  `axes` and `steps` must still be static.
+    /// `out_shape` must be pre-computed (sliced axes should be `DIM_DYNAMIC`).
+    pub fn dynamic_slice(
+        &self,
+        starts_tensor: &Tensor,
+        ends_tensor: &Tensor,
+        axes: &[i64],
+        steps: &[i64],
+        out_shape: crate::Shape,
+    ) -> Tensor {
+        assert!(
+            matches!(starts_tensor.dtype, DType::I64),
+            "dynamic_slice: starts_tensor must be I64"
+        );
+        assert!(
+            matches!(ends_tensor.dtype, DType::I64),
+            "dynamic_slice: ends_tensor must be I64"
+        );
+        assert_eq!(axes.len(), steps.len(), "dynamic_slice: axes and steps must have equal length");
+        let id = trace::record(crate::op::Op::DynamicSlice {
+            input: self.id,
+            starts_tensor: starts_tensor.id,
+            ends_tensor: ends_tensor.id,
+            axes: axes.to_vec(),
             steps: steps.to_vec(),
             shape: out_shape.clone(),
             dtype: self.dtype,
@@ -1020,13 +1067,25 @@ impl Tensor {
         for t in tensors.iter().skip(1) {
             for (d, dim) in out_dims.iter_mut().enumerate() {
                 if d == ax {
-                    *dim += t.shape.0[d];
+                    // If either side is dynamic, result is dynamic
+                    if *dim == crate::shape::DIM_DYNAMIC || t.shape.0[d] == crate::shape::DIM_DYNAMIC {
+                        *dim = crate::shape::DIM_DYNAMIC;
+                    } else {
+                        *dim += t.shape.0[d];
+                    }
                 } else {
-                    assert_eq!(
-                        *dim, t.shape.0[d],
-                        "concat: dimension {d} mismatch: {} vs {}",
-                        dim, t.shape.0[d]
-                    );
+                    // Non-axis dims must match, but dynamic is compatible with anything
+                    if *dim == crate::shape::DIM_DYNAMIC || t.shape.0[d] == crate::shape::DIM_DYNAMIC {
+                        if *dim != crate::shape::DIM_DYNAMIC && t.shape.0[d] == crate::shape::DIM_DYNAMIC {
+                            *dim = crate::shape::DIM_DYNAMIC;
+                        }
+                    } else {
+                        assert_eq!(
+                            *dim, t.shape.0[d],
+                            "concat: dimension {d} mismatch: {} vs {}",
+                            dim, t.shape.0[d]
+                        );
+                    }
                 }
             }
         }
@@ -2042,11 +2101,11 @@ mod tests {
         let out = Tensor::constant_of_shape(
             &shape_t,
             1.0,
-            crate::Shape(vec![1, 12, DIM_DYNAMIC, 64]),
+            crate::Shape(vec![1, 12, crate::shape::DIM_DYNAMIC, 64]),
             DType::F32,
         );
         let _ = take_trace();
-        assert_eq!(out.shape().0, vec![1, 12, DIM_DYNAMIC, 64]);
+        assert_eq!(out.shape().0, vec![1, 12, crate::shape::DIM_DYNAMIC, 64]);
         assert_eq!(out.dtype(), DType::F32);
     }
 
@@ -2071,9 +2130,9 @@ mod tests {
         let start = Tensor::new(&[1], DType::I64);
         let limit = Tensor::new(&[1], DType::I64);
         let delta = Tensor::new(&[1], DType::I64);
-        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![crate::shape::DIM_DYNAMIC]), DType::I64);
         let _ = take_trace();
-        assert_eq!(out.shape().0, vec![DIM_DYNAMIC]);
+        assert_eq!(out.shape().0, vec![crate::shape::DIM_DYNAMIC]);
         assert_eq!(out.dtype(), DType::I64);
     }
 
@@ -2084,7 +2143,7 @@ mod tests {
         let start = Tensor::new(&[1], DType::I64);
         let limit = Tensor::new(&[1], DType::I64);
         let delta = Tensor::new(&[1], DType::I64);
-        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![crate::shape::DIM_DYNAMIC]), DType::I64);
         let trace = take_trace();
         let op = &trace.ops()[out.id.0 as usize];
         assert!(
@@ -2100,7 +2159,7 @@ mod tests {
         begin_trace();
         let data = Tensor::new(&[6], DType::F32);
         let shape_t = Tensor::new(&[2], DType::I64);
-        let out = data.reshape_with_tensor(&shape_t, crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC]));
+        let out = data.reshape_with_tensor(&shape_t, crate::Shape(vec![crate::shape::DIM_DYNAMIC, crate::shape::DIM_DYNAMIC]));
         let trace = take_trace();
         let op = &trace.ops()[out.id.0 as usize];
         match op {

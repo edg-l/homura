@@ -878,61 +878,105 @@ fn map_node(
             // ONNX Slice opset 10+: starts, ends, axes, steps are all input tensors.
             let starts_name = &node.inputs[1];
             let ends_name = &node.inputs[2];
-            let starts_buf = constant_data.get(starts_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Slice: starts input '{starts_name}' must be a static constant"
-                ))
-            })?;
-            let ends_buf = constant_data.get(ends_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Slice: ends input '{ends_name}' must be a static constant"
-                ))
-            })?;
-            let starts = read_i64_buffer(starts_buf)?;
-            let ends = read_i64_buffer(ends_buf)?;
 
-            // axes is optional (input index 3).
-            let axes: Vec<i64> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
-                let axes_name = &node.inputs[3];
-                let axes_buf = constant_data.get(axes_name).ok_or_else(|| {
-                    OnnxError::UnsupportedOp(format!(
-                        "Slice: axes input '{axes_name}' must be a static constant"
-                    ))
-                })?;
-                read_i64_buffer(axes_buf)?
-            } else {
-                // Default: axes = [0, 1, ..., starts.len()-1].
-                (0..starts.len() as i64).collect()
-            };
+            // Try to resolve starts and ends from constant_data first.
+            let starts_const = constant_data.get(starts_name).and_then(|b| read_i64_buffer(b).ok());
+            let ends_const = constant_data.get(ends_name).and_then(|b| read_i64_buffer(b).ok());
 
-            // steps is optional (input index 4).
-            let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
-                let steps_name = &node.inputs[4];
-                let steps_buf = constant_data.get(steps_name).ok_or_else(|| {
-                    OnnxError::UnsupportedOp(format!(
-                        "Slice: steps input '{steps_name}' must be a static constant"
-                    ))
-                })?;
-                read_i64_buffer(steps_buf)?
-            } else {
-                vec![1i64; starts.len()]
-            };
+            if let (Some(starts), Some(ends)) = (starts_const, ends_const) {
+                // ── Static path ──────────────────────────────────────────────
+                // axes is optional (input index 3).
+                let axes: Vec<i64> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
+                    let axes_name = &node.inputs[3];
+                    let axes_buf = constant_data.get(axes_name).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice: axes input '{axes_name}' must be a static constant"
+                        ))
+                    })?;
+                    read_i64_buffer(axes_buf)?
+                } else {
+                    // Default: axes = [0, 1, ..., starts.len()-1].
+                    (0..starts.len() as i64).collect()
+                };
 
-            let result = data.slice(&starts, &ends, &axes, &steps);
+                // steps is optional (input index 4).
+                let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
+                    let steps_name = &node.inputs[4];
+                    let steps_buf = constant_data.get(steps_name).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice: steps input '{steps_name}' must be a static constant"
+                        ))
+                    })?;
+                    read_i64_buffer(steps_buf)?
+                } else {
+                    vec![1i64; starts.len()]
+                };
 
-            // Constant propagation: if the data input is a known constant
-            // (e.g. a shape tensor produced by Shape), evaluate the slice at
-            // trace time so downstream Squeeze/Reshape etc. can read the result.
-            let data_name = &node.inputs[0];
-            if let Some(data_buf) = constant_data.get(data_name).cloned() {
-                if let Some(const_buf) =
-                    eval_slice_constant(&data_buf, &starts, &ends, &axes, &steps)
-                {
-                    constant_data.insert(node.outputs[0].clone(), const_buf);
+                let result = data.slice(&starts, &ends, &axes, &steps);
+
+                // Constant propagation: if the data input is a known constant
+                // (e.g. a shape tensor produced by Shape), evaluate the slice at
+                // trace time so downstream Squeeze/Reshape etc. can read the result.
+                let data_name = &node.inputs[0];
+                if let Some(data_buf) = constant_data.get(data_name).cloned() {
+                    if let Some(const_buf) =
+                        eval_slice_constant(&data_buf, &starts, &ends, &axes, &steps)
+                    {
+                        constant_data.insert(node.outputs[0].clone(), const_buf);
+                    }
                 }
-            }
 
-            tensors.insert(node.outputs[0].clone(), result);
+                tensors.insert(node.outputs[0].clone(), result);
+            } else {
+                // ── Dynamic path ─────────────────────────────────────────────
+                // starts or ends come from traced ops (e.g. a Shape chain).
+                // axes and steps are still required to be static constants or defaults.
+                let starts_t = get_tensor(tensors, starts_name)?;
+                let ends_t = get_tensor(tensors, ends_name)?;
+
+                // Number of axes = length of the starts tensor (rank-1, shape [N]).
+                let n_axes = starts_t.shape().0[0] as usize;
+
+                // axes is optional (input index 3) — must still be static.
+                let axes: Vec<i64> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
+                    let axes_name = &node.inputs[3];
+                    let axes_buf = constant_data.get(axes_name).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice (dynamic): axes input '{axes_name}' must be a static constant"
+                        ))
+                    })?;
+                    read_i64_buffer(axes_buf)?
+                } else {
+                    (0..n_axes as i64).collect()
+                };
+
+                // steps is optional (input index 4) — must still be static.
+                let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
+                    let steps_name = &node.inputs[4];
+                    let steps_buf = constant_data.get(steps_name).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice (dynamic): steps input '{steps_name}' must be a static constant"
+                        ))
+                    })?;
+                    read_i64_buffer(steps_buf)?
+                } else {
+                    vec![1i64; n_axes]
+                };
+
+                // Build the output shape: mark sliced axes as DIM_DYNAMIC since
+                // the extent is not known until runtime.
+                let rank = data.shape().rank();
+                let mut out_dims = data.shape().0.clone();
+                for &ax in &axes {
+                    let ax = if ax < 0 { ax + rank as i64 } else { ax } as usize;
+                    out_dims[ax] = crate::shape::DIM_DYNAMIC;
+                }
+                let out_shape = crate::Shape(out_dims);
+
+                let result =
+                    data.dynamic_slice(&starts_t, &ends_t, &axes, &steps, out_shape);
+                tensors.insert(node.outputs[0].clone(), result);
+            }
         }
 
         "Concat" => {

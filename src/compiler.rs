@@ -5916,6 +5916,213 @@ fn emit_tensor_ops<'c>(
 
                 values.insert(node_id, result_val);
             }
+
+            // ── DynamicSlice ──────────────────────────────────────────────────
+            //
+            // Uses `tensor.extract_slice` with dynamic offsets and sizes.
+            // For each axis in `axes`:
+            //   - offset  = tensor.extract %starts_tensor[%axis_idx] cast to index
+            //   - size    = (tensor.extract %ends_tensor[%axis_idx]) - offset, cast to index
+            // For non-sliced axes:
+            //   - offset = 0 (static)
+            //   - size   = input_dim (static if known, dynamic via tensor.dim if DIM_DYNAMIC)
+            // Strides are all 1.
+
+            Op::DynamicSlice {
+                input,
+                starts_tensor,
+                ends_tensor,
+                axes,
+                steps: _steps,
+                shape,
+                dtype,
+            } => {
+                let input_val = *values.get(input).expect("DynamicSlice: input not emitted");
+                let starts_val =
+                    *values.get(starts_tensor).expect("DynamicSlice: starts_tensor not emitted");
+                let ends_val =
+                    *values.get(ends_tensor).expect("DynamicSlice: ends_tensor not emitted");
+
+                let input_shape = trace.get(*input).shape().0.clone();
+                let rank = input_shape.len();
+
+                let index_type = melior::ir::Type::parse(context, "index")
+                    .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+                let i64_type = DType::I64.to_mlir_type(context);
+
+                // Build a set of which axes are sliced, for quick lookup.
+                let normalized_axes: Vec<usize> = axes
+                    .iter()
+                    .map(|&ax| {
+                        if ax < 0 { (ax + rank as i64) as usize } else { ax as usize }
+                    })
+                    .collect();
+
+                // For each sliced axis, pre-compute (offset_index, size_index) as index-typed
+                // SSA values.  `offset_i` = starts[i], `size_i` = ends[i] - starts[i].
+                // We build a Vec<Option<(offset, size)>> indexed by position in `axes`.
+                let mut sliced_offset: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                let mut sliced_size: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+
+                for (axis_pos, _ax) in axes.iter().enumerate() {
+                    let axis_idx_const: melior::ir::Value = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, axis_pos as i64).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    // Extract start as i64, cast to index.
+                    let start_i64: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.extract", location)
+                                .add_operands(&[starts_val, axis_idx_const])
+                                .add_results(&[i64_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let start_idx: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("arith.index_cast", location)
+                                .add_operands(&[start_i64])
+                                .add_results(&[index_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    // Extract end as i64, cast to index.
+                    let end_i64: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.extract", location)
+                                .add_operands(&[ends_val, axis_idx_const])
+                                .add_results(&[i64_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let end_idx: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("arith.index_cast", location)
+                                .add_operands(&[end_i64])
+                                .add_results(&[index_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    // size = end - start (index arithmetic).
+                    let size_idx: melior::ir::Value = body_block
+                        .append_operation(arith::subi(end_idx, start_idx, location))
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    sliced_offset.push(start_idx);
+                    sliced_size.push(size_idx);
+                }
+
+                // Build per-rank static_offsets, static_sizes, static_strides and
+                // collect dynamic operands (in order: offsets first, then sizes).
+                // `i64::MIN` is MLIR's ShapedType::kDynamic sentinel.
+
+                let mut static_offsets: Vec<i64> = vec![0i64; rank];
+                let mut static_sizes: Vec<i64> = Vec::with_capacity(rank);
+                let static_strides: Vec<i64> = vec![1i64; rank];
+
+                // Compute static_sizes: for each dim, static if not sliced and input
+                // dim is known; otherwise kDynamic.
+                for (d_idx, &in_dim) in input_shape.iter().enumerate() {
+                    if normalized_axes.contains(&d_idx) {
+                        // sliced axis — size is dynamic
+                        static_sizes.push(i64::MIN);
+                    } else if in_dim == DIM_DYNAMIC {
+                        // non-sliced but dynamic input dim
+                        static_sizes.push(i64::MIN);
+                    } else {
+                        static_sizes.push(in_dim as i64);
+                    }
+                }
+
+                // All sliced axes have dynamic offsets; mark them kDynamic.
+                for &ax in &normalized_axes {
+                    static_offsets[ax] = i64::MIN;
+                }
+
+                // Dynamic operand list for tensor.extract_slice:
+                //   [dynamic_offsets..., dynamic_sizes...]
+                // dynamic offsets: one per sliced axis (in axis order)
+                // dynamic sizes: one per sliced axis + one per non-sliced dynamic dim
+                let mut dynamic_ops: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+
+                // offsets: sliced axes contribute dynamic offsets
+                for &ax in &normalized_axes {
+                    let pos = normalized_axes.iter().position(|&a| a == ax).unwrap();
+                    dynamic_ops.push(sliced_offset[pos]);
+                }
+
+                // sizes: sliced axes first (dynamic size from end-start),
+                // then non-sliced DIM_DYNAMIC axes (from tensor.dim).
+                for (d_idx, &in_dim) in input_shape.iter().enumerate() {
+                    if normalized_axes.contains(&d_idx) {
+                        let pos = normalized_axes.iter().position(|&a| a == d_idx).unwrap();
+                        dynamic_ops.push(sliced_size[pos]);
+                    } else if in_dim == DIM_DYNAMIC {
+                        let dim_v = emit_tensor_dim(context, body_block, input_val, d_idx, location)?;
+                        dynamic_ops.push(dim_v);
+                    }
+                }
+
+                // Build attribute strings.
+                let so_str = static_offsets.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                let static_offsets_attr =
+                    Attribute::parse(context, &format!("array<i64: {so_str}>"))
+                        .ok_or_else(|| CompileError::AttributeParse("static_offsets".into()))?;
+
+                let ss_str = static_sizes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                let static_sizes_attr =
+                    Attribute::parse(context, &format!("array<i64: {ss_str}>"))
+                        .ok_or_else(|| CompileError::AttributeParse("static_sizes".into()))?;
+
+                let sst_str = static_strides.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                let static_strides_attr =
+                    Attribute::parse(context, &format!("array<i64: {sst_str}>"))
+                        .ok_or_else(|| CompileError::AttributeParse("static_strides".into()))?;
+
+                let result_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.extract_slice", location)
+                            .add_operands(&[input_val])
+                            .add_operands(&dynamic_ops)
+                            .add_results(&[result_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "static_offsets"), static_offsets_attr),
+                                (Identifier::new(context, "static_sizes"), static_sizes_attr),
+                                (Identifier::new(context, "static_strides"), static_strides_attr),
+                            ])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
         }
     }
 

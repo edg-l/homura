@@ -261,6 +261,21 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Slice a tensor along specified axes with dynamic start/end operands.
+    ///
+    /// Used when `starts_tensor` or `ends_tensor` come from traced ops (e.g. a
+    /// Shape chain) rather than compile-time constants.  `axes` and `steps` are
+    /// always static.  The compiler emits `tensor.extract_slice` with dynamic
+    /// offsets and sizes.
+    DynamicSlice {
+        input: NodeId,
+        starts_tensor: NodeId, // 1-D I64 tensor, one element per axis
+        ends_tensor: NodeId,   // 1-D I64 tensor, one element per axis
+        axes: Vec<i64>,        // which axes (always static)
+        steps: Vec<i64>,       // step per axis (always static, must be 1 for now)
+        shape: Shape,          // output shape (may contain DIM_DYNAMIC for sliced axes)
+        dtype: DType,
+    },
 }
 
 impl Op {
@@ -296,6 +311,7 @@ impl Op {
             Op::ShapeOf { shape, .. } => shape,
             Op::ConstantOfShape { shape, .. } => shape,
             Op::Range { shape, .. } => shape,
+            Op::DynamicSlice { shape, .. } => shape,
         }
     }
 
@@ -331,6 +347,7 @@ impl Op {
             Op::ShapeOf { dtype, .. } => *dtype,
             Op::ConstantOfShape { dtype, .. } => *dtype,
             Op::Range { dtype, .. } => *dtype,
+            Op::DynamicSlice { dtype, .. } => *dtype,
         }
     }
 }
