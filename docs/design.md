@@ -9,9 +9,7 @@ User code             Trace              MLIR                  Machine code
 ─────────────────     ──────────────     ───────────────────   ──────────────
 let a = Tensor(...)   Op::Input(a)       bufferization.to_     fadd loop over
 let b = Tensor(...)   Op::Input(b)         tensor %arg0        raw memory
-let c = &a + &b       Op::Add(a,b)       linalg.generic {      (JIT compiled)
-                                           arith.addf
-                                         }
+let c = &a + &b       Op::Add(a,b)       tosa.add %t0, %t1    (JIT compiled)
 ```
 
 Nothing runs until you say so. You write math, Homura writes it down, then compiles and runs it all at once.
@@ -47,7 +45,7 @@ The trace lives in a **thread-local** variable. This means:
 
 ### 2. Compilation — Turning the Recipe into MLIR
 
-`Compiler::compile(trace, outputs)` walks the trace and emits MLIR intermediate representation (IR). The compiler uses **linalg.generic** operations on tensor types, which is MLIR's way of expressing "do this operation element-wise."
+`Compiler::compile(trace, outputs)` walks the trace and emits MLIR intermediate representation (IR). The compiler primarily emits **TOSA dialect** ops — MLIR's Tensor Operator Set Architecture, designed for ML inference workloads.
 
 For `c = a + b` with shape `[4]` and dtype `f32`, the generated IR is:
 
@@ -61,21 +59,8 @@ func.func @compute(%arg0: memref<4xf32>,   // input a
   %t0 = bufferization.to_tensor %arg0 restrict : memref<4xf32> to tensor<4xf32>
   %t1 = bufferization.to_tensor %arg1 restrict : memref<4xf32> to tensor<4xf32>
 
-  // Create an empty output tensor
-  %init = tensor.empty() : tensor<4xf32>
-
-  // The actual computation: element-wise add
-  %result = linalg.generic
-      {indexing_maps = [affine_map<(d0) -> (d0)>,    // how to index input 1
-                        affine_map<(d0) -> (d0)>,    // how to index input 2
-                        affine_map<(d0) -> (d0)>],   // how to index output
-       iterator_types = ["parallel"]}                 // iterations are independent
-      ins(%t0, %t1 : tensor<4xf32>, tensor<4xf32>)
-      outs(%init : tensor<4xf32>) {
-    ^bb0(%a_elem: f32, %b_elem: f32, %out_elem: f32):
-      %sum = arith.addf %a_elem, %b_elem : f32
-      linalg.yield %sum : f32
-  } -> tensor<4xf32>
+  // The actual computation: TOSA add
+  %result = tosa.add %t0, %t1 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
 
   // Convert result back to memref and copy to output argument
   %out_memref = bufferization.to_buffer %result : tensor<4xf32> to memref<4xf32>
@@ -88,23 +73,35 @@ Key things to notice:
 
 - **The function takes memref arguments** (pointers to memory), not tensors. This is the JIT calling convention.
 - **Internally everything is tensors.** `bufferization.to_tensor` at the boundary converts memrefs to tensors; `bufferization.to_buffer` converts back.
-- **`linalg.generic` describes what, not how.** It says "apply this function element-wise" without specifying loops. MLIR decides how to execute it.
-- **`iterator_types = ["parallel"]`** tells MLIR these iterations are independent — crucial for future GPU support.
+- **TOSA ops are high-level.** `tosa.add` says "add these tensors" without specifying loops. MLIR's lowering passes decide how to execute it.
+- **linalg.generic fallback** for ops TOSA doesn't support (float division, integer matmul).
 
 ### 3. Lowering — From High-Level IR to Machine Code
 
-The MLIR IR goes through a 9-pass pipeline that progressively lowers abstractions:
+The MLIR IR goes through a multi-stage pipeline that progressively lowers abstractions:
 
 ```
-linalg.generic on tensors
+tosa.* ops on tensors
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│ TOSA lowering passes (function-level)       │
+│   tosa-make-broadcastable                   │
+│     Auto-inserts reshapes for broadcast.    │
+│   tosa-to-linalg-named                      │
+│     Structured ops (matmul, conv) → named   │
+│     linalg ops.                             │
+│   tosa-to-linalg                            │
+│     Element-wise ops → linalg.generic.      │
+│   tosa-to-arith / tosa-to-tensor            │
+│     Remaining TOSA ops → arith/tensor.      │
+└─────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────┐
 │ one-shot-bufferize                          │
 │   Converts tensor ops to memref ops.        │
 │   Allocates memory for intermediates.       │
-│   The big pass — eliminates tensor          │
-│   semantics entirely.                       │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -123,13 +120,15 @@ linalg.generic on tensors
         │
         ▼
 ┌─────────────────────────────────────────────┐
+│ convert-math-to-llvm                        │
+│ expand-strided-metadata                     │
 │ finalize-memref-to-llvm                     │
 │ convert-arith-to-llvm                       │
 │ convert-index-to-llvm                       │
 │ convert-cf-to-llvm                          │
 │ convert-func-to-llvm                        │
-│   Five passes that convert everything       │
-│   remaining to LLVM dialect.                │
+│   Convert everything remaining to LLVM      │
+│   dialect.                                  │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -146,11 +145,19 @@ linalg.generic on tensors
 The exact pipeline string passed to MLIR:
 ```
 builtin.module(
+    func.func(
+        tosa-make-broadcastable,
+        tosa-to-linalg-named,
+        tosa-to-linalg,
+        tosa-to-arith,
+        tosa-to-tensor),
     one-shot-bufferize{
         function-boundary-type-conversion=identity-layout-map
         unknown-type-conversion=identity-layout-map},
     convert-linalg-to-loops,
     convert-scf-to-cf,
+    convert-math-to-llvm,
+    expand-strided-metadata,
     finalize-memref-to-llvm,
     convert-arith-to-llvm,
     convert-index-to-llvm,
@@ -159,36 +166,73 @@ builtin.module(
     reconcile-unrealized-casts)
 ```
 
-All 9 passes are required. Removing any one causes verification or lowering failures.
+TOSA passes are function-level (nested under `func.func()`). The remaining passes are module-level.
 
 ### 4. Execution — Running the Machine Code
 
 `CompiledGraph::run(inputs)` marshals Rust data into the format the JIT-compiled function expects, calls it, and extracts the result.
 
-The JIT ABI uses **memref descriptors** — C structs that describe a region of memory:
+The JIT ABI uses **N-D memref descriptors** — C structs that describe a region of memory with shape and stride information. The `llvm.emit_c_interface` attribute causes MLIR to generate a C-compatible wrapper that accepts pointers to these descriptors. The `invoke_packed` mechanism requires **double indirection**: each argument slot holds a pointer to a pointer to a descriptor.
 
-```rust
-#[repr(C)]
-struct MemRefDescriptor1D<T> {
-    allocated: *mut T,    // base allocation pointer
-    aligned:   *mut T,    // aligned data pointer (same as allocated for simple cases)
-    offset:    i64,       // 0
-    sizes:     [i64; 1],  // [num_elements]
-    strides:   [i64; 1],  // [1]
-}
+## TOSA Backend
+
+The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Architecture) is MLIR's standard op set for ML inference, with well-tested lowering passes to linalg and LLVM.
+
+**TOSA op mapping:**
+
+| Homura op   | TOSA op              | Notes                                  |
+|-------------|----------------------|----------------------------------------|
+| Add         | tosa.add             |                                        |
+| Sub         | tosa.sub             |                                        |
+| Mul         | tosa.mul             | shift operand: `tosa.const` tensor<1xi8> |
+| Neg         | tosa.negate          | zero-point operands set to 0           |
+| Relu        | tosa.clamp           | min_val=0, max_val=max_float           |
+| Exp         | tosa.exp             |                                        |
+| Tanh        | tosa.tanh            |                                        |
+| Matmul (f)  | tosa.matmul          | 3D only; 2D wraps with tosa.reshape    |
+| Gemm        | tosa.matmul + add    | optional transpose via tosa.transpose  |
+| Reshape     | tosa.reshape         | target shape via tosa.const_shape      |
+| ReduceSum   | tosa.reduce_sum      | keepdim=false adds tosa.reshape after  |
+| ReduceMax   | tosa.reduce_max      | keepdim=false adds tosa.reshape after  |
+| Div         | linalg.generic       | TOSA has no float div                  |
+| Matmul (i)  | linalg.generic       | tosa.matmul is float-only              |
+
+**LLVM 21 TOSA specifics:**
+
+| Op             | What docs say           | What LLVM 21 requires                       |
+|----------------|-------------------------|---------------------------------------------|
+| `tosa.mul`     | shift is i8 attribute   | shift is 3rd operand `tensor<1xi8>`         |
+| `tosa.negate`  | single operand          | 3 operands (input, input1_zp, output_zp)    |
+| `tosa.clamp`   | separate fp/int attrs   | unified min_val/max_val attributes           |
+| `tosa.reshape` | shape is attribute      | shape is operand via `tosa.const_shape`      |
+
+## ONNX Support
+
+Homura can load and run ONNX models directly:
+
+```
+ONNX .proto file
+    │  prost-build (build.rs)
+    ▼
+ModelProto (protobuf)
+    │  parser.rs: parse_model()
+    ▼
+OnnxModel { nodes, weights, inputs }
+    │  mapper.rs: map_graph()
+    ▼
+begin_trace() → replay ops via Tensor API → take_trace()
+    │  compiler.rs: Compiler::compile()
+    ▼
+CompiledGraph + weights → Model { compiled, weights, num_dynamic_inputs }
 ```
 
-The `llvm.emit_c_interface` attribute on the function causes MLIR to generate a C-compatible wrapper (`_mlir_ciface_compute`) that accepts pointers to these descriptors. The `invoke_packed` mechanism requires **double indirection**: each argument slot holds a pointer to a pointer to a descriptor.
+The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. ONNX initializers become weight inputs; graph inputs become dynamic inputs. The `Model` struct owns the weights and prepends them to user-provided dynamic inputs at run time.
 
-```
-args[0] → &ptr_to_desc_a → MemRefDescriptor1D { data of a }
-args[1] → &ptr_to_desc_b → MemRefDescriptor1D { data of b }
-args[2] → &ptr_to_desc_c → MemRefDescriptor1D { output buffer }
-```
+**Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, MatMul, Gemm, Softmax, Clip, Reshape.
 
 ## How Chained Operations Work
 
-For `d = (a + b) + c`, the trace records four ops and the compiler emits two `linalg.generic` operations:
+For `d = (a + b) + c`, the trace records four ops and the compiler emits two TOSA add operations:
 
 ```
 Trace:
@@ -199,42 +243,9 @@ Trace:
   4: Add(2, 3)     ← (a + b) + c
 ```
 
-The compiler walks the trace linearly, maintaining a `NodeId → Value` map. When it hits `Add(2, 3)`, it looks up the tensor value for node 2 (the result of the first add) and node 3 (input c), then emits a second `linalg.generic` that consumes the first one's output.
+The compiler walks the trace linearly, maintaining a `NodeId → Value` map. When it hits `Add(2, 3)`, it looks up the tensor value for node 2 (the result of the first add) and node 3 (input c), then emits a second `tosa.add` that consumes the first one's output.
 
-After bufferization and lowering, this becomes two loops with an intermediate buffer:
-
-```
-loop 1: for i in 0..4:  tmp[i] = a[i] + b[i]
-loop 2: for i in 0..4:  out[i] = tmp[i] + c[i]
-```
-
-MLIR's optimization passes could potentially fuse these into a single loop, but that's not required for correctness.
-
-## Why linalg.generic?
-
-The previous version of Homura emitted explicit `scf.for` loops with `memref.load/store` operations. This worked for CPU but was a dead end:
-
-```
-Old approach (manual loops):         New approach (linalg.generic):
-
-  scf.for %i = 0 to N {               linalg.generic {
-    %a = memref.load %in[%i]             arith.addf
-    %b = memref.load %in[%i]           }
-    %s = arith.addf %a, %b
-    memref.store %s, %out[%i]          Can lower to:
-  }                                      → scf.for loops (CPU)
-                                         → gpu.launch (GPU)
-  Can only lower to:                     → tiled loops (vectorized)
-    → LLVM (CPU only)                   → distributed execution
-```
-
-`linalg.generic` describes **what** to compute without specifying **how**. The `iterator_types = ["parallel"]` annotation tells MLIR the iterations are independent, which enables:
-
-- **GPU lowering**: Map parallel iterations to GPU threads
-- **Vectorization**: Process multiple elements per instruction
-- **Tiling**: Break large operations into cache-friendly chunks
-- **Fusion**: Combine adjacent operations into single loops
-- **N-D tensors**: Just add more dimensions to the affine maps
+After TOSA lowering, bufferization, and loop conversion, this becomes two loops with an intermediate buffer. MLIR's optimization passes could potentially fuse these into a single loop.
 
 ## Architecture Decisions
 
@@ -254,11 +265,13 @@ Operations are stored in a flat vector. Each `Op` references its inputs by `Node
 
 The generated function takes `memref` arguments (matching the JIT's C ABI) but uses `tensor` types internally. `bufferization.to_tensor` and `bufferization.to_buffer` convert at the boundary. This keeps the runtime ABI unchanged while letting the compiler work with high-level tensor abstractions.
 
-### One linalg.generic per operation
+### TOSA as primary backend, linalg.generic as fallback
 
-Each op becomes its own `linalg.generic`. For `a + b + c`, that's two separate operations. MLIR's fusion passes can merge them later, but the compiler doesn't try to be clever — it emits the simplest correct IR and lets the MLIR pass pipeline optimize.
+TOSA provides native ops for most ML operations with well-tested lowering passes. For ops TOSA doesn't support (float div, integer matmul), we fall back to hand-rolled `linalg.generic`. Both paths coexist in the same module — TOSA passes are no-ops when no TOSA ops are present.
 
-Binary ops (Add, Sub, Mul, Div) use 3 affine maps, 2 `ins` operands, and a 3-arg body block. Unary ops (Neg, Relu) use 2 affine maps, 1 `ins` operand, and a 2-arg body block. The only difference between ops within each category is the arith operation inside the body.
+### ONNX graph replay through Tensor API
+
+Rather than building a separate ONNX-to-MLIR compiler, the ONNX mapper replays the graph through the existing Tensor API. This reuses shape inference, broadcasting, dtype validation, and the entire compilation pipeline. The ONNX layer is a "robot user."
 
 ## Source Layout
 
@@ -266,61 +279,62 @@ Binary ops (Add, Sub, Mul, Div) use 3 affine maps, 2 `ins` operands, and a 3-arg
 src/
 ├── lib.rs          Public API re-exports
 ├── dtype.rs        DType enum (F32, F64, I32, I64) with MLIR type conversion
-├── shape.rs        Shape wrapper over Vec<u64>
-├── op.rs           NodeId (u32 index) and Op enum (Input, Add, Sub, Mul, Div, Neg, Relu)
+├── shape.rs        Shape wrapper over Vec<u64> with broadcast
+├── op.rs           NodeId and Op enum (Input, Add, Sub, Mul, Div, Neg, Relu,
+│                   Exp, Tanh, Matmul, ReduceSum, ReduceMax, Reshape, Gemm)
 ├── trace.rs        Thread-local Trace context, begin_trace/take_trace/record
-├── tensor.rs       Tensor handle with operator overloads (Add, Sub, Mul, Div, Neg) and .relu()
-├── compiler.rs     Trace → MLIR IR emission, pass pipeline, ExecutionEngine
-└── runtime.rs      MemRefDescriptor1D, CompiledGraph::run() with JIT marshalling
+├── tensor.rs       Tensor handle with operator overloads, matmul, gemm, reshape,
+│                   reductions, softmax, eval sugar
+├── compiler.rs     Trace → MLIR IR emission (TOSA + linalg), pass pipeline,
+│                   ExecutionEngine
+├── runtime.rs      N-D MemRefDescriptor, Buffer, CompiledGraph::run()
+└── onnx/
+    ├── mod.rs      Public API: Model struct (load/run)
+    ├── proto.rs    Re-export prost-generated protobuf types
+    ├── parser.rs   ONNX ModelProto → internal OnnxModel representation
+    └── mapper.rs   Walk ONNX graph, replay through Tensor API
+
+proto/
+└── onnx.proto3     Vendored ONNX protobuf definition
+
+build.rs            prost-build compilation of .proto files
 
 examples/
-├── add.rs          a + b demo (simple and chained)
-└── ops.rs          all ops demo (sub, mul, div, neg, relu)
+├── add.rs          Element-wise add demo
+├── ops.rs          All element-wise ops demo
+└── mlp.rs          Hand-coded MLP demo
 ```
 
 ## Dependencies
 
-- **melior** — Rust bindings for MLIR's C API. Used for all IR construction, pass management, and JIT execution.
+- **melior** — Rust bindings for MLIR's C API. Used for all IR construction, pass management, and JIT execution. TOSA support via `ods-dialects` feature.
 - **mlir-sys** — Low-level FFI bindings to `libMLIR-C.so`. Patched to support shared LLVM/MLIR libraries.
+- **prost** / **prost-build** — Protobuf compilation for ONNX model parsing.
+- **protobuf-src** — Vendored protoc compiler (no system dependency).
 - Requires **LLVM 21** with MLIR C API support.
 
 ## Current Limitations
 
-- **Rank-1 tensors only** — all shapes must be 1D
-- **Element-wise ops only** — no matmul, convolution, or reductions
 - **CPU JIT only** — no GPU backend
 - **Single output** — `compile()` accepts only one output node
-- **F32 execution only** — `run()` only handles `f32` data (other dtypes compile but can't execute)
-- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, which raises SIGFPE. Callers must ensure non-zero divisors.
+- **Static shapes only** — no dynamic/variable dimensions
+- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, which raises SIGFPE
 - **No autograd** — forward pass only, no gradient computation
 
 ## Roadmap
 
-### Milestone 1: Run a hand-coded MLP
+### Milestone 1: Run a hand-coded MLP (complete)
 
-The minimum to express `relu(x @ W + b)` stacked into layers.
+N-D tensors, matmul, broadcast, softmax, eval sugar.
 
-1. **N-D tensors** — add dimensions to affine maps, generalize `MemRefDescriptor` beyond 1D
-2. **Matmul** — `linalg.matmul` or `linalg.generic` with `"reduction"` iterator type
-3. **Broadcast** — bias add (`[batch, features] + [features]`)
-4. **Softmax, tanh** — needed for output layers and activations beyond relu
-5. **`Tensor::eval()` sugar** — one-call API wrapping trace/compile/run
+### Milestone 2: Run real ONNX models (in progress)
 
-### Milestone 2: Run a real pre-trained model
+TOSA backend migration, ONNX parsing, Gemm, Reshape (done). Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool, MNIST CNN, ResNet-18 (remaining).
 
-The step from "toy" to "useful." Load a model someone else trained and run inference.
+### Milestone 3: GPU backend
 
-6. **Model loading** — ONNX import or safetensors weight loading. This is what makes Homura usable in practice — nobody hand-codes weight matrices.
-7. **More ops** — Conv2d, layer norm, transpose, reshape, concat. A transformer needs ~15-20 ops; a CNN needs Conv2d + pooling at minimum.
-8. **Multiple outputs** — extend `compile()` to accept multiple output nodes
-9. **GPU backend** — swap `convert-linalg-to-loops` for GPU tiling passes (`linalg` → `gpu.launch`)
+Swap `convert-linalg-to-loops` for GPU tiling passes. The TOSA/linalg IR is already GPU-ready.
 
-### Milestone 3: Production-grade
+### Milestone 4: Production-grade
 
-Competitive with ONNX Runtime / candle for real workloads.
-
-10. **Graph optimizations** — op fusion (merge adjacent `linalg.generic`), constant folding, dead code elimination
-11. **Dynamic shapes** — support variable batch sizes without recompilation
-12. **Training** — reverse-mode automatic differentiation (walk trace backwards, emit gradient ops)
-13. **Memory planning** — buffer reuse, allocation hoisting, minimize peak memory
-14. **Multi-device** — distribute across multiple GPUs
+Graph optimizations (op fusion, constant folding), dynamic shapes, autograd, memory planning, multi-device execution.
