@@ -163,7 +163,11 @@ impl KvGenerator {
         let prompt_model = Model::load(&prompt_path)?;
 
         eprintln!("[homura] loading decode model: {}", decode_path.display());
-        let decode_model = Model::load(&decode_path)?;
+        // Keep past_sequence_length dynamic so the decode model compiles ONCE
+        // and accepts any past_len at runtime.
+        let keep_dynamic: std::collections::HashSet<String> =
+            ["past_sequence_length".to_string()].into_iter().collect();
+        let decode_model = Model::load_with_dynamic_dims(&decode_path, keep_dynamic)?;
 
         eprintln!(
             "[homura] detecting model config from {}",
