@@ -390,6 +390,53 @@ impl CompiledGraph {
             args.push(p as *mut *mut u8 as *mut ());
         }
 
+        if std::env::var_os("HOMURA_DUMP_MEMREFS").is_some() {
+            eprintln!("[HOMURA_DUMP_MEMREFS] --- inputs ({}) ---", inputs.len());
+            for (i, buf) in inputs.iter().enumerate() {
+                let data_ptr = buf.data.as_ptr();
+                eprintln!(
+                    "  input[{i}]: shape={:?} dtype={:?} ptr={data_ptr:?}",
+                    buf.shape().0,
+                    buf.dtype(),
+                );
+                match buf.dtype() {
+                    DType::F32 => {
+                        let n = buf.data.len() / 4;
+                        let show = n.min(4);
+                        let elems: Vec<f32> = (0..show)
+                            .map(|k| {
+                                let bytes = &buf.data[k * 4..(k + 1) * 4];
+                                f32::from_ne_bytes(bytes.try_into().unwrap())
+                            })
+                            .collect();
+                        eprintln!("    first {show} f32 elements: {elems:?}");
+                    }
+                    DType::I64 => {
+                        let n = buf.data.len() / 8;
+                        let show = n.min(4);
+                        let elems: Vec<i64> = (0..show)
+                            .map(|k| {
+                                let bytes = &buf.data[k * 8..(k + 1) * 8];
+                                i64::from_ne_bytes(bytes.try_into().unwrap())
+                            })
+                            .collect();
+                        eprintln!("    first {show} i64 elements: {elems:?}");
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("[HOMURA_DUMP_MEMREFS] --- outputs ({}) ---", output_bufs.len());
+            for (i, buf) in output_bufs.iter().enumerate() {
+                let data_ptr = buf.data.as_ptr();
+                eprintln!(
+                    "  output[{i}]: shape={:?} dtype={:?} ptr={data_ptr:?} size_bytes={}",
+                    buf.shape().0,
+                    buf.dtype(),
+                    buf.data.len(),
+                );
+            }
+        }
+
         unsafe {
             (self.func)(args.as_mut_ptr());
         }

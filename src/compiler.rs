@@ -8824,4 +8824,52 @@ mod tests {
             assert!(out[i].abs() < 1e-5, "out[{i}] = {}", out[i]);
         }
     }
+
+    #[test]
+    fn run_dynamic_reshape_3d_to_2d() {
+        use crate::shape::DIM_DYNAMIC;
+        use crate::trace::record;
+        // Input [?, ?, 4] f32 reshaped to [?, 4] using a runtime shape tensor [2] i64.
+        // Exercises the tensor.reshape dynamic path (shape_tensor: Some).
+        begin_trace();
+        let input_id = record(Op::Input {
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 4]),
+            dtype: DType::F32,
+            arg_index: 0,
+        });
+        let shape_id = record(Op::Input {
+            shape: crate::Shape(vec![2]),
+            dtype: DType::I64,
+            arg_index: 1,
+        });
+        let reshape_id = record(Op::Reshape {
+            input: input_id,
+            target_shape: vec![DIM_DYNAMIC, 4],
+            shape_tensor: Some(shape_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[reshape_id], None)
+            .expect("compile failed");
+
+        let x_buf = Buffer::from_slice::<f32>(
+            &[1.0f32, 2.0, 3.0, 4.0],
+            &[1, 1, 4],
+            DType::F32,
+        );
+        let shape_buf = Buffer::from_slice::<i64>(
+            &[1i64, 4],
+            &[2],
+            DType::I64,
+        );
+
+        let outputs = compiled.run_dynamic(
+            &[&x_buf, &shape_buf],
+            &[crate::Shape(vec![1, 4])],
+        );
+        let out = outputs[0].as_slice::<f32>();
+        assert_eq!(out, &[1.0f32, 2.0, 3.0, 4.0], "reshape output mismatch: {out:?}");
+    }
 }
