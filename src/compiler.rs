@@ -1787,6 +1787,12 @@ fn emit_tensor_ops<'c>(
 
                 values.insert(node_id, result_val);
             }
+
+            Op::Reshape { input, target_shape: _, shape, dtype } => {
+                let input_val = *values.get(input).expect("input not yet emitted");
+                let result_val = emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?;
+                values.insert(node_id, result_val);
+            }
         }
     }
 
@@ -2814,6 +2820,82 @@ mod tests {
         // 1e-10 is formatted by Rust as "0.0000000001" (has decimal) — passes through.
         let s = format_float(1e-10);
         assert!(s.contains('.') || s.contains('e') || s.contains('E'));
+    }
+
+    // ── Reshape tests (tasks 9.5, 9.6) ───────────────────────────────────────
+
+    #[test]
+    fn compile_reshape_emits_tosa_reshape() {
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let b = a.reshape(&[3, 4]);
+        let trace = take_trace();
+
+        let module_str = Compiler::build_ir_string(&trace, &[b.id])
+            .expect("mlir emission failed");
+        assert!(
+            module_str.contains("tosa.reshape"),
+            "expected tosa.reshape in IR:\n{module_str}"
+        );
+        assert!(
+            module_str.contains("tosa.const_shape"),
+            "expected tosa.const_shape in IR:\n{module_str}"
+        );
+    }
+
+    #[test]
+    fn run_reshape_2d_to_1d() {
+        // Flatten [2, 3] -> [6]: values should be unchanged in row-major order.
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = a.reshape(&[6]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+
+        let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let result = compiled.run(&[&input]);
+        assert_eq!(result.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn run_reshape_with_inferred_dim() {
+        // Reshape [12] -> [-1, 4]: inferred shape is [3, 4].
+        begin_trace();
+        let a = Tensor::new(&[12], DType::F32);
+        let b = a.reshape(&[-1, 4]);
+        // Verify output shape is [3, 4]
+        assert_eq!(b.shape().0, vec![3u64, 4]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+
+        let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+        let input = Buffer::from_slice::<f32>(&data, &[12], DType::F32);
+        let result = compiled.run(&[&input]);
+        // Values should be unchanged in row-major order
+        let out = result.as_slice::<f32>();
+        assert_eq!(out.len(), 12);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, (i + 1) as f32, "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn run_reshape_2d_to_different_2d() {
+        // Reshape [2, 6] -> [3, 4]: same elements, different layout.
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let b = a.reshape(&[3, 4]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+
+        let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+        let input = Buffer::from_slice::<f32>(&data, &[2, 6], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result.as_slice::<f32>();
+        assert_eq!(out.len(), 12);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, (i + 1) as f32, "mismatch at index {i}");
+        }
     }
 
     // ── Regression: Issue 1 — Gemm with non-trivial alpha compiles and runs ───

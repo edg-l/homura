@@ -287,6 +287,60 @@ impl Tensor {
         Tensor { id, shape: out_shape, dtype: self.dtype }
     }
 
+    /// Reshape the tensor to `target_shape`.
+    ///
+    /// At most one dimension may be `-1`, in which case it is inferred from the
+    /// total element count. All other dimensions must be non-negative. The total
+    /// number of elements must not change.
+    pub fn reshape(&self, target_shape: &[i64]) -> Tensor {
+        let total_elems: u64 = self.shape.0.iter().product();
+
+        // Count and locate the -1 dimension, if any.
+        let neg_count = target_shape.iter().filter(|&&d| d == -1).count();
+        assert!(
+            neg_count <= 1,
+            "reshape: at most one dimension can be -1, got {neg_count}"
+        );
+
+        let mut resolved: Vec<u64> = Vec::with_capacity(target_shape.len());
+        let mut known_product: u64 = 1;
+        let mut infer_idx: Option<usize> = None;
+
+        for (i, &d) in target_shape.iter().enumerate() {
+            if d == -1 {
+                infer_idx = Some(i);
+                resolved.push(0); // placeholder
+            } else {
+                assert!(d > 0, "reshape: dimension must be positive or -1, got {d}");
+                let d = d as u64;
+                known_product *= d;
+                resolved.push(d);
+            }
+        }
+
+        if let Some(idx) = infer_idx {
+            assert!(
+                total_elems % known_product == 0,
+                "reshape: cannot infer -1 dimension: {total_elems} elements not divisible by {known_product}"
+            );
+            resolved[idx] = total_elems / known_product;
+        } else {
+            assert_eq!(
+                known_product, total_elems,
+                "reshape: element count mismatch: input has {total_elems} elements but target shape has {known_product}"
+            );
+        }
+
+        let shape = Shape(resolved.clone());
+        let id = trace::record(Op::Reshape {
+            input: self.id,
+            target_shape: resolved,
+            shape: shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor { id, shape, dtype: self.dtype }
+    }
+
     pub fn relu(&self) -> Tensor {
         let id = trace::record(Op::Relu {
             input: self.id,
@@ -501,6 +555,59 @@ mod tests {
         let a = Tensor::new(&[4], DType::F32);
         let b = Tensor::new(&[8], DType::F32);
         let _ = &a + &b;
+        let _ = take_trace();
+    }
+
+    // ── Reshape trace tests (task 9.3) ───────────────────────────────────────
+
+    #[test]
+    fn reshape_records_op_with_resolved_shape() {
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let b = a.reshape(&[3, 4]);
+        let trace = take_trace();
+        let op = &trace.ops()[b.id.0 as usize];
+        match op {
+            Op::Reshape { target_shape, shape, dtype, .. } => {
+                assert_eq!(target_shape, &vec![3u64, 4]);
+                assert_eq!(shape.0, vec![3u64, 4]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::Reshape, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn reshape_infers_negative_one_dim() {
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let b = a.reshape(&[-1, 4]);
+        let trace = take_trace();
+        let op = &trace.ops()[b.id.0 as usize];
+        match op {
+            Op::Reshape { target_shape, .. } => {
+                // 2*6=12 elements, second dim=4, so first dim=3
+                assert_eq!(target_shape, &vec![3u64, 4]);
+            }
+            _ => panic!("expected Op::Reshape, got {:?}", op),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "at most one dimension can be -1")]
+    fn reshape_multiple_neg_one_panics() {
+        begin_trace();
+        let a = Tensor::new(&[12], DType::F32);
+        let _ = a.reshape(&[-1, -1]);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "element count mismatch")]
+    fn reshape_element_count_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let _ = a.reshape(&[3, 5]); // 15 != 12
         let _ = take_trace();
     }
 

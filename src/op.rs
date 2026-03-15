@@ -89,6 +89,14 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Reshape a tensor to a new shape with the same number of elements.
+    Reshape {
+        input: NodeId,
+        /// Fully resolved target shape (no -1 values).
+        target_shape: Vec<u64>,
+        shape: Shape,
+        dtype: DType,
+    },
     /// General matrix multiply: alpha * (A @ B) + beta * C.
     ///
     /// Equivalent to the ONNX Gemm op. The output shape is [M, N].
@@ -120,6 +128,7 @@ impl Op {
             Op::Matmul { shape, .. } => shape,
             Op::ReduceSum { shape, .. } => shape,
             Op::ReduceMax { shape, .. } => shape,
+            Op::Reshape { shape, .. } => shape,
             Op::Gemm { shape, .. } => shape,
         }
     }
@@ -138,6 +147,7 @@ impl Op {
             Op::Matmul { dtype, .. } => *dtype,
             Op::ReduceSum { dtype, .. } => *dtype,
             Op::ReduceMax { dtype, .. } => *dtype,
+            Op::Reshape { dtype, .. } => *dtype,
             Op::Gemm { dtype, .. } => *dtype,
         }
     }
