@@ -1,7 +1,11 @@
+use std::time::Instant;
+
 use homura::{Buffer, DType, Model};
 
 fn main() {
+    let t0 = Instant::now();
     let model = Model::load("tests/fixtures/mnist-12.onnx").expect("failed to load mnist-12.onnx");
+    let compile_ms = t0.elapsed().as_millis();
 
     let pixels = match std::env::args().nth(1) {
         Some(path) => load_image(&path),
@@ -13,7 +17,11 @@ fn main() {
     };
 
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
+
+    let t1 = Instant::now();
     let output = model.run(&[&input]).expect("inference failed");
+    let run_ms = t1.elapsed().as_millis();
+
     let logits = output.as_slice::<f32>();
 
     println!("MNIST logits:");
@@ -34,6 +42,7 @@ fn main() {
         .unwrap()
         .0;
     println!("\nPredicted digit: {predicted}");
+    println!("compile: {compile_ms}ms | inference: {run_ms}ms");
 }
 
 fn load_image(path: &str) -> Vec<f32> {
