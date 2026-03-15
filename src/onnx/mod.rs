@@ -124,20 +124,26 @@ impl Model {
             *guard = Some(compile_model(&resolved, inputs)?);
         }
 
-        let state = guard.as_ref().unwrap();
-
-        // Verify input shapes match what the model was compiled with.
+        // For models with symbolic dims, recompile if input shapes have changed.
         if self.parsed.is_some() {
-            for (i, buf) in inputs.iter().enumerate() {
-                if buf.shape() != &state.input_shapes[i] {
-                    return Err(OnnxError::ShapeMismatch {
-                        input_index: i,
-                        expected: state.input_shapes[i].clone(),
-                        got: buf.shape().clone(),
-                    });
-                }
+            let shapes_changed = {
+                let state = guard.as_ref().unwrap();
+                inputs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, buf)| buf.shape() != &state.input_shapes[i])
+            };
+            if shapes_changed {
+                let parsed = self
+                    .parsed
+                    .as_ref()
+                    .expect("parsed model must be present when symbolic dims exist");
+                let resolved = resolve_symbolic_dims(parsed, inputs)?;
+                *guard = Some(compile_model(&resolved, inputs)?);
             }
         }
+
+        let state = guard.as_ref().unwrap();
         let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + state.weights.len());
         all_args.extend_from_slice(inputs);
         for w in &state.weights {
