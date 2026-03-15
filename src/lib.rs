@@ -1,3 +1,4 @@
+pub mod cache;
 mod compiler;
 pub mod dtype;
 pub mod generate;

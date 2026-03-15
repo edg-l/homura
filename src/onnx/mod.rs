@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use crate::{
     Compiler, Shape,
+    cache::CompilationCache,
     runtime::{Buffer, CompiledGraph},
 };
 use parser::{Dim, OnnxError, OnnxModel};
@@ -34,6 +35,10 @@ pub struct Model {
     parsed: Option<OnnxModel>,
     /// `None` until compiled (lazy). `Some` after eager or first lazy compile.
     state: Mutex<Option<CompiledState>>,
+    /// Raw protobuf bytes of the model, used for cache key computation.
+    /// `None` when the model was created via `load_bytes` with no bytes stored,
+    /// but in practice always `Some` for models loaded from file or bytes.
+    model_bytes: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Model {
@@ -52,8 +57,9 @@ impl Model {
     /// Models with all-static shapes are compiled immediately. Models with
     /// symbolic dimensions defer compilation to the first `run()` call.
     pub fn load(path: impl AsRef<Path>) -> Result<Model, OnnxError> {
-        let onnx_model = parser::parse_model(path)?;
-        Model::from_onnx(onnx_model)
+        let bytes = std::fs::read(path).map_err(OnnxError::Io)?;
+        let onnx_model = parser::parse_bytes(&bytes)?;
+        Model::from_onnx(onnx_model, Some(bytes))
     }
 
     /// Load an ONNX model from raw protobuf bytes.
@@ -61,10 +67,10 @@ impl Model {
     /// Useful in tests where models are built in memory.
     pub fn load_bytes(bytes: &[u8]) -> Result<Model, OnnxError> {
         let onnx_model = parser::parse_bytes(bytes)?;
-        Model::from_onnx(onnx_model)
+        Model::from_onnx(onnx_model, Some(bytes.to_vec()))
     }
 
-    fn from_onnx(onnx_model: OnnxModel) -> Result<Model, OnnxError> {
+    fn from_onnx(onnx_model: OnnxModel, model_bytes: Option<Vec<u8>>) -> Result<Model, OnnxError> {
         let num_dynamic = onnx_model.dynamic_inputs.len();
 
         if onnx_model.has_symbolic_dims() {
@@ -73,6 +79,7 @@ impl Model {
                 num_dynamic_inputs: num_dynamic,
                 parsed: Some(onnx_model),
                 state: Mutex::new(None),
+                model_bytes,
             })
         } else {
             // All shapes concrete: compile eagerly (backward compat).
@@ -83,7 +90,11 @@ impl Model {
                 .map(|di| di.concrete_shape().expect("all dims are concrete"))
                 .collect();
             let (trace, output_ids, weights) = mapper::map_graph(&onnx_model)?;
-            let compiled = Compiler::compile(&trace, &output_ids)
+            let cache_key = model_bytes.as_deref().map(|b| {
+                let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
+                CompilationCache::cache_key(b, &shape_refs)
+            });
+            let compiled = Compiler::compile(&trace, &output_ids, cache_key.as_deref())
                 .map_err(|e| OnnxError::CompileError(e.to_string()))?;
             let state = CompiledState {
                 compiled,
@@ -94,6 +105,7 @@ impl Model {
                 num_dynamic_inputs: num_dynamic,
                 parsed: None,
                 state: Mutex::new(Some(state)),
+                model_bytes,
             })
         }
     }
@@ -121,7 +133,7 @@ impl Model {
                 .expect("parsed model must be present when state is None");
 
             let resolved = resolve_symbolic_dims(parsed, inputs)?;
-            *guard = Some(compile_model(&resolved, inputs)?);
+            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref())?);
         }
 
         // For models with symbolic dims, recompile if input shapes have changed.
@@ -139,7 +151,7 @@ impl Model {
                     .as_ref()
                     .expect("parsed model must be present when symbolic dims exist");
                 let resolved = resolve_symbolic_dims(parsed, inputs)?;
-                *guard = Some(compile_model(&resolved, inputs)?);
+                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref())?);
             }
         }
 
@@ -157,10 +169,20 @@ impl Model {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 /// Compile an `OnnxModel` whose dynamic inputs all have concrete shapes.
-fn compile_model(model: &OnnxModel, inputs: &[&Buffer]) -> Result<CompiledState, OnnxError> {
+///
+/// `model_bytes` is used to compute a cache key. Pass `None` to skip caching.
+fn compile_model(
+    model: &OnnxModel,
+    inputs: &[&Buffer],
+    model_bytes: Option<&[u8]>,
+) -> Result<CompiledState, OnnxError> {
     let input_shapes: Vec<Shape> = inputs.iter().map(|b| b.shape().clone()).collect();
     let (trace, output_ids, weights) = mapper::map_graph(model)?;
-    let compiled = Compiler::compile(&trace, &output_ids)
+    let cache_key = model_bytes.map(|b| {
+        let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
+        CompilationCache::cache_key(b, &shape_refs)
+    });
+    let compiled = Compiler::compile(&trace, &output_ids, cache_key.as_deref())
         .map_err(|e| OnnxError::CompileError(e.to_string()))?;
     Ok(CompiledState {
         compiled,

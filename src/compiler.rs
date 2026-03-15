@@ -22,6 +22,7 @@ use melior::{
 
 use crate::{
     DType,
+    cache::CompilationCache,
     op::{NodeId, Op},
     runtime::{CompiledGraph, OutputDesc},
     trace::Trace,
@@ -60,12 +61,22 @@ impl std::error::Error for CompileError {}
 pub struct Compiler;
 
 impl Compiler {
-    /// Compile a trace into an MLIR ExecutionEngine ready to invoke.
+    /// Compile a trace into a `CompiledGraph` ready to execute.
     ///
     /// `outputs` is a list of node IDs whose results should become output
-    /// memref arguments of the generated function. Currently only a single
-    /// output is supported.
-    pub fn compile(trace: &Trace, outputs: &[NodeId]) -> Result<CompiledGraph, CompileError> {
+    /// memref arguments of the generated function.
+    ///
+    /// If `cache_key` is provided, the compiler first checks `~/.cache/homura/`
+    /// (or `HOMURA_CACHE_DIR`) for a cached native shared library (`.so`). On a
+    /// hit the expensive MLIR pass pipeline and LLVM JIT compilation are skipped;
+    /// the `.so` is loaded via dlopen in milliseconds. On a miss the full pipeline
+    /// runs, the result is compiled to a `.so`, and both the library and a small
+    /// metadata sidecar are stored for future calls.
+    pub fn compile(
+        trace: &Trace,
+        outputs: &[NodeId],
+        cache_key: Option<&str>,
+    ) -> Result<CompiledGraph, CompileError> {
         if trace.ops().is_empty() {
             return Err(CompileError::EmptyTrace);
         }
@@ -73,11 +84,33 @@ impl Compiler {
             return Err(CompileError::NoOutputs);
         }
 
+        // We need num_inputs and output_descs regardless of cache path.
+        // Build them from the trace before attempting any cache lookup so that
+        // the returned CompiledGraph is always fully-formed.
         let context = create_context();
         let location = Location::unknown(&context);
-        let mut module = Module::new(location);
-        let (num_inputs, output_descs) =
-            build_module(&context, &module, trace, outputs)?;
+        let module = Module::new(location);
+        let (num_inputs, output_descs) = build_module(&context, &module, trace, outputs)?;
+
+        // ---- Cache hit path --------------------------------------------------
+        if let Some(key) = cache_key {
+            let cache = CompilationCache::new();
+            if let Some((so_path, meta_path)) = cache.get(key) {
+                if let Some(meta) = CompilationCache::load_meta(&meta_path) {
+                    match CompiledGraph::from_cached_lib(&so_path, meta.num_inputs, meta.outputs) {
+                        Ok(graph) => return Ok(graph),
+                        Err(e) => {
+                            // Cache entry is unloadable (corrupt/stale). Fall
+                            // through to recompile and overwrite.
+                            eprintln!(
+                                "homura cache: failed to load {}: {e}, recompiling",
+                                so_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // ---- Run lowering passes ----------------------------------------------
         // TOSA passes (func-level) run first, then bufferize → LLVM (module-level).
@@ -121,15 +154,23 @@ impl Compiler {
         )
         .map_err(CompileError::Pass)?;
 
+        let mut module = module;
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
 
         // ---- Create ExecutionEngine -------------------------------------------
         // Ensure libmlir_runner_utils.so is loaded globally so the ORC JIT
         // can resolve `memrefCopy` emitted by padded conv2d bufferization.
         ensure_runner_utils_loaded();
-        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
+        // enable_object_dump=true is required for dump_to_object_file to work.
+        let engine = melior::ExecutionEngine::new(&module, 3, &[], true);
+        let graph = CompiledGraph::new(engine, num_inputs, output_descs);
 
-        Ok(CompiledGraph::new(engine, num_inputs, output_descs))
+        // ---- Cache store (on miss) -------------------------------------------
+        if let Some(key) = cache_key {
+            store_native_cache(key, &graph);
+        }
+
+        Ok(graph)
     }
 
     /// Build the MLIR module for a trace and return its text representation
@@ -183,6 +224,101 @@ fn ensure_runner_utils_loaded() {
             }
         }
     });
+}
+
+/// Compile the JIT-compiled graph to a native `.so` and store it in the cache
+/// alongside a metadata sidecar.
+///
+/// Steps:
+/// 1. Dump the object file to a temp path via `dump_to_object_file`.
+/// 2. Link it to a `.so` with `cc -shared`.
+/// 3. Store the `.so` and metadata via `CompilationCache::store`.
+///
+/// Non-fatal: on any error, a warning is printed and the caller's `CompiledGraph`
+/// (which is already valid for the current process) continues to work.
+fn store_native_cache(key: &str, graph: &CompiledGraph) {
+    use crate::cache::CacheMeta;
+
+    let cache = CompilationCache::new();
+
+    // Use a temp directory so partial files are not mistaken for valid cache entries.
+    let tmp_dir = match tempfile_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!("homura cache: cannot determine temp dir, skipping cache write");
+            return;
+        }
+    };
+
+    let obj_path = tmp_dir.join(format!("{key}.o"));
+    let so_path = tmp_dir.join(format!("{key}.so"));
+
+    let obj_str = match obj_path.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            eprintln!("homura cache: non-UTF-8 temp path, skipping cache write");
+            return;
+        }
+    };
+
+    // Step 1: dump object file.
+    graph.dump_to_object_file(&obj_str);
+    if !obj_path.exists() {
+        // dump_to_object_file may silently fail for models that reference external
+        // symbols (e.g. memrefCopy from libmlir_c_runner_utils). This is a known
+        // limitation — the cache simply won't be populated for these models.
+        return;
+    }
+
+    // Step 2: link to .so.
+    let cc_status = std::process::Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-o",
+            so_path.to_str().unwrap_or_default(),
+            &obj_str,
+            "-lm",
+        ])
+        .status();
+
+    let _ = std::fs::remove_file(&obj_path); // clean up .o regardless
+
+    match cc_status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("homura cache: cc exited with {s}, skipping cache write");
+            return;
+        }
+        Err(e) => {
+            eprintln!("homura cache: failed to run cc: {e}, skipping cache write");
+            return;
+        }
+    }
+
+    // Step 3: store .so + metadata.
+    let meta = CacheMeta {
+        num_inputs: graph.num_inputs(),
+        outputs: graph
+            .outputs()
+            .iter()
+            .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
+            .collect(),
+    };
+
+    if let Err(e) = cache.store(key, &so_path, &meta) {
+        eprintln!("homura cache: failed to write cache entry: {e}");
+    }
+
+    let _ = std::fs::remove_file(&so_path);
+}
+
+/// Return a temp directory path for staging cache files.
+fn tempfile_dir() -> Option<std::path::PathBuf> {
+    std::env::var("TMPDIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| Some(std::path::PathBuf::from("/tmp")))
 }
 
 /// Create an MLIR context with all dialects and LLVM translations registered.
@@ -4267,7 +4403,7 @@ mod tests {
         let c = &a + &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4280,7 +4416,7 @@ mod tests {
         let d = &(&a + &b) + &c;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[d.id]);
+        let result = Compiler::compile(&trace, &[d.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4292,7 +4428,7 @@ mod tests {
         let c = &a - &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4304,7 +4440,7 @@ mod tests {
         let c = &a * &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4316,7 +4452,7 @@ mod tests {
         let c = &a / &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4327,7 +4463,7 @@ mod tests {
         let b = -&a;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4338,7 +4474,7 @@ mod tests {
         let b = a.relu();
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4350,7 +4486,7 @@ mod tests {
         let c = &a / &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4361,7 +4497,7 @@ mod tests {
         let b = -&a;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4372,7 +4508,7 @@ mod tests {
         let b = a.relu();
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4386,7 +4522,7 @@ mod tests {
         let c = &a + &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4398,7 +4534,7 @@ mod tests {
         let c = &a + &b;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -4409,7 +4545,7 @@ mod tests {
         let b = -&a;
         let trace = take_trace();
 
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
     }
 
@@ -5243,7 +5379,7 @@ mod tests {
         };
         let c = a.gemm(&b, bias_ref, alpha, beta, trans_a, trans_b);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
 
         let a_buf = Buffer::from_slice::<f32>(a_data, a_shape, DType::F32);
         let b_buf = Buffer::from_slice::<f32>(b_data, b_shape, DType::F32);
@@ -5407,7 +5543,7 @@ mod tests {
         let a = Tensor::new(&[2, 3], DType::F32);
         let b = a.reshape(&[6]);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
 
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&input]);
@@ -5423,7 +5559,7 @@ mod tests {
         // Verify output shape is [3, 4]
         assert_eq!(b.shape().0, vec![3u64, 4]);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
 
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
         let input = Buffer::from_slice::<f32>(&data, &[12], DType::F32);
@@ -5443,7 +5579,7 @@ mod tests {
         let a = Tensor::new(&[2, 6], DType::F32);
         let b = a.reshape(&[3, 4]);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
 
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
         let input = Buffer::from_slice::<f32>(&data, &[2, 6], DType::F32);
@@ -5515,7 +5651,7 @@ mod tests {
         let c = -&c;
         let c = c.tanh();
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[0.5, 0.5, 0.5, 0.5], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
@@ -5593,7 +5729,7 @@ mod tests {
         };
         let out = input_t.conv2d(&kernel_t, bias_ref, strides, pads, dilations);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
 
         let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
         let kernel_buf = Buffer::from_slice::<f32>(kernel_data, kernel_shape, DType::F32);
@@ -5782,7 +5918,7 @@ mod tests {
             begin_trace();
             take_trace()
         };
-        let result = Compiler::compile(&trace, &[NodeId(0)]);
+        let result = Compiler::compile(&trace, &[NodeId(0)], None);
         assert!(result.is_err());
     }
 
@@ -5791,7 +5927,7 @@ mod tests {
         begin_trace();
         let _a = Tensor::new(&[4], DType::F32);
         let trace = take_trace();
-        let result = Compiler::compile(&trace, &[]);
+        let result = Compiler::compile(&trace, &[], None);
         assert!(result.is_err());
     }
 
@@ -5832,7 +5968,7 @@ mod tests {
         let input_t = Tensor::new(input_shape, DType::F32);
         let out = input_t.max_pool2d(kernel_size, strides, pads);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
         compiled.run(&[&input_buf])[0].as_slice::<f32>().to_vec()
     }
@@ -5971,7 +6107,7 @@ mod tests {
         let var_t = Tensor::new(&[c], DType::F32);
         let out = input_t.batch_norm(&scale_t, &bias_t, &mean_t, &var_t, epsilon);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
         let scale_buf = Buffer::from_slice::<f32>(scale_data, &[c], DType::F32);
         let bias_buf = Buffer::from_slice::<f32>(bias_data, &[c], DType::F32);
@@ -6108,7 +6244,7 @@ mod tests {
         let input = Tensor::new(&[1, 1, 2, 2], DType::F32);
         let out = input.global_avg_pool();
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let input_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], DType::F32);
         let result = compiled.run(&[&input_buf]);
         let out_slice = result[0].as_slice::<f32>();
@@ -6133,7 +6269,7 @@ mod tests {
         let input = Tensor::new(&[2, 2, 2, 2], DType::F32);
         let out = input.global_avg_pool();
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         #[rustfmt::skip]
         let data: Vec<f32> = vec![
             // batch 0
@@ -6192,7 +6328,7 @@ mod tests {
         let c = a.pow(&b);
         let trace = take_trace();
 
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
         let base = Buffer::from_slice::<f32>(&[2.0, 3.0], &[2], DType::F32);
         let exp = Buffer::from_slice::<f32>(&[3.0, 2.0], &[2], DType::F32);
         let result = compiled.run(&[&base, &exp]);
@@ -6209,7 +6345,7 @@ mod tests {
         let c = a.pow(&b);
         let trace = take_trace();
 
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
         let base = Buffer::from_slice::<f32>(&[2.0, 3.0, 4.0], &[3], DType::F32);
         let exp = Buffer::from_slice::<f32>(&[2.0], &[1], DType::F32);
         let result = compiled.run(&[&base, &exp]);
@@ -6239,7 +6375,7 @@ mod tests {
         let b = a.sqrt();
         let trace = take_trace();
 
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<f32>(&[4.0, 9.0, 16.0], &[3], DType::F32);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<f32>();
@@ -6266,7 +6402,7 @@ mod tests {
         let b = a.cast(DType::F32);
         let trace = take_trace();
 
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<i64>(&[1, 2, 3], &[3], DType::I64);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<f32>();
@@ -6282,7 +6418,7 @@ mod tests {
         let b = a.cast(DType::I64);
         let trace = take_trace();
 
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<f32>(&[1.5, 2.7], &[2], DType::F32);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<i64>();
@@ -6328,7 +6464,7 @@ mod tests {
 
         assert_eq!(b.shape().0, vec![2u64], "expected shape [2], got {:?}", b.shape().0);
 
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<f32>();
@@ -6358,7 +6494,7 @@ mod tests {
             b.shape().0
         );
 
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<f32>();
@@ -6397,7 +6533,7 @@ mod tests {
         for i in 12..24 {
             data[i] = 2.0;
         }
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let input = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
         let result = compiled.run(&[&input]);
         let out = result[0].as_slice::<f32>();
@@ -6435,7 +6571,7 @@ mod tests {
         let out = data.gather(&indices, 0);
         let trace = take_trace();
         assert_eq!(out.shape().0, vec![3u64, 2]);
-        let result = Compiler::compile(&trace, &[out.id]);
+        let result = Compiler::compile(&trace, &[out.id], None);
         assert!(result.is_ok(), "gather IR compile failed: {:?}", result.err());
     }
 
@@ -6449,7 +6585,7 @@ mod tests {
         let indices = Tensor::new(&[3], DType::I64);
         let out = data.gather(&indices, 0);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let data_buf = Buffer::from_slice::<f32>(
             &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
             &[4, 2],
@@ -6470,7 +6606,7 @@ mod tests {
         let indices = Tensor::new(&[2], DType::I64);
         let out = data.gather(&indices, 1);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let data_buf =
             Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let idx_buf = Buffer::from_slice::<i64>(&[2, 0], &[2], DType::I64);
@@ -6490,7 +6626,7 @@ mod tests {
         let out = data.gather(&indices, 0);
         let trace = take_trace();
         assert_eq!(out.shape().0, vec![2u64, 4, 3]);
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         // data rows: row i = [i*10, i*10+1, i*10+2]
         let data_vals: Vec<f32> = (0..vocab)
             .flat_map(|i| (0..dim).map(move |j| (i * 10 + j) as f32))
@@ -6518,7 +6654,7 @@ mod tests {
         let b = a.slice(&[0], &[3], &[0], &[1]);
         let trace = take_trace();
         assert_eq!(b.shape().0, vec![3u64]);
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "slice IR compile failed: {:?}", result.err());
     }
 
@@ -6529,7 +6665,7 @@ mod tests {
         let a = Tensor::new(&[5], DType::F32);
         let b = a.slice(&[1], &[4], &[0], &[1]);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let a_buf =
             Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5], DType::F32);
         let results = compiled.run(&[&a_buf]);
@@ -6546,7 +6682,7 @@ mod tests {
         let b = a.slice(&[0, 1], &[2, 3], &[0, 1], &[1, 1]);
         let trace = take_trace();
         assert_eq!(b.shape().0, vec![2u64, 2]);
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
             &[3, 4],
@@ -6564,7 +6700,7 @@ mod tests {
         let b = a.slice(&[0], &[10], &[0], &[2]);
         let trace = take_trace();
         assert_eq!(b.shape().0, vec![5u64]);
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let a_data: Vec<f32> = (0..10).map(|i| i as f32).collect();
         let a_buf = Buffer::from_slice::<f32>(&a_data, &[10], DType::F32);
         let results = compiled.run(&[&a_buf]);
@@ -6581,7 +6717,7 @@ mod tests {
         let c = Tensor::concat(&[&a, &b], 0);
         let trace = take_trace();
         assert_eq!(c.shape().0, vec![4u64, 3]);
-        let result = Compiler::compile(&trace, &[c.id]);
+        let result = Compiler::compile(&trace, &[c.id], None);
         assert!(result.is_ok(), "concat IR compile failed: {:?}", result.err());
     }
 
@@ -6593,7 +6729,7 @@ mod tests {
         let b = Tensor::new(&[1, 3], DType::F32);
         let c = Tensor::concat(&[&a, &b], 0);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
         let a_buf =
             Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3], DType::F32);
         let b_buf =
@@ -6614,7 +6750,7 @@ mod tests {
         let c = Tensor::concat(&[&a, &b], 1);
         let trace = take_trace();
         assert_eq!(c.shape().0, vec![2u64, 3]);
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
         let a_buf =
             Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0], &[2, 1], DType::F32);
@@ -6634,7 +6770,7 @@ mod tests {
         let out = Tensor::concat(&[&a, &b, &c_t], 0);
         let trace = take_trace();
         assert_eq!(out.shape().0, vec![6u64]);
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[4.0, 5.0], &[2], DType::F32);
         let c_buf = Buffer::from_slice::<f32>(&[6.0], &[1], DType::F32);
@@ -6654,7 +6790,7 @@ mod tests {
         let b = a.transpose(&[1, 0]);
         let trace = take_trace();
         assert_eq!(b.shape().0, vec![4u64, 3]);
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "transpose IR compile failed: {:?}", result.err());
     }
 
@@ -6665,7 +6801,7 @@ mod tests {
         let a = Tensor::new(&[2, 3], DType::F32);
         let b = a.transpose(&[1, 0]);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         let a_buf =
             Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let results = compiled.run(&[&a_buf]);
@@ -6683,7 +6819,7 @@ mod tests {
         let b = a.transpose(&[0, 2, 3, 1]);
         let trace = take_trace();
         assert_eq!(b.shape().0, vec![1u64, 3, 4, 2]);
-        let result = Compiler::compile(&trace, &[b.id]);
+        let result = Compiler::compile(&trace, &[b.id], None);
         assert!(result.is_ok(), "4D transpose compile failed: {:?}", result.err());
     }
 
@@ -6698,7 +6834,7 @@ mod tests {
         let out = Tensor::where_select(&cond, &x, &y);
         let trace = take_trace();
         assert_eq!(out.shape().0, vec![4u64]);
-        let result = Compiler::compile(&trace, &[out.id]);
+        let result = Compiler::compile(&trace, &[out.id], None);
         assert!(result.is_ok(), "where IR compile failed: {:?}", result.err());
     }
 
@@ -6712,7 +6848,7 @@ mod tests {
         let y = Tensor::new(&[4], DType::F32);
         let out = Tensor::where_select(&cond, &x, &y);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let cond_buf = Buffer::from_slice::<i64>(&[1, 0, 1, 0], &[4], DType::I64);
         let x_buf =
             Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
@@ -6735,7 +6871,7 @@ mod tests {
         let y = Tensor::new(&[2, 2], DType::F32);
         let out = Tensor::where_select(&cond, &x, &y);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[out.id], None).expect("compile failed");
         let cond_buf = Buffer::from_slice::<i64>(&[1, 0, 0, 1], &[2, 2], DType::I64);
         let x_buf =
             Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
@@ -6809,7 +6945,7 @@ mod tests {
         let c = a.matmul(&b);
         let trace = take_trace();
         assert_eq!(c.shape().0, vec![2u64, 2, 3]);
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
 
         let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b_data: Vec<f32> = vec![
@@ -6838,7 +6974,7 @@ mod tests {
         let c = a.matmul(&b);
         let trace = take_trace();
         assert_eq!(c.shape().0, vec![1u64, 2, 2, 2]);
-        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
 
         // lhs: batch=0, head=0: [[1,2],[3,4]], head=1: [[5,6],[7,8]]
         let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -6853,5 +6989,77 @@ mod tests {
             &[1.0, 2.0, 3.0, 4.0, 10.0, 12.0, 14.0, 16.0],
             "batched 4D matmul result mismatch"
         );
+    }
+
+    // ── Native .so cache integration tests ───────────────────────────────────
+
+    /// Compile a graph once (cold), then compile again with the same cache key
+    /// (warm). The warm run must hit the .so cache and produce identical results.
+    #[test]
+    fn compile_with_so_cache_hit_produces_correct_results() {
+        use std::time::Instant;
+
+        // Use an isolated cache dir so this test cannot interfere with or be
+        // polluted by the user's real cache.
+        let cache_dir = std::path::PathBuf::from("/tmp/homura_test_cache_so");
+        std::fs::create_dir_all(&cache_dir).expect("create test cache dir");
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::set_var("HOMURA_CACHE_DIR", &cache_dir); }
+
+        let key = "test_cache_key_add_f32";
+
+        let make_trace = || {
+            begin_trace();
+            let a = Tensor::new(&[4], DType::F32);
+            let b = Tensor::new(&[4], DType::F32);
+            let c = &a + &b;
+            (take_trace(), c.id)
+        };
+
+        let (trace, out_id) = make_trace();
+        let t0 = Instant::now();
+        let cold = Compiler::compile(&trace, &[out_id], Some(key)).expect("cold compile");
+        let cold_time = t0.elapsed();
+
+        // Warm compile — must use the .so cache.
+        let (trace2, out_id2) = make_trace();
+        let t1 = Instant::now();
+        let warm = Compiler::compile(&trace2, &[out_id2], Some(key)).expect("warm compile");
+        let warm_time = t1.elapsed();
+
+        println!("cold={cold_time:?}  warm={warm_time:?}");
+        // The warm run should be dramatically faster — at minimum it should not
+        // take longer than 1/3 of the cold run.  We don't assert timing (it's
+        // flaky in CI) but we do assert correctness.
+
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+
+        let cold_out = cold.run(&[&a_buf, &b_buf]);
+        let warm_out = warm.run(&[&a_buf, &b_buf]);
+
+        assert_eq!(
+            cold_out[0].as_slice::<f32>(),
+            warm_out[0].as_slice::<f32>(),
+            "cached result must match JIT result"
+        );
+        assert_eq!(
+            warm_out[0].as_slice::<f32>(),
+            &[11.0f32, 22.0, 33.0, 44.0]
+        );
+
+        // Verify cache files exist.
+        assert!(
+            cache_dir.join(format!("{key}.so")).exists(),
+            ".so file should be in cache dir"
+        );
+        assert!(
+            cache_dir.join(format!("{key}.meta")).exists(),
+            ".meta file should be in cache dir"
+        );
+
+        // Restore env (best-effort).
+        // SAFETY: single-threaded test, no concurrent env access.
+        unsafe { std::env::remove_var("HOMURA_CACHE_DIR"); }
     }
 }

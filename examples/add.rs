@@ -13,7 +13,7 @@ fn main() {
     println!("Trace has {} op(s)", trace.ops().len());
 
     // Compile.
-    let compiled = Compiler::compile(&trace, &[c.id()]).expect("compilation failed");
+    let compiled = Compiler::compile(&trace, &[c.id()], None).expect("compilation failed");
 
     // Execute.
     let a_data = [1.0f32, 2.0, 3.0, 4.0];
@@ -37,7 +37,7 @@ fn main() {
     let out = &(&x + &y) + &z;
     let trace2 = take_trace();
 
-    let compiled2 = Compiler::compile(&trace2, &[out.id()]).expect("chained compile failed");
+    let compiled2 = Compiler::compile(&trace2, &[out.id()], None).expect("chained compile failed");
     let x_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
     let y_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let z_buf = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);

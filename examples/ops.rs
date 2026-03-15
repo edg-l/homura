@@ -10,7 +10,7 @@ fn main() {
     let b = Tensor::new(&[4], DType::F32);
     let c = &a - &b;
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[c.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[c.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
@@ -26,7 +26,7 @@ fn main() {
     let b = Tensor::new(&[4], DType::F32);
     let c = &a * &b;
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[c.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[c.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
@@ -42,7 +42,7 @@ fn main() {
     let b = Tensor::new(&[4], DType::F32);
     let c = &a / &b;
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[c.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[c.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[2.0, 4.0, 5.0, 8.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
@@ -57,7 +57,7 @@ fn main() {
     let a = Tensor::new(&[4], DType::F32);
     let b = -&a;
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[b.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[b.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf]);
     println!("Neg: -[1,-2,3,-4] = {:?}", result[0].as_slice::<f32>());
@@ -68,7 +68,7 @@ fn main() {
     let a = Tensor::new(&[4], DType::F32);
     let b = a.relu();
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[b.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[b.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[-1.0, 2.0, -3.0, 4.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf]);
     println!("Relu: relu([-1,2,-3,4]) = {:?}", result[0].as_slice::<f32>());
@@ -80,7 +80,7 @@ fn main() {
     let b = Tensor::new(&[4], DType::F32);
     let c = (&a + &b).relu();
     let trace = take_trace();
-    let compiled = Compiler::compile(&trace, &[c.id()]).expect("compile failed");
+    let compiled = Compiler::compile(&trace, &[c.id()], None).expect("compile failed");
     let a_buf = Buffer::from_slice::<f32>(&[1.0, -5.0, 3.0, -7.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[2.0, 3.0, -4.0, 5.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
