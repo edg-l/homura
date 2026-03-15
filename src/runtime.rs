@@ -79,7 +79,9 @@ impl Buffer {
             self.dtype,
             self.dtype.size_bytes(),
         );
-        unsafe { slice::from_raw_parts(self.data.as_ptr() as *const T, self.data.len() / elem_size) }
+        unsafe {
+            slice::from_raw_parts(self.data.as_ptr() as *const T, self.data.len() / elem_size)
+        }
     }
 
     pub fn shape(&self) -> &Shape {
@@ -125,16 +127,20 @@ fn row_major_strides(shape: &[u64]) -> Vec<i64> {
 /// - bytes 24+8N .. 24+16N: strides[0..N]
 ///
 /// Total: 24 + 16*N bytes.
-pub(crate) fn build_memref_descriptor(data_ptr: *mut u8, shape: &[i64], strides: &[i64]) -> Vec<u8> {
+pub(crate) fn build_memref_descriptor(
+    data_ptr: *mut u8,
+    shape: &[i64],
+    strides: &[i64],
+) -> Vec<u8> {
     assert_eq!(shape.len(), strides.len());
     let n = shape.len();
     let total = 24 + 16 * n;
     let mut buf = vec![0u8; total];
 
     let ptr_val = data_ptr as u64;
-    buf[0..8].copy_from_slice(&ptr_val.to_ne_bytes());   // allocated_ptr
-    buf[8..16].copy_from_slice(&ptr_val.to_ne_bytes());  // aligned_ptr
-    buf[16..24].copy_from_slice(&0i64.to_ne_bytes());    // offset = 0
+    buf[0..8].copy_from_slice(&ptr_val.to_ne_bytes()); // allocated_ptr
+    buf[8..16].copy_from_slice(&ptr_val.to_ne_bytes()); // aligned_ptr
+    buf[16..24].copy_from_slice(&0i64.to_ne_bytes()); // offset = 0
 
     for (i, &s) in shape.iter().enumerate() {
         let off = 24 + i * 8;
@@ -207,11 +213,7 @@ impl CompiledGraph {
             .zip(input_shapes.iter())
             .zip(input_strides.iter())
             .map(|((buf, shape), strides)| {
-                build_memref_descriptor(
-                    buf.data.as_ptr() as *mut u8,
-                    shape.as_slice(),
-                    strides,
-                )
+                build_memref_descriptor(buf.data.as_ptr() as *mut u8, shape.as_slice(), strides)
             })
             .collect();
 
@@ -224,10 +226,7 @@ impl CompiledGraph {
         // invoke_packed dereferences each args[i] as a void* to get the
         // pointer passed to the MLIR C-interface wrapper, which then
         // dereferences that pointer to get the MemRefDescriptor struct.
-        let mut desc_ptrs: Vec<*mut u8> = input_descs
-            .iter_mut()
-            .map(|d| d.as_mut_ptr())
-            .collect();
+        let mut desc_ptrs: Vec<*mut u8> = input_descs.iter_mut().map(|d| d.as_mut_ptr()).collect();
         let mut output_desc_ptr = output_desc.as_mut_ptr();
 
         let mut args: Vec<*mut ()> = desc_ptrs
@@ -497,9 +496,13 @@ mod tests {
 
         let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
-        let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
+        let b_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0]
+        );
     }
 
     #[test]
@@ -511,10 +514,21 @@ mod tests {
         let trace = take_trace();
 
         let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
-        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 2, 2], DType::F32);
-        let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0], &[2, 2, 2], DType::F32);
+        let a_buf = Buffer::from_slice::<f32>(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[2, 2, 2],
+            DType::F32,
+        );
+        let b_buf = Buffer::from_slice::<f32>(
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+            &[2, 2, 2],
+            DType::F32,
+        );
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0]
+        );
     }
 
     // ── Matmul integration tests (tasks 3.4, 3.5, 3.6) ───────────────────────
@@ -531,13 +545,11 @@ mod tests {
         // A = [[1, 2, 3], [4, 5, 6]] (2x3)
         // B = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] (3x4)
         // C = A @ B = [[38, 44, 50, 56], [83, 98, 113, 128]] (2x4)
-        let a_buf = Buffer::from_slice::<f32>(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[2, 3],
-            DType::F32,
-        );
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             &[3, 4],
             DType::F32,
         );
@@ -558,13 +570,11 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
 
         // Same values as f32 test
-        let a_buf = Buffer::from_slice::<f64>(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[2, 3],
-            DType::F64,
-        );
+        let a_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F64);
         let b_buf = Buffer::from_slice::<f64>(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             &[3, 4],
             DType::F64,
         );
@@ -591,11 +601,7 @@ mod tests {
         // A = [[1, 2, 3], [4, 5, 6]] (2x3)
         // B = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]] (3x4)
         // C = A @ B = [[38, 44, 50, 56], [83, 98, 113, 128]] (2x4)
-        let a_buf = Buffer::from_slice::<i32>(
-            &[1, 2, 3, 4, 5, 6],
-            &[2, 3],
-            DType::I32,
-        );
+        let a_buf = Buffer::from_slice::<i32>(&[1, 2, 3, 4, 5, 6], &[2, 3], DType::I32);
         let b_buf = Buffer::from_slice::<i32>(
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             &[3, 4],
@@ -648,7 +654,8 @@ mod tests {
         let trace = take_trace();
 
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
-        let a_buf = Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0], &[2, 3], DType::F32);
+        let a_buf =
+            Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
         assert_eq!(result.as_slice::<f32>(), &[-1.0, 2.0, -3.0, 4.0, -5.0, 6.0]);
     }
@@ -667,7 +674,10 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]
+        );
     }
 
     #[test]
@@ -682,7 +692,10 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0], &[2, 1], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[1, 3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[11.0, 21.0, 31.0, 12.0, 22.0, 32.0]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[11.0, 21.0, 31.0, 12.0, 22.0, 32.0]
+        );
     }
 
     #[test]
@@ -702,12 +715,15 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&b_data, &[3, 5, 4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         // Expected: for outer in 0..3, repeat a_row 5 times each plus 100.0
-        let expected: Vec<f32> = (0..3_usize).flat_map(|outer| {
-            let base = (outer * 4) as f32;
-            let a_row = [base + 1.0, base + 2.0, base + 3.0, base + 4.0];
-            (0..5).flat_map(move |_| a_row.iter().map(|&v| v + 100.0).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        }).collect();
+        let expected: Vec<f32> = (0..3_usize)
+            .flat_map(|outer| {
+                let base = (outer * 4) as f32;
+                let a_row = [base + 1.0, base + 2.0, base + 3.0, base + 4.0];
+                (0..5)
+                    .flat_map(move |_| a_row.iter().map(|&v| v + 100.0).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         assert_eq!(result.as_slice::<f32>(), expected.as_slice());
     }
 
@@ -775,7 +791,8 @@ mod tests {
         let trace = take_trace();
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         // [[-5,-3,-1],[-9,-7,-4]] -> max along dim -1 -> [-1, -4]  (proves init is -inf, not 0)
-        let a_buf = Buffer::from_slice::<f32>(&[-5.0, -3.0, -1.0, -9.0, -7.0, -4.0], &[2, 3], DType::F32);
+        let a_buf =
+            Buffer::from_slice::<f32>(&[-5.0, -3.0, -1.0, -9.0, -7.0, -4.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
         assert_eq!(result.as_slice::<f32>(), &[-1.0, -4.0]);
     }

@@ -23,8 +23,16 @@ impl Shape {
         let max_rank = a.len().max(b.len());
         let mut result = Vec::with_capacity(max_rank);
         for i in 0..max_rank {
-            let a_dim = if i < max_rank - a.len() { 1 } else { a[i - (max_rank - a.len())] };
-            let b_dim = if i < max_rank - b.len() { 1 } else { b[i - (max_rank - b.len())] };
+            let a_dim = if i < max_rank - a.len() {
+                1
+            } else {
+                a[i - (max_rank - a.len())]
+            };
+            let b_dim = if i < max_rank - b.len() {
+                1
+            } else {
+                b[i - (max_rank - b.len())]
+            };
             if a_dim == b_dim {
                 result.push(a_dim);
             } else if a_dim == 1 {

@@ -45,7 +45,9 @@ impl std::ops::Add for &Tensor {
 
     fn add(self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Add");
-        let shape = self.shape.broadcast(&rhs.shape)
+        let shape = self
+            .shape
+            .broadcast(&rhs.shape)
             .unwrap_or_else(|e| panic!("broadcast failed in Add: {e}"));
         let id = trace::record(Op::Add {
             lhs: self.id,
@@ -53,7 +55,11 @@ impl std::ops::Add for &Tensor {
             shape: shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape,
+            dtype: self.dtype,
+        }
     }
 }
 
@@ -86,7 +92,9 @@ impl std::ops::Sub for &Tensor {
 
     fn sub(self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Sub");
-        let shape = self.shape.broadcast(&rhs.shape)
+        let shape = self
+            .shape
+            .broadcast(&rhs.shape)
             .unwrap_or_else(|e| panic!("broadcast failed in Sub: {e}"));
         let id = trace::record(Op::Sub {
             lhs: self.id,
@@ -94,7 +102,11 @@ impl std::ops::Sub for &Tensor {
             shape: shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape,
+            dtype: self.dtype,
+        }
     }
 }
 
@@ -127,7 +139,9 @@ impl std::ops::Mul for &Tensor {
 
     fn mul(self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Mul");
-        let shape = self.shape.broadcast(&rhs.shape)
+        let shape = self
+            .shape
+            .broadcast(&rhs.shape)
             .unwrap_or_else(|e| panic!("broadcast failed in Mul: {e}"));
         let id = trace::record(Op::Mul {
             lhs: self.id,
@@ -135,7 +149,11 @@ impl std::ops::Mul for &Tensor {
             shape: shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape,
+            dtype: self.dtype,
+        }
     }
 }
 
@@ -168,7 +186,9 @@ impl std::ops::Div for &Tensor {
 
     fn div(self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.dtype, rhs.dtype, "dtype mismatch in Div");
-        let shape = self.shape.broadcast(&rhs.shape)
+        let shape = self
+            .shape
+            .broadcast(&rhs.shape)
             .unwrap_or_else(|e| panic!("broadcast failed in Div: {e}"));
         let id = trace::record(Op::Div {
             lhs: self.id,
@@ -176,7 +196,11 @@ impl std::ops::Div for &Tensor {
             shape: shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape,
+            dtype: self.dtype,
+        }
     }
 }
 
@@ -245,8 +269,16 @@ impl Tensor {
 
         // self shape: [M, K] or [K, M] if trans_a
         // rhs shape:  [K, N] or [N, K] if trans_b
-        let m = if trans_a { self.shape.0[1] } else { self.shape.0[0] };
-        let n = if trans_b { rhs.shape.0[0] } else { rhs.shape.0[1] };
+        let m = if trans_a {
+            self.shape.0[1]
+        } else {
+            self.shape.0[0]
+        };
+        let n = if trans_b {
+            rhs.shape.0[0]
+        } else {
+            rhs.shape.0[1]
+        };
         let output_shape = Shape(vec![m, n]);
 
         let op = Op::Gemm {
@@ -261,7 +293,11 @@ impl Tensor {
             dtype: self.dtype,
         };
         let id = trace::record(op);
-        Tensor { id, shape: output_shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype: self.dtype,
+        }
     }
 
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
@@ -284,7 +320,11 @@ impl Tensor {
             shape: out_shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape: out_shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape: out_shape,
+            dtype: self.dtype,
+        }
     }
 
     /// Reshape the tensor to `target_shape`.
@@ -338,7 +378,11 @@ impl Tensor {
             shape: shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape,
+            dtype: self.dtype,
+        }
     }
 
     pub fn relu(&self) -> Tensor {
@@ -365,7 +409,11 @@ impl Tensor {
             shape: self.shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape: self.shape.clone(), dtype: self.dtype }
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
     }
 
     pub fn tanh(&self) -> Tensor {
@@ -379,7 +427,11 @@ impl Tensor {
             shape: self.shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape: self.shape.clone(), dtype: self.dtype }
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
     }
 
     pub fn reduce_sum(&self, dim: i32, keepdim: bool) -> Tensor {
@@ -392,7 +444,11 @@ impl Tensor {
             shape: out_shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape: out_shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape: out_shape,
+            dtype: self.dtype,
+        }
     }
 
     pub fn reduce_max(&self, dim: i32, keepdim: bool) -> Tensor {
@@ -405,7 +461,11 @@ impl Tensor {
             shape: out_shape.clone(),
             dtype: self.dtype,
         });
-        Tensor { id, shape: out_shape, dtype: self.dtype }
+        Tensor {
+            id,
+            shape: out_shape,
+            dtype: self.dtype,
+        }
     }
 
     /// Numerically stable softmax along `dim`.
@@ -427,8 +487,8 @@ impl Tensor {
     /// `Tensor::new` calls that created the graph's input placeholders.
     pub fn eval(&self, inputs: &[Buffer]) -> Buffer {
         let trace = crate::trace::take_trace();
-        let compiled = crate::Compiler::compile(&trace, &[self.id])
-            .expect("compilation failed in eval");
+        let compiled =
+            crate::Compiler::compile(&trace, &[self.id]).expect("compilation failed in eval");
         compiled.run(&inputs.iter().collect::<Vec<&Buffer>>())
     }
 }
@@ -439,10 +499,7 @@ fn resolve_dim(dim: i32, rank: usize) -> usize {
     } else {
         dim as usize
     };
-    assert!(
-        resolved < rank,
-        "dim {dim} is out of range for rank {rank}"
-    );
+    assert!(resolved < rank, "dim {dim} is out of range for rank {rank}");
     resolved
 }
 
@@ -459,7 +516,10 @@ fn reduce_shape(shape: &Shape, dim: usize, keepdim: bool) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Compiler, trace::{begin_trace, take_trace}};
+    use crate::{
+        Compiler,
+        trace::{begin_trace, take_trace},
+    };
 
     #[test]
     fn tensor_new_records_input() {
@@ -485,7 +545,16 @@ mod tests {
         assert_eq!(trace.input_count(), 2);
         let op = &trace.ops()[c.id.0 as usize];
         match op {
-            Op::Gemm { alpha, beta, trans_a, trans_b, bias, shape, dtype, .. } => {
+            Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                bias,
+                shape,
+                dtype,
+                ..
+            } => {
                 assert_eq!(*alpha, 1.0);
                 assert_eq!(*beta, 1.0);
                 assert!(!trans_a);
@@ -507,7 +576,12 @@ mod tests {
         let trace = take_trace();
         let op = &trace.ops()[c.id.0 as usize];
         match op {
-            Op::Gemm { trans_a, trans_b, shape, .. } => {
+            Op::Gemm {
+                trans_a,
+                trans_b,
+                shape,
+                ..
+            } => {
                 assert!(*trans_a);
                 assert!(*trans_b);
                 // output [M, N] = [2, 4]
@@ -527,7 +601,12 @@ mod tests {
         let trace = take_trace();
         let op = &trace.ops()[c.id.0 as usize];
         match op {
-            Op::Gemm { alpha, beta, bias: bias_id, .. } => {
+            Op::Gemm {
+                alpha,
+                beta,
+                bias: bias_id,
+                ..
+            } => {
                 assert_eq!(*alpha, 2.0);
                 assert_eq!(*beta, 0.5);
                 assert!(bias_id.is_some());
@@ -568,7 +647,12 @@ mod tests {
         let trace = take_trace();
         let op = &trace.ops()[b.id.0 as usize];
         match op {
-            Op::Reshape { target_shape, shape, dtype, .. } => {
+            Op::Reshape {
+                target_shape,
+                shape,
+                dtype,
+                ..
+            } => {
                 assert_eq!(target_shape, &vec![3u64, 4]);
                 assert_eq!(shape.0, vec![3u64, 4]);
                 assert_eq!(*dtype, DType::F32);
@@ -621,11 +705,7 @@ mod tests {
         let trace = take_trace();
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         // [[1, 2, 3], [1, 2, 3]]
-        let a_buf = Buffer::from_slice::<f32>(
-            &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
-            &[2, 3],
-            DType::F32,
-        );
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 1.0, 2.0, 3.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
         let out = result.as_slice::<f32>();
         // Each row should sum to ~1.0

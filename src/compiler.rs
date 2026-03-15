@@ -316,7 +316,10 @@ fn make_broadcast_map<'c>(
 
 // ── Helper: build N parallel iterator types ──────────────────────────────────
 
-fn make_iterator_types<'c>(context: &'c Context, count: usize) -> Result<Attribute<'c>, CompileError> {
+fn make_iterator_types<'c>(
+    context: &'c Context,
+    count: usize,
+) -> Result<Attribute<'c>, CompileError> {
     let entries: Vec<&str> = vec!["#linalg.iterator_type<parallel>"; count];
     let attr_str = format!("[{}]", entries.join(", "));
     Attribute::parse(context, &attr_str)
@@ -340,7 +343,11 @@ fn emit_binary_elementwise<'c, F>(
     body_fn: F,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError>
 where
-    F: FnOnce(&Block<'c>, melior::ir::Value<'c, 'c>, melior::ir::Value<'c, 'c>) -> melior::ir::Value<'c, 'c>,
+    F: FnOnce(
+        &Block<'c>,
+        melior::ir::Value<'c, 'c>,
+        melior::ir::Value<'c, 'c>,
+    ) -> melior::ir::Value<'c, 'c>,
 {
     let elem_type = dtype.to_mlir_type(context);
     let tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
@@ -401,9 +408,15 @@ where
                 .add_operands(&[lhs_val, rhs_val, init_val])
                 .add_results(&[tensor_type])
                 .add_attributes(&[
-                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
                     (Identifier::new(context, "iterator_types"), iterator_types),
-                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
                 ])
                 .add_regions([linalg_region])
                 .build()
@@ -598,7 +611,10 @@ fn promote_rank_with_reshape<'c>(
                 .add_results(&[new_tensor_type])
                 .add_attributes(&[
                     (Identifier::new(context, "reassociation"), reassoc_attr),
-                    (Identifier::new(context, "static_output_shape"), static_shape_attr),
+                    (
+                        Identifier::new(context, "static_output_shape"),
+                        static_shape_attr,
+                    ),
                 ])
                 .build()
                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
@@ -636,10 +652,22 @@ fn emit_tosa_binary<'c>(
     // Promote to matching rank if needed (tosa.add/sub/mul require equal ranks).
     let target_rank = output_shape.len();
     let (lhs_val, _) = promote_rank_with_reshape(
-        context, body_block, lhs_val, lhs_shape, target_rank, dtype, location,
+        context,
+        body_block,
+        lhs_val,
+        lhs_shape,
+        target_rank,
+        dtype,
+        location,
     )?;
     let (rhs_val, _) = promote_rank_with_reshape(
-        context, body_block, rhs_val, rhs_shape, target_rank, dtype, location,
+        context,
+        body_block,
+        rhs_val,
+        rhs_shape,
+        target_rank,
+        dtype,
+        location,
     )?;
 
     let result_val = body_block
@@ -682,10 +710,22 @@ fn emit_tosa_mul<'c>(
     // Promote to matching rank if needed.
     let target_rank = output_shape.len();
     let (lhs_val, _) = promote_rank_with_reshape(
-        context, body_block, lhs_val, lhs_shape, target_rank, dtype, location,
+        context,
+        body_block,
+        lhs_val,
+        lhs_shape,
+        target_rank,
+        dtype,
+        location,
     )?;
     let (rhs_val, _) = promote_rank_with_reshape(
-        context, body_block, rhs_val, rhs_shape, target_rank, dtype, location,
+        context,
+        body_block,
+        rhs_val,
+        rhs_shape,
+        target_rank,
+        dtype,
+        location,
     )?;
 
     // shift is a rank-1 size-1 tensor<1xi8> with value 0 (required even for float mul).
@@ -853,9 +893,9 @@ fn emit_tosa_matmul<'c>(
     values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
     lhs: NodeId,
     rhs: NodeId,
-    lhs_shape: &[u64],  // [M, K]
-    rhs_shape: &[u64],  // [K, N]
-    output_shape: &[u64],  // [M, N]
+    lhs_shape: &[u64],    // [M, K]
+    rhs_shape: &[u64],    // [K, N]
+    output_shape: &[u64], // [M, N]
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
@@ -864,7 +904,15 @@ fn emit_tosa_matmul<'c>(
 
     // Delegate to the value-based helper.
     emit_tosa_matmul_2d_values(
-        context, body_block, lhs_val, rhs_val, lhs_shape, rhs_shape, output_shape, dtype, location,
+        context,
+        body_block,
+        lhs_val,
+        rhs_val,
+        lhs_shape,
+        rhs_shape,
+        output_shape,
+        dtype,
+        location,
     )
 }
 
@@ -881,9 +929,9 @@ fn emit_tosa_matmul_2d_values<'c>(
     body_block: &Block<'c>,
     lhs_val: melior::ir::Value<'c, 'c>,
     rhs_val: melior::ir::Value<'c, 'c>,
-    lhs_shape: &[u64],  // [M, K]
-    rhs_shape: &[u64],  // [K, N]
-    output_shape: &[u64],  // [M, N]
+    lhs_shape: &[u64],    // [M, K]
+    rhs_shape: &[u64],    // [K, N]
+    output_shape: &[u64], // [M, N]
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
@@ -891,12 +939,8 @@ fn emit_tosa_matmul_2d_values<'c>(
     let k = lhs_shape[1];
     let n = rhs_shape[1];
 
-    let lhs_3d = emit_tosa_reshape(
-        context, body_block, lhs_val, &[1, m, k], dtype, location,
-    )?;
-    let rhs_3d = emit_tosa_reshape(
-        context, body_block, rhs_val, &[1, k, n], dtype, location,
-    )?;
+    let lhs_3d = emit_tosa_reshape(context, body_block, lhs_val, &[1, m, k], dtype, location)?;
+    let rhs_3d = emit_tosa_reshape(context, body_block, rhs_val, &[1, k, n], dtype, location)?;
 
     let zp_dense = match dtype {
         DType::F32 => "dense<0.0> : tensor<1xf32>",
@@ -933,7 +977,7 @@ fn emit_matmul<'c>(
     values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
     lhs: NodeId,
     rhs: NodeId,
-    output_shape: &[u64],  // [M, N]
+    output_shape: &[u64], // [M, N]
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
@@ -1092,8 +1136,8 @@ fn emit_reduction<'c>(
     body_block: &Block<'c>,
     values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
     input: NodeId,
-    input_shape: &[u64],   // shape of the INPUT tensor
-    output_shape: &[u64],  // shape of the OUTPUT tensor
+    input_shape: &[u64],  // shape of the INPUT tensor
+    output_shape: &[u64], // shape of the OUTPUT tensor
     dim: usize,
     keepdim: bool,
     dtype: DType,
@@ -1241,9 +1285,8 @@ fn emit_reduction<'c>(
     }
     let result_str = result_exprs.join(", ");
     let output_map_str = format!("affine_map<({dims_str}) -> ({result_str})>");
-    let output_map = Attribute::parse(context, &output_map_str).ok_or_else(|| {
-        CompileError::AttributeParse(format!("failed to parse {output_map_str}"))
-    })?;
+    let output_map = Attribute::parse(context, &output_map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {output_map_str}")))?;
 
     let indexing_maps = ArrayAttribute::new(context, &[input_map, output_map]);
     let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
@@ -1303,9 +1346,15 @@ fn emit_reduction<'c>(
                 .add_operands(&[input_val, filled_val])
                 .add_results(&[output_tensor_type])
                 .add_attributes(&[
-                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
                     (Identifier::new(context, "iterator_types"), iterator_types),
-                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
                 ])
                 .add_regions([linalg_region])
                 .build()
@@ -1335,10 +1384,10 @@ fn emit_tosa_reduce<'c>(
     context: &'c Context,
     body_block: &Block<'c>,
     values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
-    op_name: &str,  // "tosa.reduce_sum" or "tosa.reduce_max"
+    op_name: &str, // "tosa.reduce_sum" or "tosa.reduce_max"
     input: NodeId,
     input_shape: &[u64],
-    output_shape: &[u64],  // final output shape (keepdim already reflected)
+    output_shape: &[u64], // final output shape (keepdim already reflected)
     dim: usize,
     keepdim: bool,
     dtype: DType,
@@ -1388,7 +1437,8 @@ fn emit_tosa_reduce<'c>(
     // keepdim=false: use tosa.const_shape + tosa.reshape to remove the size-1 dim
     // at position `dim`. tosa_out_shape has rank = input_rank; output_shape has
     // rank = input_rank - 1 (the size-1 dim at `dim` has been removed).
-    let result_val = emit_tosa_reshape(context, body_block, reduced, output_shape, dtype, location)?;
+    let result_val =
+        emit_tosa_reshape(context, body_block, reduced, output_shape, dtype, location)?;
 
     Ok(result_val)
 }
@@ -1402,7 +1452,7 @@ fn emit_tosa_transpose_2d<'c>(
     context: &'c Context,
     body_block: &Block<'c>,
     input: melior::ir::Value<'c, 'c>,
-    input_shape: &[u64],  // [rows, cols] before transpose
+    input_shape: &[u64], // [rows, cols] before transpose
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
@@ -1488,10 +1538,18 @@ fn emit_tosa_scale<'c>(
     // Reshape scalar tensor<1xT> to match matrix rank: [1, 1] for rank-2.
     let rank = mat_shape.len();
     let scalar_shape: Vec<u64> = vec![1u64; rank];
-    let scalar_reshaped = emit_tosa_reshape(context, body_block, scalar_val, &scalar_shape, dtype, location)?;
+    let scalar_reshaped = emit_tosa_reshape(
+        context,
+        body_block,
+        scalar_val,
+        &scalar_shape,
+        dtype,
+        location,
+    )?;
 
     // shift operand required by tosa.mul (zero for float/int unquantized)
-    let shift_val = emit_tosa_const_scalar(context, body_block, "dense<0> : tensor<1xi8>", location)?;
+    let shift_val =
+        emit_tosa_const_scalar(context, body_block, "dense<0> : tensor<1xi8>", location)?;
 
     let result_type = make_ranked_tensor_type(context, mat_shape, dtype);
     let result: melior::ir::Value = body_block
@@ -1527,7 +1585,13 @@ fn emit_tosa_add_bias<'c>(
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     let target_rank = mat_shape.len();
     let (bias_promoted, _) = promote_rank_with_reshape(
-        context, body_block, bias, bias_shape, target_rank, dtype, location,
+        context,
+        body_block,
+        bias,
+        bias_shape,
+        target_rank,
+        dtype,
+        location,
     )?;
 
     let result_type = make_ranked_tensor_type(context, mat_shape, dtype);
@@ -1559,7 +1623,6 @@ fn emit_tensor_ops<'c>(
     location: Location<'c>,
     context: &'c Context,
 ) -> Result<(), CompileError> {
-
     // NodeId -> SSA tensor Value for each op emitted so far.
     let mut values: HashMap<NodeId, melior::ir::Value<'c, 'c>> = HashMap::new();
 
@@ -1594,85 +1657,172 @@ fn emit_tensor_ops<'c>(
                 values.insert(node_id, tensor_val);
             }
 
-            Op::Add { lhs, rhs, shape, dtype } => {
+            Op::Add {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
                 let result_val = emit_tosa_binary(
-                    context, body_block, &values, "tosa.add",
-                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    context,
+                    body_block,
+                    &values,
+                    "tosa.add",
+                    *lhs,
+                    *rhs,
+                    &lhs_shape.0,
+                    &rhs_shape.0,
+                    &shape.0,
+                    *dtype,
+                    location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Sub { lhs, rhs, shape, dtype } => {
+            Op::Sub {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
                 let result_val = emit_tosa_binary(
-                    context, body_block, &values, "tosa.sub",
-                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    context,
+                    body_block,
+                    &values,
+                    "tosa.sub",
+                    *lhs,
+                    *rhs,
+                    &lhs_shape.0,
+                    &rhs_shape.0,
+                    &shape.0,
+                    *dtype,
+                    location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Mul { lhs, rhs, shape, dtype } => {
+            Op::Mul {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
                 let result_val = emit_tosa_mul(
-                    context, body_block, &values,
-                    *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    context,
+                    body_block,
+                    &values,
+                    *lhs,
+                    *rhs,
+                    &lhs_shape.0,
+                    &rhs_shape.0,
+                    &shape.0,
+                    *dtype,
+                    location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Div { lhs, rhs, shape, dtype } => {
+            Op::Div {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
                 let result_val = emit_binary_elementwise(
-                    context, body_block, &values, *lhs, *rhs,
-                    &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                    context,
+                    body_block,
+                    &values,
+                    *lhs,
+                    *rhs,
+                    &lhs_shape.0,
+                    &rhs_shape.0,
+                    &shape.0,
+                    *dtype,
+                    location,
                     |block, lhs_elem, rhs_elem| match dtype {
                         DType::F32 | DType::F64 => block
                             .append_operation(arith::divf(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
+                            .result(0)
+                            .unwrap()
+                            .into(),
                         DType::I32 | DType::I64 => block
                             .append_operation(arith::divsi(lhs_elem, rhs_elem, location))
-                            .result(0).unwrap().into(),
+                            .result(0)
+                            .unwrap()
+                            .into(),
                     },
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Neg { input, shape, dtype } => {
+            Op::Neg {
+                input,
+                shape,
+                dtype,
+            } => {
                 let result_val = emit_tosa_negate(
-                    context, body_block, &values,
-                    *input, &shape.0, *dtype, location,
+                    context, body_block, &values, *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Exp { input, shape, dtype } => {
+            Op::Exp {
+                input,
+                shape,
+                dtype,
+            } => {
                 let result_val = emit_tosa_unary_simple(
-                    context, body_block, &values, "tosa.exp",
-                    *input, &shape.0, *dtype, location,
+                    context, body_block, &values, "tosa.exp", *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Tanh { input, shape, dtype } => {
+            Op::Tanh {
+                input,
+                shape,
+                dtype,
+            } => {
                 let result_val = emit_tosa_unary_simple(
-                    context, body_block, &values, "tosa.tanh",
-                    *input, &shape.0, *dtype, location,
+                    context,
+                    body_block,
+                    &values,
+                    "tosa.tanh",
+                    *input,
+                    &shape.0,
+                    *dtype,
+                    location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::Matmul { lhs, rhs, shape, dtype } => {
+            Op::Matmul {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
                 let result_val = match dtype {
                     DType::F32 | DType::F64 => emit_tosa_matmul(
-                        context, body_block, &values,
-                        *lhs, *rhs, &lhs_shape.0, &rhs_shape.0, &shape.0, *dtype, location,
+                        context,
+                        body_block,
+                        &values,
+                        *lhs,
+                        *rhs,
+                        &lhs_shape.0,
+                        &rhs_shape.0,
+                        &shape.0,
+                        *dtype,
+                        location,
                     )?,
                     DType::I32 | DType::I64 => emit_matmul(
                         context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
@@ -1681,47 +1831,106 @@ fn emit_tensor_ops<'c>(
                 values.insert(node_id, result_val);
             }
 
-            Op::Relu { input, shape, dtype } => {
+            Op::Relu {
+                input,
+                shape,
+                dtype,
+            } => {
                 let result_val = emit_tosa_clamp(
-                    context, body_block, &values, *input,
-                    &shape.0, *dtype, location,
+                    context, body_block, &values, *input, &shape.0, *dtype, location,
                 )?;
                 values.insert(node_id, result_val);
             }
 
-            Op::ReduceSum { input, dim, keepdim, shape, dtype } => {
+            Op::ReduceSum {
+                input,
+                dim,
+                keepdim,
+                shape,
+                dtype,
+            } => {
                 let input_shape = trace.get(*input).shape();
                 let result_val = match dtype {
                     DType::F32 | DType::F64 => emit_tosa_reduce(
-                        context, body_block, &values, "tosa.reduce_sum",
-                        *input, &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        context,
+                        body_block,
+                        &values,
+                        "tosa.reduce_sum",
+                        *input,
+                        &input_shape.0,
+                        &shape.0,
+                        *dim,
+                        *keepdim,
+                        *dtype,
+                        location,
                     )?,
                     DType::I32 | DType::I64 => emit_reduction(
-                        context, body_block, &values, *input,
-                        &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        context,
+                        body_block,
+                        &values,
+                        *input,
+                        &input_shape.0,
+                        &shape.0,
+                        *dim,
+                        *keepdim,
+                        *dtype,
+                        location,
                         false,
                     )?,
                 };
                 values.insert(node_id, result_val);
             }
 
-            Op::ReduceMax { input, dim, keepdim, shape, dtype } => {
+            Op::ReduceMax {
+                input,
+                dim,
+                keepdim,
+                shape,
+                dtype,
+            } => {
                 let input_shape = trace.get(*input).shape();
                 let result_val = match dtype {
                     DType::F32 | DType::F64 => emit_tosa_reduce(
-                        context, body_block, &values, "tosa.reduce_max",
-                        *input, &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        context,
+                        body_block,
+                        &values,
+                        "tosa.reduce_max",
+                        *input,
+                        &input_shape.0,
+                        &shape.0,
+                        *dim,
+                        *keepdim,
+                        *dtype,
+                        location,
                     )?,
                     DType::I32 | DType::I64 => emit_reduction(
-                        context, body_block, &values, *input,
-                        &input_shape.0, &shape.0, *dim, *keepdim, *dtype, location,
+                        context,
+                        body_block,
+                        &values,
+                        *input,
+                        &input_shape.0,
+                        &shape.0,
+                        *dim,
+                        *keepdim,
+                        *dtype,
+                        location,
                         true,
                     )?,
                 };
                 values.insert(node_id, result_val);
             }
 
-            Op::Gemm { lhs, rhs, bias, alpha, beta, trans_a, trans_b, shape: _, dtype } => {
+            Op::Gemm {
+                lhs,
+                rhs,
+                bias,
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                shape: _,
+                dtype,
+            } => {
                 let lhs_shape = trace.get(*lhs).shape().0.clone();
                 let rhs_shape = trace.get(*rhs).shape().0.clone();
 
@@ -1750,7 +1959,13 @@ fn emit_tensor_ops<'c>(
                 // Step 4: optional alpha scaling (skip when alpha == 1.0)
                 if (*alpha - 1.0f64).abs() > f64::EPSILON {
                     lhs_val = emit_tosa_scale(
-                        context, body_block, lhs_val, &lhs_eff_shape, *alpha, *dtype, location,
+                        context,
+                        body_block,
+                        lhs_val,
+                        &lhs_eff_shape,
+                        *alpha,
+                        *dtype,
+                        location,
                     )?;
                 }
 
@@ -1765,8 +1980,15 @@ fn emit_tensor_ops<'c>(
                 let out_shape = [m, n];
 
                 let mut result_val = emit_tosa_matmul_2d_values(
-                    context, body_block, lhs_val, rhs_val,
-                    &lhs_matmul_shape, &rhs_matmul_shape, &out_shape, *dtype, location,
+                    context,
+                    body_block,
+                    lhs_val,
+                    rhs_val,
+                    &lhs_matmul_shape,
+                    &rhs_matmul_shape,
+                    &out_shape,
+                    *dtype,
+                    location,
                 )?;
 
                 // Step 7: optional bias add (with optional beta scaling)
@@ -1776,21 +1998,40 @@ fn emit_tensor_ops<'c>(
 
                     if (*beta - 1.0f64).abs() > f64::EPSILON {
                         bias_val = emit_tosa_scale(
-                            context, body_block, bias_val, &bias_shape, *beta, *dtype, location,
+                            context,
+                            body_block,
+                            bias_val,
+                            &bias_shape,
+                            *beta,
+                            *dtype,
+                            location,
                         )?;
                     }
 
                     result_val = emit_tosa_add_bias(
-                        context, body_block, result_val, &out_shape, bias_val, &bias_shape, *dtype, location,
+                        context,
+                        body_block,
+                        result_val,
+                        &out_shape,
+                        bias_val,
+                        &bias_shape,
+                        *dtype,
+                        location,
                     )?;
                 }
 
                 values.insert(node_id, result_val);
             }
 
-            Op::Reshape { input, target_shape: _, shape, dtype } => {
+            Op::Reshape {
+                input,
+                target_shape: _,
+                shape,
+                dtype,
+            } => {
                 let input_val = *values.get(input).expect("input not yet emitted");
-                let result_val = emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?;
+                let result_val =
+                    emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?;
                 values.insert(node_id, result_val);
             }
         }
@@ -2057,8 +2298,7 @@ mod tests {
             let strides = vec![1i64];
 
             // Build input descriptors (treat &[f32] data as *mut u8).
-            let mut input_data_vecs: Vec<Vec<f32>> =
-                inputs.iter().map(|s| s.to_vec()).collect();
+            let mut input_data_vecs: Vec<Vec<f32>> = inputs.iter().map(|s| s.to_vec()).collect();
             let mut input_descs: Vec<Vec<u8>> = input_data_vecs
                 .iter_mut()
                 .map(|v| build_memref_descriptor(v.as_mut_ptr() as *mut u8, &shape, &strides))
@@ -2112,10 +2352,8 @@ mod tests {
         let f32_type = melior::ir::r#type::IntegerType::new(&context, 32);
         // Use f32 — obtain via DType helper.
         let f32_mlir = DType::F32.to_mlir_type(&context);
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&[4u64], f32_mlir, None).into();
-        let memref_type: melior::ir::Type =
-            MemRefType::new(f32_mlir, &[4i64], None, None).into();
+        let tensor_type: melior::ir::Type = RankedTensorType::new(&[4u64], f32_mlir, None).into();
+        let memref_type: melior::ir::Type = MemRefType::new(f32_mlir, &[4i64], None, None).into();
         let _ = f32_type; // silence unused warning
 
         {
@@ -2222,8 +2460,7 @@ mod tests {
             "MLIR module verification failed before passes"
         );
 
-        run_tosa_pipeline(&mut module, &context)
-            .expect("TOSA pipeline failed");
+        run_tosa_pipeline(&mut module, &context).expect("TOSA pipeline failed");
 
         // JIT execute: [1,2,3,4] + [10,20,30,40] = [11,22,33,44]
         let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
@@ -2259,10 +2496,8 @@ mod tests {
         let mut module = Module::new(location);
 
         let f32_mlir = DType::F32.to_mlir_type(&context);
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&[4u64], f32_mlir, None).into();
-        let memref_type: melior::ir::Type =
-            MemRefType::new(f32_mlir, &[4i64], None, None).into();
+        let tensor_type: melior::ir::Type = RankedTensorType::new(&[4u64], f32_mlir, None).into();
+        let memref_type: melior::ir::Type = MemRefType::new(f32_mlir, &[4i64], None, None).into();
 
         {
             // Function: (%a, %b, %c, %out : all memref<4xf32>) -> ()
@@ -2333,8 +2568,8 @@ mod tests {
             let indexing_maps =
                 ArrayAttribute::new(&context, &[identity_map, identity_map, identity_map]);
             let iterator_types = make_iterator_types(&context, 1).expect("iterator types");
-            let segment_sizes = Attribute::parse(&context, "array<i32: 2, 1>")
-                .expect("segment sizes");
+            let segment_sizes =
+                Attribute::parse(&context, "array<i32: 2, 1>").expect("segment sizes");
 
             let linalg_region = {
                 let linalg_block = Block::new(&[
@@ -2342,22 +2577,19 @@ mod tests {
                     (f32_mlir, location),
                     (f32_mlir, location),
                 ]);
-                let lhs_elem: melior::ir::Value =
-                    linalg_block.argument(0).unwrap().into();
-                let rhs_elem: melior::ir::Value =
-                    linalg_block.argument(1).unwrap().into();
+                let lhs_elem: melior::ir::Value = linalg_block.argument(0).unwrap().into();
+                let rhs_elem: melior::ir::Value = linalg_block.argument(1).unwrap().into();
                 let div_val: melior::ir::Value = linalg_block
                     .append_operation(arith::divf(lhs_elem, rhs_elem, location))
                     .result(0)
                     .unwrap()
                     .into();
-                linalg_block
-                    .append_operation(
-                        OperationBuilder::new("linalg.yield", location)
-                            .add_operands(&[div_val])
-                            .build()
-                            .expect("linalg.yield"),
-                    );
+                linalg_block.append_operation(
+                    OperationBuilder::new("linalg.yield", location)
+                        .add_operands(&[div_val])
+                        .build()
+                        .expect("linalg.yield"),
+                );
                 let r = Region::new();
                 r.append_block(linalg_block);
                 r
@@ -2432,8 +2664,7 @@ mod tests {
             "MLIR module verification failed before passes"
         );
 
-        run_tosa_pipeline(&mut module, &context)
-            .expect("TOSA mixed pipeline failed");
+        run_tosa_pipeline(&mut module, &context).expect("TOSA mixed pipeline failed");
 
         // JIT execute: a=[2,4,6,8], b=[0,0,0,0] -> tosa.add=[2,4,6,8]
         //              c=[1,2,3,4] -> linalg div=[2,2,2,2]
@@ -2451,10 +2682,14 @@ mod tests {
             let mut c_data = c.to_vec();
             let mut out_data = vec![0.0f32; 4];
 
-            let mut a_desc = build_memref_descriptor(a_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut b_desc = build_memref_descriptor(b_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut c_desc = build_memref_descriptor(c_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut out_desc = build_memref_descriptor(out_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut a_desc =
+                build_memref_descriptor(a_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut b_desc =
+                build_memref_descriptor(b_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut c_desc =
+                build_memref_descriptor(c_data.as_mut_ptr() as *mut u8, &shape, &strides);
+            let mut out_desc =
+                build_memref_descriptor(out_data.as_mut_ptr() as *mut u8, &shape, &strides);
 
             let mut a_ptr = a_desc.as_mut_ptr();
             let mut b_ptr = b_desc.as_mut_ptr();
@@ -2489,7 +2724,10 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
         assert!(ir.contains("tosa.add"), "expected tosa.add in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2501,7 +2739,10 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
         assert!(ir.contains("tosa.sub"), "expected tosa.sub in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2513,7 +2754,10 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
         assert!(ir.contains("tosa.mul"), "expected tosa.mul in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2523,8 +2767,14 @@ mod tests {
         let b = -&a;
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.negate"), "expected tosa.negate in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.negate"),
+            "expected tosa.negate in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2534,8 +2784,14 @@ mod tests {
         let b = a.relu();
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.clamp"), "expected tosa.clamp in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.clamp"),
+            "expected tosa.clamp in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2546,7 +2802,10 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
         assert!(ir.contains("tosa.exp"), "expected tosa.exp in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2557,7 +2816,10 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
         assert!(ir.contains("tosa.tanh"), "expected tosa.tanh in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2569,7 +2831,10 @@ mod tests {
         let c = &a / &b;
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("linalg.generic"), "expected linalg.generic for div in IR:\n{ir}");
+        assert!(
+            ir.contains("linalg.generic"),
+            "expected linalg.generic for div in IR:\n{ir}"
+        );
         assert!(!ir.contains("tosa.div"), "unexpected tosa.div in IR:\n{ir}");
     }
 
@@ -2584,12 +2849,30 @@ mod tests {
         let c = a.matmul(&b);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
-        assert!(ir.contains("tosa.const_shape"), "expected tosa.const_shape in IR:\n{ir}");
-        assert!(ir.contains("tosa.reshape"), "expected tosa.reshape in IR:\n{ir}");
-        assert!(!ir.contains("tensor.expand_shape"), "unexpected tensor.expand_shape in IR:\n{ir}");
-        assert!(!ir.contains("tensor.collapse_shape"), "unexpected tensor.collapse_shape in IR:\n{ir}");
-        assert!(!ir.contains("linalg.matmul"), "unexpected linalg.matmul in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.matmul"),
+            "expected tosa.matmul in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.const_shape"),
+            "expected tosa.const_shape in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.reshape"),
+            "expected tosa.reshape in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tensor.expand_shape"),
+            "unexpected tensor.expand_shape in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tensor.collapse_shape"),
+            "unexpected tensor.collapse_shape in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.matmul"),
+            "unexpected linalg.matmul in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2601,8 +2884,14 @@ mod tests {
         let c = a.matmul(&b);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("linalg.matmul"), "expected linalg.matmul in IR:\n{ir}");
-        assert!(!ir.contains("tosa.matmul"), "unexpected tosa.matmul in IR:\n{ir}");
+        assert!(
+            ir.contains("linalg.matmul"),
+            "expected linalg.matmul in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tosa.matmul"),
+            "unexpected tosa.matmul in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2613,8 +2902,14 @@ mod tests {
         let b = a.reduce_sum(1, false);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.reduce_sum"), "expected tosa.reduce_sum in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.reduce_sum"),
+            "expected tosa.reduce_sum in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2627,10 +2922,19 @@ mod tests {
         let b = a.reduce_max(1, true);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.reduce_max"), "expected tosa.reduce_max in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.reduce_max"),
+            "expected tosa.reduce_max in IR:\n{ir}"
+        );
         // Output type should reflect keepdim: tensor<3x1xf32>
-        assert!(ir.contains("tensor<3x1xf32>"), "expected tensor<3x1xf32> output shape in IR:\n{ir}");
-        assert!(!ir.contains("linalg.generic"), "unexpected linalg.generic in IR:\n{ir}");
+        assert!(
+            ir.contains("tensor<3x1xf32>"),
+            "expected tensor<3x1xf32> output shape in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
     }
 
     // ── Gemm IR verification tests (task 6.5) ─────────────────────────────────
@@ -2645,9 +2949,18 @@ mod tests {
         let c = a.gemm(&b, None, 1.0, 1.0, false, false);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
-        assert!(!ir.contains("tosa.transpose"), "unexpected tosa.transpose in IR:\n{ir}");
-        assert!(!ir.contains("tosa.mul"), "unexpected tosa.mul (alpha=1.0) in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.matmul"),
+            "expected tosa.matmul in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tosa.transpose"),
+            "unexpected tosa.transpose in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tosa.mul"),
+            "unexpected tosa.mul (alpha=1.0) in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2659,8 +2972,14 @@ mod tests {
         let c = a.gemm(&b, None, 1.0, 1.0, false, true);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
-        assert!(ir.contains("tosa.transpose"), "expected tosa.transpose in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.matmul"),
+            "expected tosa.matmul in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.transpose"),
+            "expected tosa.transpose in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2672,8 +2991,14 @@ mod tests {
         let c = a.gemm(&b, None, 1.0, 1.0, true, false);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.matmul"), "expected tosa.matmul in IR:\n{ir}");
-        assert!(ir.contains("tosa.transpose"), "expected tosa.transpose in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.matmul"),
+            "expected tosa.matmul in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.transpose"),
+            "expected tosa.transpose in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2687,8 +3012,14 @@ mod tests {
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
         // No tosa.mul for alpha=1 or beta=1; bias add should use tosa.add.
-        assert!(!ir.contains("tosa.mul"), "unexpected tosa.mul when alpha=1.0/beta=1.0:\n{ir}");
-        assert!(ir.contains("tosa.add"), "expected tosa.add (bias) in IR:\n{ir}");
+        assert!(
+            !ir.contains("tosa.mul"),
+            "unexpected tosa.mul when alpha=1.0/beta=1.0:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.add"),
+            "expected tosa.add (bias) in IR:\n{ir}"
+        );
     }
 
     #[test]
@@ -2700,18 +3031,25 @@ mod tests {
         let c = a.gemm(&b, None, 2.0, 1.0, false, false);
         let trace = take_trace();
         let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
-        assert!(ir.contains("tosa.mul"), "expected tosa.mul (alpha scaling) in IR:\n{ir}");
+        assert!(
+            ir.contains("tosa.mul"),
+            "expected tosa.mul (alpha scaling) in IR:\n{ir}"
+        );
     }
 
     // ── Gemm execution tests (task 6.6) ──────────────────────────────────────
 
     /// Helper: run a gemm trace and return the output f32 slice as Vec.
     fn run_gemm_f32(
-        a_data: &[f32], a_shape: &[u64],
-        b_data: &[f32], b_shape: &[u64],
+        a_data: &[f32],
+        a_shape: &[u64],
+        b_data: &[f32],
+        b_shape: &[u64],
         bias_data: Option<(&[f32], &[u64])>,
-        alpha: f64, beta: f64,
-        trans_a: bool, trans_b: bool,
+        alpha: f64,
+        beta: f64,
+        trans_a: bool,
+        trans_b: bool,
     ) -> Vec<f32> {
         begin_trace();
         let a = Tensor::new(a_shape, DType::F32);
@@ -2746,9 +3084,21 @@ mod tests {
         // A = [[1,2,3],[4,5,6]], B = [[1,2,3,4],[5,6,7,8],[9,10,11,12]], bias=[1,1,1,1]
         // A@B = [[38,44,50,56],[83,98,113,128]], + bias = [[39,45,51,57],[84,99,114,129]]
         let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b = [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let bias = [1.0f32, 1.0, 1.0, 1.0];
-        let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], Some((&bias, &[4])), 1.0, 1.0, false, false);
+        let out = run_gemm_f32(
+            &a,
+            &[2, 3],
+            &b,
+            &[3, 4],
+            Some((&bias, &[4])),
+            1.0,
+            1.0,
+            false,
+            false,
+        );
         assert_eq!(out, &[39.0, 45.0, 51.0, 57.0, 84.0, 99.0, 114.0, 129.0]);
     }
 
@@ -2762,7 +3112,9 @@ mod tests {
         //   row0: [1*1+2*2+3*3, 1*4+2*5+3*6, 1*7+2*8+3*9, 1*10+2*11+3*12] = [14, 32, 50, 68]
         //   row1: [4*1+5*2+6*3, 4*4+5*5+6*6, 4*7+5*8+6*9, 4*10+5*11+6*12] = [32, 77, 122, 167]
         let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]; // shape [4,3]
+        let b = [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ]; // shape [4,3]
         let out = run_gemm_f32(&a, &[2, 3], &b, &[4, 3], None, 1.0, 1.0, false, true);
         assert_eq!(out, &[14.0, 32.0, 50.0, 68.0, 32.0, 77.0, 122.0, 167.0]);
     }
@@ -2773,8 +3125,20 @@ mod tests {
         // A stored as [3,2] = [[1,4],[2,5],[3,6]]  (i.e. A^T = [[1,2,3],[4,5,6]])
         // A^T @ B = [[1,2,3],[4,5,6]] @ B_standard = [[38,44,50,56],[83,98,113,128]]
         let a_col_major = [1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0]; // shape [3, 2]
-        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-        let out = run_gemm_f32(&a_col_major, &[3, 2], &b, &[3, 4], None, 1.0, 1.0, true, false);
+        let b = [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let out = run_gemm_f32(
+            &a_col_major,
+            &[3, 2],
+            &b,
+            &[3, 4],
+            None,
+            1.0,
+            1.0,
+            true,
+            false,
+        );
         assert_eq!(out, &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]);
     }
 
@@ -2786,9 +3150,21 @@ mod tests {
         // C = [2,2,2,2], 0.5*C = [1,1,1,1]
         // result = [[77,89,101,113],[167,197,227,257]]
         let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b = [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let bias = [2.0f32, 2.0, 2.0, 2.0];
-        let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], Some((&bias, &[4])), 2.0, 0.5, false, false);
+        let out = run_gemm_f32(
+            &a,
+            &[2, 3],
+            &b,
+            &[3, 4],
+            Some((&bias, &[4])),
+            2.0,
+            0.5,
+            false,
+            false,
+        );
         assert_eq!(out, &[77.0, 89.0, 101.0, 113.0, 167.0, 197.0, 227.0, 257.0]);
     }
 
@@ -2796,7 +3172,9 @@ mod tests {
     fn run_gemm_no_bias() {
         // No bias: just A@B = [[38,44,50,56],[83,98,113,128]]
         let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b = [
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let out = run_gemm_f32(&a, &[2, 3], &b, &[3, 4], None, 1.0, 1.0, false, false);
         assert_eq!(out, &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]);
     }
@@ -2831,8 +3209,7 @@ mod tests {
         let b = a.reshape(&[3, 4]);
         let trace = take_trace();
 
-        let module_str = Compiler::build_ir_string(&trace, &[b.id])
-            .expect("mlir emission failed");
+        let module_str = Compiler::build_ir_string(&trace, &[b.id]).expect("mlir emission failed");
         assert!(
             module_str.contains("tosa.reshape"),
             "expected tosa.reshape in IR:\n{module_str}"
@@ -2913,13 +3290,15 @@ mod tests {
         let expected_diag = alpha as f32;
         assert!(
             (out[0] - expected_diag).abs() < 1e-5,
-            "expected {expected_diag}, got {} (alpha precision truncated?)", out[0]
+            "expected {expected_diag}, got {} (alpha precision truncated?)",
+            out[0]
         );
         assert!((out[1]).abs() < 1e-5);
         assert!((out[2]).abs() < 1e-5);
         assert!(
             (out[3] - expected_diag).abs() < 1e-5,
-            "expected {expected_diag}, got {} (alpha precision truncated?)", out[3]
+            "expected {expected_diag}, got {} (alpha precision truncated?)",
+            out[3]
         );
     }
 }

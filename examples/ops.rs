@@ -14,7 +14,10 @@ fn main() {
     let a_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
-    println!("Sub: [10,20,30,40] - [1,2,3,4] = {:?}", result.as_slice::<f32>());
+    println!(
+        "Sub: [10,20,30,40] - [1,2,3,4] = {:?}",
+        result.as_slice::<f32>()
+    );
     assert_eq!(result.as_slice::<f32>(), &[9.0, 18.0, 27.0, 36.0]);
 
     // Mul: [1, 2, 3, 4] * [5, 6, 7, 8] = [5, 12, 21, 32]
@@ -27,7 +30,10 @@ fn main() {
     let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
-    println!("Mul: [1,2,3,4] * [5,6,7,8] = {:?}", result.as_slice::<f32>());
+    println!(
+        "Mul: [1,2,3,4] * [5,6,7,8] = {:?}",
+        result.as_slice::<f32>()
+    );
     assert_eq!(result.as_slice::<f32>(), &[5.0, 12.0, 21.0, 32.0]);
 
     // Div: [10, 20, 30, 40] / [2, 4, 5, 8] = [5, 5, 6, 5]
@@ -40,7 +46,10 @@ fn main() {
     let a_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[2.0, 4.0, 5.0, 8.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
-    println!("Div: [10,20,30,40] / [2,4,5,8] = {:?}", result.as_slice::<f32>());
+    println!(
+        "Div: [10,20,30,40] / [2,4,5,8] = {:?}",
+        result.as_slice::<f32>()
+    );
     assert_eq!(result.as_slice::<f32>(), &[5.0, 5.0, 6.0, 5.0]);
 
     // Neg: -[1, -2, 3, -4] = [-1, 2, -3, 4]
@@ -75,7 +84,10 @@ fn main() {
     let a_buf = Buffer::from_slice::<f32>(&[1.0, -5.0, 3.0, -7.0], &[4], DType::F32);
     let b_buf = Buffer::from_slice::<f32>(&[2.0, 3.0, -4.0, 5.0], &[4], DType::F32);
     let result = compiled.run(&[&a_buf, &b_buf]);
-    println!("Chained relu(a+b): relu([3,-2,-1,-2]) = {:?}", result.as_slice::<f32>());
+    println!(
+        "Chained relu(a+b): relu([3,-2,-1,-2]) = {:?}",
+        result.as_slice::<f32>()
+    );
     assert_eq!(result.as_slice::<f32>(), &[3.0, 0.0, 0.0, 0.0]);
 
     println!();

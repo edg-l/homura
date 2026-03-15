@@ -4,7 +4,7 @@ use crate::{
     Tensor,
     op::NodeId,
     runtime::Buffer,
-    trace::{begin_trace, take_trace, Trace},
+    trace::{Trace, begin_trace, take_trace},
 };
 
 use super::parser::{OnnxAttribute, OnnxError, OnnxModel, OnnxNode};
@@ -216,10 +216,7 @@ fn map_node(node: &OnnxNode, tensors: &mut HashMap<String, Tensor>) -> Result<()
 /// Clone a `Tensor` handle out of the map by edge name.
 ///
 /// Cloning a `Tensor` is cheap (NodeId + Shape + DType — no data).
-fn get_tensor(
-    tensors: &HashMap<String, Tensor>,
-    name: &str,
-) -> Result<Tensor, OnnxError> {
+fn get_tensor(tensors: &HashMap<String, Tensor>, name: &str) -> Result<Tensor, OnnxError> {
     tensors
         .get(name)
         .cloned()
@@ -231,7 +228,7 @@ fn get_tensor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DType, Shape, op::Op, onnx::parser::DynamicInput};
+    use crate::{DType, Shape, onnx::parser::DynamicInput, op::Op};
 
     // ── Test model builder ────────────────────────────────────────────────────
 
@@ -403,7 +400,12 @@ mod tests {
             .ops()
             .iter()
             .filter_map(|op| {
-                if let Op::Input { arg_index, shape, dtype } = op {
+                if let Op::Input {
+                    arg_index,
+                    shape,
+                    dtype,
+                } = op
+                {
                     Some((*arg_index, shape, *dtype))
                 } else {
                     None
@@ -411,7 +413,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(inputs.len(), 3, "expected 3 Input ops (1 dynamic + 2 weights)");
+        assert_eq!(
+            inputs.len(),
+            3,
+            "expected 3 Input ops (1 dynamic + 2 weights)"
+        );
         // arg_index must be 0, 1, 2 in order.
         assert_eq!(inputs[0].0, 0);
         assert_eq!(inputs[1].0, 1);
@@ -474,7 +480,10 @@ mod tests {
         );
 
         // The ReduceMax op should use dim=1 (axis 1 on rank-2 input).
-        let reduce_max_op = trace.ops().iter().find(|op| matches!(op, Op::ReduceMax { .. }));
+        let reduce_max_op = trace
+            .ops()
+            .iter()
+            .find(|op| matches!(op, Op::ReduceMax { .. }));
         assert!(reduce_max_op.is_some(), "expected a ReduceMax op");
         if let Some(Op::ReduceMax { dim, keepdim, .. }) = reduce_max_op {
             assert_eq!(*dim, 1, "ReduceMax should reduce dim 1");
@@ -540,7 +549,14 @@ mod tests {
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out_id = output_ids[0];
         match trace.get(out_id) {
-            Op::Gemm { alpha, beta, trans_a, trans_b, bias, .. } => {
+            Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                bias,
+                ..
+            } => {
                 assert_eq!(*alpha, 1.0);
                 assert_eq!(*beta, 1.0);
                 assert!(!trans_a);
@@ -576,7 +592,14 @@ mod tests {
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out_id = output_ids[0];
         match trace.get(out_id) {
-            Op::Gemm { alpha, beta, trans_a, trans_b, shape, .. } => {
+            Op::Gemm {
+                alpha,
+                beta,
+                trans_a,
+                trans_b,
+                shape,
+                ..
+            } => {
                 assert_eq!(*alpha, 2.0);
                 assert_eq!(*beta, 0.5);
                 assert!(*trans_a);
@@ -672,6 +695,9 @@ mod tests {
             outputs: vec!["Y".to_string()],
         };
         let result = map_graph(&good_model);
-        assert!(result.is_ok(), "second call should succeed but got an error");
+        assert!(
+            result.is_ok(),
+            "second call should succeed but got an error"
+        );
     }
 }

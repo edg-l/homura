@@ -108,7 +108,7 @@ pub enum Op {
         beta: f64,            // scaling for C
         trans_a: bool,
         trans_b: bool,
-        shape: Shape,         // output shape [M, N]
+        shape: Shape, // output shape [M, N]
         dtype: DType,
     },
 }

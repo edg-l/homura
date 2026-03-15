@@ -4,7 +4,10 @@ pub mod proto;
 
 use std::path::Path;
 
-use crate::{Compiler, runtime::{Buffer, CompiledGraph}};
+use crate::{
+    Compiler,
+    runtime::{Buffer, CompiledGraph},
+};
 use parser::OnnxError;
 
 impl std::fmt::Debug for Model {
@@ -226,7 +229,10 @@ mod tests {
         // Model expects 2 inputs; pass 0.
         let result = model.run(&[]);
         match result {
-            Err(OnnxError::WrongInputCount { expected: 2, got: 0 }) => {}
+            Err(OnnxError::WrongInputCount {
+                expected: 2,
+                got: 0,
+            }) => {}
             other => panic!("expected WrongInputCount{{2, 0}}, got: {:?}", other),
         }
     }
@@ -241,7 +247,10 @@ mod tests {
         let z = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let result = model.run(&[&x, &y, &z]);
         match result {
-            Err(OnnxError::WrongInputCount { expected: 2, got: 3 }) => {}
+            Err(OnnxError::WrongInputCount {
+                expected: 2,
+                got: 3,
+            }) => {}
             other => panic!("expected WrongInputCount{{2, 3}}, got: {:?}", other),
         }
     }

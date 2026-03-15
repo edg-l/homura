@@ -79,7 +79,11 @@ fn main() {
             row_sum
         );
         for &v in row_data {
-            assert!(v > 0.0 && v < 1.0, "Softmax value {} out of (0, 1) range", v);
+            assert!(
+                v > 0.0 && v < 1.0,
+                "Softmax value {} out of (0, 1) range",
+                v
+            );
         }
     }
     println!("All assertions passed! Softmax outputs are valid probabilities.");

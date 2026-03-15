@@ -7,10 +7,8 @@ use crate::runtime::Buffer;
 use crate::{DType, Shape};
 
 use super::proto::{
-    self, ModelProto,
-    attribute_proto::AttributeType,
-    type_proto,
-    tensor_shape_proto::dimension::Value as DimValue,
+    self, ModelProto, attribute_proto::AttributeType,
+    tensor_shape_proto::dimension::Value as DimValue, type_proto,
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -77,9 +75,15 @@ pub enum OnnxError {
     /// MLIR compilation of the traced graph failed.
     CompileError(String),
     /// Caller passed the wrong number of dynamic inputs to `Model::run`.
-    WrongInputCount { expected: usize, got: usize },
+    WrongInputCount {
+        expected: usize,
+        got: usize,
+    },
     /// A TensorProto's raw_data byte count doesn't match its declared shape.
-    RawDataLengthMismatch { got: usize, expected: usize },
+    RawDataLengthMismatch {
+        got: usize,
+        expected: usize,
+    },
     /// Model has more than one output (not yet supported).
     MultipleOutputs(usize),
 }
@@ -107,7 +111,10 @@ impl std::fmt::Display for OnnxError {
                 write!(f, "raw_data length {got} != expected {expected}")
             }
             OnnxError::MultipleOutputs(n) => {
-                write!(f, "model has {n} outputs; only a single output is supported")
+                write!(
+                    f,
+                    "model has {n} outputs; only a single output is supported"
+                )
             }
         }
     }
@@ -219,7 +226,11 @@ fn tensor_proto_to_buffer(t: &proto::TensorProto) -> Result<Buffer, OnnxError> {
 
     let buf = if !t.raw_data.is_empty() {
         // raw_data: byte array — copy directly into a Buffer.
-        let num_elems: u64 = if shape.is_empty() { 1 } else { shape.iter().product() };
+        let num_elems: u64 = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
         let expected_bytes = num_elems as usize * dtype.size_bytes();
         if t.raw_data.len() != expected_bytes {
             return Err(OnnxError::RawDataLengthMismatch {
@@ -462,9 +473,7 @@ mod tests {
         assert_eq!(attrs.len(), 4);
         assert!(matches!(attrs["kernel_shape"], OnnxAttribute::Ints(ref v) if v == &[3i64, 3]));
         assert!(matches!(attrs["group"], OnnxAttribute::Int(1)));
-        assert!(
-            matches!(attrs["auto_pad"], OnnxAttribute::String(ref s) if s == "NOTSET")
-        );
+        assert!(matches!(attrs["auto_pad"], OnnxAttribute::String(ref s) if s == "NOTSET"));
     }
 
     // ── Task 5.7: initializer raw_data vs float_data ──────────────────────────
@@ -512,10 +521,7 @@ mod tests {
         let values = vec![1.0f32, 2.0, 3.0, 4.0];
 
         // Build raw_data by reinterpreting the f32 slice as bytes.
-        let raw: Vec<u8> = values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         let tensor_raw = TensorProto {
             name: "W_raw".into(),
@@ -662,7 +668,7 @@ mod tests {
         let tensor = TensorProto {
             name: "fp16_weight".into(),
             dims: vec![2],
-            data_type: 10, // FLOAT16 — unsupported
+            data_type: 10,          // FLOAT16 — unsupported
             raw_data: vec![0u8; 4], // 2 * 2 bytes for fp16
             ..Default::default()
         };
@@ -742,7 +748,7 @@ mod tests {
         let tensor = TensorProto {
             name: "W".into(),
             dims: vec![4],
-            data_type: 1, // FLOAT
+            data_type: 1,           // FLOAT
             raw_data: vec![0u8; 8], // too short
             ..Default::default()
         };
@@ -760,7 +766,13 @@ mod tests {
 
         let result = parse_bytes(&encode(&model));
         assert!(
-            matches!(result, Err(OnnxError::RawDataLengthMismatch { got: 8, expected: 16 })),
+            matches!(
+                result,
+                Err(OnnxError::RawDataLengthMismatch {
+                    got: 8,
+                    expected: 16
+                })
+            ),
             "expected RawDataLengthMismatch{{8, 16}}, got {result:?}"
         );
     }
