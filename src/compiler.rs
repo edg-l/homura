@@ -8785,4 +8785,43 @@ mod tests {
             assert!((got - exp).abs() < 1e-5, "range[{i}]: expected {exp}, got {got}");
         }
     }
+
+    // ── Dynamic runtime tests ──────────────────────────────────────────────
+
+    #[test]
+    fn run_dynamic_matmul_2d() {
+        use crate::shape::DIM_DYNAMIC;
+        // [?, 4] x [4, 8] → [?, 8] with dynamic M dim.
+        // Exercises the batched matmul fallback path (linalg.generic)
+        // for 2D matmul with dynamic dims.
+        begin_trace();
+        let a = Tensor::new(&[DIM_DYNAMIC, 4], DType::F32);
+        let b = Tensor::new(&[4, 8], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id], None)
+            .expect("compile failed");
+
+        // a = [[1,0,0,0]] shape [1,4], b = I4 padded to [4,8]
+        let a_buf = Buffer::from_slice::<f32>(
+            &[1.0, 0.0, 0.0, 0.0],
+            &[1, 4],
+            DType::F32,
+        );
+        let mut w_data = vec![0.0f32; 32];
+        for i in 0..4 { w_data[i * 8 + i] = 1.0; }
+        let b_buf = Buffer::from_slice::<f32>(&w_data, &[4, 8], DType::F32);
+
+        let outputs = compiled.run_dynamic(
+            &[&a_buf, &b_buf],
+            &[crate::Shape(vec![1, 8])],
+        );
+        let out = outputs[0].as_slice::<f32>();
+        assert_eq!(out.len(), 8);
+        assert!((out[0] - 1.0).abs() < 1e-5, "out[0] = {}", out[0]);
+        for i in 1..8 {
+            assert!(out[i].abs() < 1e-5, "out[{i}] = {}", out[i]);
+        }
+    }
 }
