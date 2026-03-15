@@ -306,46 +306,72 @@ fn map_node(
         "Reshape" => {
             let x = get_tensor(tensors, &node.inputs[0])?;
             // ONNX Reshape takes the target shape as a second input. It may be a
-            // static initializer or a value produced at trace time (e.g. by Shape).
+            // static initializer/constant or a value produced by a traced op.
             let shape_name = &node.inputs[1];
-            let shape_buf = constant_data.get(shape_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Reshape: shape input '{shape_name}' must be a static or constant value"
-                ))
-            })?;
-            let target_shape: Vec<i64> = match shape_buf.dtype() {
-                crate::DType::I64 => shape_buf.as_slice::<i64>().to_vec(),
-                crate::DType::I32 => shape_buf
-                    .as_slice::<i32>()
-                    .iter()
-                    .map(|&v| v as i64)
-                    .collect(),
-                other => {
-                    return Err(OnnxError::UnsupportedOp(format!(
-                        "Reshape: shape tensor has unsupported dtype {other:?}"
-                    )));
-                }
-            };
-            let result = x.reshape(&target_shape);
 
-            // Constant propagation: if the data input is a known constant,
-            // propagate it with the new shape so downstream ops can read it.
-            let x_name = &node.inputs[0];
-            if let Some(in_buf) = constant_data.get(x_name).cloned() {
-                let new_shape_u64: Vec<u64> = result
-                    .shape()
-                    .0
-                    .iter()
-                    .map(|&d| d)
-                    .collect();
-                let mut out_buf = Buffer::new(&new_shape_u64, in_buf.dtype());
-                if out_buf.data.len() == in_buf.data.len() {
-                    out_buf.data_mut().copy_from_slice(&in_buf.data);
-                    constant_data.insert(node.outputs[0].clone(), out_buf);
+            // Check whether the shape is fully static (in constant_data, no sentinels).
+            let static_shape_opt = constant_data
+                .get(shape_name)
+                .filter(|buf| !contains_dynamic_sentinel(buf))
+                .and_then(|buf| {
+                    match buf.dtype() {
+                        crate::DType::I64 => Some(buf.as_slice::<i64>().to_vec()),
+                        crate::DType::I32 => Some(
+                            buf.as_slice::<i32>().iter().map(|&v| v as i64).collect(),
+                        ),
+                        _ => None,
+                    }
+                });
+
+            if let Some(target_shape) = static_shape_opt {
+                // Static path: existing constant-fold reshape.
+                let result = x.reshape(&target_shape);
+
+                // Constant propagation: if the data input is a known constant,
+                // propagate it with the new shape so downstream ops can read it.
+                let x_name = &node.inputs[0];
+                if let Some(in_buf) = constant_data.get(x_name).cloned() {
+                    let new_shape_u64: Vec<u64> =
+                        result.shape().0.iter().map(|&d| d).collect();
+                    let mut out_buf = Buffer::new(&new_shape_u64, in_buf.dtype());
+                    if out_buf.data.len() == in_buf.data.len() {
+                        out_buf.data_mut().copy_from_slice(&in_buf.data);
+                        constant_data.insert(node.outputs[0].clone(), out_buf);
+                    }
                 }
+
+                tensors.insert(node.outputs[0].clone(), result);
+            } else {
+                // Dynamic path: shape comes from a traced tensor.
+                // The output rank = number of elements in the shape tensor (a 1-D tensor).
+                let shape_tensor = get_tensor(tensors, shape_name)?;
+                let out_rank = shape_tensor.shape().0[0] as usize;
+
+                // Try to get partial static dims from the constant buffer even if it
+                // contains some sentinel values, so we don't lose static info.
+                let output_shape = if let Some(buf) = constant_data.get(shape_name) {
+                    if let Ok(dims) = read_i64_buffer(buf) {
+                        let v: Vec<u64> = dims
+                            .iter()
+                            .map(|&d| {
+                                if d == -1 || d == i64::MIN {
+                                    crate::shape::DIM_DYNAMIC
+                                } else {
+                                    d as u64
+                                }
+                            })
+                            .collect();
+                        crate::Shape(v)
+                    } else {
+                        crate::Shape(vec![crate::shape::DIM_DYNAMIC; out_rank])
+                    }
+                } else {
+                    crate::Shape(vec![crate::shape::DIM_DYNAMIC; out_rank])
+                };
+
+                let result = x.reshape_with_tensor(&shape_tensor, output_shape);
+                tensors.insert(node.outputs[0].clone(), result);
             }
-
-            tensors.insert(node.outputs[0].clone(), result);
         }
         "Flatten" => {
             let x = get_tensor(tensors, &node.inputs[0])?;
@@ -454,106 +480,169 @@ fn map_node(
         "Shape" => {
             // ONNX Shape: returns the shape of the input tensor as an I64 1-D tensor.
             let input = get_tensor(tensors, &node.inputs[0])?;
-            let dims: Vec<i64> = input.shape().0.iter().map(|&d| d as i64).collect();
-            let buf = Buffer::from_slice::<i64>(&dims, &[dims.len() as u64], crate::DType::I64);
-            let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
-            tensors.insert(node.outputs[0].clone(), t);
+            if input.shape().has_dynamic_dims() {
+                // Dynamic path: trace a ShapeOf op so the compiler emits tensor.dim
+                // at runtime for each dynamic dimension.
+                let result = input.shape_of();
+                tensors.insert(node.outputs[0].clone(), result);
+                // Do NOT insert into constant_data — the values are only known at runtime.
+            } else {
+                // Static path: constant-fold as before.
+                let dims: Vec<i64> = input.shape().0.iter().map(|&d| d as i64).collect();
+                let buf = Buffer::from_slice::<i64>(&dims, &[dims.len() as u64], crate::DType::I64);
+                let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
+                tensors.insert(node.outputs[0].clone(), t);
+            }
         }
 
         "ConstantOfShape" => {
             // ONNX ConstantOfShape: creates a tensor of the given shape filled with `value`.
-            // The shape comes from the first input (must be in constant_data).
+            // The shape comes from the first input (a 1-D I64 tensor).
             let shape_name = &node.inputs[0];
-            let shape_buf = constant_data.get(shape_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "ConstantOfShape: shape input '{shape_name}' is not a known constant"
-                ))
-            })?;
-            let shape_dims = read_i64_buffer(shape_buf)?;
 
-            // The `value` attribute is optional; default is 0.0 f32.
-            let buf = if let Some(OnnxAttribute::Tensor(val_buf)) = node.attributes.get("value") {
-                // Fill target shape with the scalar from val_buf.
-                let dtype = val_buf.dtype();
-                let elem_size = dtype.size_bytes();
+            // Parse fill value and dtype from the `value` attribute.
+            let (fill_value, fill_dtype) =
+                if let Some(OnnxAttribute::Tensor(val_buf)) = node.attributes.get("value") {
+                    let fv = match val_buf.dtype() {
+                        crate::DType::F32 => val_buf.as_slice::<f32>()[0] as f64,
+                        crate::DType::F64 => val_buf.as_slice::<f64>()[0],
+                        crate::DType::I32 => val_buf.as_slice::<i32>()[0] as f64,
+                        crate::DType::I64 => val_buf.as_slice::<i64>()[0] as f64,
+                    };
+                    (fv, val_buf.dtype())
+                } else {
+                    (0.0, crate::DType::F32)
+                };
+
+            // Determine whether the shape is statically known without sentinels.
+            let static_shape_opt = constant_data
+                .get(shape_name)
+                .filter(|buf| !contains_dynamic_sentinel(buf))
+                .and_then(|buf| read_i64_buffer(buf).ok());
+
+            if let Some(shape_dims) = static_shape_opt {
+                // Static path: constant-fold as before.
                 let shape_u64: Vec<u64> = shape_dims.iter().map(|&d| d as u64).collect();
-                let total: usize = shape_u64.iter().product::<u64>().max(1) as usize;
-                let mut out = Buffer::new(&shape_u64, dtype);
-                // val_buf is a scalar (or 1-element tensor); repeat its raw bytes.
-                let elem: &[u8] = &val_buf.data[..elem_size];
-                let out_bytes = out.data_mut();
-                for i in 0..total {
-                    out_bytes[i * elem_size..(i + 1) * elem_size].copy_from_slice(elem);
-                }
-                out
+                let buf = if let Some(OnnxAttribute::Tensor(val_buf)) = node.attributes.get("value") {
+                    let dtype = val_buf.dtype();
+                    let elem_size = dtype.size_bytes();
+                    let total: usize = shape_u64.iter().product::<u64>().max(1) as usize;
+                    let mut out = Buffer::new(&shape_u64, dtype);
+                    let elem: &[u8] = &val_buf.data[..elem_size];
+                    let out_bytes = out.data_mut();
+                    for i in 0..total {
+                        out_bytes[i * elem_size..(i + 1) * elem_size].copy_from_slice(elem);
+                    }
+                    out
+                } else {
+                    Buffer::new(&shape_u64, crate::DType::F32)
+                };
+                let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
+                tensors.insert(node.outputs[0].clone(), t);
             } else {
-                // Default: zeros of dtype F32.
-                let shape_u64: Vec<u64> = shape_dims.iter().map(|&d| d as u64).collect();
-                Buffer::new(&shape_u64, crate::DType::F32)
-            };
+                // Dynamic path: the shape tensor is not fully static.
+                // Determine which output dims are known vs dynamic.
+                let shape_tensor = get_tensor(tensors, shape_name)?;
+                // Rank of the output = number of elements in the 1-D shape tensor.
+                // shape_tensor.shape() = [rank] (it's a 1-D tensor of that many elements).
+                let out_rank = shape_tensor.shape().0[0] as usize;
 
-            let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
-            tensors.insert(node.outputs[0].clone(), t);
+                // Try to get partial shape info from constant_data (even if sentinel).
+                // For positions with sentinel values, mark as DIM_DYNAMIC.
+                let output_shape = if let Some(buf) = constant_data.get(shape_name) {
+                    if let Ok(dims) = read_i64_buffer(buf) {
+                        let v: Vec<u64> = dims
+                            .iter()
+                            .map(|&d| {
+                                if d == i64::MIN || d < 0 {
+                                    crate::shape::DIM_DYNAMIC
+                                } else {
+                                    d as u64
+                                }
+                            })
+                            .collect();
+                        crate::Shape(v)
+                    } else {
+                        // Unknown — all dims dynamic.
+                        crate::Shape(vec![crate::shape::DIM_DYNAMIC; out_rank])
+                    }
+                } else {
+                    // shape_input is a traced tensor — all output dims are unknown.
+                    crate::Shape(vec![crate::shape::DIM_DYNAMIC; out_rank])
+                };
+
+                let result = Tensor::constant_of_shape(&shape_tensor, fill_value, output_shape, fill_dtype);
+                tensors.insert(node.outputs[0].clone(), result);
+            }
         }
 
         "Range" => {
             // ONNX Range: produces [start, start+delta, ...] up to (but not including) limit.
-            // All three inputs (start, limit, delta) must be scalar constants.
             let start_name = &node.inputs[0];
             let limit_name = &node.inputs[1];
             let delta_name = &node.inputs[2];
 
-            let start_buf = constant_data.get(start_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Range: start input '{start_name}' is not a known constant"
-                ))
-            })?;
-            let limit_buf = constant_data.get(limit_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Range: limit input '{limit_name}' is not a known constant"
-                ))
-            })?;
-            let delta_buf = constant_data.get(delta_name).ok_or_else(|| {
-                OnnxError::UnsupportedOp(format!(
-                    "Range: delta input '{delta_name}' is not a known constant"
-                ))
-            })?;
+            // Static path: all three inputs are fully-static constants (no sentinel).
+            let start_static = constant_data
+                .get(start_name)
+                .filter(|b| !contains_dynamic_sentinel(b))
+                .cloned();
+            let limit_static = constant_data
+                .get(limit_name)
+                .filter(|b| !contains_dynamic_sentinel(b))
+                .cloned();
+            let delta_static = constant_data
+                .get(delta_name)
+                .filter(|b| !contains_dynamic_sentinel(b))
+                .cloned();
 
-            // All inputs share the same dtype (ONNX spec constraint).
-            let dtype = start_buf.dtype();
-            let buf = match dtype {
-                crate::DType::I32 => {
-                    let start = start_buf.as_slice::<i32>()[0];
-                    let limit = limit_buf.as_slice::<i32>()[0];
-                    let delta = delta_buf.as_slice::<i32>()[0];
-                    let values: Vec<i32> = range_values(start, limit, delta);
-                    Buffer::from_slice::<i32>(&values, &[values.len() as u64], dtype)
-                }
-                crate::DType::I64 => {
-                    let start = start_buf.as_slice::<i64>()[0];
-                    let limit = limit_buf.as_slice::<i64>()[0];
-                    let delta = delta_buf.as_slice::<i64>()[0];
-                    let values: Vec<i64> = range_values(start, limit, delta);
-                    Buffer::from_slice::<i64>(&values, &[values.len() as u64], dtype)
-                }
-                crate::DType::F32 => {
-                    let start = start_buf.as_slice::<f32>()[0];
-                    let limit = limit_buf.as_slice::<f32>()[0];
-                    let delta = delta_buf.as_slice::<f32>()[0];
-                    let values: Vec<f32> = range_values_f32(start, limit, delta);
-                    Buffer::from_slice::<f32>(&values, &[values.len() as u64], dtype)
-                }
-                crate::DType::F64 => {
-                    let start = start_buf.as_slice::<f64>()[0];
-                    let limit = limit_buf.as_slice::<f64>()[0];
-                    let delta = delta_buf.as_slice::<f64>()[0];
-                    let values: Vec<f64> = range_values_f64(start, limit, delta);
-                    Buffer::from_slice::<f64>(&values, &[values.len() as u64], dtype)
-                }
-            };
-
-            let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
-            tensors.insert(node.outputs[0].clone(), t);
+            if let (Some(start_buf), Some(limit_buf), Some(delta_buf)) =
+                (start_static, limit_static, delta_static)
+            {
+                // All inputs share the same dtype (ONNX spec constraint).
+                let dtype = start_buf.dtype();
+                let buf = match dtype {
+                    crate::DType::I32 => {
+                        let start = start_buf.as_slice::<i32>()[0];
+                        let limit = limit_buf.as_slice::<i32>()[0];
+                        let delta = delta_buf.as_slice::<i32>()[0];
+                        let values: Vec<i32> = range_values(start, limit, delta);
+                        Buffer::from_slice::<i32>(&values, &[values.len() as u64], dtype)
+                    }
+                    crate::DType::I64 => {
+                        let start = start_buf.as_slice::<i64>()[0];
+                        let limit = limit_buf.as_slice::<i64>()[0];
+                        let delta = delta_buf.as_slice::<i64>()[0];
+                        let values: Vec<i64> = range_values(start, limit, delta);
+                        Buffer::from_slice::<i64>(&values, &[values.len() as u64], dtype)
+                    }
+                    crate::DType::F32 => {
+                        let start = start_buf.as_slice::<f32>()[0];
+                        let limit = limit_buf.as_slice::<f32>()[0];
+                        let delta = delta_buf.as_slice::<f32>()[0];
+                        let values: Vec<f32> = range_values_f32(start, limit, delta);
+                        Buffer::from_slice::<f32>(&values, &[values.len() as u64], dtype)
+                    }
+                    crate::DType::F64 => {
+                        let start = start_buf.as_slice::<f64>()[0];
+                        let limit = limit_buf.as_slice::<f64>()[0];
+                        let delta = delta_buf.as_slice::<f64>()[0];
+                        let values: Vec<f64> = range_values_f64(start, limit, delta);
+                        Buffer::from_slice::<f64>(&values, &[values.len() as u64], dtype)
+                    }
+                };
+                let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
+                tensors.insert(node.outputs[0].clone(), t);
+            } else {
+                // Dynamic path: at least one input is non-constant or contains sentinel.
+                let start_t = get_tensor(tensors, start_name)?;
+                let limit_t = get_tensor(tensors, limit_name)?;
+                let delta_t = get_tensor(tensors, delta_name)?;
+                let dtype = start_t.dtype();
+                let output_shape = crate::Shape(vec![crate::shape::DIM_DYNAMIC]);
+                let result = Tensor::range(&start_t, &limit_t, &delta_t, output_shape, dtype);
+                tensors.insert(node.outputs[0].clone(), result);
+            }
         }
 
         "Squeeze" => {
@@ -1073,6 +1162,19 @@ fn read_i64_buffer(buf: &Buffer) -> Result<Vec<i64>, OnnxError> {
     }
 }
 
+/// Returns `true` if an I64 buffer contains `i64::MIN` (the `DIM_DYNAMIC` sentinel).
+///
+/// When `DIM_DYNAMIC` (u64::MAX, which becomes i64::MIN when cast) leaks into a
+/// constant buffer, constant-folding downstream ops would produce garbage results.
+/// This guard prevents that.
+fn contains_dynamic_sentinel(buf: &Buffer) -> bool {
+    if buf.dtype() == crate::DType::I64 {
+        buf.as_slice::<i64>().iter().any(|&v| v == i64::MIN)
+    } else {
+        false
+    }
+}
+
 /// Compute integer range values: [start, start+delta, ...] stopping before limit.
 ///
 /// Follows ONNX semantics: if delta > 0, produces ascending values < limit;
@@ -1235,6 +1337,12 @@ fn eval_gather_constant(data: &Buffer, indices: &Buffer, axis: i64) -> Option<Bu
     }
     // Only handle axis=0.
     if axis != 0 {
+        return None;
+    }
+    // Guard: if data contains DIM_DYNAMIC sentinel (i64::MIN), the result would
+    // be a literal i64::MIN which would corrupt downstream ops (ConstantOfShape,
+    // Range, etc.). Return None so the caller takes the dynamic-trace path.
+    if contains_dynamic_sentinel(data) {
         return None;
     }
 

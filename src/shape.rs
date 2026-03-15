@@ -1,9 +1,10 @@
 /// Sentinel value representing a dynamic (unknown at compile time) dimension.
 ///
-/// Chosen as `u64::MAX` because `u64::MAX as i64 == i64::MIN`, which is MLIR's
-/// `ShapedType::kDynamic` (-9223372036854775808). This means the value can be
-/// passed directly to `RankedTensorType::new` / `MemRefType::new` and the
-/// MLIR C API will interpret it as a `?` dimension.
+/// Chosen as `u64::MAX` for distinctness. Note that `u64::MAX as i64 == -1`,
+/// which is NOT MLIR's `ShapedType::kDynamic` (= `i64::MIN`). The compiler
+/// helper `dim_to_mlir` / `dim_to_mlir_i64` in `compiler.rs` translates this
+/// sentinel to `i64::MIN` (kDynamic) before passing to MLIR C API calls such
+/// as `RankedTensorType::new` and `MemRefType::new`.
 pub const DIM_DYNAMIC: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

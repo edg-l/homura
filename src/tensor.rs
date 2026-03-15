@@ -584,6 +584,7 @@ impl Tensor {
         let id = trace::record(Op::Reshape {
             input: self.id,
             target_shape: resolved,
+            shape_tensor: None,
             shape: shape.clone(),
             dtype: self.dtype,
         });
@@ -591,6 +592,93 @@ impl Tensor {
             id,
             shape,
             dtype: self.dtype,
+        }
+    }
+
+    /// Dynamic reshape: shape comes from a traced tensor at runtime.
+    ///
+    /// `shape_tensor` is a 1-D I64 tensor whose values are the output dimensions.
+    /// `output_shape` is the statically-inferred output shape (may contain DIM_DYNAMIC).
+    pub fn reshape_with_tensor(&self, shape_tensor: &Tensor, output_shape: Shape) -> Tensor {
+        let id = trace::record(Op::Reshape {
+            input: self.id,
+            target_shape: output_shape.0.clone(),
+            shape_tensor: Some(shape_tensor.id),
+            shape: output_shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype: self.dtype,
+        }
+    }
+
+    /// Extract the runtime shape of this tensor as a 1-D I64 tensor.
+    ///
+    /// The output shape is always static `[rank]`. Suitable for models with
+    /// dynamic dimensions where the shape must be computed at runtime.
+    pub fn shape_of(&self) -> Tensor {
+        let rank = self.shape.rank() as u64;
+        let out_shape = Shape(vec![rank]);
+        let id = trace::record(Op::ShapeOf {
+            input: self.id,
+            shape: out_shape.clone(),
+            dtype: DType::I64,
+        });
+        Tensor {
+            id,
+            shape: out_shape,
+            dtype: DType::I64,
+        }
+    }
+
+    /// Create a tensor filled with `fill_value` with shape described by `shape_tensor`.
+    ///
+    /// `shape_tensor` is a 1-D I64 tensor whose elements give the output shape at runtime.
+    /// `output_shape` is the statically-inferred output shape (may contain DIM_DYNAMIC).
+    /// `dtype` is the element type of the output tensor.
+    pub fn constant_of_shape(
+        shape_tensor: &Tensor,
+        fill_value: f64,
+        output_shape: Shape,
+        dtype: DType,
+    ) -> Tensor {
+        let id = trace::record(Op::ConstantOfShape {
+            shape_input: shape_tensor.id,
+            fill_value,
+            shape: output_shape.clone(),
+            dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype,
+        }
+    }
+
+    /// Create an arange tensor: [start, start+delta, ...) up to (not including) limit.
+    ///
+    /// `start`, `limit`, `delta` are scalar (1-element) tensors with the same dtype.
+    /// `output_shape` is typically `[DIM_DYNAMIC]` when inputs are non-constant.
+    pub fn range(
+        start: &Tensor,
+        limit: &Tensor,
+        delta: &Tensor,
+        output_shape: Shape,
+        dtype: DType,
+    ) -> Tensor {
+        let id = trace::record(Op::Range {
+            start: start.id,
+            limit: limit.id,
+            delta: delta.id,
+            shape: output_shape.clone(),
+            dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype,
         }
     }
 
@@ -1917,5 +2005,109 @@ mod tests {
             "expected Op::Where, got {:?}",
             op
         );
+    }
+
+    // ── ShapeOf / ConstantOfShape / Range trace tests ─────────────────────────
+
+    #[test]
+    fn shape_of_records_correct_shape_and_dtype() {
+        begin_trace();
+        let a = Tensor::new(&[3, 4, 5], DType::F32);
+        let s = a.shape_of();
+        let _ = take_trace();
+        // Output shape is always [rank] = [3]
+        assert_eq!(s.shape().0, vec![3u64]);
+        assert_eq!(s.dtype(), DType::I64);
+    }
+
+    #[test]
+    fn shape_of_records_op() {
+        begin_trace();
+        let a = Tensor::new(&[2, 7], DType::F32);
+        let s = a.shape_of();
+        let trace = take_trace();
+        let op = &trace.ops()[s.id.0 as usize];
+        assert!(
+            matches!(op, Op::ShapeOf { .. }),
+            "expected Op::ShapeOf, got {:?}",
+            op
+        );
+    }
+
+    #[test]
+    fn constant_of_shape_records_correct_shape_and_dtype() {
+        use crate::shape::DIM_DYNAMIC;
+        begin_trace();
+        let shape_t = Tensor::new(&[4], DType::I64);
+        let out = Tensor::constant_of_shape(
+            &shape_t,
+            1.0,
+            crate::Shape(vec![1, 12, DIM_DYNAMIC, 64]),
+            DType::F32,
+        );
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![1, 12, DIM_DYNAMIC, 64]);
+        assert_eq!(out.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn constant_of_shape_records_op() {
+        begin_trace();
+        let shape_t = Tensor::new(&[2], DType::I64);
+        let out = Tensor::constant_of_shape(&shape_t, 0.0, crate::Shape(vec![4, 4]), DType::F32);
+        let trace = take_trace();
+        let op = &trace.ops()[out.id.0 as usize];
+        assert!(
+            matches!(op, Op::ConstantOfShape { .. }),
+            "expected Op::ConstantOfShape, got {:?}",
+            op
+        );
+    }
+
+    #[test]
+    fn range_records_correct_shape_and_dtype() {
+        use crate::shape::DIM_DYNAMIC;
+        begin_trace();
+        let start = Tensor::new(&[1], DType::I64);
+        let limit = Tensor::new(&[1], DType::I64);
+        let delta = Tensor::new(&[1], DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![DIM_DYNAMIC]);
+        assert_eq!(out.dtype(), DType::I64);
+    }
+
+    #[test]
+    fn range_records_op() {
+        use crate::shape::DIM_DYNAMIC;
+        begin_trace();
+        let start = Tensor::new(&[1], DType::I64);
+        let limit = Tensor::new(&[1], DType::I64);
+        let delta = Tensor::new(&[1], DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let trace = take_trace();
+        let op = &trace.ops()[out.id.0 as usize];
+        assert!(
+            matches!(op, Op::Range { .. }),
+            "expected Op::Range, got {:?}",
+            op
+        );
+    }
+
+    #[test]
+    fn reshape_with_tensor_records_op_with_shape_tensor() {
+        use crate::shape::DIM_DYNAMIC;
+        begin_trace();
+        let data = Tensor::new(&[6], DType::F32);
+        let shape_t = Tensor::new(&[2], DType::I64);
+        let out = data.reshape_with_tensor(&shape_t, crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC]));
+        let trace = take_trace();
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::Reshape { shape_tensor, .. } => {
+                assert!(shape_tensor.is_some(), "shape_tensor should be Some");
+            }
+            _ => panic!("expected Op::Reshape, got {:?}", op),
+        }
     }
 }

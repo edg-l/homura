@@ -595,14 +595,14 @@ fn build_module<'c>(
             let Op::Input { shape, dtype, .. } = op else {
                 unreachable!()
             };
-            let dims: Vec<i64> = shape.0.iter().map(|&d| d as i64).collect();
+            let dims: Vec<i64> = shape.0.iter().map(|&d| dim_to_mlir_i64(d)).collect();
             let mref = MemRefType::new(dtype.to_mlir_type(context), &dims, None, None);
             arg_types.push((mref.into(), location));
         }
         // Each output gets its own trailing memref argument (sret-style).
         for desc in &output_descs {
             let elem_type = desc.dtype.to_mlir_type(context);
-            let out_dims: Vec<i64> = desc.shape.0.iter().map(|&d| d as i64).collect();
+            let out_dims: Vec<i64> = desc.shape.0.iter().map(|&d| dim_to_mlir_i64(d)).collect();
             let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
             arg_types.push((out_mref.into(), location));
         }
@@ -641,6 +641,29 @@ fn build_module<'c>(
     Ok((num_inputs, output_descs))
 }
 
+// ── Helper: convert a homura shape dim to the MLIR C API representation ──────
+//
+// homura uses DIM_DYNAMIC = u64::MAX as its sentinel for unknown dims.
+// MLIR's C API (mlirRankedTensorTypeGet / mlirMemRefTypeGet) uses
+// ShapedType::kDynamic = i64::MIN as the sentinel for unknown dims.
+//
+// u64::MAX reinterpreted as i64 gives -1, which is NOT kDynamic; MLIR would
+// treat it as a literal negative dimension (and tensor.empty verification
+// would reject it with "incorrect number of dynamic sizes").
+//
+// Convert by mapping: DIM_DYNAMIC → i64::MIN as u64 (= kDynamic in i64 bits).
+// All other values are small u64s that fit in i64 unchanged.
+#[inline]
+fn dim_to_mlir(d: u64) -> u64 {
+    if d == DIM_DYNAMIC { i64::MIN as u64 } else { d }
+}
+
+/// Like `dim_to_mlir` but returns `i64` for use with `MemRefType::new(&[i64])`.
+#[inline]
+fn dim_to_mlir_i64(d: u64) -> i64 {
+    if d == DIM_DYNAMIC { i64::MIN } else { d as i64 }
+}
+
 // ── Helper: build a RankedTensorType for an arbitrary shape ──────────────────
 
 fn make_ranked_tensor_type<'c>(
@@ -648,7 +671,8 @@ fn make_ranked_tensor_type<'c>(
     shape: &[u64],
     dtype: DType,
 ) -> melior::ir::Type<'c> {
-    RankedTensorType::new(shape, dtype.to_mlir_type(context), None).into()
+    let dims: Vec<u64> = shape.iter().map(|&d| dim_to_mlir(d)).collect();
+    RankedTensorType::new(&dims, dtype.to_mlir_type(context), None).into()
 }
 
 // ── Helper: emit tensor.dim to query a runtime dimension ─────────────────────
@@ -3820,11 +3844,32 @@ fn emit_tensor_ops<'c>(
             Op::Reshape {
                 input,
                 target_shape: _,
+                shape_tensor,
                 shape,
                 dtype,
             } => {
                 let input_val = *values.get(input).expect("input not yet emitted");
                 let input_shape = trace.get(*input).shape().0.clone();
+
+                // Dynamic reshape via shape tensor: emit `tensor.reshape %input(%shape_tensor)`.
+                if let Some(st_id) = shape_tensor {
+                    let shape_val = *values.get(st_id).expect("shape_tensor not yet emitted");
+                    let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                    let result_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.reshape", location)
+                                .add_operands(&[input_val, shape_val])
+                                .add_results(&[out_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    values.insert(node_id, result_val);
+                    continue; // skip the static path below
+                }
+
                 let result_val = if shape.0.contains(&DIM_DYNAMIC)
                     || input_shape.contains(&DIM_DYNAMIC)
                 {
@@ -5252,6 +5297,625 @@ fn emit_tensor_ops<'c>(
 
                 values.insert(node_id, result_val);
             }
+
+            // ── ShapeOf ───────────────────────────────────────────────────────
+            //
+            // For each dimension of the input tensor:
+            //   - If static: emit `arith.constant {val} : i64`
+            //   - If dynamic: emit `memref.dim` on the raw memref arg (for Input ops)
+            //     or `tensor.dim` (for computed tensors), then `arith.index_cast` to i64
+            // Then pack all values into `tensor<{rank}xi64>` via `tensor.from_elements`.
+            //
+            // NOTE: We use `memref.dim` on Input ops' block arguments (rather than
+            // `tensor.dim` on the bufferization.to_tensor result) because MLIR's
+            // canonicalization passes can constant-fold `tensor.dim(to_tensor(%arg))`
+            // to the type's shape value (-1) rather than the runtime memref descriptor.
+            // `memref.dim` on a function-argument memref is reliably lowered to a
+            // GEP+load from the descriptor's sizes array.
+
+            Op::ShapeOf { input, shape, .. } => {
+                let input_val = *values.get(input).expect("ShapeOf: input not yet emitted");
+                let input_op = trace.get(*input);
+                let input_shape = input_op.shape().clone();
+                let rank = input_shape.rank();
+                let i64_type = DType::I64.to_mlir_type(context);
+                let index_type = melior::ir::Type::parse(context, "index")
+                    .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+
+                // If the input is a direct Input op, get the raw memref block argument.
+                // Otherwise, use the tensor value (tensor.dim will be used).
+                let memref_arg_opt: Option<melior::ir::Value<'c, 'c>> =
+                    if let Op::Input { arg_index, .. } = input_op {
+                        Some(body_block.argument(*arg_index as usize).unwrap().into())
+                    } else {
+                        None
+                    };
+
+                let mut dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::with_capacity(rank);
+                for i in 0..rank {
+                    let dim_val: melior::ir::Value<'c, 'c> = if input_shape.is_dynamic_dim(i) {
+                        let idx_const: melior::ir::Value = body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(index_type, i as i64).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+
+                        // Use memref.dim on the raw arg if available; otherwise tensor.dim.
+                        let dim_idx: melior::ir::Value = if let Some(mref) = memref_arg_opt {
+                            body_block
+                                .append_operation(
+                                    OperationBuilder::new("memref.dim", location)
+                                        .add_operands(&[mref, idx_const])
+                                        .add_results(&[index_type])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        } else {
+                            body_block
+                                .append_operation(
+                                    OperationBuilder::new("tensor.dim", location)
+                                        .add_operands(&[input_val, idx_const])
+                                        .add_results(&[index_type])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        };
+
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[dim_idx])
+                                    .add_results(&[i64_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    } else {
+                        // Compile-time constant: emit arith.constant directly.
+                        body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(i64_type, input_shape.0[i] as i64).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    };
+                    dim_vals.push(dim_val);
+                }
+
+                let result_type = make_ranked_tensor_type(context, &shape.0, DType::I64);
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.from_elements", location)
+                            .add_operands(&dim_vals)
+                            .add_results(&[result_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
+
+            // ── ConstantOfShape ───────────────────────────────────────────────
+            //
+            // For each DIM_DYNAMIC position i in `shape`:
+            //   extract shape_input[i] as i64, then cast to index
+            // Emit `tensor.empty(%dim...)` + `linalg.fill` with fill_value.
+
+            Op::ConstantOfShape {
+                shape_input,
+                fill_value,
+                shape,
+                dtype,
+            } => {
+                let shape_val = *values.get(shape_input).expect("ConstantOfShape: shape_input not yet emitted");
+                let i64_type = DType::I64.to_mlir_type(context);
+                let index_type = melior::ir::Type::parse(context, "index")
+                    .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+                let elem_type = dtype.to_mlir_type(context);
+
+                // Collect index-typed dynamic dim values from the shape tensor.
+                let mut dynamic_dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                for (i, &dim) in shape.0.iter().enumerate() {
+                    if dim == DIM_DYNAMIC {
+                        let idx_const: melior::ir::Value = body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(index_type, i as i64).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let i64_val: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.extract", location)
+                                    .add_operands(&[shape_val, idx_const])
+                                    .add_results(&[i64_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let idx_val: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[i64_val])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        dynamic_dim_vals.push(idx_val);
+                    }
+                }
+
+                let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                let empty_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.empty", location)
+                            .add_operands(&dynamic_dim_vals)
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Emit the fill scalar constant with the correct dtype.
+                let fill_scalar: melior::ir::Value = match dtype {
+                    DType::F32 => body_block
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, elem_type, *fill_value).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into(),
+                    DType::F64 => body_block
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, elem_type, *fill_value).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into(),
+                    DType::I32 => body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(elem_type, *fill_value as i64).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into(),
+                    DType::I64 => body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(elem_type, *fill_value as i64).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into(),
+                };
+
+                // linalg.fill: fill the empty tensor with the scalar.
+                let fill_seg = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+                    CompileError::AttributeParse("linalg.fill segment sizes".into())
+                })?;
+                let fill_region = {
+                    let fill_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+                    let fill_in = fill_block.argument(0).unwrap().into();
+                    fill_block.append_operation(
+                        OperationBuilder::new("linalg.yield", location)
+                            .add_operands(&[fill_in])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    );
+                    let r = Region::new();
+                    r.append_block(fill_block);
+                    r
+                };
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("linalg.fill", location)
+                            .add_operands(&[fill_scalar, empty_val])
+                            .add_results(&[out_type])
+                            .add_attributes(&[(
+                                Identifier::new(context, "operand_segment_sizes"),
+                                fill_seg,
+                            )])
+                            .add_regions([fill_region])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
+
+            // ── Range ─────────────────────────────────────────────────────────
+            //
+            // Inputs are 1-element rank-1 tensors (tensor<1xDtype>).
+            // 1. Extract scalars: tensor.extract %t[%c0]
+            // 2. Compute length: ceil((limit - start) / delta), clamped >= 0
+            // 3. tensor.empty(%len_idx) : tensor<?xDtype>
+            // 4. linalg.generic body: out[i] = start + i * delta
+
+            Op::Range {
+                start,
+                limit,
+                delta,
+                shape,
+                dtype,
+            } => {
+                let start_val = *values.get(start).expect("Range: start not yet emitted");
+                let limit_val = *values.get(limit).expect("Range: limit not yet emitted");
+                let delta_val = *values.get(delta).expect("Range: delta not yet emitted");
+                let elem_type = dtype.to_mlir_type(context);
+                let index_type = melior::ir::Type::parse(context, "index")
+                    .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+
+                // Extract scalar from 1-element tensor.
+                let c0: melior::ir::Value = body_block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(index_type, 0).into(),
+                        location,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                let s: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.extract", location)
+                            .add_operands(&[start_val, c0])
+                            .add_results(&[elem_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let l: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.extract", location)
+                            .add_operands(&[limit_val, c0])
+                            .add_results(&[elem_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let d: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.extract", location)
+                            .add_operands(&[delta_val, c0])
+                            .add_results(&[elem_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Compute length as an index value.
+                // For integers: diff = l - s; len = max(0, ceildiv(diff, d))
+                // For floats: diff = l - s; len = max(0, ceil(diff / d))
+                let len_idx: melior::ir::Value = match dtype {
+                    DType::I32 | DType::I64 => {
+                        let diff: melior::ir::Value = body_block
+                            .append_operation(arith::subi(l, s, location))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let len: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.ceildivsi", location)
+                                    .add_operands(&[diff, d])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let zero: melior::ir::Value = body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(elem_type, 0).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let len_pos: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.maxsi", location)
+                                    .add_operands(&[len, zero])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[len_pos])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    }
+                    DType::F32 | DType::F64 => {
+                        let diff: melior::ir::Value = body_block
+                            .append_operation(arith::subf(l, s, location))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let quot: melior::ir::Value = body_block
+                            .append_operation(arith::divf(diff, d, location))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let ceil: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("math.ceil", location)
+                                    .add_operands(&[quot])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let zero: melior::ir::Value = body_block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, elem_type, 0.0).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let ceil_pos: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.maximumf", location)
+                                    .add_operands(&[ceil, zero])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        // Convert float length to index via fptosi then index_cast.
+                        let i64_type = DType::I64.to_mlir_type(context);
+                        let len_i64: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.fptosi", location)
+                                    .add_operands(&[ceil_pos])
+                                    .add_results(&[i64_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[len_i64])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    }
+                };
+
+                // tensor.empty(%len_idx) : tensor<?xDtype>
+                let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                let empty_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.empty", location)
+                            .add_operands(&[len_idx])
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // linalg.generic: out[i] = start + i * delta
+                // indexing_maps = [(d0) -> (d0)] (identity for single output)
+                // iterator_types = ["parallel"]
+                let out_map = make_identity_map(context, 1)?;
+                let indexing_maps = ArrayAttribute::new(context, &[out_map]);
+                let iterator_types = make_iterator_types(context, 1)?;
+                let segment_sizes = Attribute::parse(context, "array<i32: 0, 1>")
+                    .ok_or_else(|| CompileError::AttributeParse("range segment sizes".into()))?;
+
+                let linalg_region = {
+                    let linalg_block = Block::new(&[(elem_type, location)]);
+                    // Compute: out[i] = start + index_cast(i) * delta
+                    let i_idx: melior::ir::Value = linalg_block
+                        .append_operation(
+                            OperationBuilder::new("linalg.index", location)
+                                .add_results(&[index_type])
+                                .add_attributes(&[(
+                                    Identifier::new(context, "dim"),
+                                    IntegerAttribute::new(
+                                        melior::ir::Type::parse(context, "i64").unwrap(),
+                                        0,
+                                    )
+                                    .into(),
+                                )])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let i_typed: melior::ir::Value = match dtype {
+                        DType::I32 => {
+                            let i_i64: melior::ir::Value = linalg_block
+                                .append_operation(
+                                    OperationBuilder::new("arith.index_cast", location)
+                                        .add_operands(&[i_idx])
+                                        .add_results(&[DType::I64.to_mlir_type(context)])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            linalg_block
+                                .append_operation(
+                                    OperationBuilder::new("arith.trunci", location)
+                                        .add_operands(&[i_i64])
+                                        .add_results(&[elem_type])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        }
+                        DType::I64 => linalg_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[i_idx])
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                        DType::F32 | DType::F64 => {
+                            let i_i64: melior::ir::Value = linalg_block
+                                .append_operation(
+                                    OperationBuilder::new("arith.index_cast", location)
+                                        .add_operands(&[i_idx])
+                                        .add_results(&[DType::I64.to_mlir_type(context)])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            linalg_block
+                                .append_operation(
+                                    OperationBuilder::new("arith.sitofp", location)
+                                        .add_operands(&[i_i64])
+                                        .add_results(&[elem_type])
+                                        .build()
+                                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        }
+                    };
+
+                    let step: melior::ir::Value = match dtype {
+                        DType::I32 | DType::I64 => linalg_block
+                            .append_operation(arith::muli(i_typed, d, location))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                        DType::F32 | DType::F64 => linalg_block
+                            .append_operation(arith::mulf(i_typed, d, location))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                    };
+                    let val: melior::ir::Value = match dtype {
+                        DType::I32 | DType::I64 => linalg_block
+                            .append_operation(arith::addi(s, step, location))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                        DType::F32 | DType::F64 => linalg_block
+                            .append_operation(arith::addf(s, step, location))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                    };
+
+                    linalg_block.append_operation(
+                        OperationBuilder::new("linalg.yield", location)
+                            .add_operands(&[val])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    );
+
+                    let r = Region::new();
+                    r.append_block(linalg_block);
+                    r
+                };
+
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("linalg.generic", location)
+                            .add_operands(&[empty_val])
+                            .add_results(&[out_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                                (Identifier::new(context, "iterator_types"), iterator_types),
+                                (
+                                    Identifier::new(context, "operand_segment_sizes"),
+                                    segment_sizes,
+                                ),
+                            ])
+                            .add_regions([linalg_region])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
         }
     }
 
@@ -5262,7 +5926,7 @@ fn emit_tensor_ops<'c>(
 
         let output_op = trace.get(output_id);
         let out_elem_type = output_op.dtype().to_mlir_type(context);
-        let dims: Vec<i64> = output_op.shape().0.iter().map(|&d| d as i64).collect();
+        let dims: Vec<i64> = output_op.shape().0.iter().map(|&d| dim_to_mlir_i64(d)).collect();
         let out_memref_type: melior::ir::Type =
             MemRefType::new(out_elem_type, &dims, None, None).into();
 
@@ -7601,5 +8265,167 @@ mod tests {
             ir.err()
         );
         // The module should verify successfully (verified inside build_module).
+    }
+
+    // ── Runtime shape ops: compile tests ──────────────────────────────────────
+
+    #[test]
+    fn compile_shape_of_static() {
+        // ShapeOf on a fully static tensor: output is tensor<3xi64> with compile-time dims.
+        begin_trace();
+        let a = Tensor::new(&[2, 4, 8], DType::F32);
+        let s = a.shape_of();
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[s.id], None);
+        assert!(result.is_ok(), "compile_shape_of_static failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn run_shape_of_static() {
+        // Compile and run ShapeOf on a static tensor; verify the output is [2, 4, 8].
+        begin_trace();
+        let a = Tensor::new(&[2, 4, 8], DType::F32);
+        let s = a.shape_of();
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[s.id], None)
+            .expect("compile failed");
+
+        let a_buf = Buffer::new(&[2, 4, 8], DType::F32);
+        let outputs = compiled.run(&[&a_buf]);
+        let out = outputs[0].as_slice::<i64>();
+        assert_eq!(out, &[2i64, 4, 8], "shape_of output mismatch: {out:?}");
+    }
+
+    #[test]
+    fn compile_shape_of_dynamic() {
+        use crate::shape::DIM_DYNAMIC;
+        // ShapeOf on a tensor with one dynamic dim should still compile.
+        begin_trace();
+        let a = Tensor::new(&[2, DIM_DYNAMIC, 8], DType::F32);
+        let s = a.shape_of();
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[s.id], None);
+        assert!(result.is_ok(), "compile_shape_of_dynamic failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn run_shape_of_dynamic() {
+        use crate::shape::DIM_DYNAMIC;
+        // Run ShapeOf on a dynamic tensor; the middle dim should come from the actual input.
+        // ShapeOf always produces a STATIC output tensor: tensor<{rank}xi64>.
+        // The output shape [3] is always static even when the input dims are dynamic.
+        begin_trace();
+        let a = Tensor::new(&[2, DIM_DYNAMIC, 8], DType::F32);
+        let s = a.shape_of();
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[s.id], None)
+            .expect("compile failed");
+
+        // Provide a concrete input with shape [2, 5, 8] — output shape is [3] (static).
+        let a_buf = Buffer::new(&[2, 5, 8], DType::F32);
+        let outputs = compiled.run(&[&a_buf]);
+        let out = outputs[0].as_slice::<i64>();
+        assert_eq!(out, &[2i64, 5, 8], "dynamic shape_of mismatch: {out:?}");
+    }
+
+    #[test]
+    fn compile_constant_of_shape_static() {
+        // ConstantOfShape with a fully static output shape.
+        begin_trace();
+        let shape_t = Tensor::new(&[3], DType::I64); // will hold [2, 4, 8] at runtime
+        let out = Tensor::constant_of_shape(&shape_t, 1.0, crate::Shape(vec![2, 4, 8]), DType::F32);
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[out.id], None);
+        assert!(result.is_ok(), "compile_constant_of_shape_static failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn run_constant_of_shape_static() {
+        // Verify ConstantOfShape fills the output with 1.0f32.
+        begin_trace();
+        let shape_t = Tensor::new(&[3], DType::I64);
+        let out = Tensor::constant_of_shape(&shape_t, 1.0, crate::Shape(vec![2, 3, 4]), DType::F32);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[out.id], None)
+            .expect("compile failed");
+
+        let shape_buf = Buffer::from_slice::<i64>(&[2, 3, 4], &[3], DType::I64);
+        let outputs = compiled.run(&[&shape_buf]);
+        let data = outputs[0].as_slice::<f32>();
+        assert_eq!(data.len(), 24);
+        for &v in data {
+            assert!((v - 1.0).abs() < 1e-6, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn compile_range_i64_static() {
+        use crate::shape::DIM_DYNAMIC;
+        // Range with static-length output.
+        begin_trace();
+        let start = Tensor::new(&[1], DType::I64);
+        let limit = Tensor::new(&[1], DType::I64);
+        let delta = Tensor::new(&[1], DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let trace = take_trace();
+
+        let result = Compiler::compile(&trace, &[out.id], None);
+        assert!(result.is_ok(), "compile_range_i64 failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn run_range_i64() {
+        use crate::shape::DIM_DYNAMIC;
+        // Range(0, 5, 1) → [0, 1, 2, 3, 4]
+        begin_trace();
+        let start = Tensor::new(&[1], DType::I64);
+        let limit = Tensor::new(&[1], DType::I64);
+        let delta = Tensor::new(&[1], DType::I64);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::I64);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[out.id], None)
+            .expect("compile failed");
+
+        let start_buf = Buffer::from_slice::<i64>(&[0], &[1], DType::I64);
+        let limit_buf = Buffer::from_slice::<i64>(&[5], &[1], DType::I64);
+        let delta_buf = Buffer::from_slice::<i64>(&[1], &[1], DType::I64);
+        let outputs =
+            compiled.run_dynamic(&[&start_buf, &limit_buf, &delta_buf], &[crate::Shape(vec![5])]);
+        let data = outputs[0].as_slice::<i64>();
+        assert_eq!(data, &[0i64, 1, 2, 3, 4], "range output mismatch: {data:?}");
+    }
+
+    #[test]
+    fn run_range_f32() {
+        use crate::shape::DIM_DYNAMIC;
+        // Range(0.0, 3.0, 0.5) → [0.0, 0.5, 1.0, 1.5, 2.0, 2.5] (6 elements)
+        begin_trace();
+        let start = Tensor::new(&[1], DType::F32);
+        let limit = Tensor::new(&[1], DType::F32);
+        let delta = Tensor::new(&[1], DType::F32);
+        let out = Tensor::range(&start, &limit, &delta, crate::Shape(vec![DIM_DYNAMIC]), DType::F32);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[out.id], None)
+            .expect("compile failed");
+
+        let start_buf = Buffer::from_slice::<f32>(&[0.0], &[1], DType::F32);
+        let limit_buf = Buffer::from_slice::<f32>(&[3.0], &[1], DType::F32);
+        let delta_buf = Buffer::from_slice::<f32>(&[0.5], &[1], DType::F32);
+        let outputs =
+            compiled.run_dynamic(&[&start_buf, &limit_buf, &delta_buf], &[crate::Shape(vec![6])]);
+        let data = outputs[0].as_slice::<f32>();
+        assert_eq!(data.len(), 6, "expected 6 elements, got {}", data.len());
+        let expected = [0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5];
+        for (i, (&got, &exp)) in data.iter().zip(expected.iter()).enumerate() {
+            assert!((got - exp).abs() < 1e-5, "range[{i}]: expected {exp}, got {got}");
+        }
     }
 }

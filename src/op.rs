@@ -94,6 +94,10 @@ pub enum Op {
         input: NodeId,
         /// Fully resolved target shape (no -1 values).
         target_shape: Vec<u64>,
+        /// When `Some`, the reshape target shape comes from a traced tensor at
+        /// runtime. The compiler emits `tensor.reshape` using this tensor as the
+        /// shape operand. When `None`, the static `target_shape` is used.
+        shape_tensor: Option<NodeId>,
         shape: Shape,
         dtype: DType,
     },
@@ -227,6 +231,36 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Extract the runtime shape of a tensor as a 1-D I64 tensor.
+    ///
+    /// Output shape is always static `[rank]` (rank is known at trace time).
+    /// dtype is always I64.
+    ShapeOf {
+        input: NodeId,
+        shape: Shape, // always [rank]
+        dtype: DType, // always I64
+    },
+    /// Create a tensor filled with a constant value; output shape may be dynamic.
+    ///
+    /// `shape_input` is a traced 1-D I64 tensor describing the output shape at runtime.
+    /// `shape` is the statically-known output shape (may contain DIM_DYNAMIC).
+    ConstantOfShape {
+        shape_input: NodeId,
+        fill_value: f64,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Create an arange tensor [start, start+delta, ...) up to (not including) limit.
+    ///
+    /// `start`, `limit`, `delta` are scalar (1-element) tensors.
+    /// Output shape is `[DIM_DYNAMIC]` when any input is non-constant.
+    Range {
+        start: NodeId,
+        limit: NodeId,
+        delta: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
 }
 
 impl Op {
@@ -259,6 +293,9 @@ impl Op {
             Op::Concat { shape, .. } => shape,
             Op::Transpose { shape, .. } => shape,
             Op::Where { shape, .. } => shape,
+            Op::ShapeOf { shape, .. } => shape,
+            Op::ConstantOfShape { shape, .. } => shape,
+            Op::Range { shape, .. } => shape,
         }
     }
 
@@ -291,6 +328,9 @@ impl Op {
             Op::Concat { dtype, .. } => *dtype,
             Op::Transpose { dtype, .. } => *dtype,
             Op::Where { dtype, .. } => *dtype,
+            Op::ShapeOf { dtype, .. } => *dtype,
+            Op::ConstantOfShape { dtype, .. } => *dtype,
+            Op::Range { dtype, .. } => *dtype,
         }
     }
 }
