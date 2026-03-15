@@ -2,42 +2,61 @@ pub mod mapper;
 pub mod parser;
 pub mod proto;
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::{
-    Compiler,
+    Compiler, Shape,
     runtime::{Buffer, CompiledGraph},
 };
-use parser::OnnxError;
+use parser::{Dim, OnnxError, OnnxModel};
+
+// ── Compiled state ─────────────────────────────────────────────────────────────
+
+struct CompiledState {
+    compiled: CompiledGraph,
+    weights: Vec<Buffer>,
+    /// Input shapes used during compilation (for shape-change detection).
+    input_shapes: Vec<Shape>,
+}
+
+// ── Model ──────────────────────────────────────────────────────────────────────
+
+/// An ONNX model that is either eagerly compiled (no symbolic dims) or lazily
+/// compiled on the first `run()` call (symbolic dims resolved from input shapes).
+///
+/// Thread-safety: `run()` takes `&self`; the inner `Mutex` serialises the
+/// one-time compilation for models with symbolic dims.
+pub struct Model {
+    num_dynamic_inputs: usize,
+    /// Stored for lazy compilation. `None` after eager compilation.
+    parsed: Option<OnnxModel>,
+    /// `None` until compiled (lazy). `Some` after eager or first lazy compile.
+    state: Mutex<Option<CompiledState>>,
+}
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let compiled = self.state.lock().unwrap().is_some();
         f.debug_struct("Model")
             .field("num_dynamic_inputs", &self.num_dynamic_inputs)
-            .field("num_weights", &self.weights.len())
+            .field("compiled", &compiled)
             .finish_non_exhaustive()
     }
 }
 
-/// A compiled ONNX model ready for repeated inference.
-///
-/// Weights are stored alongside the compiled graph. Each call to `run`
-/// prepends the caller-supplied dynamic inputs to the stored weights and
-/// invokes the JIT function.
-pub struct Model {
-    compiled: CompiledGraph,
-    weights: Vec<Buffer>,
-    num_dynamic_inputs: usize,
-}
-
 impl Model {
-    /// Load and compile an ONNX model from a file path.
+    /// Load an ONNX model from a file path.
+    ///
+    /// Models with all-static shapes are compiled immediately. Models with
+    /// symbolic dimensions defer compilation to the first `run()` call.
     pub fn load(path: impl AsRef<Path>) -> Result<Model, OnnxError> {
         let onnx_model = parser::parse_model(path)?;
         Model::from_onnx(onnx_model)
     }
 
-    /// Load and compile an ONNX model from raw protobuf bytes.
+    /// Load an ONNX model from raw protobuf bytes.
     ///
     /// Useful in tests where models are built in memory.
     pub fn load_bytes(bytes: &[u8]) -> Result<Model, OnnxError> {
@@ -45,28 +64,46 @@ impl Model {
         Model::from_onnx(onnx_model)
     }
 
-    fn from_onnx(onnx_model: parser::OnnxModel) -> Result<Model, OnnxError> {
-        if onnx_model.outputs.len() > 1 {
-            return Err(OnnxError::MultipleOutputs(onnx_model.outputs.len()));
-        }
+    fn from_onnx(onnx_model: OnnxModel) -> Result<Model, OnnxError> {
         let num_dynamic = onnx_model.dynamic_inputs.len();
-        let (trace, output_ids, weights) = mapper::map_graph(&onnx_model)?;
 
-        let compiled = Compiler::compile(&trace, &output_ids)
-            .map_err(|e| OnnxError::CompileError(e.to_string()))?;
-
-        Ok(Model {
-            compiled,
-            weights,
-            num_dynamic_inputs: num_dynamic,
-        })
+        if onnx_model.has_symbolic_dims() {
+            // Defer compilation — we don't know concrete shapes yet.
+            Ok(Model {
+                num_dynamic_inputs: num_dynamic,
+                parsed: Some(onnx_model),
+                state: Mutex::new(None),
+            })
+        } else {
+            // All shapes concrete: compile eagerly (backward compat).
+            // Build dummy input shapes from the concrete dims for the CompiledState.
+            let input_shapes: Vec<Shape> = onnx_model
+                .dynamic_inputs
+                .iter()
+                .map(|di| di.concrete_shape().expect("all dims are concrete"))
+                .collect();
+            let (trace, output_ids, weights) = mapper::map_graph(&onnx_model)?;
+            let compiled = Compiler::compile(&trace, &output_ids)
+                .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+            let state = CompiledState {
+                compiled,
+                weights,
+                input_shapes,
+            };
+            Ok(Model {
+                num_dynamic_inputs: num_dynamic,
+                parsed: None,
+                state: Mutex::new(Some(state)),
+            })
+        }
     }
 
     /// Run inference with the given dynamic inputs.
     ///
+    /// For models with symbolic dimensions, the first call resolves dims from
+    /// the actual input buffer shapes and triggers JIT compilation.
     /// `inputs` must have exactly `num_dynamic_inputs` entries.
-    /// The weights stored in the model are appended automatically.
-    pub fn run(&self, inputs: &[&Buffer]) -> Result<Buffer, OnnxError> {
+    pub fn run(&self, inputs: &[&Buffer]) -> Result<Vec<Buffer>, OnnxError> {
         if inputs.len() != self.num_dynamic_inputs {
             return Err(OnnxError::WrongInputCount {
                 expected: self.num_dynamic_inputs,
@@ -74,15 +111,131 @@ impl Model {
             });
         }
 
-        let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + self.weights.len());
+        let mut guard = self.state.lock().unwrap();
+
+        if guard.is_none() {
+            // Lazy compile path: resolve symbolic dims from actual input shapes.
+            let parsed = self
+                .parsed
+                .as_ref()
+                .expect("parsed model must be present when state is None");
+
+            let resolved = resolve_symbolic_dims(parsed, inputs)?;
+            *guard = Some(compile_model(&resolved, inputs)?);
+        }
+
+        let state = guard.as_ref().unwrap();
+
+        // Verify input shapes match what the model was compiled with.
+        if self.parsed.is_some() {
+            for (i, buf) in inputs.iter().enumerate() {
+                if buf.shape() != &state.input_shapes[i] {
+                    return Err(OnnxError::ShapeMismatch {
+                        input_index: i,
+                        expected: state.input_shapes[i].clone(),
+                        got: buf.shape().clone(),
+                    });
+                }
+            }
+        }
+        let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + state.weights.len());
         all_args.extend_from_slice(inputs);
-        for w in &self.weights {
+        for w in &state.weights {
             all_args.push(w);
         }
 
-        let output = self.compiled.run(&all_args);
-        Ok(output)
+        Ok(state.compiled.run(&all_args))
     }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Compile an `OnnxModel` whose dynamic inputs all have concrete shapes.
+fn compile_model(model: &OnnxModel, inputs: &[&Buffer]) -> Result<CompiledState, OnnxError> {
+    let input_shapes: Vec<Shape> = inputs.iter().map(|b| b.shape().clone()).collect();
+    let (trace, output_ids, weights) = mapper::map_graph(model)?;
+    let compiled = Compiler::compile(&trace, &output_ids)
+        .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+    Ok(CompiledState {
+        compiled,
+        weights,
+        input_shapes,
+    })
+}
+
+/// Build a resolved copy of `model` where every symbolic dim in
+/// `dynamic_inputs` is replaced with the concrete size read from `inputs`.
+///
+/// Returns `ConflictingSymbolicDim` if two inputs disagree on the same name.
+/// Returns `UnresolvedSymbolicDim` if a name appears but no input covers it.
+fn resolve_symbolic_dims(model: &OnnxModel, inputs: &[&Buffer]) -> Result<OnnxModel, OnnxError> {
+    // Build name → value map from the provided buffers.
+    let mut sym_map: HashMap<String, u64> = HashMap::new();
+
+    for (input_spec, buffer) in model.dynamic_inputs.iter().zip(inputs.iter()) {
+        let buf_shape = buffer.shape();
+        for (idx, dim) in input_spec.dims.iter().enumerate() {
+            if let Dim::Symbolic(name) = dim {
+                // If the caller passed a buffer with fewer dims than declared,
+                // this symbolic dim position is not covered — it stays absent
+                // from sym_map and will be caught by the unresolved check below.
+                if let Some(&concrete) = buf_shape.0.get(idx) {
+                    match sym_map.get(name) {
+                        None => {
+                            sym_map.insert(name.clone(), concrete);
+                        }
+                        Some(&existing) if existing == concrete => {} // consistent
+                        Some(&existing) => {
+                            return Err(OnnxError::ConflictingSymbolicDim {
+                                name: name.clone(),
+                                first: existing,
+                                second: concrete,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Verify all symbolic dims are resolved.
+    for input_spec in &model.dynamic_inputs {
+        for dim in &input_spec.dims {
+            if let Dim::Symbolic(name) = dim {
+                if !sym_map.contains_key(name) {
+                    return Err(OnnxError::UnresolvedSymbolicDim(name.clone()));
+                }
+            }
+        }
+    }
+
+    // Build a resolved OnnxModel clone with all dims replaced.
+    let resolved_inputs = model
+        .dynamic_inputs
+        .iter()
+        .map(|inp| {
+            let resolved_dims = inp
+                .dims
+                .iter()
+                .map(|d| match d {
+                    Dim::Fixed(v) => Dim::Fixed(*v),
+                    Dim::Symbolic(name) => Dim::Fixed(*sym_map.get(name).unwrap()),
+                })
+                .collect();
+            parser::DynamicInput {
+                name: inp.name.clone(),
+                dims: resolved_dims,
+                dtype: inp.dtype,
+            }
+        })
+        .collect();
+
+    Ok(OnnxModel {
+        nodes: model.nodes.clone(),
+        initializers: model.initializers.clone(),
+        dynamic_inputs: resolved_inputs,
+        outputs: model.outputs.clone(),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -269,9 +422,9 @@ mod tests {
 
         let input_data: Vec<f32> = vec![1.0f32; 1 * 1 * 8 * 8];
         let input = Buffer::from_slice::<f32>(&input_data, &[1, 1, 8, 8], DType::F32);
-        let output = model.run(&[&input]).expect("run failed");
+        let outputs = model.run(&[&input]).expect("run failed");
 
-        let out = output.as_slice::<f32>();
+        let out = outputs[0].as_slice::<f32>();
 
         // Task 13.3: verify shape and values.
         assert_eq!(out.len(), 4, "expected 4 output values");
@@ -298,8 +451,8 @@ mod tests {
     fn load_and_run_mnist_12() {
         let model = Model::load("tests/fixtures/mnist-12.onnx").expect("load failed");
         let input = Buffer::from_slice::<f32>(&vec![0.0f32; 784], &[1, 1, 28, 28], DType::F32);
-        let output = model.run(&[&input]).expect("run failed");
-        let out = output.as_slice::<f32>();
+        let outputs = model.run(&[&input]).expect("run failed");
+        let out = outputs[0].as_slice::<f32>();
         assert_eq!(out.len(), 10, "expected 10 output logits");
         assert!(
             out.iter().all(|v| v.is_finite()),
@@ -405,9 +558,9 @@ mod tests {
 
         let x = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let y = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
-        let out = model.run(&[&x, &y]).expect("run failed");
+        let outs = model.run(&[&x, &y]).expect("run failed");
 
-        assert_eq!(out.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(outs[0].as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
     }
 
     #[test]
@@ -418,9 +571,9 @@ mod tests {
 
         // Only 1 dynamic input — the weight is baked in.
         let x = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
-        let out = model.run(&[&x]).expect("run failed");
+        let outs = model.run(&[&x]).expect("run failed");
 
-        assert_eq!(out.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(outs[0].as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
     }
 
     // ── Task 8.5: error cases ──────────────────────────────────────────────────
@@ -478,16 +631,16 @@ mod tests {
 
         let x1 = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let y1 = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
-        let out1 = model.run(&[&x1, &y1]).expect("first run failed");
-        assert_eq!(out1.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
+        let outs1 = model.run(&[&x1, &y1]).expect("first run failed");
+        assert_eq!(outs1[0].as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
 
         let x2 = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F32);
         let y2 = Buffer::from_slice::<f32>(&[50.0, 60.0, 70.0, 80.0], &[4], DType::F32);
-        let out2 = model.run(&[&x2, &y2]).expect("second run failed");
-        assert_eq!(out2.as_slice::<f32>(), &[55.0, 66.0, 77.0, 88.0]);
+        let outs2 = model.run(&[&x2, &y2]).expect("second run failed");
+        assert_eq!(outs2[0].as_slice::<f32>(), &[55.0, 66.0, 77.0, 88.0]);
 
         // First result is still correct — no aliasing between runs.
-        assert_eq!(out1.as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(outs1[0].as_slice::<f32>(), &[11.0, 22.0, 33.0, 44.0]);
     }
 
     #[test]
@@ -497,22 +650,24 @@ mod tests {
         let model = Model::load_bytes(&bytes).expect("load_bytes failed");
 
         let x1 = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
-        let out1 = model.run(&[&x1]).expect("first run failed");
-        assert_eq!(out1.as_slice::<f32>(), &[1.5, 3.0, 4.5, 6.0]);
+        let outs1 = model.run(&[&x1]).expect("first run failed");
+        assert_eq!(outs1[0].as_slice::<f32>(), &[1.5, 3.0, 4.5, 6.0]);
 
         // Run again with different input; weight should be unchanged.
         let x2 = Buffer::from_slice::<f32>(&[10.0, 10.0, 10.0, 10.0], &[4], DType::F32);
-        let out2 = model.run(&[&x2]).expect("second run failed");
-        assert_eq!(out2.as_slice::<f32>(), &[10.5, 11.0, 11.5, 12.0]);
+        let outs2 = model.run(&[&x2]).expect("second run failed");
+        assert_eq!(outs2[0].as_slice::<f32>(), &[10.5, 11.0, 11.5, 12.0]);
 
         // Confirm first result is independent.
-        assert_eq!(out1.as_slice::<f32>(), &[1.5, 3.0, 4.5, 6.0]);
+        assert_eq!(outs1[0].as_slice::<f32>(), &[1.5, 3.0, 4.5, 6.0]);
     }
 
-    // ── Regression: Issue 9 — model with 2 outputs returns MultipleOutputs ────
+    // ── Task 2.6: multi-output model loads and returns all outputs ────────────
 
     #[test]
-    fn model_with_two_outputs_returns_error() {
+    fn model_with_two_outputs_succeeds() {
+        // Add(X, Y) -> Z; graph outputs are Z and X.
+        // Both Z (= X + Y) and X should be returned.
         let bytes = encode(&ModelProto {
             ir_version: 8,
             graph: Some(GraphProto {
@@ -523,19 +678,31 @@ mod tests {
                     ..Default::default()
                 }],
                 input: vec![value_info("X", &[4]), value_info("Y", &[4])],
-                // Two outputs: Z and X (both valid edges, but >1 output unsupported).
+                // Two outputs: Z (add result) and X (passthrough of first input).
                 output: vec![value_info("Z", &[4]), value_info("X", &[4])],
                 ..Default::default()
             }),
             ..Default::default()
         });
 
-        let result = Model::load_bytes(&bytes);
-        match result {
-            Err(OnnxError::MultipleOutputs(2)) => {}
-            Err(other) => panic!("expected MultipleOutputs(2), got Err({other})"),
-            Ok(_) => panic!("expected Err for 2-output model, got Ok"),
-        }
+        let model = Model::load_bytes(&bytes).expect("load must succeed for 2-output model");
+        let x = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let y = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+        let outputs = model.run(&[&x, &y]).expect("run must succeed");
+
+        assert_eq!(outputs.len(), 2, "expected 2 output buffers");
+        // First output: Z = X + Y
+        assert_eq!(
+            outputs[0].as_slice::<f32>(),
+            &[11.0, 22.0, 33.0, 44.0],
+            "first output (Z = X + Y) is wrong"
+        );
+        // Second output: X (passthrough)
+        assert_eq!(
+            outputs[1].as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0],
+            "second output (X passthrough) is wrong"
+        );
     }
 
     // ── Multi-op round-trip tests ────────────────────────────────────────────
@@ -559,8 +726,8 @@ mod tests {
         });
         let model = Model::load_bytes(&bytes).expect("load failed");
         let x = Buffer::from_slice::<f32>(&[-1.0, 0.0, 3.0, -4.0], &[4], DType::F32);
-        let result = model.run(&[&x]).unwrap();
-        assert_eq!(result.as_slice::<f32>(), &[0.0, 0.0, 3.0, 0.0]);
+        let results = model.run(&[&x]).unwrap();
+        assert_eq!(results[0].as_slice::<f32>(), &[0.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
@@ -591,9 +758,9 @@ mod tests {
         let model = Model::load_bytes(&bytes).expect("load failed");
         let x = Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F32);
         let y = Buffer::from_slice::<f32>(&[5.0, 6.0, -7.0, 8.0], &[4], DType::F32);
-        let result = model.run(&[&x, &y]).unwrap();
+        let results = model.run(&[&x, &y]).unwrap();
         // add=[6,4,-4,4], relu=[6,4,0,4]
-        assert_eq!(result.as_slice::<f32>(), &[6.0, 4.0, 0.0, 4.0]);
+        assert_eq!(results[0].as_slice::<f32>(), &[6.0, 4.0, 0.0, 4.0]);
     }
 
     #[test]
@@ -652,8 +819,295 @@ mod tests {
         });
         let model = Model::load_bytes(&bytes).expect("load failed");
         let x = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
-        let result = model.run(&[&x]).unwrap();
+        let results = model.run(&[&x]).unwrap();
         // x + w1 + w2 = [111, 222, 333, 444]
-        assert_eq!(result.as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
+        assert_eq!(results[0].as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
+    }
+
+    // ── Task 1.6: symbolic-dim model tests ────────────────────────────────────
+
+    /// Build Add(X, Y) -> Z where X has a symbolic first dim `batch` and fixed
+    /// second dim `width`. Returns bytes for `Model::load_bytes`.
+    fn make_symbolic_add_model_bytes(sym_name: &str, fixed_dim: i64) -> Vec<u8> {
+        use crate::onnx::proto::tensor_shape_proto::Dimension;
+        use crate::onnx::proto::type_proto;
+
+        let sym_dim = Dimension {
+            value: Some(
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
+                    sym_name.into(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let fixed_dim_proto = Dimension {
+            value: Some(
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(fixed_dim),
+            ),
+            ..Default::default()
+        };
+
+        let make_tensor_type = || TypeProto {
+            value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                elem_type: 1, // FLOAT
+                shape: Some(TensorShapeProto {
+                    dim: vec![sym_dim.clone(), fixed_dim_proto.clone()],
+                }),
+            })),
+            ..Default::default()
+        };
+
+        encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    op_type: "Add".into(),
+                    input: vec!["X".into(), "Y".into()],
+                    output: vec!["Z".into()],
+                    ..Default::default()
+                }],
+                input: vec![
+                    ValueInfoProto {
+                        name: "X".into(),
+                        r#type: Some(make_tensor_type()),
+                        ..Default::default()
+                    },
+                    ValueInfoProto {
+                        name: "Y".into(),
+                        r#type: Some(make_tensor_type()),
+                        ..Default::default()
+                    },
+                ],
+                output: vec![ValueInfoProto {
+                    name: "Z".into(),
+                    r#type: Some(make_tensor_type()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn model_with_symbolic_dims_defers_compilation() {
+        let bytes = make_symbolic_add_model_bytes("batch", 4);
+        let model = Model::load_bytes(&bytes).expect("load must succeed for symbolic dims");
+
+        // Compilation should have been deferred: state is None until run().
+        let guard = model.state.lock().unwrap();
+        assert!(
+            guard.is_none(),
+            "compilation should be deferred for symbolic-dim models"
+        );
+    }
+
+    #[test]
+    fn symbolic_dims_resolved_on_first_run() {
+        let bytes = make_symbolic_add_model_bytes("batch", 4);
+        let model = Model::load_bytes(&bytes).expect("load failed");
+
+        // Concrete shape: batch=2, fixed=4 → [2, 4]
+        let x = Buffer::from_slice::<f32>(&vec![1.0f32; 8], &[2, 4], DType::F32);
+        let y = Buffer::from_slice::<f32>(&vec![2.0f32; 8], &[2, 4], DType::F32);
+        let outs = model.run(&[&x, &y]).expect("first run failed");
+
+        let result = outs[0].as_slice::<f32>();
+        assert_eq!(result.len(), 8, "output should have 8 elements");
+        assert!(
+            result.iter().all(|&v| (v - 3.0f32).abs() < 1e-6),
+            "expected all 3.0, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_symbolic_dim_returns_error() {
+        // Build a model where X and Y share the same symbolic dim name "batch"
+        // but we pass inputs with different sizes in that position.
+        let bytes = make_symbolic_add_model_bytes("batch", 4);
+        let model = Model::load_bytes(&bytes).expect("load failed");
+
+        // X has batch=2, Y has batch=3 — conflict on "batch".
+        let x = Buffer::from_slice::<f32>(&vec![1.0f32; 8], &[2, 4], DType::F32);
+        let y = Buffer::from_slice::<f32>(&vec![1.0f32; 12], &[3, 4], DType::F32);
+        let result = model.run(&[&x, &y]);
+
+        assert!(
+            matches!(
+                result,
+                Err(OnnxError::ConflictingSymbolicDim { .. })
+            ),
+            "expected ConflictingSymbolicDim, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_symbolic_dim_returns_error() {
+        // Build a model with a symbolic dim that is NOT covered by the provided
+        // input buffer shapes. We do this by giving an input whose symbolic dim
+        // position has the wrong rank (0-dim buffer vs expected 2-dim).
+        // More directly: build a model with a symbolic dim and pass a scalar
+        // that has no dims to cover the symbolic slot.
+        //
+        // We construct this by building a 1-input model with shape [sym, 4] and
+        // passing a buffer whose shape has only 1 dim, which will panic in the
+        // indexing. Instead, we test via a model where the second input covers a
+        // *different* symbolic dim name than the first, leaving the first's sym
+        // unresolved.
+        use crate::onnx::proto::tensor_shape_proto::Dimension;
+        use crate::onnx::proto::type_proto;
+
+        // X has dim "sym_a", Y has dim "sym_b" — two different symbolic names.
+        // We only pass buffers that cover sym_a (batch=2), leaving sym_b
+        // unresolved (because we give Y a different batch size, which would
+        // conflict first). We need a model where a sym dim simply never appears
+        // in any input buffer position.
+        //
+        // Simplest: build a model with ONE input whose shape is [sym, 4] but
+        // pass zero inputs (wrong count) → WrongInputCount, not what we want.
+        //
+        // Instead: use two inputs, X=[sym_x, 4] and Y=[sym_y, 4], then provide
+        // X but Y uses a different sym name whose position we zero out. Actually
+        // the resolution loop iterates both inputs, so both names get resolved.
+        //
+        // The cleanest way: call resolve_symbolic_dims directly with a model
+        // that has a sym dim but empty inputs list.
+        let sym_dim = Dimension {
+            value: Some(
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
+                    "unresolvable".into(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let make_type = || TypeProto {
+            value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                elem_type: 1,
+                shape: Some(TensorShapeProto {
+                    dim: vec![sym_dim.clone()],
+                }),
+            })),
+            ..Default::default()
+        };
+        let bytes = encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    op_type: "Relu".into(),
+                    input: vec!["X".into()],
+                    output: vec!["Y".into()],
+                    ..Default::default()
+                }],
+                input: vec![ValueInfoProto {
+                    name: "X".into(),
+                    r#type: Some(make_type()),
+                    ..Default::default()
+                }],
+                output: vec![ValueInfoProto {
+                    name: "Y".into(),
+                    r#type: Some(make_type()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // Load deferred model (not used directly; we test via model2 below).
+        let _model = Model::load_bytes(&bytes).expect("load failed");
+
+        // Pass an input with 0 dims (scalar-like). The sym_dim "unresolvable"
+        // sits at index 0 in the input's dims vec, but the actual buffer has
+        // shape [4], so index 0 IS resolved to 4 — that's fine.
+        //
+        // True unresolved dim: build a model where input has 2 dims [fixed, sym]
+        // but the buffer passed has only 1 dim — buffer.shape().0[1] would
+        // panic. So we test unresolved by using resolve_symbolic_dims with an
+        // empty inputs slice via the internal helper instead.
+        //
+        // Since resolve_symbolic_dims is private, we trigger it through run()
+        // by constructing a buffer whose shape length is shorter than the dims
+        // vec. This would panic in the zip, not reach the unresolved check.
+        //
+        // The cleanest approach: use a model where NO input carries the symbolic
+        // dim at all — i.e., a zero-input model (only initializers) where some
+        // internal-only value has a symbolic shape. But ONNX doesn't model that.
+        //
+        // Alternative: expose the path via public OnnxModel → test at the Model
+        // level by passing a buffer too small. But that causes an index panic.
+        //
+        // Simplest testable case: build the model where the single input has
+        // 2 dims ([fixed=4, sym="unresolvable"]) but pass a 1-D buffer of len
+        // 4. The zip stops at 1 element (the fixed dim), and Symbolic at index
+        // 1 is never visited → UnresolvedSymbolicDim.
+        use crate::onnx::proto::tensor_shape_proto::Dimension as D2;
+        let fixed_dim = D2 {
+            value: Some(
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(4),
+            ),
+            ..Default::default()
+        };
+        let sym2 = D2 {
+            value: Some(
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
+                    "unresolved_sym".into(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let make_type2 = || TypeProto {
+            value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                elem_type: 1,
+                shape: Some(TensorShapeProto {
+                    dim: vec![fixed_dim.clone(), sym2.clone()],
+                }),
+            })),
+            ..Default::default()
+        };
+        let bytes2 = encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    op_type: "Relu".into(),
+                    input: vec!["X".into()],
+                    output: vec!["Y".into()],
+                    ..Default::default()
+                }],
+                input: vec![ValueInfoProto {
+                    name: "X".into(),
+                    r#type: Some(make_type2()),
+                    ..Default::default()
+                }],
+                output: vec![ValueInfoProto {
+                    name: "Y".into(),
+                    r#type: Some(make_type2()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let model2 = Model::load_bytes(&bytes2).expect("load failed");
+        // Pass a 1-D buffer: zip covers only dim[0]=Fixed(4), dim[1]=Symbolic stays unresolved.
+        let x = Buffer::from_slice::<f32>(&[1.0f32; 4], &[4], DType::F32);
+        let result = model2.run(&[&x]);
+        assert!(
+            matches!(result, Err(OnnxError::UnresolvedSymbolicDim(_))),
+            "expected UnresolvedSymbolicDim, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn static_model_still_compiles_eagerly() {
+        // A model with all-fixed dims must compile during load(), not lazily.
+        let bytes = make_add_model_bytes();
+        let model = Model::load_bytes(&bytes).expect("load failed");
+
+        // Compilation must have happened eagerly: state is Some.
+        let guard = model.state.lock().unwrap();
+        assert!(
+            guard.is_some(),
+            "static model should compile eagerly at load time"
+        );
     }
 }

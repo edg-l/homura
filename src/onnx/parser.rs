@@ -13,8 +13,18 @@ use super::proto::{
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// A single dimension in an input tensor shape.
+///
+/// ONNX models may use symbolic names (e.g. `batch_size`, `sequence_length`)
+/// for dimensions that are resolved at runtime from the actual input shapes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dim {
+    Fixed(u64),
+    Symbolic(String),
+}
+
 /// A parsed and validated ONNX model ready for further lowering.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OnnxModel {
     /// Computation nodes in topological order (guaranteed by ONNX spec).
     pub nodes: Vec<OnnxNode>,
@@ -26,8 +36,17 @@ pub struct OnnxModel {
     pub outputs: Vec<String>,
 }
 
+impl OnnxModel {
+    /// Returns `true` if any dynamic input has a symbolic (non-fixed) dimension.
+    pub fn has_symbolic_dims(&self) -> bool {
+        self.dynamic_inputs
+            .iter()
+            .any(|i| i.dims.iter().any(|d| matches!(d, Dim::Symbolic(_))))
+    }
+}
+
 /// A single ONNX computation node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OnnxNode {
     pub op_type: String,
     /// Input edge names (some may be empty strings for optional inputs).
@@ -38,11 +57,28 @@ pub struct OnnxNode {
 }
 
 /// A dynamic (runtime-provided) input to the model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynamicInput {
     pub name: String,
-    pub shape: Shape,
+    /// Per-dimension specification: fixed integer or symbolic name.
+    pub dims: Vec<Dim>,
     pub dtype: DType,
+}
+
+impl DynamicInput {
+    /// Try to produce a concrete `Shape` from this input's dims.
+    ///
+    /// Returns `None` if any dim is symbolic (caller must resolve first).
+    pub fn concrete_shape(&self) -> Option<Shape> {
+        let mut out = Vec::with_capacity(self.dims.len());
+        for d in &self.dims {
+            match d {
+                Dim::Fixed(v) => out.push(*v),
+                Dim::Symbolic(_) => return None,
+            }
+        }
+        Some(Shape(out))
+    }
 }
 
 /// A typed attribute value from an ONNX node.
@@ -53,6 +89,8 @@ pub enum OnnxAttribute {
     String(String),
     Ints(Vec<i64>),
     Floats(Vec<f32>),
+    /// A tensor-typed attribute (e.g. the `value` attribute of a `Constant` node).
+    Tensor(Buffer),
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -84,8 +122,16 @@ pub enum OnnxError {
         got: usize,
         expected: usize,
     },
-    /// Model has more than one output (not yet supported).
-    MultipleOutputs(usize),
+    /// Two inputs assign different concrete values to the same symbolic dim name.
+    ConflictingSymbolicDim { name: String, first: u64, second: u64 },
+    /// A symbolic dim appears in the model but no input resolves it.
+    UnresolvedSymbolicDim(String),
+    /// Input shape changed after lazy compilation (symbolic-dim model).
+    ShapeMismatch {
+        input_index: usize,
+        expected: Shape,
+        got: Shape,
+    },
 }
 
 impl std::fmt::Display for OnnxError {
@@ -110,10 +156,19 @@ impl std::fmt::Display for OnnxError {
             OnnxError::RawDataLengthMismatch { got, expected } => {
                 write!(f, "raw_data length {got} != expected {expected}")
             }
-            OnnxError::MultipleOutputs(n) => {
+            OnnxError::ConflictingSymbolicDim { name, first, second } => {
                 write!(
                     f,
-                    "model has {n} outputs; only a single output is supported"
+                    "conflicting values for symbolic dim '{name}': {first} vs {second}"
+                )
+            }
+            OnnxError::UnresolvedSymbolicDim(name) => {
+                write!(f, "symbolic dim '{name}' was not resolved by any input")
+            }
+            OnnxError::ShapeMismatch { input_index, expected, got } => {
+                write!(
+                    f,
+                    "input {input_index} shape mismatch: compiled for {expected:?}, got {got:?}"
                 )
             }
         }
@@ -174,10 +229,10 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
         if init_names.contains(vi.name.as_str()) {
             continue;
         }
-        let (shape, dtype) = extract_input_type(vi)?;
+        let (dims, dtype) = extract_input_type(vi)?;
         dynamic_inputs.push(DynamicInput {
             name: vi.name.clone(),
-            shape,
+            dims,
             dtype,
         });
     }
@@ -222,15 +277,28 @@ fn tensor_proto_to_buffer(t: &proto::TensorProto) -> Result<Buffer, OnnxError> {
         }
         shape.push(d as u64);
     }
+    let is_bool = t.data_type == 9;
     let dtype = onnx_dtype(t.data_type)?;
 
-    let buf = if !t.raw_data.is_empty() {
+    let num_elems: u64 = if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
+    };
+
+    let buf = if is_bool && !t.raw_data.is_empty() {
+        // Bool raw_data: 1 byte per element → convert to I64
+        let expected_bytes = num_elems as usize;
+        if t.raw_data.len() != expected_bytes {
+            return Err(OnnxError::RawDataLengthMismatch {
+                got: t.raw_data.len(),
+                expected: expected_bytes,
+            });
+        }
+        let i64_data: Vec<i64> = t.raw_data.iter().map(|&b| b as i64).collect();
+        Buffer::from_slice::<i64>(&i64_data, &shape, DType::I64)
+    } else if !t.raw_data.is_empty() {
         // raw_data: byte array — copy directly into a Buffer.
-        let num_elems: u64 = if shape.is_empty() {
-            1
-        } else {
-            shape.iter().product()
-        };
         let expected_bytes = num_elems as usize * dtype.size_bytes();
         if t.raw_data.len() != expected_bytes {
             return Err(OnnxError::RawDataLengthMismatch {
@@ -261,12 +329,17 @@ fn onnx_dtype(data_type: i32) -> Result<DType, OnnxError> {
         11 => Ok(DType::F64),
         6 => Ok(DType::I32),
         7 => Ok(DType::I64),
+        9 => Ok(DType::I64), // Bool → treat as I64 (0/1)
         other => Err(OnnxError::UnsupportedDtype(other)),
     }
 }
 
-/// Extract shape and dtype from a `ValueInfoProto`. Only tensor types supported.
-fn extract_input_type(vi: &proto::ValueInfoProto) -> Result<(Shape, DType), OnnxError> {
+/// Extract dims and dtype from a `ValueInfoProto`. Only tensor types supported.
+///
+/// Symbolic dimensions (`dim_param`) are stored as `Dim::Symbolic` instead of
+/// producing an error. A missing `dim.value` is treated as an anonymous symbolic
+/// dim with the input name as the symbol name.
+fn extract_input_type(vi: &proto::ValueInfoProto) -> Result<(Vec<Dim>, DType), OnnxError> {
     let type_proto = vi
         .r#type
         .as_ref()
@@ -286,22 +359,23 @@ fn extract_input_type(vi: &proto::ValueInfoProto) -> Result<(Shape, DType), Onnx
         .ok_or_else(|| OnnxError::UnsupportedInputType(vi.name.clone()))?;
 
     let mut dims = Vec::with_capacity(shape_proto.dim.len());
-    for dim in &shape_proto.dim {
+    for (idx, dim) in shape_proto.dim.iter().enumerate() {
         match &dim.value {
-            Some(DimValue::DimValue(v)) => dims.push(*v as u64),
-            Some(DimValue::DimParam(p)) => {
-                return Err(OnnxError::DynamicShape(p.clone()));
+            Some(DimValue::DimValue(v)) => dims.push(Dim::Fixed(*v as u64)),
+            Some(DimValue::DimParam(p)) => dims.push(Dim::Symbolic(p.clone())),
+            None => {
+                // Unknown dim: treat as anonymous symbolic using input name + index.
+                dims.push(Dim::Symbolic(format!("{}_{}", vi.name, idx)));
             }
-            None => return Err(OnnxError::DynamicShape(vi.name.clone())),
         }
     }
 
-    Ok((Shape(dims), dtype))
+    Ok((dims, dtype))
 }
 
 /// Extract node attributes into a `HashMap<String, OnnxAttribute>`.
 ///
-/// Unsupported attribute types (TENSOR, GRAPH, etc.) are silently skipped.
+/// Unsupported attribute types (GRAPH, etc.) are silently skipped.
 fn extract_attributes(
     node: &proto::NodeProto,
 ) -> Result<HashMap<String, OnnxAttribute>, OnnxError> {
@@ -315,7 +389,14 @@ fn extract_attributes(
             }
             Ok(AttributeType::Ints) => OnnxAttribute::Ints(attr.ints.clone()),
             Ok(AttributeType::Floats) => OnnxAttribute::Floats(attr.floats.clone()),
-            // Skip TENSOR, GRAPH, and other unsupported types.
+            Ok(AttributeType::Tensor) => {
+                if let Some(t) = &attr.t {
+                    OnnxAttribute::Tensor(tensor_proto_to_buffer(t)?)
+                } else {
+                    continue;
+                }
+            }
+            // Skip GRAPH and other unsupported types.
             _ => continue,
         };
         map.insert(attr.name.clone(), value);
@@ -418,7 +499,10 @@ mod tests {
         assert!(parsed.initializers.is_empty());
         assert_eq!(parsed.dynamic_inputs.len(), 2);
         assert_eq!(parsed.dynamic_inputs[0].name, "X");
-        assert_eq!(parsed.dynamic_inputs[0].shape, Shape(vec![2, 3]));
+        assert_eq!(
+            parsed.dynamic_inputs[0].dims,
+            vec![Dim::Fixed(2), Dim::Fixed(3)]
+        );
         assert_eq!(parsed.dynamic_inputs[0].dtype, DType::F32);
         assert_eq!(parsed.outputs, vec!["Z"]);
     }
@@ -688,23 +772,23 @@ mod tests {
         assert!(matches!(result, Err(OnnxError::UnsupportedDtype(10))));
     }
 
-    #[test]
-    fn dynamic_shape_in_input_returns_error() {
+    // ── Task 1.6: symbolic dim tests ──────────────────────────────────────────
+
+    /// Helper: build a `ValueInfoProto` where one dimension is symbolic.
+    fn symbolic_dim_input(name: &str, sym_name: &str, fixed: i64) -> ValueInfoProto {
         use crate::onnx::proto::tensor_shape_proto::Dimension;
         use crate::onnx::proto::type_proto;
-
-        // Input with a symbolic dim ("batch_size" instead of a fixed integer).
-        let dynamic_input = ValueInfoProto {
-            name: "X".into(),
+        ValueInfoProto {
+            name: name.into(),
             r#type: Some(TypeProto {
                 value: Some(type_proto::Value::TensorType(type_proto::Tensor {
-                    elem_type: 1,
+                    elem_type: 1, // FLOAT
                     shape: Some(TensorShapeProto {
                         dim: vec![
                             Dimension {
                                 value: Some(
                                     crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
-                                        "batch_size".into(),
+                                        sym_name.into(),
                                     ),
                                 ),
                                 ..Default::default()
@@ -712,7 +796,66 @@ mod tests {
                             Dimension {
                                 value: Some(
                                     crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(
-                                        128,
+                                        fixed,
+                                    ),
+                                ),
+                                ..Default::default()
+                            },
+                        ],
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn symbolic_dim_in_input_is_accepted() {
+        // Parser must store symbolic dims rather than returning an error.
+        let model = ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                input: vec![symbolic_dim_input("X", "batch_size", 128)],
+                output: vec![],
+                node: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let parsed = parse_bytes(&encode(&model)).expect("parse must succeed for symbolic dims");
+        assert_eq!(parsed.dynamic_inputs.len(), 1);
+        assert_eq!(
+            parsed.dynamic_inputs[0].dims,
+            vec![Dim::Symbolic("batch_size".into()), Dim::Fixed(128)]
+        );
+    }
+
+    #[test]
+    fn mixed_fixed_and_symbolic_dims() {
+        // [batch_size, seq_len] with fixed inner dims.
+        use crate::onnx::proto::tensor_shape_proto::Dimension;
+        use crate::onnx::proto::type_proto;
+        let vi = ValueInfoProto {
+            name: "tokens".into(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: 7, // INT64
+                    shape: Some(TensorShapeProto {
+                        dim: vec![
+                            Dimension {
+                                value: Some(
+                                    crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(
+                                        1,
+                                    ),
+                                ),
+                                ..Default::default()
+                            },
+                            Dimension {
+                                value: Some(
+                                    crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
+                                        "seq_len".into(),
                                     ),
                                 ),
                                 ..Default::default()
@@ -728,7 +871,7 @@ mod tests {
         let model = ModelProto {
             ir_version: 8,
             graph: Some(GraphProto {
-                input: vec![dynamic_input],
+                input: vec![vi],
                 output: vec![],
                 node: vec![],
                 ..Default::default()
@@ -736,8 +879,11 @@ mod tests {
             ..Default::default()
         };
 
-        let result = parse_bytes(&encode(&model));
-        assert!(matches!(result, Err(OnnxError::DynamicShape(_))));
+        let parsed = parse_bytes(&encode(&model)).expect("parse must succeed");
+        assert_eq!(
+            parsed.dynamic_inputs[0].dims,
+            vec![Dim::Fixed(1), Dim::Symbolic("seq_len".into())]
+        );
     }
 
     // ── Regression: Issue 4 — raw_data length mismatch returns error ──────────

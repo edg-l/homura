@@ -90,7 +90,7 @@ fn cmd_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // Dynamic inputs
     println!("Inputs ({}):", onnx.dynamic_inputs.len());
     for inp in &onnx.dynamic_inputs {
-        println!("  {} : {:?} {:?}", inp.name, inp.dtype, inp.shape.0);
+        println!("  {} : {:?} {:?}", inp.name, inp.dtype, inp.dims);
     }
 
     // Outputs
@@ -206,7 +206,10 @@ fn cmd_run(
                 onnx.dynamic_inputs.len()
             );
         }
-        Buffer::new(&first.shape.0, first.dtype)
+        let shape = first
+            .concrete_shape()
+            .ok_or("model has symbolic dims; provide --shape to specify input shape")?;
+        Buffer::new(&shape.0, first.dtype)
     };
 
     // If the model has multiple dynamic inputs, we need all of them.
@@ -217,16 +220,23 @@ fn cmd_run(
         buffers.push(input_buf);
         // Fill remaining dynamic inputs with zeros
         for inp in onnx.dynamic_inputs.iter().skip(1) {
-            buffers.push(Buffer::new(&inp.shape.0, inp.dtype));
+            let shape = inp
+                .concrete_shape()
+                .ok_or("model has symbolic dims; provide --shape to specify input shape")?;
+            buffers.push(Buffer::new(&shape.0, inp.dtype));
         }
     } else {
         for inp in &onnx.dynamic_inputs {
-            buffers.push(Buffer::new(&inp.shape.0, inp.dtype));
+            let shape = inp
+                .concrete_shape()
+                .ok_or("model has symbolic dims; provide --shape to specify input shape")?;
+            buffers.push(Buffer::new(&shape.0, inp.dtype));
         }
     }
 
     let refs: Vec<&Buffer> = buffers.iter().collect();
-    let output = model.run(&refs)?;
+    let outputs = model.run(&refs)?;
+    let output = &outputs[0];
 
     // Write or print output
     if let Some(out_path) = output_path {

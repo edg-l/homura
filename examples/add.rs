@@ -24,9 +24,9 @@ fn main() {
 
     println!("a      = {:?}", a_data);
     println!("b      = {:?}", b_data);
-    println!("a + b  = {:?}", result.as_slice::<f32>());
+    println!("a + b  = {:?}", result[0].as_slice::<f32>());
 
-    assert_eq!(result.as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
+    assert_eq!(result[0].as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
     println!("Result verified.");
 
     // Demonstrate chained add: a + b + c
@@ -42,7 +42,7 @@ fn main() {
     let y_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
     let z_buf = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
     let result2 = compiled2.run(&[&x_buf, &y_buf, &z_buf]);
-    println!("x + y + z = {:?}", result2.as_slice::<f32>());
-    assert_eq!(result2.as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
+    println!("x + y + z = {:?}", result2[0].as_slice::<f32>());
+    assert_eq!(result2[0].as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
     println!("Chained result verified.");
 }

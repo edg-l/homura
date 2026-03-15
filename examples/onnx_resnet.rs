@@ -34,10 +34,10 @@ fn main() {
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 3, 224, 224], DType::F32);
 
     let t1 = Instant::now();
-    let output = model.run(&[&input]).expect("inference failed");
+    let outputs = model.run(&[&input]).expect("inference failed");
     let run_ms = t1.elapsed().as_millis();
 
-    let logits = output.as_slice::<f32>();
+    let logits = outputs[0].as_slice::<f32>();
 
     // Sort by logit value, print top 5
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();

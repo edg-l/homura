@@ -23,7 +23,7 @@ use melior::{
 use crate::{
     DType,
     op::{NodeId, Op},
-    runtime::CompiledGraph,
+    runtime::{CompiledGraph, OutputDesc},
     trace::Trace,
 };
 
@@ -76,7 +76,7 @@ impl Compiler {
         let context = create_context();
         let location = Location::unknown(&context);
         let mut module = Module::new(location);
-        let (num_inputs, output_shape, output_dtype) =
+        let (num_inputs, output_descs) =
             build_module(&context, &module, trace, outputs)?;
 
         // ---- Run lowering passes ----------------------------------------------
@@ -129,12 +129,7 @@ impl Compiler {
         ensure_runner_utils_loaded();
         let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
 
-        Ok(CompiledGraph::new(
-            engine,
-            num_inputs,
-            output_shape,
-            output_dtype,
-        ))
+        Ok(CompiledGraph::new(engine, num_inputs, output_descs))
     }
 
     /// Build the MLIR module for a trace and return its text representation
@@ -208,7 +203,7 @@ fn create_context() -> Context {
 // ── Shared module builder ─────────────────────────────────────────────────────
 //
 // Populates `module` with the `@compute` func body for the given trace and
-// verifies it. Returns `(num_inputs, output_shape, output_dtype)`.
+// verifies it. Returns `(num_inputs, Vec<OutputDesc>)`.
 //
 // `context` and `module` are caller-owned so their lifetimes do not cross a
 // function boundary (which would require a self-referential return).
@@ -218,7 +213,7 @@ fn build_module<'c>(
     module: &Module<'c>,
     trace: &Trace,
     outputs: &[NodeId],
-) -> Result<(usize, crate::Shape, DType), CompileError> {
+) -> Result<(usize, Vec<OutputDesc>), CompileError> {
     // Collect input ops in arg_index order.
     let mut input_ops: Vec<(NodeId, &Op)> = trace
         .ops()
@@ -241,16 +236,22 @@ fn build_module<'c>(
     });
 
     let num_inputs = input_ops.len();
-    let output_id = outputs[0];
-    let output_op = trace.get(output_id);
-    let output_shape = output_op.shape().clone();
-    let output_dtype = output_op.dtype();
+
+    // Collect output descriptors for all requested output nodes.
+    let output_descs: Vec<OutputDesc> = outputs
+        .iter()
+        .map(|&id| {
+            let op = trace.get(id);
+            OutputDesc {
+                shape: op.shape().clone(),
+                dtype: op.dtype(),
+            }
+        })
+        .collect();
 
     let location = Location::unknown(context);
 
     {
-        let elem_type = output_dtype.to_mlir_type(context);
-
         let mut arg_types: Vec<(melior::ir::Type, Location)> = Vec::new();
         for (_, op) in &input_ops {
             let Op::Input { shape, dtype, .. } = op else {
@@ -260,16 +261,20 @@ fn build_module<'c>(
             let mref = MemRefType::new(dtype.to_mlir_type(context), &dims, None, None);
             arg_types.push((mref.into(), location));
         }
-        let out_dims: Vec<i64> = output_shape.0.iter().map(|&d| d as i64).collect();
-        let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
-        arg_types.push((out_mref.into(), location));
+        // Each output gets its own trailing memref argument (sret-style).
+        for desc in &output_descs {
+            let elem_type = desc.dtype.to_mlir_type(context);
+            let out_dims: Vec<i64> = desc.shape.0.iter().map(|&d| d as i64).collect();
+            let out_mref = MemRefType::new(elem_type, &out_dims, None, None);
+            arg_types.push((out_mref.into(), location));
+        }
 
         let func_arg_types: Vec<melior::ir::Type> = arg_types.iter().map(|(t, _)| *t).collect();
         let function_type = FunctionType::new(context, &func_arg_types, &[]);
 
         let body_block = Block::new(&arg_types);
 
-        emit_tensor_ops(trace, output_id, num_inputs, &body_block, location, context)?;
+        emit_tensor_ops(trace, outputs, num_inputs, &body_block, location, context)?;
 
         body_block.append_operation(func::r#return(&[], location));
 
@@ -295,7 +300,7 @@ fn build_module<'c>(
         return Err(CompileError::Verification);
     }
 
-    Ok((num_inputs, output_shape, output_dtype))
+    Ok((num_inputs, output_descs))
 }
 
 // ── Helper: build a RankedTensorType for an arbitrary shape ──────────────────
@@ -1172,6 +1177,270 @@ fn emit_matmul<'c>(
     Ok(result_val)
 }
 
+// ── Helper: emit batched matmul via linalg.generic ────────────────────────────
+//
+// Works for any rank >= 2. For rank-2 inputs (n_batch=0) this produces:
+//   iterators: (m, n, k)  — m,n parallel; k reduction
+//   lhs_map:  (m, n, k) -> (m, k)
+//   rhs_map:  (m, n, k) -> (k, n)
+//   out_map:  (m, n, k) -> (m, n)
+//
+// For rank-3 inputs (n_batch=1, e.g. [B,M,K] @ [B,K,N]):
+//   iterators: (b, m, n, k)  — b,m,n parallel; k reduction
+//   lhs_map:  (b, m, n, k) -> (b, m, k)
+//   rhs_map:  (b, m, n, k) -> (b, k, n)
+//   out_map:  (b, m, n, k) -> (b, m, n)
+//
+// In general for rank r (n_batch = r - 2):
+//   total iterators = n_batch + 3  (batch dims + m + n + k)
+//   lhs picks dims: d0..d(n_batch-1), d(n_batch), d(n_batch+2)   → [..., m, k]
+//   rhs picks dims: d0..d(n_batch-1), d(n_batch+2), d(n_batch+1) → [..., k, n]
+//   out picks dims: d0..d(n_batch-1), d(n_batch), d(n_batch+1)   → [..., m, n]
+//   last iterator is reduction (k); all others are parallel
+
+#[allow(clippy::too_many_arguments)]
+fn emit_batched_matmul<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    lhs: NodeId,
+    rhs: NodeId,
+    lhs_shape: &[u64],     // [..., M, K]
+    rhs_shape: &[u64],     // [..., K, N] — may differ in rank from lhs (broadcast)
+    output_shape: &[u64],  // [..., M, N]
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let lhs_val = *values.get(&lhs).expect("lhs node not yet emitted");
+    let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
+    let elem_type = dtype.to_mlir_type(context);
+    let out_tensor_type = make_ranked_tensor_type(context, output_shape, dtype);
+
+    let out_rank = output_shape.len();
+    let n_batch = out_rank - 2; // number of batch dimensions in output
+
+    // Total iterator count: batch dims + m + n + k
+    let n_iters = n_batch + 3;
+    // dim indices:
+    //   d0 .. d(n_batch-1)  = batch dims
+    //   d(n_batch)          = m
+    //   d(n_batch+1)        = n
+    //   d(n_batch+2)        = k  (reduction)
+    let dims: Vec<String> = (0..n_iters).map(|i| format!("d{i}")).collect();
+    let dims_str = dims.join(", ");
+
+    let m_dim = &dims[n_batch];
+    let n_dim = &dims[n_batch + 1];
+    let k_dim = &dims[n_batch + 2];
+
+    // Build broadcast-aware maps for lhs and rhs.
+    // Each operand may have fewer batch dims than the output.
+    fn build_matmul_map(
+        dims: &[String],
+        dims_str: &str,
+        operand_shape: &[u64],
+        output_shape: &[u64],
+        n_batch: usize,
+        inner_dims: &[&str], // [m,k] for lhs, [k,n] for rhs
+    ) -> String {
+        let op_rank = operand_shape.len();
+        let op_batch = op_rank - 2;
+        // Right-align batch dims
+        let batch_offset = n_batch - op_batch;
+        let mut result_exprs: Vec<String> = Vec::new();
+        for i in 0..op_batch {
+            let out_idx = batch_offset + i;
+            if operand_shape[i] == 1 && output_shape[out_idx] != 1 {
+                result_exprs.push("0".to_string());
+            } else {
+                result_exprs.push(dims[out_idx].clone());
+            }
+        }
+        for d in inner_dims {
+            result_exprs.push(d.to_string());
+        }
+        format!("affine_map<({dims_str}) -> ({})>", result_exprs.join(", "))
+    }
+
+    let lhs_map_str = build_matmul_map(&dims, &dims_str, lhs_shape, output_shape, n_batch, &[m_dim, k_dim]);
+    let rhs_map_str = build_matmul_map(&dims, &dims_str, rhs_shape, output_shape, n_batch, &[k_dim, n_dim]);
+
+    // Output map: all batch dims + m + n
+    let batch_dims: Vec<&str> = dims[..n_batch].iter().map(|s| s.as_str()).collect();
+    let batch_str = if n_batch > 0 {
+        format!("{}, ", batch_dims.join(", "))
+    } else {
+        String::new()
+    };
+    let out_map_str = format!("affine_map<({dims_str}) -> ({batch_str}{m_dim}, {n_dim})>");
+
+    let lhs_map = Attribute::parse(context, &lhs_map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {lhs_map_str}")))?;
+    let rhs_map = Attribute::parse(context, &rhs_map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {rhs_map_str}")))?;
+    let out_map = Attribute::parse(context, &out_map_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {out_map_str}")))?;
+
+    let indexing_maps = ArrayAttribute::new(context, &[lhs_map, rhs_map, out_map]);
+
+    // Iterator types: all parallel except the last (k = reduction).
+    let iters: Vec<&str> = (0..n_iters)
+        .map(|i| {
+            if i == n_iters - 1 {
+                "#linalg.iterator_type<reduction>"
+            } else {
+                "#linalg.iterator_type<parallel>"
+            }
+        })
+        .collect();
+    let iter_str = format!("[{}]", iters.join(", "));
+    let iterator_types = Attribute::parse(context, &iter_str)
+        .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {iter_str}")))?;
+
+    // tensor.empty() for the output accumulator.
+    let empty_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[out_tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Zero constant for the fill.
+    let zero_val: melior::ir::Value = match dtype {
+        DType::F32 | DType::F64 => body_block
+            .append_operation(arith::constant(
+                context,
+                FloatAttribute::new(context, elem_type, 0.0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into(),
+        DType::I32 | DType::I64 => body_block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(elem_type, 0).into(),
+                location,
+            ))
+            .result(0)
+            .unwrap()
+            .into(),
+    };
+
+    // linalg.fill to initialize accumulator to zero.
+    let segment_fill = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse linalg.fill segment sizes".into())
+    })?;
+    let fill_region = {
+        let fill_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let fill_in = fill_block.argument(0).unwrap().into();
+        fill_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[fill_in])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+        let r = Region::new();
+        r.append_block(fill_block);
+        r
+    };
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.fill", location)
+                .add_operands(&[zero_val, empty_val])
+                .add_results(&[out_tensor_type])
+                .add_attributes(&[(
+                    Identifier::new(context, "operand_segment_sizes"),
+                    segment_fill,
+                )])
+                .add_regions([fill_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg.generic body: mul + accumulate.
+    let segment_generic = Attribute::parse(context, "array<i32: 2, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse linalg.generic segment sizes".into())
+    })?;
+    let generic_region = {
+        let generic_block = Block::new(&[
+            (elem_type, location),
+            (elem_type, location),
+            (elem_type, location),
+        ]);
+        let a_elem: melior::ir::Value = generic_block.argument(0).unwrap().into();
+        let b_elem: melior::ir::Value = generic_block.argument(1).unwrap().into();
+        let c_elem: melior::ir::Value = generic_block.argument(2).unwrap().into();
+
+        let mul_val: melior::ir::Value = match dtype {
+            DType::F32 | DType::F64 => generic_block
+                .append_operation(arith::mulf(a_elem, b_elem, location))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 | DType::I64 => generic_block
+                .append_operation(arith::muli(a_elem, b_elem, location))
+                .result(0)
+                .unwrap()
+                .into(),
+        };
+        let add_val: melior::ir::Value = match dtype {
+            DType::F32 | DType::F64 => generic_block
+                .append_operation(arith::addf(c_elem, mul_val, location))
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::I32 | DType::I64 => generic_block
+                .append_operation(arith::addi(c_elem, mul_val, location))
+                .result(0)
+                .unwrap()
+                .into(),
+        };
+        generic_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[add_val])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+        let r = Region::new();
+        r.append_block(generic_block);
+        r
+    };
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[lhs_val, rhs_val, init_val])
+                .add_results(&[out_tensor_type])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_generic,
+                    ),
+                ])
+                .add_regions([generic_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
 // ── Helper: emit a reduction linalg.generic (ReduceSum or ReduceMax) ─────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1709,14 +1978,779 @@ fn emit_tosa_add_bias<'c>(
     Ok(result)
 }
 
+// ── Helper: emit a unary linalg.generic with a single-operand math op ────────
+//
+// Used for Sqrt (math.sqrt). The math op name is passed as a string, e.g.
+// "math.sqrt". The body block has 2 args: (in_elem, out_elem); yields the
+// math op applied to in_elem.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_unary_linalg_math<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    math_op: &str,
+    input: NodeId,
+    shape: &[u64],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let elem_type = dtype.to_mlir_type(context);
+    let tensor_type = make_ranked_tensor_type(context, shape, dtype);
+    let rank = shape.len();
+
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg body: 2 block args (in_elem, out_elem); yield math_op(in_elem).
+    let linalg_region = {
+        let linalg_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+        let in_elem: melior::ir::Value = linalg_block.argument(0).unwrap().into();
+
+        let result: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new(math_op, location)
+                    .add_operands(&[in_elem])
+                    .add_results(&[elem_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[result])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    let in_map = make_identity_map(context, rank)?;
+    let out_map = make_identity_map(context, rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[in_map, out_map]);
+    let iterator_types = make_iterator_types(context, rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
+    })?;
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[input_val, init_val])
+                .add_results(&[tensor_type])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit a Cast via linalg.generic + arith cast ops ──────────────────
+//
+// Selects the appropriate arith dialect cast op based on src/dst dtype pair:
+//   F32/F64 → I32/I64 : arith.fptosi
+//   I32/I64 → F32/F64 : arith.sitofp
+//   I32     → I64     : arith.extsi
+//   I64     → I32     : arith.trunci
+//   F32     → F64     : arith.extf
+//   F64     → F32     : arith.truncf
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cast<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    input: NodeId,
+    shape: &[u64],
+    src_dtype: DType,
+    dst_dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let src_elem_type = src_dtype.to_mlir_type(context);
+    let dst_elem_type = dst_dtype.to_mlir_type(context);
+    let src_tensor_type = make_ranked_tensor_type(context, shape, src_dtype);
+    let dst_tensor_type = make_ranked_tensor_type(context, shape, dst_dtype);
+    let rank = shape.len();
+
+    let input_val = *values.get(&input).expect("input node not yet emitted");
+
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[dst_tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Select arith cast op name.
+    let cast_op = match (src_dtype, dst_dtype) {
+        (DType::F32 | DType::F64, DType::I32 | DType::I64) => "arith.fptosi",
+        (DType::I32 | DType::I64, DType::F32 | DType::F64) => "arith.sitofp",
+        (DType::I32, DType::I64) => "arith.extsi",
+        (DType::I64, DType::I32) => "arith.trunci",
+        (DType::F32, DType::F64) => "arith.extf",
+        (DType::F64, DType::F32) => "arith.truncf",
+        _ => {
+            return Err(CompileError::AttributeParse(format!(
+                "Cast: unsupported {src_dtype:?} -> {dst_dtype:?}"
+            )))
+        }
+    };
+
+    // linalg body: 2 block args (src_elem, dst_elem); yield cast(src_elem).
+    let linalg_region = {
+        let linalg_block = Block::new(&[(src_elem_type, location), (dst_elem_type, location)]);
+        let src_elem: melior::ir::Value = linalg_block.argument(0).unwrap().into();
+
+        let casted: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new(cast_op, location)
+                    .add_operands(&[src_elem])
+                    .add_results(&[dst_elem_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[casted])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    let in_map = make_identity_map(context, rank)?;
+    let out_map = make_identity_map(context, rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[in_map, out_map]);
+    let iterator_types = make_iterator_types(context, rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
+    })?;
+
+    let _ = src_tensor_type; // used implicitly via input_val type
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[input_val, init_val])
+                .add_results(&[dst_tensor_type])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit ReduceMean via tosa.reduce_sum + tosa.reciprocal + tosa.mul ──
+//
+// Each axis is reduced sequentially using tosa.reduce_sum (which always keeps
+// the reduced dim as size-1). After all reductions, multiply by 1/N where N is
+// the total number of elements reduced. If !keepdim, reshape to remove the
+// size-1 dims.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_reduce_mean<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    values: &HashMap<NodeId, melior::ir::Value<'c, 'c>>,
+    input: NodeId,
+    input_shape: &[u64],
+    output_shape: &[u64], // final output shape (keepdim already reflected)
+    axes: &[i64],         // normalized non-negative axes
+    keepdim: bool,
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // We work with intermediate values directly (not looking up by NodeId after
+    // first access), so we need the initial value from the map.
+    let mut current_val = *values.get(&input).expect("input node not yet emitted");
+    let mut current_shape = input_shape.to_vec();
+
+    // Count total reduced elements for the reciprocal constant.
+    let total_reduced: u64 = axes.iter().map(|&a| input_shape[a as usize]).product();
+
+    // Reduce each axis (all keepdim=true during intermediate steps).
+    for &ax in axes {
+        let ax_usize = ax as usize;
+
+        // tosa.reduce_sum output: same rank, dim `ax` becomes 1.
+        let mut tosa_out_shape = current_shape.clone();
+        tosa_out_shape[ax_usize] = 1;
+        let tosa_out_type = make_ranked_tensor_type(context, &tosa_out_shape, dtype);
+
+        let axis_attr = IntegerAttribute::new(
+            melior::ir::r#type::IntegerType::new(context, 32).into(),
+            ax_usize as i64,
+        );
+
+        current_val = body_block
+            .append_operation(
+                OperationBuilder::new("tosa.reduce_sum", location)
+                    .add_operands(&[current_val])
+                    .add_results(&[tosa_out_type])
+                    .add_attributes(&[(Identifier::new(context, "axis"), axis_attr.into())])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        current_shape = tosa_out_shape;
+    }
+
+    // Multiply by reciprocal: 1.0 / total_reduced.
+    // Emit a tosa.const for the reciprocal scalar (shape = current_shape for broadcast).
+    let recip = 1.0 / total_reduced as f64;
+    let recip_str = match dtype {
+        DType::F32 => format!("dense<{}> : tensor<1xf32>", format_float(recip)),
+        DType::F64 => format!("dense<{}> : tensor<1xf64>", format_float(recip)),
+        DType::I32 | DType::I64 => {
+            // Integer mean: use integer division constant (1/N ~ 0 for N>1).
+            // This is a best-effort approximation for integer types.
+            format!("dense<{}> : tensor<1xi32>", (recip as i32))
+        }
+    };
+    let recip_val = emit_tosa_const_scalar(context, body_block, &recip_str, location)?;
+
+    // Reshape scalar tensor<1xT> to match the rank of current tensor.
+    let rank = current_shape.len();
+    let scalar_shape: Vec<u64> = vec![1u64; rank];
+    let recip_reshaped =
+        emit_tosa_reshape(context, body_block, recip_val, &scalar_shape, dtype, location)?;
+
+    // shift operand for tosa.mul
+    let shift_val =
+        emit_tosa_const_scalar(context, body_block, "dense<0> : tensor<1xi8>", location)?;
+
+    let keepdim_type = make_ranked_tensor_type(context, &current_shape, dtype);
+    let mean_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.mul", location)
+                .add_operands(&[current_val, recip_reshaped, shift_val])
+                .add_results(&[keepdim_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // If !keepdim, reshape to remove the size-1 reduced dims.
+    if keepdim {
+        return Ok(mean_val);
+    }
+
+    let result_val =
+        emit_tosa_reshape(context, body_block, mean_val, output_shape, dtype, location)?;
+    Ok(result_val)
+}
+
+// ── Helper: emit a tosa.slice (stride-1 slice) ───────────────────────────────
+//
+// Emits tosa.const_shape for start + size, then tosa.slice.
+// `starts` and `out_shape` are per-axis; the input tensor has `input_rank` dims.
+// For axes not present in `axes`, start=0 and size=input_shape[ax].
+
+#[allow(clippy::too_many_arguments)]
+fn emit_tosa_slice<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    input: melior::ir::Value<'c, 'c>,
+    input_shape: &[u64],
+    starts: &[i64],  // per-axis start (normalized, length = input_rank)
+    out_shape: &[u64], // per-axis size = output shape (length = input_rank)
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let rank = input_shape.len();
+    let shape_type_str = format!("!tosa.shape<{rank}>");
+    let shape_type = melior::ir::Type::parse(context, &shape_type_str)
+        .ok_or_else(|| CompileError::AttributeParse(shape_type_str.clone()))?;
+
+    // Build start const_shape.
+    let starts_str = starts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+    let start_dense = format!("dense<[{starts_str}]> : tensor<{rank}xindex>");
+    let start_attr = Attribute::parse(context, &start_dense)
+        .ok_or_else(|| CompileError::AttributeParse(start_dense.clone()))?;
+    let start_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.const_shape", location)
+                .add_results(&[shape_type])
+                .add_attributes(&[(Identifier::new(context, "values"), start_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Build size const_shape.
+    let sizes_str = out_shape.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+    let size_dense = format!("dense<[{sizes_str}]> : tensor<{rank}xindex>");
+    let size_attr = Attribute::parse(context, &size_dense)
+        .ok_or_else(|| CompileError::AttributeParse(size_dense.clone()))?;
+    let size_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.const_shape", location)
+                .add_results(&[shape_type])
+                .add_attributes(&[(Identifier::new(context, "values"), size_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let result_type = make_ranked_tensor_type(context, out_shape, dtype);
+    let result: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.slice", location)
+                .add_operands(&[input, start_val, size_val])
+                .add_results(&[result_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result)
+}
+
+// ── Helper: emit strided slice via linalg.generic + linalg.index ─────────────
+//
+// Used when any step != 1. Maps each output index to a data index:
+//   data_idx[ax] = start[ax] + out_idx[ax] * step[ax]
+// for sliced axes, and data_idx[ax] = out_idx[ax] for non-sliced axes.
+
+#[allow(clippy::too_many_arguments)]
+fn emit_strided_slice<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    input: melior::ir::Value<'c, 'c>,
+    _input_shape: &[u64],
+    starts: &[i64],    // per-sliced-axis starts (length = axes.len())
+    axes: &[i64],      // which axes are sliced (length = axes.len())
+    steps: &[i64],     // per-sliced-axis steps (length = axes.len())
+    out_shape: &[u64], // output tensor shape (all axes)
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let out_rank = out_shape.len();
+    let elem_type = dtype.to_mlir_type(context);
+    let out_tensor_type = make_ranked_tensor_type(context, out_shape, dtype);
+
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[out_tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    let out_map = make_identity_map(context, out_rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[out_map]);
+    let iterator_types = make_iterator_types(context, out_rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 0, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("strided slice segment sizes".into())
+    })?;
+
+    let linalg_region = {
+        let linalg_block = Block::new(&[(elem_type, location)]);
+
+        let index_type = melior::ir::Type::parse(context, "index")
+            .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+        let i64_type = DType::I64.to_mlir_type(context);
+
+        // Get each output dim index.
+        let mut out_indices: Vec<melior::ir::Value> = Vec::with_capacity(out_rank);
+        for d in 0..out_rank {
+            let dim_attr = IntegerAttribute::new(
+                melior::ir::r#type::IntegerType::new(context, 64).into(),
+                d as i64,
+            );
+            let idx: melior::ir::Value = linalg_block
+                .append_operation(
+                    OperationBuilder::new("linalg.index", location)
+                        .add_results(&[index_type])
+                        .add_attributes(&[(Identifier::new(context, "dim"), dim_attr.into())])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            out_indices.push(idx);
+        }
+
+        // For each output dim, compute data_index = start + out_idx * step.
+        let mut data_indices: Vec<melior::ir::Value> = out_indices.clone();
+        for (i, &ax) in axes.iter().enumerate() {
+            let ax_usize = ax as usize;
+            let start = starts[i];
+            let step = steps[i];
+
+            // Cast out_idx to i64, multiply by step, add start, cast back to index.
+            let out_idx_i64: melior::ir::Value = linalg_block
+                .append_operation(
+                    OperationBuilder::new("arith.index_cast", location)
+                        .add_operands(&[out_indices[ax_usize]])
+                        .add_results(&[i64_type])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            let step_val: melior::ir::Value = linalg_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(i64_type, step).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+
+            let start_val: melior::ir::Value = linalg_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(i64_type, start).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+
+            let mul: melior::ir::Value = linalg_block
+                .append_operation(arith::muli(out_idx_i64, step_val, location))
+                .result(0)
+                .unwrap()
+                .into();
+
+            let add: melior::ir::Value = linalg_block
+                .append_operation(arith::addi(mul, start_val, location))
+                .result(0)
+                .unwrap()
+                .into();
+
+            let data_idx: melior::ir::Value = linalg_block
+                .append_operation(
+                    OperationBuilder::new("arith.index_cast", location)
+                        .add_operands(&[add])
+                        .add_results(&[index_type])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            data_indices[ax_usize] = data_idx;
+        }
+
+        // tensor.extract from input at computed data_indices.
+        let val: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new("tensor.extract", location)
+                    .add_operands(&[input])
+                    .add_operands(&data_indices)
+                    .add_results(&[elem_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[val])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[init_val])
+                .add_results(&[out_tensor_type])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
+// ── Helper: emit Gather via scf.for loop nest + tensor.extract/insert ────────
+//
+// Iterates over all output indices. For each output element:
+//   1. Extract the axis index from the indices tensor (linalg.index for the
+//      indices-portion dims).
+//   2. Construct the full data index (pre-axis from output, axis from indices,
+//      post-axis from output).
+//   3. tensor.extract from data, tensor.insert into output.
+//
+// Uses linalg.generic with output-identity map + linalg.index + tensor.extract
+// for the gathered access (valid because tensor.extract is allowed inside
+// linalg.generic bodies on captured tensors).
+
+#[allow(clippy::too_many_arguments)]
+fn emit_gather<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    data_val: melior::ir::Value<'c, 'c>,
+    indices_val: melior::ir::Value<'c, 'c>,
+    data_shape: &[u64],   // shape of data tensor
+    indices_shape: &[u64], // shape of indices tensor
+    out_shape: &[u64],    // output shape
+    axis: usize,
+    dtype: DType,
+    indices_dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let out_rank = out_shape.len();
+    let idx_rank = indices_shape.len();
+    let elem_type = dtype.to_mlir_type(context);
+    let out_tensor_type = make_ranked_tensor_type(context, out_shape, dtype);
+
+    // Emit tensor.empty for the output.
+    let init_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_results(&[out_tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    // linalg.generic: output-only (identity map). data and indices are captured
+    // SSA values used via tensor.extract inside the body.
+    //
+    // Output map: identity over out_rank dims.
+    let out_map = make_identity_map(context, out_rank)?;
+    let indexing_maps = ArrayAttribute::new(context, &[out_map]);
+    let iterator_types = make_iterator_types(context, out_rank)?;
+    let segment_sizes = Attribute::parse(context, "array<i32: 0, 1>").ok_or_else(|| {
+        CompileError::AttributeParse("failed to parse gather segment sizes".into())
+    })?;
+
+    // Build the linalg body.
+    // Block args: (out_elem) — we ignore it and yield the extracted value.
+    let linalg_region = {
+        let linalg_block = Block::new(&[(elem_type, location)]);
+
+        // Get each output dim index via linalg.index.
+        let index_type = melior::ir::Type::parse(context, "index")
+            .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+        let mut out_indices: Vec<melior::ir::Value> = Vec::with_capacity(out_rank);
+        for d in 0..out_rank {
+            let dim_attr =
+                IntegerAttribute::new(melior::ir::r#type::IntegerType::new(context, 64).into(), d as i64);
+            let idx: melior::ir::Value = linalg_block
+                .append_operation(
+                    OperationBuilder::new("linalg.index", location)
+                        .add_results(&[index_type])
+                        .add_attributes(&[(Identifier::new(context, "dim"), dim_attr.into())])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            out_indices.push(idx);
+        }
+
+        // Build indices_tensor_indices: dims [axis .. axis+idx_rank) of out_indices.
+        let idx_tensor_indices: Vec<melior::ir::Value> =
+            out_indices[axis..axis + idx_rank].to_vec();
+
+        // Extract the axis value from the indices tensor.
+        let indices_tensor_type = make_ranked_tensor_type(context, indices_shape, indices_dtype);
+        let raw_idx: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new("tensor.extract", location)
+                    .add_operands(&[indices_val])
+                    .add_operands(&idx_tensor_indices)
+                    .add_results(&[indices_dtype.to_mlir_type(context)])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let _ = indices_tensor_type;
+
+        // Cast the extracted index to the `index` type.
+        let axis_idx: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new("arith.index_cast", location)
+                    .add_operands(&[raw_idx])
+                    .add_results(&[index_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        // Build the full data index:
+        //   out_indices[0..axis] ++ [axis_idx] ++ out_indices[axis+idx_rank..]
+        let mut data_indices: Vec<melior::ir::Value> = Vec::with_capacity(data_shape.len());
+        data_indices.extend_from_slice(&out_indices[..axis]);
+        data_indices.push(axis_idx);
+        data_indices.extend_from_slice(&out_indices[axis + idx_rank..]);
+        debug_assert_eq!(
+            data_indices.len(),
+            data_shape.len(),
+            "gather data index count mismatch"
+        );
+
+        // Extract element from data tensor.
+        let data_tensor_type = make_ranked_tensor_type(context, data_shape, dtype);
+        let val: melior::ir::Value = linalg_block
+            .append_operation(
+                OperationBuilder::new("tensor.extract", location)
+                    .add_operands(&[data_val])
+                    .add_operands(&data_indices)
+                    .add_results(&[elem_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let _ = data_tensor_type;
+
+        linalg_block.append_operation(
+            OperationBuilder::new("linalg.yield", location)
+                .add_operands(&[val])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        );
+
+        let r = Region::new();
+        r.append_block(linalg_block);
+        r
+    };
+
+    let result_val: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("linalg.generic", location)
+                .add_operands(&[init_val])
+                .add_results(&[out_tensor_type])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "indexing_maps"),
+                        indexing_maps.into(),
+                    ),
+                    (Identifier::new(context, "iterator_types"), iterator_types),
+                    (
+                        Identifier::new(context, "operand_segment_sizes"),
+                        segment_sizes,
+                    ),
+                ])
+                .add_regions([linalg_region])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(result_val)
+}
+
 /// Walk the trace linearly, emitting tensor-level ops into `body_block`.
 ///
 /// For each `Input` op: emits `bufferization.to_tensor` with `restrict`.
 /// For each compute op: emits `tensor.empty` + `linalg.generic`.
-/// After all ops: emits `bufferization.to_buffer` + `memref.copy` for the output.
+/// After all ops: emits `bufferization.to_buffer` + `memref.copy` for each output.
 fn emit_tensor_ops<'c>(
     trace: &Trace,
-    output_id: NodeId,
+    output_ids: &[NodeId],
     num_inputs: usize,
     body_block: &Block<'c>,
     location: Location<'c>,
@@ -1910,8 +2944,28 @@ fn emit_tensor_ops<'c>(
             } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
-                let result_val = match dtype {
-                    DType::F32 | DType::F64 => emit_tosa_matmul(
+                let result_val = if lhs_shape.rank() == 2 && rhs_shape.rank() == 2 {
+                    // 2D path: use tosa.matmul for float, linalg.matmul for integer.
+                    match dtype {
+                        DType::F32 | DType::F64 => emit_tosa_matmul(
+                            context,
+                            body_block,
+                            &values,
+                            *lhs,
+                            *rhs,
+                            &lhs_shape.0,
+                            &rhs_shape.0,
+                            &shape.0,
+                            *dtype,
+                            location,
+                        )?,
+                        DType::I32 | DType::I64 => emit_matmul(
+                            context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
+                        )?,
+                    }
+                } else {
+                    // Batched path (rank > 2): use linalg.generic with proper indexing maps.
+                    emit_batched_matmul(
                         context,
                         body_block,
                         &values,
@@ -1922,10 +2976,7 @@ fn emit_tensor_ops<'c>(
                         &shape.0,
                         *dtype,
                         location,
-                    )?,
-                    DType::I32 | DType::I64 => emit_matmul(
-                        context, body_block, &values, *lhs, *rhs, &shape.0, *dtype, location,
-                    )?,
+                    )?
                 };
                 values.insert(node_id, result_val);
             }
@@ -2771,38 +3822,429 @@ fn emit_tensor_ops<'c>(
 
                 values.insert(node_id, result_val);
             }
+
+            Op::Pow {
+                lhs,
+                rhs,
+                shape,
+                dtype,
+            } => {
+                let lhs_shape = trace.get(*lhs).shape();
+                let rhs_shape = trace.get(*rhs).shape();
+                // tosa.pow is float-only; integer pow is not supported.
+                assert!(
+                    matches!(dtype, DType::F32 | DType::F64),
+                    "Pow only supported for float dtypes"
+                );
+                let result_val = emit_tosa_binary(
+                    context,
+                    body_block,
+                    &values,
+                    "tosa.pow",
+                    *lhs,
+                    *rhs,
+                    &lhs_shape.0,
+                    &rhs_shape.0,
+                    &shape.0,
+                    *dtype,
+                    location,
+                )?;
+                values.insert(node_id, result_val);
+            }
+
+            Op::Sqrt {
+                input,
+                shape,
+                dtype,
+            } => {
+                let result_val = emit_unary_linalg_math(
+                    context,
+                    body_block,
+                    &values,
+                    "math.sqrt",
+                    *input,
+                    &shape.0,
+                    *dtype,
+                    location,
+                )?;
+                values.insert(node_id, result_val);
+            }
+
+            Op::Cast {
+                input,
+                target_dtype,
+                shape,
+                dtype: _,
+            } => {
+                let src_dtype = trace.get(*input).dtype();
+                let result_val = emit_cast(
+                    context,
+                    body_block,
+                    &values,
+                    *input,
+                    &shape.0,
+                    src_dtype,
+                    *target_dtype,
+                    location,
+                )?;
+                values.insert(node_id, result_val);
+            }
+
+            Op::ReduceMean {
+                input,
+                axes,
+                keepdim,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone();
+                let result_val = emit_reduce_mean(
+                    context,
+                    body_block,
+                    &values,
+                    *input,
+                    &input_shape,
+                    &shape.0,
+                    axes,
+                    *keepdim,
+                    *dtype,
+                    location,
+                )?;
+                values.insert(node_id, result_val);
+            }
+
+            Op::Gather {
+                input,
+                indices,
+                axis,
+                shape,
+                dtype,
+            } => {
+                let data_shape = trace.get(*input).shape().0.clone();
+                let indices_shape = trace.get(*indices).shape().0.clone();
+                let indices_dtype = trace.get(*indices).dtype();
+                let data_val = *values.get(input).expect("gather: input not emitted");
+                let indices_val = *values.get(indices).expect("gather: indices not emitted");
+
+                let result_val = emit_gather(
+                    context,
+                    body_block,
+                    data_val,
+                    indices_val,
+                    &data_shape,
+                    &indices_shape,
+                    &shape.0,
+                    *axis as usize,
+                    *dtype,
+                    indices_dtype,
+                    location,
+                )?;
+                values.insert(node_id, result_val);
+            }
+
+            Op::Slice {
+                input,
+                starts,
+                ends: _,
+                axes,
+                steps,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone();
+                let input_val = *values.get(input).expect("slice: input not emitted");
+                let rank = input_shape.len();
+
+                // Build per-axis start array (all axes), falling back to 0 for non-sliced axes.
+                let mut full_starts = vec![0i64; rank];
+                for (i, &ax) in axes.iter().enumerate() {
+                    full_starts[ax as usize] = starts[i];
+                }
+
+                let all_stride_one = steps.iter().all(|&s| s == 1);
+
+                let result_val = if all_stride_one {
+                    // Use tosa.slice for stride-1 case.
+                    emit_tosa_slice(
+                        context,
+                        body_block,
+                        input_val,
+                        &input_shape,
+                        &full_starts,
+                        &shape.0,
+                        *dtype,
+                        location,
+                    )?
+                } else {
+                    // Strided slice: use linalg.generic with linalg.index.
+                    emit_strided_slice(
+                        context,
+                        body_block,
+                        input_val,
+                        &input_shape,
+                        starts,
+                        axes,
+                        steps,
+                        &shape.0,
+                        *dtype,
+                        location,
+                    )?
+                };
+                values.insert(node_id, result_val);
+            }
+
+            Op::Concat {
+                inputs,
+                axis,
+                shape,
+                dtype,
+            } => {
+                let ax = *axis as i32;
+                let tensor_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                let mut operands: Vec<melior::ir::Value> = Vec::new();
+                for &inp in inputs {
+                    operands.push(*values.get(&inp).expect("concat: input not emitted"));
+                }
+
+                // tosa.concat requires i32 axis attribute.
+                let axis_attr = IntegerAttribute::new(
+                    melior::ir::r#type::IntegerType::new(context, 32).into(),
+                    ax as i64,
+                );
+
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.concat", location)
+                            .add_operands(&operands)
+                            .add_results(&[tensor_type])
+                            .add_attributes(&[(Identifier::new(context, "axis"), axis_attr.into())])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
+
+            Op::Transpose {
+                input,
+                perm,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone();
+                let input_val = *values.get(input).expect("transpose: input not emitted");
+                let perms_usize: Vec<usize> = perm.iter().map(|&p| p as usize).collect();
+
+                let result_val = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    input_val,
+                    &input_shape,
+                    &perms_usize,
+                    *dtype,
+                    location,
+                )?;
+                let _ = shape; // shape is derived from perms + input_shape inside helper
+                values.insert(node_id, result_val);
+            }
+
+            Op::Where {
+                condition,
+                x,
+                y,
+                shape,
+                dtype,
+            } => {
+                let cond_shape = trace.get(*condition).shape().0.clone();
+                let x_shape = trace.get(*x).shape().0.clone();
+                let y_shape = trace.get(*y).shape().0.clone();
+
+                let cond_val = *values.get(condition).expect("where: condition not emitted");
+                let x_val = *values.get(x).expect("where: x not emitted");
+                let y_val = *values.get(y).expect("where: y not emitted");
+
+                let out_rank = shape.0.len();
+
+                // Promote all operands to the output rank.
+                let (cond_promoted, cond_promoted_shape) = promote_rank_with_reshape(
+                    context,
+                    body_block,
+                    cond_val,
+                    &cond_shape,
+                    out_rank,
+                    DType::I64,
+                    location,
+                )?;
+                let (x_promoted, _) = promote_rank_with_reshape(
+                    context,
+                    body_block,
+                    x_val,
+                    &x_shape,
+                    out_rank,
+                    *dtype,
+                    location,
+                )?;
+                let (y_promoted, _) = promote_rank_with_reshape(
+                    context,
+                    body_block,
+                    y_val,
+                    &y_shape,
+                    out_rank,
+                    *dtype,
+                    location,
+                )?;
+
+                // Convert I64 condition to i1 via arith.cmpi ne 0.
+                let i1_type = melior::ir::Type::parse(context, "i1")
+                    .ok_or_else(|| CompileError::AttributeParse("i1 type".into()))?;
+                let i64_type = DType::I64.to_mlir_type(context);
+                let i1_tensor_type: melior::ir::Type<'c> =
+                    RankedTensorType::new(&shape.0, i1_type, None).into();
+
+                // Emit zero constant for comparison.
+                let zero_val: melior::ir::Value = body_block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(i64_type, 0).into(),
+                        location,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // linalg.generic: cast I64 → i1 (cmpi ne 0).
+                let i64_tensor_type =
+                    make_ranked_tensor_type(context, &shape.0, DType::I64);
+                let i1_init: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tensor.empty", location)
+                            .add_results(&[i1_tensor_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                let cond_map = make_broadcast_map(context, &cond_promoted_shape, &shape.0)?;
+                let out_i1_map = make_identity_map(context, out_rank)?;
+                let i1_maps = ArrayAttribute::new(context, &[cond_map, out_i1_map]);
+                let i1_iters = make_iterator_types(context, out_rank)?;
+                let i1_segs =
+                    Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+                        CompileError::AttributeParse("i1 cast segment sizes".into())
+                    })?;
+
+                let i1_region = {
+                    let i1_block =
+                        Block::new(&[(i64_type, location), (i1_type, location)]);
+                    let in_elem: melior::ir::Value = i1_block.argument(0).unwrap().into();
+
+                    let cmp: melior::ir::Value = i1_block
+                        .append_operation(
+                            OperationBuilder::new("arith.cmpi", location)
+                                .add_operands(&[in_elem, zero_val])
+                                .add_results(&[i1_type])
+                                .add_attributes(&[(
+                                    Identifier::new(context, "predicate"),
+                                    IntegerAttribute::new(
+                                        melior::ir::r#type::IntegerType::new(context, 64).into(),
+                                        1, // "ne" = 1
+                                    )
+                                    .into(),
+                                )])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    i1_block.append_operation(
+                        OperationBuilder::new("linalg.yield", location)
+                            .add_operands(&[cmp])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    );
+
+                    let r = Region::new();
+                    r.append_block(i1_block);
+                    r
+                };
+
+                let cond_i1: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("linalg.generic", location)
+                            .add_operands(&[cond_promoted, i1_init])
+                            .add_results(&[i1_tensor_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "indexing_maps"), i1_maps.into()),
+                                (Identifier::new(context, "iterator_types"), i1_iters),
+                                (Identifier::new(context, "operand_segment_sizes"), i1_segs),
+                            ])
+                            .add_regions([i1_region])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let _ = (i64_tensor_type, zero_val);
+
+                // tosa.select: (cond: i1 tensor, x, y) → output
+                let out_tensor_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.select", location)
+                            .add_operands(&[cond_i1, x_promoted, y_promoted])
+                            .add_results(&[out_tensor_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
         }
     }
 
-    // ---- Output boundary: bufferization.to_buffer + memref.copy ---------------
-    let result_tensor = *values.get(&output_id).expect("output node not emitted");
+    // ---- Output boundary: bufferization.to_buffer + memref.copy for each output ----
+    // Output memref args immediately follow all input args in the function signature.
+    for (out_idx, &output_id) in output_ids.iter().enumerate() {
+        let result_tensor = *values.get(&output_id).expect("output node not emitted");
 
-    let output_op = trace.get(output_id);
-    let out_elem_type = output_op.dtype().to_mlir_type(context);
-    let dims: Vec<i64> = output_op.shape().0.iter().map(|&d| d as i64).collect();
-    let out_memref_type: melior::ir::Type =
-        MemRefType::new(out_elem_type, &dims, None, None).into();
+        let output_op = trace.get(output_id);
+        let out_elem_type = output_op.dtype().to_mlir_type(context);
+        let dims: Vec<i64> = output_op.shape().0.iter().map(|&d| d as i64).collect();
+        let out_memref_type: melior::ir::Type =
+            MemRefType::new(out_elem_type, &dims, None, None).into();
 
-    let result_memref = body_block
-        .append_operation(
-            OperationBuilder::new("bufferization.to_buffer", location)
-                .add_operands(&[result_tensor])
-                .add_results(&[out_memref_type])
+        let result_memref = body_block
+            .append_operation(
+                OperationBuilder::new("bufferization.to_buffer", location)
+                    .add_operands(&[result_tensor])
+                    .add_results(&[out_memref_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        let out_arg: melior::ir::Value =
+            body_block.argument(num_inputs + out_idx).unwrap().into();
+        body_block.append_operation(
+            OperationBuilder::new("memref.copy", location)
+                .add_operands(&[result_memref, out_arg])
                 .build()
                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // The output func arg immediately follows all input args.
-    let out_arg: melior::ir::Value = body_block.argument(num_inputs).unwrap().into();
-    body_block.append_operation(
-        OperationBuilder::new("memref.copy", location)
-            .add_operands(&[result_memref, out_arg])
-            .build()
-            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-    );
+        );
+    }
 
     Ok(())
 }
@@ -3813,7 +5255,7 @@ mod tests {
             compiled.run(&[&a_buf, &b_buf])
         };
 
-        result.as_slice::<f32>().to_vec()
+        result[0].as_slice::<f32>().to_vec()
     }
 
     #[test]
@@ -3969,7 +5411,7 @@ mod tests {
 
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&input]);
-        assert_eq!(result.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
@@ -3987,7 +5429,7 @@ mod tests {
         let input = Buffer::from_slice::<f32>(&data, &[12], DType::F32);
         let result = compiled.run(&[&input]);
         // Values should be unchanged in row-major order
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert_eq!(out.len(), 12);
         for (i, &v) in out.iter().enumerate() {
             assert_eq!(v, (i + 1) as f32, "mismatch at index {i}");
@@ -4006,7 +5448,7 @@ mod tests {
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
         let input = Buffer::from_slice::<f32>(&data, &[2, 6], DType::F32);
         let result = compiled.run(&[&input]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert_eq!(out.len(), 12);
         for (i, &v) in out.iter().enumerate() {
             assert_eq!(v, (i + 1) as f32, "mismatch at index {i}");
@@ -4077,7 +5519,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[0.5, 0.5, 0.5, 0.5], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         // a+b=[1.5,2.5,3.5,4.5], *a=[1.5,5,10.5,18], relu=same, -b=[1,4.5,10,17.5]
         // neg=[-1,-4.5,-10,-17.5], tanh=[-0.762,-0.9998,-1.0,-1.0]
         assert!((out[0] - (-1.0_f32).tanh()).abs() < 1e-3);
@@ -4162,7 +5604,7 @@ mod tests {
         } else {
             compiled.run(&[&input_buf, &kernel_buf])
         };
-        result.as_slice::<f32>().to_vec()
+        result[0].as_slice::<f32>().to_vec()
     }
 
     #[test]
@@ -4392,7 +5834,7 @@ mod tests {
         let trace = take_trace();
         let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
         let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
-        compiled.run(&[&input_buf]).as_slice::<f32>().to_vec()
+        compiled.run(&[&input_buf])[0].as_slice::<f32>().to_vec()
     }
 
     #[test]
@@ -4536,7 +5978,7 @@ mod tests {
         let mean_buf = Buffer::from_slice::<f32>(mean_data, &[c], DType::F32);
         let var_buf = Buffer::from_slice::<f32>(var_data, &[c], DType::F32);
         compiled
-            .run(&[&input_buf, &scale_buf, &bias_buf, &mean_buf, &var_buf])
+            .run(&[&input_buf, &scale_buf, &bias_buf, &mean_buf, &var_buf])[0]
             .as_slice::<f32>()
             .to_vec()
     }
@@ -4669,7 +6111,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
         let input_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], DType::F32);
         let result = compiled.run(&[&input_buf]);
-        let out_slice = result.as_slice::<f32>();
+        let out_slice = result[0].as_slice::<f32>();
         // Output shape [1, 1, 1, 1] → single element = mean(1,2,3,4) = 2.5
         assert_eq!(out_slice.len(), 1, "expected 1 output element");
         assert!(
@@ -4703,7 +6145,7 @@ mod tests {
         ];
         let input_buf = Buffer::from_slice::<f32>(&data, &[2, 2, 2, 2], DType::F32);
         let result = compiled.run(&[&input_buf]);
-        let out_slice = result.as_slice::<f32>();
+        let out_slice = result[0].as_slice::<f32>();
         // Output shape [2, 2, 1, 1] → 4 elements in NCHW order
         assert_eq!(out_slice.len(), 4, "expected 4 output elements");
         assert!(
@@ -4728,6 +6170,249 @@ mod tests {
         );
     }
 
+    // ── Task 4.1: Pow ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pow_ir_contains_tosa_pow() {
+        begin_trace();
+        let a = Tensor::new(&[2], DType::F32);
+        let b = Tensor::new(&[2], DType::F32);
+        let c = a.pow(&b);
+        let trace = take_trace();
+
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string failed");
+        assert!(ir.contains("tosa.pow"), "expected tosa.pow in IR:\n{ir}");
+    }
+
+    #[test]
+    fn pow_runtime_elementwise() {
+        begin_trace();
+        let a = Tensor::new(&[2], DType::F32);
+        let b = Tensor::new(&[2], DType::F32);
+        let c = a.pow(&b);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let base = Buffer::from_slice::<f32>(&[2.0, 3.0], &[2], DType::F32);
+        let exp = Buffer::from_slice::<f32>(&[3.0, 2.0], &[2], DType::F32);
+        let result = compiled.run(&[&base, &exp]);
+        let out = result[0].as_slice::<f32>();
+        assert!((out[0] - 8.0).abs() < 1e-4, "expected 8.0, got {}", out[0]);
+        assert!((out[1] - 9.0).abs() < 1e-4, "expected 9.0, got {}", out[1]);
+    }
+
+    #[test]
+    fn pow_runtime_broadcast_scalar_exponent() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = Tensor::new(&[1], DType::F32);
+        let c = a.pow(&b);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let base = Buffer::from_slice::<f32>(&[2.0, 3.0, 4.0], &[3], DType::F32);
+        let exp = Buffer::from_slice::<f32>(&[2.0], &[1], DType::F32);
+        let result = compiled.run(&[&base, &exp]);
+        let out = result[0].as_slice::<f32>();
+        assert!((out[0] - 4.0).abs() < 1e-4, "expected 4.0, got {}", out[0]);
+        assert!((out[1] - 9.0).abs() < 1e-4, "expected 9.0, got {}", out[1]);
+        assert!((out[2] - 16.0).abs() < 1e-4, "expected 16.0, got {}", out[2]);
+    }
+
+    // ── Task 4.2: Sqrt ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sqrt_ir_contains_math_sqrt() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = a.sqrt();
+        let trace = take_trace();
+
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string failed");
+        assert!(ir.contains("math.sqrt"), "expected math.sqrt in IR:\n{ir}");
+    }
+
+    #[test]
+    fn sqrt_runtime_basic() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = a.sqrt();
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<f32>(&[4.0, 9.0, 16.0], &[3], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<f32>();
+        assert!((out[0] - 2.0).abs() < 1e-4, "expected 2.0, got {}", out[0]);
+        assert!((out[1] - 3.0).abs() < 1e-4, "expected 3.0, got {}", out[1]);
+        assert!((out[2] - 4.0).abs() < 1e-4, "expected 4.0, got {}", out[2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sqrt requires float dtype")]
+    fn sqrt_integer_panics() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::I32);
+        let _ = a.sqrt();
+        let _ = take_trace();
+    }
+
+    // ── Task 4.3: Cast ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cast_i64_to_f32_runtime() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::I64);
+        let b = a.cast(DType::F32);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<i64>(&[1, 2, 3], &[3], DType::I64);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<f32>();
+        assert!((out[0] - 1.0).abs() < 1e-5, "expected 1.0, got {}", out[0]);
+        assert!((out[1] - 2.0).abs() < 1e-5, "expected 2.0, got {}", out[1]);
+        assert!((out[2] - 3.0).abs() < 1e-5, "expected 3.0, got {}", out[2]);
+    }
+
+    #[test]
+    fn cast_f32_to_i64_runtime() {
+        begin_trace();
+        let a = Tensor::new(&[2], DType::F32);
+        let b = a.cast(DType::I64);
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<f32>(&[1.5, 2.7], &[2], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<i64>();
+        assert_eq!(out[0], 1, "expected truncation to 1, got {}", out[0]);
+        assert_eq!(out[1], 2, "expected truncation to 2, got {}", out[1]);
+    }
+
+    #[test]
+    fn cast_same_dtype_is_noop() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = a.cast(DType::F32);
+        let trace = take_trace();
+        // Same-type cast should not add an extra op.
+        assert_eq!(trace.ops().len(), 1, "same-type cast should not add an op");
+        assert_eq!(a.id, b.id, "same-type cast should return same node id");
+    }
+
+    // ── Task 4.4: ReduceMean ──────────────────────────────────────────────────
+
+    #[test]
+    fn reduce_mean_ir_contains_reduce_sum_and_mul() {
+        begin_trace();
+        let a = Tensor::new(&[2, 2], DType::F32);
+        let b = a.reduce_mean(&[1], true);
+        let trace = take_trace();
+
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("build_ir_string failed");
+        assert!(
+            ir.contains("tosa.reduce_sum"),
+            "expected tosa.reduce_sum in IR:\n{ir}"
+        );
+        assert!(ir.contains("tosa.mul"), "expected tosa.mul in IR:\n{ir}");
+    }
+
+    #[test]
+    fn reduce_mean_axis1_no_keepdim() {
+        begin_trace();
+        // [2, 2] shaped input: [[1, 2], [3, 4]], reduce axis=1 → [1.5, 3.5]
+        let a = Tensor::new(&[2, 2], DType::F32);
+        let b = a.reduce_mean(&[1], false);
+        let trace = take_trace();
+
+        assert_eq!(b.shape().0, vec![2u64], "expected shape [2], got {:?}", b.shape().0);
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<f32>();
+        assert!(
+            (out[0] - 1.5).abs() < 1e-4,
+            "expected 1.5, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 3.5).abs() < 1e-4,
+            "expected 3.5, got {}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn reduce_mean_axis1_keepdim() {
+        begin_trace();
+        let a = Tensor::new(&[2, 2], DType::F32);
+        let b = a.reduce_mean(&[1], true);
+        let trace = take_trace();
+
+        assert_eq!(
+            b.shape().0,
+            vec![2u64, 1],
+            "expected shape [2,1], got {:?}",
+            b.shape().0
+        );
+
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<f32>();
+        assert!(
+            (out[0] - 1.5).abs() < 1e-4,
+            "expected 1.5, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 3.5).abs() < 1e-4,
+            "expected 3.5, got {}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn reduce_mean_multi_axis() {
+        begin_trace();
+        // [2, 3, 4] tensor, axes=[1,2], keepdim=false → shape [2]
+        let a = Tensor::new(&[2, 3, 4], DType::F32);
+        let b = a.reduce_mean(&[1, 2], false);
+        let trace = take_trace();
+
+        assert_eq!(
+            b.shape().0,
+            vec![2u64],
+            "expected shape [2], got {:?}",
+            b.shape().0
+        );
+
+        // Build input: batch 0 = all 1.0, batch 1 = all 2.0
+        let mut data = vec![0.0f32; 24];
+        for i in 0..12 {
+            data[i] = 1.0;
+        }
+        for i in 12..24 {
+            data[i] = 2.0;
+        }
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let input = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
+        let result = compiled.run(&[&input]);
+        let out = result[0].as_slice::<f32>();
+        assert!(
+            (out[0] - 1.0).abs() < 1e-4,
+            "expected 1.0, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 2.0).abs() < 1e-4,
+            "expected 2.0, got {}",
+            out[1]
+        );
+    }
+
     // NOTE: affine-loop-fusion was investigated and found unsafe for our pipeline.
     // Two root causes:
     // 1. memref.expand_shape aliases: fusion doesn't track that expand_shape creates
@@ -4737,5 +6422,436 @@ mod tests {
     //    buffer. fusion merges the fill-zeros loop with the copy-input loop, breaking
     //    pad semantics. fold-memref-alias-ops can't resolve strided subviews.
     //    No fix available — this is a fundamental limitation of affine fusion with
-    //    subview aliasing from one-shot-bufferize.
+    //    subview aliasing from one-shot, bufferize.
+
+    // ── Gather tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn gather_axis0_ir() {
+        begin_trace();
+        // data[4, 2], indices[3] → out[3, 2]
+        let data = Tensor::new(&[4, 2], DType::F32);
+        let indices = Tensor::new(&[3], DType::I64);
+        let out = data.gather(&indices, 0);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![3u64, 2]);
+        let result = Compiler::compile(&trace, &[out.id]);
+        assert!(result.is_ok(), "gather IR compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn gather_axis0_runtime() {
+        begin_trace();
+        // data = [[10, 20], [30, 40], [50, 60], [70, 80]]
+        // indices = [2, 0, 3]
+        // expected = [[50, 60], [10, 20], [70, 80]]
+        let data = Tensor::new(&[4, 2], DType::F32);
+        let indices = Tensor::new(&[3], DType::I64);
+        let out = data.gather(&indices, 0);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let data_buf = Buffer::from_slice::<f32>(
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+            &[4, 2],
+            DType::F32,
+        );
+        let idx_buf = Buffer::from_slice::<i64>(&[2, 0, 3], &[3], DType::I64);
+        let results = compiled.run(&[&data_buf, &idx_buf]);
+        let out_data = results[0].as_slice::<f32>();
+        assert_eq!(out_data, &[50.0, 60.0, 10.0, 20.0, 70.0, 80.0]);
+    }
+
+    #[test]
+    fn gather_axis1_runtime() {
+        begin_trace();
+        // data = [[1, 2, 3], [4, 5, 6]], indices = [2, 0], axis=1
+        // expected = [[3, 1], [6, 4]]
+        let data = Tensor::new(&[2, 3], DType::F32);
+        let indices = Tensor::new(&[2], DType::I64);
+        let out = data.gather(&indices, 1);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let data_buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let idx_buf = Buffer::from_slice::<i64>(&[2, 0], &[2], DType::I64);
+        let results = compiled.run(&[&data_buf, &idx_buf]);
+        let out_data = results[0].as_slice::<f32>();
+        assert_eq!(out_data, &[3.0, 1.0, 6.0, 4.0]);
+    }
+
+    #[test]
+    fn gather_2d_indices_runtime() {
+        begin_trace();
+        // Embedding lookup: data[vocab=5, dim=3], indices[2, 4] → out[2, 4, 3]
+        let vocab = 5usize;
+        let dim = 3usize;
+        let data = Tensor::new(&[vocab as u64, dim as u64], DType::F32);
+        let indices = Tensor::new(&[2, 4], DType::I64);
+        let out = data.gather(&indices, 0);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![2u64, 4, 3]);
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        // data rows: row i = [i*10, i*10+1, i*10+2]
+        let data_vals: Vec<f32> = (0..vocab)
+            .flat_map(|i| (0..dim).map(move |j| (i * 10 + j) as f32))
+            .collect();
+        // indices: pick rows 1,3,0,2 and 4,2,1,0
+        let idx_vals: Vec<i64> = vec![1, 3, 0, 2, 4, 2, 1, 0];
+        let data_buf =
+            Buffer::from_slice::<f32>(&data_vals, &[vocab as u64, dim as u64], DType::F32);
+        let idx_buf = Buffer::from_slice::<i64>(&idx_vals, &[2, 4], DType::I64);
+        let results = compiled.run(&[&data_buf, &idx_buf]);
+        let out_data = results[0].as_slice::<f32>();
+        // Verify spot check: out[0,0] = data[1] = [10,11,12]
+        assert_eq!(&out_data[0..3], &[10.0, 11.0, 12.0]);
+        // out[0,1] = data[3] = [30,31,32]
+        assert_eq!(&out_data[3..6], &[30.0, 31.0, 32.0]);
+    }
+
+    // ── Slice tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn slice_stride1_ir() {
+        begin_trace();
+        // Slice [0..3] of a 1D tensor of length 5.
+        let a = Tensor::new(&[5], DType::F32);
+        let b = a.slice(&[0], &[3], &[0], &[1]);
+        let trace = take_trace();
+        assert_eq!(b.shape().0, vec![3u64]);
+        let result = Compiler::compile(&trace, &[b.id]);
+        assert!(result.is_ok(), "slice IR compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn slice_1d_runtime() {
+        begin_trace();
+        // a = [10, 20, 30, 40, 50], slice [1..4] → [20, 30, 40]
+        let a = Tensor::new(&[5], DType::F32);
+        let b = a.slice(&[1], &[4], &[0], &[1]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0], &[5], DType::F32);
+        let results = compiled.run(&[&a_buf]);
+        assert_eq!(results[0].as_slice::<f32>(), &[20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn slice_2d_runtime() {
+        begin_trace();
+        // data[3, 4], slice rows [0..2], cols [1..3] → shape [2, 2]
+        // data = [[1,2,3,4],[5,6,7,8],[9,10,11,12]]
+        // → [[2,3],[6,7]]
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = a.slice(&[0, 1], &[2, 3], &[0, 1], &[1, 1]);
+        let trace = take_trace();
+        assert_eq!(b.shape().0, vec![2u64, 2]);
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            &[3, 4],
+            DType::F32,
+        );
+        let results = compiled.run(&[&a_buf]);
+        assert_eq!(results[0].as_slice::<f32>(), &[2.0, 3.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn slice_strided_runtime() {
+        begin_trace();
+        // a = [0,1,2,3,4,5,6,7,8,9], slice with step=2 → [0,2,4,6,8]
+        let a = Tensor::new(&[10], DType::F32);
+        let b = a.slice(&[0], &[10], &[0], &[2]);
+        let trace = take_trace();
+        assert_eq!(b.shape().0, vec![5u64]);
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_data: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&a_data, &[10], DType::F32);
+        let results = compiled.run(&[&a_buf]);
+        assert_eq!(results[0].as_slice::<f32>(), &[0.0, 2.0, 4.0, 6.0, 8.0]);
+    }
+
+    // ── Concat tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn concat_ir() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[2, 3], DType::F32);
+        let c = Tensor::concat(&[&a, &b], 0);
+        let trace = take_trace();
+        assert_eq!(c.shape().0, vec![4u64, 3]);
+        let result = Compiler::compile(&trace, &[c.id]);
+        assert!(result.is_ok(), "concat IR compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn concat_axis0_runtime() {
+        begin_trace();
+        // a = [[1,2,3]], b = [[4,5,6]] → [[1,2,3],[4,5,6]]
+        let a = Tensor::new(&[1, 3], DType::F32);
+        let b = Tensor::new(&[1, 3], DType::F32);
+        let c = Tensor::concat(&[&a, &b], 0);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[1, 3], DType::F32);
+        let b_buf =
+            Buffer::from_slice::<f32>(&[4.0, 5.0, 6.0], &[1, 3], DType::F32);
+        let results = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(
+            results[0].as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn concat_axis1_runtime() {
+        begin_trace();
+        // a = [[1,2],[3,4]], b = [[5],[6]] → [[1,2,5],[3,4,6]]
+        let a = Tensor::new(&[2, 2], DType::F32);
+        let b = Tensor::new(&[2, 1], DType::F32);
+        let c = Tensor::concat(&[&a, &b], 1);
+        let trace = take_trace();
+        assert_eq!(c.shape().0, vec![2u64, 3]);
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0], &[2, 1], DType::F32);
+        let results = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(
+            results[0].as_slice::<f32>(),
+            &[1.0, 2.0, 5.0, 3.0, 4.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn concat_three_tensors_runtime() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = Tensor::new(&[2], DType::F32);
+        let c_t = Tensor::new(&[1], DType::F32);
+        let out = Tensor::concat(&[&a, &b, &c_t], 0);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![6u64]);
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[4.0, 5.0], &[2], DType::F32);
+        let c_buf = Buffer::from_slice::<f32>(&[6.0], &[1], DType::F32);
+        let results = compiled.run(&[&a_buf, &b_buf, &c_buf]);
+        assert_eq!(
+            results[0].as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    // ── Transpose tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn transpose_2d_ir() {
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = a.transpose(&[1, 0]);
+        let trace = take_trace();
+        assert_eq!(b.shape().0, vec![4u64, 3]);
+        let result = Compiler::compile(&trace, &[b.id]);
+        assert!(result.is_ok(), "transpose IR compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn transpose_2d_runtime() {
+        begin_trace();
+        // [[1,2,3],[4,5,6]] transpose → [[1,4],[2,5],[3,6]]
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = a.transpose(&[1, 0]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let results = compiled.run(&[&a_buf]);
+        assert_eq!(
+            results[0].as_slice::<f32>(),
+            &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn transpose_4d_nchw_nhwc_runtime() {
+        begin_trace();
+        // NCHW → NHWC: [1, 2, 3, 4] perm [0,2,3,1] → [1, 3, 4, 2]
+        let a = Tensor::new(&[1, 2, 3, 4], DType::F32);
+        let b = a.transpose(&[0, 2, 3, 1]);
+        let trace = take_trace();
+        assert_eq!(b.shape().0, vec![1u64, 3, 4, 2]);
+        let result = Compiler::compile(&trace, &[b.id]);
+        assert!(result.is_ok(), "4D transpose compile failed: {:?}", result.err());
+    }
+
+    // ── Where tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn where_ir() {
+        begin_trace();
+        let cond = Tensor::new(&[4], DType::I64);
+        let x = Tensor::new(&[4], DType::F32);
+        let y = Tensor::new(&[4], DType::F32);
+        let out = Tensor::where_select(&cond, &x, &y);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![4u64]);
+        let result = Compiler::compile(&trace, &[out.id]);
+        assert!(result.is_ok(), "where IR compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn where_runtime() {
+        begin_trace();
+        // cond = [1, 0, 1, 0], x = [10, 20, 30, 40], y = [100, 200, 300, 400]
+        // expected = [10, 200, 30, 400]
+        let cond = Tensor::new(&[4], DType::I64);
+        let x = Tensor::new(&[4], DType::F32);
+        let y = Tensor::new(&[4], DType::F32);
+        let out = Tensor::where_select(&cond, &x, &y);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let cond_buf = Buffer::from_slice::<i64>(&[1, 0, 1, 0], &[4], DType::I64);
+        let x_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+        let y_buf =
+            Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
+        let results = compiled.run(&[&cond_buf, &x_buf, &y_buf]);
+        assert_eq!(
+            results[0].as_slice::<f32>(),
+            &[10.0, 200.0, 30.0, 400.0]
+        );
+    }
+
+    #[test]
+    fn where_2d_runtime() {
+        begin_trace();
+        // cond = [[1,0],[0,1]], x = [[1,2],[3,4]], y = [[10,20],[30,40]]
+        // expected = [[1,20],[30,4]]
+        let cond = Tensor::new(&[2, 2], DType::I64);
+        let x = Tensor::new(&[2, 2], DType::F32);
+        let y = Tensor::new(&[2, 2], DType::F32);
+        let out = Tensor::where_select(&cond, &x, &y);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let cond_buf = Buffer::from_slice::<i64>(&[1, 0, 0, 1], &[2, 2], DType::I64);
+        let x_buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
+        let y_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[2, 2], DType::F32);
+        let results = compiled.run(&[&cond_buf, &x_buf, &y_buf]);
+        assert_eq!(results[0].as_slice::<f32>(), &[1.0, 20.0, 30.0, 4.0]);
+    }
+
+    // ── Batched matmul tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn ir_batched_matmul_f32_uses_linalg_generic() {
+        // Batched float matmul should emit linalg.generic (not tosa.matmul).
+        begin_trace();
+        let a = Tensor::new(&[2, 3, 4], DType::F32);
+        let b = Tensor::new(&[2, 4, 5], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(
+            ir.contains("linalg.generic"),
+            "expected linalg.generic in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tosa.matmul"),
+            "unexpected tosa.matmul in batched IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.matmul"),
+            "unexpected linalg.matmul in batched IR:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn ir_batched_matmul_4d_uses_linalg_generic() {
+        // 4D batched float matmul: [B,H,M,K] @ [B,H,K,N] should emit linalg.generic.
+        begin_trace();
+        let a = Tensor::new(&[2, 3, 4, 5], DType::F32);
+        let b = Tensor::new(&[2, 3, 5, 6], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[c.id]).expect("build_ir_string");
+        assert!(
+            ir.contains("linalg.generic"),
+            "expected linalg.generic in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("tosa.matmul"),
+            "unexpected tosa.matmul in 4D batched IR:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn runtime_batched_matmul_3d_f32() {
+        // [2, 2, 2] @ [2, 2, 3] -> [2, 2, 3]
+        // batch=0: [[1,2],[3,4]] @ [[1,0,0],[0,1,0]] = [[1,2,0],[3,4,0]]  (with 3-col RHS)
+        // batch=0: [[1,2],[3,4]] @ [[1,2,3],[4,5,6]] = [[9,12,15],[19,26,33]]
+        // batch=1: [[5,6],[7,8]] @ [[1,0,0],[0,1,0]] = [[5,6,0],[7,8,0]]
+        // Use simple case: identity-like RHS for easy verification.
+        //
+        // lhs[0] = [[1,2],[3,4]], lhs[1] = [[5,6],[7,8]]
+        // rhs[0] = [[1,2,3],[4,5,6]], rhs[1] = [[7,8,9],[10,11,12]]
+        // out[0,0,:] = 1*1+2*4, 1*2+2*5, 1*3+2*6 = 9,12,15
+        // out[0,1,:] = 3*1+4*4, 3*2+4*5, 3*3+4*6 = 19,26,33
+        // out[1,0,:] = 5*7+6*10, 5*8+6*11, 5*9+6*12 = 95,106,117
+        // out[1,1,:] = 7*7+8*10, 7*8+8*11, 7*9+8*12 = 129,144,159
+        begin_trace();
+        let a = Tensor::new(&[2, 2, 2], DType::F32);
+        let b = Tensor::new(&[2, 2, 3], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        assert_eq!(c.shape().0, vec![2u64, 2, 3]);
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b_data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let a_buf = Buffer::from_slice::<f32>(&a_data, &[2, 2, 2], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&b_data, &[2, 2, 3], DType::F32);
+        let results = compiled.run(&[&a_buf, &b_buf]);
+        let out = results[0].as_slice::<f32>();
+        assert_eq!(
+            out,
+            &[9.0, 12.0, 15.0, 19.0, 26.0, 33.0, 95.0, 106.0, 117.0, 129.0, 144.0, 159.0],
+            "batched 3D matmul result mismatch"
+        );
+    }
+
+    #[test]
+    fn runtime_batched_matmul_4d_f32() {
+        // [1, 2, 2, 2] @ [1, 2, 2, 2] -> [1, 2, 2, 2]
+        // Two 2x2 matrices for head dimension:
+        // head=0: [[1,2],[3,4]] @ [[1,0],[0,1]] = [[1,2],[3,4]]
+        // head=1: [[5,6],[7,8]] @ [[2,0],[0,2]] = [[10,12],[14,16]]
+        begin_trace();
+        let a = Tensor::new(&[1, 2, 2, 2], DType::F32);
+        let b = Tensor::new(&[1, 2, 2, 2], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        assert_eq!(c.shape().0, vec![1u64, 2, 2, 2]);
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+
+        // lhs: batch=0, head=0: [[1,2],[3,4]], head=1: [[5,6],[7,8]]
+        let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        // rhs: batch=0, head=0: [[1,0],[0,1]] (identity), head=1: [[2,0],[0,2]]
+        let b_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
+        let a_buf = Buffer::from_slice::<f32>(&a_data, &[1, 2, 2, 2], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&b_data, &[1, 2, 2, 2], DType::F32);
+        let results = compiled.run(&[&a_buf, &b_buf]);
+        let out = results[0].as_slice::<f32>();
+        assert_eq!(
+            out,
+            &[1.0, 2.0, 3.0, 4.0, 10.0, 12.0, 14.0, 16.0],
+            "batched 4D matmul result mismatch"
+        );
+    }
 }

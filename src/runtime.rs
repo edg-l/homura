@@ -79,6 +79,9 @@ impl Buffer {
             self.dtype,
             self.dtype.size_bytes(),
         );
+        if self.data.is_empty() {
+            return &[];
+        }
         unsafe {
             slice::from_raw_parts(self.data.as_ptr() as *const T, self.data.len() / elem_size)
         }
@@ -156,39 +159,42 @@ pub(crate) fn build_memref_descriptor(
 
 // ── CompiledGraph ─────────────────────────────────────────────────────────────
 
+/// Metadata for a single output tensor of a compiled graph.
+pub(crate) struct OutputDesc {
+    pub shape: Shape,
+    pub dtype: DType,
+}
+
 /// A compiled computation graph, ready to execute.
 pub struct CompiledGraph {
     engine: ExecutionEngine,
     num_inputs: usize,
-    output_shape: Shape,
-    output_dtype: DType,
+    outputs: Vec<OutputDesc>,
 }
 
 impl CompiledGraph {
     pub(crate) fn new(
         engine: ExecutionEngine,
         num_inputs: usize,
-        output_shape: Shape,
-        output_dtype: DType,
+        outputs: Vec<OutputDesc>,
     ) -> Self {
         Self {
             engine,
             num_inputs,
-            output_shape,
-            output_dtype,
+            outputs,
         }
     }
 
-    /// Execute the graph with the given input `Buffer`s. Returns the output as
-    /// an owned `Buffer`.
+    /// Execute the graph with the given input `Buffer`s. Returns all outputs as
+    /// owned `Buffer`s in the same order as the `outputs` slice passed to
+    /// `Compiler::compile`.
     ///
     /// # Panics
     ///
     /// Panics if:
     /// - The number of inputs doesn't match the compiled graph.
-    /// - Any input dtype doesn't match the graph's output dtype.
     /// - The JIT invocation fails (mismatched ABI).
-    pub fn run(&self, inputs: &[&Buffer]) -> Buffer {
+    pub fn run(&self, inputs: &[&Buffer]) -> Vec<Buffer> {
         assert_eq!(
             inputs.len(),
             self.num_inputs,
@@ -197,8 +203,12 @@ impl CompiledGraph {
             inputs.len()
         );
 
-        // Allocate output buffer (must exist before descriptor is built).
-        let mut output = Buffer::new(self.output_shape.0.as_slice(), self.output_dtype);
+        // Allocate output buffers (must exist before descriptors are built).
+        let mut output_bufs: Vec<Buffer> = self
+            .outputs
+            .iter()
+            .map(|desc| Buffer::new(desc.shape.0.as_slice(), desc.dtype))
+            .collect();
 
         // Build memref descriptors for inputs. Inputs are immutable references,
         // but the JIT only reads them, so the const→mut cast is safe.
@@ -217,23 +227,30 @@ impl CompiledGraph {
             })
             .collect();
 
-        let output_shape_i64: Vec<i64> = self.output_shape.0.iter().map(|&d| d as i64).collect();
-        let output_strides: Vec<i64> = output.strides().to_vec();
-        let mut output_desc =
-            build_memref_descriptor(output.data.as_mut_ptr(), &output_shape_i64, &output_strides);
+        let mut output_descs: Vec<Vec<u8>> = output_bufs
+            .iter_mut()
+            .map(|buf| {
+                let shape_i64: Vec<i64> = buf.shape().0.iter().map(|&d| d as i64).collect();
+                let strides = buf.strides().to_vec();
+                build_memref_descriptor(buf.data.as_mut_ptr(), &shape_i64, &strides)
+            })
+            .collect();
 
         // Build args: each args[i] = &mut (ptr_to_descriptor) cast to *mut ().
         // invoke_packed dereferences each args[i] as a void* to get the
         // pointer passed to the MLIR C-interface wrapper, which then
         // dereferences that pointer to get the MemRefDescriptor struct.
         let mut desc_ptrs: Vec<*mut u8> = input_descs.iter_mut().map(|d| d.as_mut_ptr()).collect();
-        let mut output_desc_ptr = output_desc.as_mut_ptr();
+        let mut output_desc_ptrs: Vec<*mut u8> =
+            output_descs.iter_mut().map(|d| d.as_mut_ptr()).collect();
 
         let mut args: Vec<*mut ()> = desc_ptrs
             .iter_mut()
             .map(|p| p as *mut *mut u8 as *mut ())
             .collect();
-        args.push(&mut output_desc_ptr as *mut *mut u8 as *mut ());
+        for p in output_desc_ptrs.iter_mut() {
+            args.push(p as *mut *mut u8 as *mut ());
+        }
 
         unsafe {
             self.engine
@@ -241,7 +258,7 @@ impl CompiledGraph {
                 .expect("JIT invocation failed");
         }
 
-        output
+        output_bufs
     }
 }
 
@@ -344,7 +361,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
     }
 
     #[test]
@@ -361,7 +378,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
         let c_buf = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf, &c_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
     }
 
     #[test]
@@ -380,7 +397,7 @@ mod tests {
         let result = compiled.run(&[&a_buf, &b_buf]);
 
         let expected: Vec<f32> = (0..8).map(|i| (i + i * 2) as f32).collect();
-        assert_eq!(result.as_slice::<f32>(), expected.as_slice());
+        assert_eq!(result[0].as_slice::<f32>(), expected.as_slice());
     }
 
     #[test]
@@ -409,7 +426,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[4.0, 3.0, 2.0, 1.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[-3.0, -1.0, 1.0, 3.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[-3.0, -1.0, 1.0, 3.0]);
     }
 
     #[test]
@@ -424,7 +441,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[5.0, 12.0, 21.0, 32.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[5.0, 12.0, 21.0, 32.0]);
     }
 
     #[test]
@@ -439,7 +456,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[2.0, 4.0, 5.0, 8.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[5.0, 5.0, 6.0, 5.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[5.0, 5.0, 6.0, 5.0]);
     }
 
     #[test]
@@ -452,7 +469,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[-1.0, 2.0, -3.0, 4.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[-1.0, 2.0, -3.0, 4.0]);
     }
 
     #[test]
@@ -465,7 +482,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[-1.0, 2.0, -3.0, 4.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[0.0, 2.0, 0.0, 4.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[0.0, 2.0, 0.0, 4.0]);
     }
 
     #[test]
@@ -481,7 +498,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, -5.0, 3.0, -7.0], &[4], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[2.0, 3.0, -4.0, 5.0], &[4], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[3.0, 0.0, 0.0, 0.0]);
     }
 
     // ── Rank-2 and rank-3 integration tests ──────────────────────────────────
@@ -500,7 +517,7 @@ mod tests {
             Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0]
         );
     }
@@ -526,7 +543,7 @@ mod tests {
         );
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[11.0, 22.0, 33.0, 44.0, 55.0, 66.0, 77.0, 88.0]
         );
     }
@@ -555,7 +572,7 @@ mod tests {
         );
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
         );
     }
@@ -580,7 +597,7 @@ mod tests {
         );
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f64>(),
+            result[0].as_slice::<f64>(),
             &[38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]
         );
     }
@@ -609,7 +626,7 @@ mod tests {
         );
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<i32>(),
+            result[0].as_slice::<i32>(),
             &[38, 44, 50, 56, 83, 98, 113, 128]
         );
     }
@@ -623,7 +640,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[0.0, 1.0, 2.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         // exp(0) = 1.0, exp(1) ≈ 2.718, exp(2) ≈ 7.389
         assert!((out[0] - 1.0).abs() < 1e-5);
         assert!((out[1] - std::f32::consts::E).abs() < 1e-5);
@@ -639,7 +656,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[-1.0, 0.0, 1.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         // tanh(-1) ≈ -0.7616, tanh(0) = 0.0, tanh(1) ≈ 0.7616
         assert!((out[0] - (-0.7615942)).abs() < 1e-5);
         assert!((out[1] - 0.0).abs() < 1e-5);
@@ -657,7 +674,7 @@ mod tests {
         let a_buf =
             Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0, 5.0, -6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[-1.0, 2.0, -3.0, 4.0, -5.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[-1.0, 2.0, -3.0, 4.0, -5.0, 6.0]);
     }
 
     // ── Broadcast integration tests (task 4.6) ───────────────────────────────
@@ -675,7 +692,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]
         );
     }
@@ -693,7 +710,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[1, 3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[11.0, 21.0, 31.0, 12.0, 22.0, 32.0]
         );
     }
@@ -724,7 +741,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(result.as_slice::<f32>(), expected.as_slice());
+        assert_eq!(result[0].as_slice::<f32>(), expected.as_slice());
     }
 
     // ── Reduction integration tests (tasks 6.4 – 6.7) ────────────────────────
@@ -739,7 +756,7 @@ mod tests {
         // [[1,2,3],[4,5,6]] -> sum along dim 0 -> [5, 7, 9]
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[5.0, 7.0, 9.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[5.0, 7.0, 9.0]);
     }
 
     #[test]
@@ -752,7 +769,7 @@ mod tests {
         // [[1,2,3],[4,5,6]] -> sum along dim -1 (=1) -> [6, 15]
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[6.0, 15.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[6.0, 15.0]);
     }
 
     #[test]
@@ -766,8 +783,8 @@ mod tests {
         // [[1,2,3],[4,5,6]] -> sum along dim -1 keepdim -> [[6], [15]]
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.shape(), &Shape(vec![2, 1]));
-        assert_eq!(result.as_slice::<f32>(), &[6.0, 15.0]);
+        assert_eq!(result[0].shape(), &Shape(vec![2, 1]));
+        assert_eq!(result[0].as_slice::<f32>(), &[6.0, 15.0]);
     }
 
     #[test]
@@ -780,7 +797,7 @@ mod tests {
         // [[1,3,2],[6,4,5]] -> max along dim -1 -> [3, 6]
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 3.0, 2.0, 6.0, 4.0, 5.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[3.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[3.0, 6.0]);
     }
 
     #[test]
@@ -794,7 +811,7 @@ mod tests {
         let a_buf =
             Buffer::from_slice::<f32>(&[-5.0, -3.0, -1.0, -9.0, -7.0, -4.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[-1.0, -4.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[-1.0, -4.0]);
     }
 
     #[test]
@@ -807,7 +824,7 @@ mod tests {
         // [[-5, -3, -1], [-10, -7, -4]] -> max along last dim -> [-1, -4]
         let a_buf = Buffer::from_slice::<i32>(&[-5, -3, -1, -10, -7, -4], &[2, 3], DType::I32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<i32>(), &[-1, -4]);
+        assert_eq!(result[0].as_slice::<i32>(), &[-1, -4]);
     }
 
     // ── F64 dtype coverage ───────────────────────────────────────────────────
@@ -823,7 +840,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f64>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F64);
         let b_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F64);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[4.0, 4.0, 4.0, 4.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[4.0, 4.0, 4.0, 4.0]);
     }
 
     #[test]
@@ -837,7 +854,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f64>(&[2.0, 3.0, 4.0, 5.0], &[4], DType::F64);
         let b_buf = Buffer::from_slice::<f64>(&[1.5, 2.0, 0.5, 3.0], &[4], DType::F64);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[3.0, 6.0, 2.0, 15.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[3.0, 6.0, 2.0, 15.0]);
     }
 
     #[test]
@@ -851,7 +868,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f64>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F64);
         let b_buf = Buffer::from_slice::<f64>(&[2.0, 4.0, 5.0, 8.0], &[4], DType::F64);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[5.0, 5.0, 6.0, 5.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[5.0, 5.0, 6.0, 5.0]);
     }
 
     #[test]
@@ -863,7 +880,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[-1.0, 2.0, -3.0, 4.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[-1.0, 2.0, -3.0, 4.0]);
     }
 
     #[test]
@@ -875,7 +892,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[-1.0, 0.0, 3.0, -4.0], &[4], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[0.0, 0.0, 3.0, 0.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[0.0, 0.0, 3.0, 0.0]);
     }
 
     #[test]
@@ -887,7 +904,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[0.0, 1.0, -1.0], &[3], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f64>();
+        let out = result[0].as_slice::<f64>();
         assert!((out[0] - 1.0).abs() < 1e-10);
         assert!((out[1] - std::f64::consts::E).abs() < 1e-10);
         assert!((out[2] - 1.0 / std::f64::consts::E).abs() < 1e-10);
@@ -902,7 +919,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[0.0, 1.0, -1.0], &[3], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f64>();
+        let out = result[0].as_slice::<f64>();
         assert!(out[0].abs() < 1e-10);
         assert!((out[1] - 1.0_f64.tanh()).abs() < 1e-10);
         assert!((out[2] - (-1.0_f64).tanh()).abs() < 1e-10);
@@ -917,7 +934,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[6.0, 15.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[6.0, 15.0]);
     }
 
     #[test]
@@ -929,7 +946,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[5.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[5.0, 6.0]);
     }
 
     #[test]
@@ -941,7 +958,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f64>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f64>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     // ── Broadcast tests for Sub, Mul, Div ────────────────────────────────────
@@ -959,7 +976,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[9.0, 18.0, 27.0, 39.0, 48.0, 57.0]
         );
     }
@@ -976,7 +993,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(
-            result.as_slice::<f32>(),
+            result[0].as_slice::<f32>(),
             &[10.0, 40.0, 90.0, 40.0, 100.0, 180.0]
         );
     }
@@ -993,7 +1010,7 @@ mod tests {
             Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[2.0, 5.0, 10.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[5.0, 4.0, 3.0, 20.0, 10.0, 6.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[5.0, 4.0, 3.0, 20.0, 10.0, 6.0]);
     }
 
     // ── Edge value tests ─────────────────────────────────────────────────────
@@ -1009,7 +1026,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[1.0, -1.0, 0.0], &[3], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[0.0, 0.0, 0.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert!(out[0].is_infinite() && out[0] > 0.0, "1/0 should be +inf");
         assert!(out[1].is_infinite() && out[1] < 0.0, "-1/0 should be -inf");
         assert!(out[2].is_nan(), "0/0 should be NaN");
@@ -1024,7 +1041,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[100.0, -100.0, 0.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert!(out[0].is_infinite(), "exp(100) should overflow to inf");
         assert!((out[1]).abs() < 1e-30, "exp(-100) should underflow to ~0");
         assert!((out[2] - 1.0).abs() < 1e-6, "exp(0) = 1");
@@ -1039,7 +1056,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<f32>(&[100.0, -100.0, 0.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert!((out[0] - 1.0).abs() < 1e-6, "tanh(100) ≈ 1");
         assert!((out[1] + 1.0).abs() < 1e-6, "tanh(-100) ≈ -1");
         assert!(out[2].abs() < 1e-6, "tanh(0) = 0");
@@ -1057,7 +1074,7 @@ mod tests {
         let b_buf =
             Buffer::from_slice::<f32>(&[1.0, f32::NAN, f32::NEG_INFINITY], &[3], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert!(out[0].is_nan(), "NaN + 1 = NaN");
         assert!(out[1].is_nan(), "1 + NaN = NaN");
         assert!(out[2].is_nan(), "inf + -inf = NaN");
@@ -1076,7 +1093,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[3.0], &[1, 1], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[5.0], &[1, 1], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[15.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[15.0]);
     }
 
     #[test]
@@ -1090,7 +1107,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<f32>(&[3.0], &[1], DType::F32);
         let b_buf = Buffer::from_slice::<f32>(&[7.0], &[1], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<f32>(), &[10.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[10.0]);
     }
 
     // ── Complex graph test ───────────────────────────────────────────────────
@@ -1120,7 +1137,7 @@ mod tests {
         let result = compiled.run(&[&x_buf, &w_buf, &b_buf]);
         // x@w = [[1,0,0,0],[0,1,0,0]], + b = [[1,0,0,-10],[0,1,0,-10]]
         // relu = [[1,0,0,0],[0,1,0,0]], sum = [1, 1]
-        assert_eq!(result.as_slice::<f32>(), &[1.0, 1.0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[1.0, 1.0]);
     }
 
     // ── I64 dtype tests ──────────────────────────────────────────────────────
@@ -1136,7 +1153,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<i64>(&[1_000_000_000, -500, 0], &[3], DType::I64);
         let b_buf = Buffer::from_slice::<i64>(&[1_000_000_000, 500, 0], &[3], DType::I64);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<i64>(), &[2_000_000_000, 0, 0]);
+        assert_eq!(result[0].as_slice::<i64>(), &[2_000_000_000, 0, 0]);
     }
 
     #[test]
@@ -1148,7 +1165,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<i64>(&[100, -200, 0], &[3], DType::I64);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<i64>(), &[-100, 200, 0]);
+        assert_eq!(result[0].as_slice::<i64>(), &[-100, 200, 0]);
     }
 
     #[test]
@@ -1162,7 +1179,7 @@ mod tests {
         let a_buf = Buffer::from_slice::<i64>(&[1, 2, 3, 4], &[2, 2], DType::I64);
         let b_buf = Buffer::from_slice::<i64>(&[5, 6, 7, 8], &[2, 2], DType::I64);
         let result = compiled.run(&[&a_buf, &b_buf]);
-        assert_eq!(result.as_slice::<i64>(), &[19, 22, 43, 50]);
+        assert_eq!(result[0].as_slice::<i64>(), &[19, 22, 43, 50]);
     }
 
     // ── I32 reduce tests ─────────────────────────────────────────────────────
@@ -1176,7 +1193,7 @@ mod tests {
         let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
         let a_buf = Buffer::from_slice::<i32>(&[1, 2, 3, 4, 5, 6], &[2, 3], DType::I32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<i32>(), &[6, 15]);
+        assert_eq!(result[0].as_slice::<i32>(), &[6, 15]);
     }
 
     // ── 3D reduce tests ──────────────────────────────────────────────────────
@@ -1191,7 +1208,7 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let a_buf = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert_eq!(out.len(), 8);
         // batch 0: sum rows [[0,1,2,3],[4,5,6,7],[8,9,10,11]] → [12,15,18,21]
         assert!((out[0] - 12.0).abs() < 1e-5);
@@ -1210,7 +1227,7 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let a_buf = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert_eq!(out.len(), 12);
         // max(a[0,i,j], a[1,i,j]) — second batch always larger
         assert!((out[0] - 12.0).abs() < 1e-5);
@@ -1230,7 +1247,7 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let a_buf = Buffer::from_slice::<f32>(&data, &[24], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        assert_eq!(result.as_slice::<f32>(), data.as_slice());
+        assert_eq!(result[0].as_slice::<f32>(), data.as_slice());
     }
 
     // ── Gemm with bias + alpha + beta combined ───────────────────────────────
@@ -1250,7 +1267,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[3, 2], DType::F32);
         let bias_buf = Buffer::from_slice::<f32>(&[10.0, 20.0], &[2], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf, &bias_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         assert!((out[0] - 7.0).abs() < 1e-4);
         assert!((out[1] - 10.0).abs() < 1e-4);
         assert!((out[2] - 5.0).abs() < 1e-4);
@@ -1272,7 +1289,7 @@ mod tests {
         let b_buf = Buffer::from_slice::<f32>(&[2.0], &[1], DType::F32);
         let result = compiled.run(&[&a_buf, &b_buf]);
         let expected: Vec<f32> = a_data.iter().map(|x| x * 2.0).collect();
-        assert_eq!(result.as_slice::<f32>(), expected.as_slice());
+        assert_eq!(result[0].as_slice::<f32>(), expected.as_slice());
     }
 
     // ── 3D softmax ───────────────────────────────────────────────────────────
@@ -1287,7 +1304,7 @@ mod tests {
         let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let a_buf = Buffer::from_slice::<f32>(&data, &[2, 2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
-        let out = result.as_slice::<f32>();
+        let out = result[0].as_slice::<f32>();
         // Each group of 3 should sum to 1.0
         for i in 0..4 {
             let sum: f32 = out[i * 3..i * 3 + 3].iter().sum();

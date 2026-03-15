@@ -21,8 +21,8 @@ fn mnist_predicts_7_from_image() {
     let model = Model::load("tests/fixtures/mnist-12.onnx").expect("load failed");
     let pixels = load_image("tests/fixtures/digit7.png");
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
-    let output = model.run(&[&input]).expect("inference failed");
-    let logits = output.as_slice::<f32>();
+    let outputs = model.run(&[&input]).expect("inference failed");
+    let logits = outputs[0].as_slice::<f32>();
 
     assert_eq!(logits.len(), 10);
     assert!(logits.iter().all(|v| v.is_finite()));

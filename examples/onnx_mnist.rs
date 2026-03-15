@@ -19,10 +19,10 @@ fn main() {
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
 
     let t1 = Instant::now();
-    let output = model.run(&[&input]).expect("inference failed");
+    let outputs = model.run(&[&input]).expect("inference failed");
     let run_ms = t1.elapsed().as_millis();
 
-    let logits = output.as_slice::<f32>();
+    let logits = outputs[0].as_slice::<f32>();
 
     println!("MNIST logits:");
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

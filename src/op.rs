@@ -139,6 +139,34 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// Element-wise power: base ^ exponent (broadcast-compatible, float only).
+    Pow {
+        lhs: NodeId, // base
+        rhs: NodeId, // exponent
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise square root (float only).
+    Sqrt {
+        input: NodeId,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Cast tensor elements to a different dtype.
+    Cast {
+        input: NodeId,
+        target_dtype: DType,
+        shape: Shape,
+        dtype: DType, // equals target_dtype
+    },
+    /// Reduce by computing mean along one or more axes.
+    ReduceMean {
+        input: NodeId,
+        axes: Vec<i64>, // negative axes are relative to rank
+        keepdim: bool,
+        shape: Shape,
+        dtype: DType,
+    },
     /// General matrix multiply: alpha * (A @ B) + beta * C.
     ///
     /// Equivalent to the ONNX Gemm op. The output shape is [M, N].
@@ -151,6 +179,52 @@ pub enum Op {
         trans_a: bool,
         trans_b: bool,
         shape: Shape, // output shape [M, N]
+        dtype: DType,
+    },
+    /// Gather: index into `input` along `axis` using `indices`.
+    ///
+    /// output_shape = input.shape[0..axis] + indices.shape + input.shape[axis+1..]
+    Gather {
+        input: NodeId,   // data tensor
+        indices: NodeId, // index tensor (I32 or I64)
+        axis: i64,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Slice a tensor along specified axes with optional step.
+    ///
+    /// `starts`, `ends`, `axes`, and `steps` are all per-axis, pre-normalized.
+    Slice {
+        input: NodeId,
+        starts: Vec<i64>,
+        ends: Vec<i64>,
+        axes: Vec<i64>,
+        steps: Vec<i64>,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Concatenate a list of tensors along `axis`.
+    Concat {
+        inputs: Vec<NodeId>,
+        axis: i64,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Permute tensor dimensions according to `perm`.
+    Transpose {
+        input: NodeId,
+        perm: Vec<i64>,
+        shape: Shape,
+        dtype: DType,
+    },
+    /// Element-wise conditional selection: output[i] = x[i] if condition[i] else y[i].
+    ///
+    /// `condition` dtype is I64 (treated as boolean: non-zero = true).
+    Where {
+        condition: NodeId,
+        x: NodeId,
+        y: NodeId,
+        shape: Shape,
         dtype: DType,
     },
 }
@@ -176,6 +250,15 @@ impl Op {
             Op::GlobalAvgPool { shape, .. } => shape,
             Op::BatchNorm { shape, .. } => shape,
             Op::Gemm { shape, .. } => shape,
+            Op::Pow { shape, .. } => shape,
+            Op::Sqrt { shape, .. } => shape,
+            Op::Cast { shape, .. } => shape,
+            Op::ReduceMean { shape, .. } => shape,
+            Op::Gather { shape, .. } => shape,
+            Op::Slice { shape, .. } => shape,
+            Op::Concat { shape, .. } => shape,
+            Op::Transpose { shape, .. } => shape,
+            Op::Where { shape, .. } => shape,
         }
     }
 
@@ -199,6 +282,15 @@ impl Op {
             Op::GlobalAvgPool { dtype, .. } => *dtype,
             Op::BatchNorm { dtype, .. } => *dtype,
             Op::Gemm { dtype, .. } => *dtype,
+            Op::Pow { dtype, .. } => *dtype,
+            Op::Sqrt { dtype, .. } => *dtype,
+            Op::Cast { dtype, .. } => *dtype,
+            Op::ReduceMean { dtype, .. } => *dtype,
+            Op::Gather { dtype, .. } => *dtype,
+            Op::Slice { dtype, .. } => *dtype,
+            Op::Concat { dtype, .. } => *dtype,
+            Op::Transpose { dtype, .. } => *dtype,
+            Op::Where { dtype, .. } => *dtype,
         }
     }
 }
