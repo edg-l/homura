@@ -107,6 +107,57 @@ something accesses invalid memory.
 - [ ] Trace back to which tensor.reshape / tensor.cast / collapse_shape produced the bad descriptor
 - [ ] Optionally: write a minimal test with a small dynamic-dim model to isolate the crash
 
+### Approach history
+
+**Approach 1: `tensor.reshape` (current)**
+- Compiles successfully, `mlir-opt` runs full pipeline without errors
+- Segfaults at runtime in generated code
+- Crash at `compute+13072`, `vmovups` loading from address 192 (0xC0)
+
+**Approach 2: `tensor.expand_shape` / `tensor.collapse_shape` (abandoned)**
+- MLIR itself crashes in `expand-strided-metadata` pass
+- `mlir::IntegerAttr::getValue()` in `dispatchIndexOpFoldResult`
+- LLVM bug, related to #61158, not fixed in LLVM 21
+
+**Industry approach:** IREE uses `flow.tensor.reshape` (custom), ONNX-MLIR uses
+`memref.reinterpret_cast` (post-bufferize). Neither uses upstream `tensor.reshape`
+or `expand_shape`/`collapse_shape` with dynamic dims in production.
+
+### gdb findings (detailed)
+
+- Crash: `vmovups -0xc0(%rax,%rdx,4),%zmm0` at compute+13072
+- `rax = 0xC0 = 192`, `rdx = 0` → load from address 192-192 = 0 → segfault
+- `%rbx` points to a stack struct; the code reads fields:
+  - `rbx+0x80 = 0` (used as stride multiplier → 0)
+  - `rbx+0xC0 = 192` (added as base → becomes the "pointer")
+  - `rbx+0x130 = 9216` (another stride/size: 12*768 or 12*64*12)
+- The struct at `rbx` looks like loop state with multiple packed descriptors
+- First entries at `rbx+0x00..0x10` are NULL (not valid memref pointers)
+- `rbx+0x10` contains a valid heap pointer (0x555595...) in the offset field
+
+### Ruled out causes
+
+- **memref<0xi64> dangling pointers**: Fixed (use sentinel), crash unchanged.
+  0-element memrefs have valid descriptors now but crash is at the same location.
+- **Input/output descriptor construction**: Confirmed correct via HOMURA_DUMP_MEMREFS.
+  All 1408 inputs have valid pointers, correct shapes. 25 outputs correct.
+- **matmul codegen**: Tested `run_dynamic_matmul_2d` — works correctly at runtime.
+- **Buffer reuse in one-shot-bufferize**: Initially suspected but NOT confirmed.
+  `finalize-memref-to-llvm` lowers `memref.reshape` by reading shape buffer values
+  at the reshape site (immediate, not lazy). Reuse should be safe.
+
+### Next: map crash to MLIR source op
+
+The crash at `compute+13072` is in a vectorized memcpy loop. The struct at `%rbx`
+has wrong field values (0 stride, 192 as "base pointer"). Need to:
+
+1. Dump LLVM IR (`HOMURA_DUMP_IR=1`)
+2. Find which LLVM IR block/function corresponds to compute+13072
+3. Trace back through the LLVM IR to find which memref op produced the bad descriptor
+4. The `0xC0 = 192` value is suspicious: 192 = 48*4 = 12*16 or 3*64 — possibly
+   a stride from a [1, 12, ?, 64] tensor (stride for dim 3 = 64, stride for dim 2 = 64,
+   stride for dim 1 = ?*64)
+
 ### IR dump
 
 Set `HOMURA_DUMP_IR=1` to dump:
@@ -129,7 +180,7 @@ Set `HOMURA_DUMP_IR=1` to dump:
 | Prefill (cold) | ~28-30s | First-ever compile for this bucket |
 | Prefill (warm) | ~7.5s | Cache hit: dlopen + inference |
 | Decode (cold) | ~? | First-ever compile for decode model (compiles now!) |
-| Decode (warm) | ~0.85s/token | Cache hit: dlopen + inference (blocked by segfault) |
+| Decode (warm) | ~0.85s/token | Target: cache hit, dlopen + inference |
 
 The decode model compiles ONCE (dynamic past_sequence_length). After that,
 every token is just inference — no recompilation.
