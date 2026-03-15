@@ -497,11 +497,14 @@ impl Tensor {
         let k = self.shape.0[lhs_rank - 1];
         let k2 = rhs.shape.0[rhs_rank - 2];
         let n = rhs.shape.0[rhs_rank - 1];
-        assert_eq!(
-            k, k2,
-            "inner dimensions mismatch in matmul: last dims [{}, {}] x [{}, {}]",
-            m, k, k2, n
-        );
+        // Inner dims must match (or be dynamic — assumed compatible at runtime).
+        if k != crate::shape::DIM_DYNAMIC && k2 != crate::shape::DIM_DYNAMIC {
+            assert_eq!(
+                k, k2,
+                "inner dimensions mismatch in matmul: last dims [{}, {}] x [{}, {}]",
+                m, k, k2, n
+            );
+        }
 
         // Broadcast the batch dimensions (all dims except the last two).
         let lhs_batch = Shape(self.shape.0[..lhs_rank - 2].to_vec());

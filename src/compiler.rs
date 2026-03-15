@@ -1034,6 +1034,24 @@ fn emit_tosa_reshape<'c>(
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // If any dim is DIM_DYNAMIC, tosa.const_shape can't represent it.
+    // Fall back to tensor.cast (same rank) or tensor.expand/collapse_shape.
+    if target_shape.iter().any(|&d| d == DIM_DYNAMIC) {
+        let out_type = make_ranked_tensor_type(context, target_shape, dtype);
+        let result: melior::ir::Value = body_block
+            .append_operation(
+                OperationBuilder::new("tensor.cast", location)
+                    .add_operands(&[input])
+                    .add_results(&[out_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        return Ok(result);
+    }
+
     let n = target_shape.len();
 
     // Build the !tosa.shape<N> type.
@@ -3922,11 +3940,20 @@ fn emit_tensor_ops<'c>(
                             .unwrap()
                             .into()
                     } else {
-                        // Same rank: fall back to tosa.reshape for static dims in shape,
-                        // or emit a linalg.generic copy if all dims match.
-                        // For simplicity, if same rank just emit tosa.reshape —
-                        // same-rank reshape with ? dims shouldn't occur in practice.
-                        emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?
+                        // Same rank with dynamic dims: use tensor.cast if shapes
+                        // are compatible (same static dims, dynamic dims match).
+                        let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.cast", location)
+                                    .add_operands(&[input_val])
+                                    .add_results(&[out_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
                     }
                 } else {
                     emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?
