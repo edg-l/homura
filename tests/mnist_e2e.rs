@@ -1,0 +1,40 @@
+use homura::{Buffer, DType, Model};
+
+fn load_image(path: &str) -> Vec<f32> {
+    let img = image::open(path)
+        .unwrap_or_else(|e| panic!("failed to open {path}: {e}"))
+        .grayscale()
+        .resize_exact(28, 28, image::imageops::FilterType::Lanczos3)
+        .into_luma8();
+
+    let raw: Vec<f32> = img.pixels().map(|p| p.0[0] as f32 / 255.0).collect();
+    let mean: f32 = raw.iter().sum::<f32>() / raw.len() as f32;
+    if mean > 0.5 {
+        raw.iter().map(|&v| 1.0 - v).collect()
+    } else {
+        raw
+    }
+}
+
+#[test]
+fn mnist_predicts_7_from_image() {
+    let model = Model::load("tests/fixtures/mnist-12.onnx").expect("load failed");
+    let pixels = load_image("tests/fixtures/digit7.png");
+    let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
+    let output = model.run(&[&input]).expect("inference failed");
+    let logits = output.as_slice::<f32>();
+
+    assert_eq!(logits.len(), 10);
+    assert!(logits.iter().all(|v| v.is_finite()));
+
+    let predicted = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0;
+    assert_eq!(
+        predicted, 7,
+        "expected digit 7, got {predicted} (logits: {logits:?})"
+    );
+}
