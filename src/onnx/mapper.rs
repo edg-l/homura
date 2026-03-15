@@ -40,16 +40,18 @@ fn map_graph_inner(model: &OnnxModel) -> Result<(Trace, Vec<NodeId>, Vec<Buffer>
     }
 
     // 2. Weights (initializers) in initializer order.
+    let mut initializer_data: HashMap<String, Buffer> = HashMap::new();
     let mut weights: Vec<Buffer> = Vec::with_capacity(model.initializers.len());
     for (name, buffer) in &model.initializers {
         let t = Tensor::new(&buffer.shape().0, buffer.dtype());
         tensors.insert(name.clone(), t);
+        initializer_data.insert(name.clone(), buffer.clone());
         weights.push(buffer.clone());
     }
 
     // 3. Walk nodes in topological order (guaranteed by ONNX spec).
     for node in &model.nodes {
-        map_node(node, &mut tensors)?;
+        map_node(node, &mut tensors, &initializer_data)?;
     }
 
     // 4. Collect output NodeIds.
@@ -68,7 +70,11 @@ fn map_graph_inner(model: &OnnxModel) -> Result<(Trace, Vec<NodeId>, Vec<Buffer>
 
 // ── Node dispatch ─────────────────────────────────────────────────────────────
 
-fn map_node(node: &OnnxNode, tensors: &mut HashMap<String, Tensor>) -> Result<(), OnnxError> {
+fn map_node(
+    node: &OnnxNode,
+    tensors: &mut HashMap<String, Tensor>,
+    initializer_data: &HashMap<String, Buffer>,
+) -> Result<(), OnnxError> {
     match node.op_type.as_str() {
         "Add" => {
             let a = get_tensor(tensors, &node.inputs[0])?;
@@ -192,6 +198,86 @@ fn map_node(node: &OnnxNode, tensors: &mut HashMap<String, Tensor>) -> Result<()
             let result = a.gemm(&b, bias.as_ref(), alpha, beta, trans_a, trans_b);
             tensors.insert(node.outputs[0].clone(), result);
         }
+        "Conv" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            let w = get_tensor(tensors, &node.inputs[1])?;
+            let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
+                Some(get_tensor(tensors, &node.inputs[2])?)
+            } else {
+                None
+            };
+            let strides = get_ints_attr(&node.attributes, "strides", &[1, 1]);
+            let pads = get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0]);
+            let dilations = get_ints_attr(&node.attributes, "dilations", &[1, 1]);
+            let result = x.conv2d(
+                &w,
+                bias.as_ref(),
+                [strides[0] as u64, strides[1] as u64],
+                [
+                    pads[0] as u64,
+                    pads[1] as u64,
+                    pads[2] as u64,
+                    pads[3] as u64,
+                ],
+                [dilations[0] as u64, dilations[1] as u64],
+            );
+            tensors.insert(node.outputs[0].clone(), result);
+        }
+        "MaxPool" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            let kernel_shape = get_ints_attr(&node.attributes, "kernel_shape", &[]);
+            if kernel_shape.len() != 2 {
+                return Err(OnnxError::UnsupportedOp(
+                    "MaxPool: kernel_shape must have exactly 2 elements".to_string(),
+                ));
+            }
+            let strides = get_ints_attr(&node.attributes, "strides", &[1, 1]);
+            let pads = get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0]);
+            let result = x.max_pool2d(
+                [kernel_shape[0] as u64, kernel_shape[1] as u64],
+                [strides[0] as u64, strides[1] as u64],
+                [
+                    pads[0] as u64,
+                    pads[1] as u64,
+                    pads[2] as u64,
+                    pads[3] as u64,
+                ],
+            );
+            tensors.insert(node.outputs[0].clone(), result);
+        }
+        "Reshape" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            // ONNX Reshape takes the target shape as a second input (typically an initializer).
+            let shape_name = &node.inputs[1];
+            let shape_buf = initializer_data.get(shape_name).ok_or_else(|| {
+                OnnxError::UnsupportedOp(format!(
+                    "Reshape: shape input '{shape_name}' must be a static initializer"
+                ))
+            })?;
+            let target_shape: Vec<i64> = shape_buf.as_slice::<i64>().to_vec();
+            let result = x.reshape(&target_shape);
+            tensors.insert(node.outputs[0].clone(), result);
+        }
+        "Flatten" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            let axis = node
+                .attributes
+                .get("axis")
+                .and_then(|attr| {
+                    if let OnnxAttribute::Int(v) = attr {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1) as usize;
+            // Flatten: merge dims [0..axis) into one, [axis..) into another.
+            let shape = &x.shape().0;
+            let dim0: u64 = shape[..axis].iter().product();
+            let dim1: u64 = shape[axis..].iter().product();
+            let result = x.reshape(&[dim0 as i64, dim1 as i64]);
+            tensors.insert(node.outputs[0].clone(), result);
+        }
         "Clip" => {
             // In opset 11+, min/max are optional inputs (not attributes).
             // Map Clip(x) with exactly 1 input → relu (x clipped to [0, ∞)).
@@ -211,6 +297,20 @@ fn map_node(node: &OnnxNode, tensors: &mut HashMap<String, Tensor>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Extract an `Ints` attribute, returning `default` if missing.
+fn get_ints_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str, default: &[i64]) -> Vec<i64> {
+    attrs
+        .get(name)
+        .and_then(|attr| {
+            if let OnnxAttribute::Ints(v) = attr {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| default.to_vec())
 }
 
 /// Clone a `Tensor` handle out of the map by edge name.
@@ -513,7 +613,7 @@ mod tests {
     #[test]
     fn unsupported_op_error_message_contains_op_name() {
         let model = OnnxModel {
-            nodes: vec![make_node("Conv", &["X", "W"], &["Y"], vec![])],
+            nodes: vec![make_node("GRU", &["X"], &["Y"], vec![])],
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 1, 4, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
@@ -524,11 +624,11 @@ mod tests {
             Err(err) => {
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("Conv"),
-                    "error message should mention 'Conv', got: {msg}"
+                    msg.contains("GRU"),
+                    "error message should mention 'GRU', got: {msg}"
                 );
             }
-            Ok(_) => panic!("expected an error for Conv, got Ok"),
+            Ok(_) => panic!("expected an error for GRU, got Ok"),
         }
     }
 
@@ -850,5 +950,124 @@ mod tests {
         // Input(X), Input(W), Input(B), Matmul, Add, Relu → 6 ops
         assert_eq!(trace.ops().len(), 6);
         assert!(matches!(trace.get(output_ids[0]), Op::Relu { .. }));
+    }
+
+    // ── Conv mapping (task 12.1) ─────────────────────────────────────────────
+
+    #[test]
+    fn map_conv_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "Conv",
+                &["X", "W"],
+                &["Y"],
+                vec![
+                    ("kernel_shape", OnnxAttribute::Ints(vec![3, 3])),
+                    ("strides", OnnxAttribute::Ints(vec![1, 1])),
+                    ("pads", OnnxAttribute::Ints(vec![0, 0, 0, 0])),
+                    ("dilations", OnnxAttribute::Ints(vec![1, 1])),
+                ],
+            )],
+            initializers: vec![make_weight("W", &[1.0; 9], &[1, 1, 3, 3])],
+            dynamic_inputs: vec![make_dynamic("X", &[1, 1, 5, 5], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
+        assert_eq!(weights.len(), 1);
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Conv2d { .. }),
+            "expected Op::Conv2d, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    // ── MaxPool mapping (task 12.2) ──────────────────────────────────────────
+
+    #[test]
+    fn map_max_pool_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "MaxPool",
+                &["X"],
+                &["Y"],
+                vec![
+                    ("kernel_shape", OnnxAttribute::Ints(vec![2, 2])),
+                    ("strides", OnnxAttribute::Ints(vec![2, 2])),
+                    ("pads", OnnxAttribute::Ints(vec![0, 0, 0, 0])),
+                ],
+            )],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[1, 1, 4, 4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::MaxPool2d { .. }),
+            "expected Op::MaxPool2d, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    // ── Reshape mapping (task 12.3) ──────────────────────────────────────────
+
+    fn make_i64_weight(name: &str, data: &[i64], shape: &[u64]) -> (String, Buffer) {
+        let buf = Buffer::from_slice::<i64>(data, shape, DType::I64);
+        (name.to_string(), buf)
+    }
+
+    #[test]
+    fn map_reshape_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Reshape", &["X", "shape"], &["Y"], vec![])],
+            initializers: vec![make_i64_weight("shape", &[3, 4], &[2])],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 6], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Reshape { .. }),
+            "expected Op::Reshape, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    // ── Flatten mapping (task 12.3) ──────────────────────────────────────────
+
+    #[test]
+    fn map_flatten_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "Flatten",
+                &["X"],
+                &["Y"],
+                vec![("axis", OnnxAttribute::Int(1))],
+            )],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        let out = trace.get(output_ids[0]);
+        assert!(
+            matches!(out, Op::Reshape { .. }),
+            "expected Op::Reshape, got {:?}",
+            out
+        );
+        // Flatten(axis=1) on [2,3,4] → [2, 12]
+        assert_eq!(out.shape().0, vec![2, 12]);
+    }
+
+    #[test]
+    fn map_flatten_default_axis() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Flatten", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        let out = trace.get(output_ids[0]);
+        // Default axis=1: [2, 3*4] = [2, 12]
+        assert_eq!(out.shape().0, vec![2, 12]);
     }
 }

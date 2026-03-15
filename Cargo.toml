@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main", features = ["ods-dialects"] }
 prost = "0.13"
+libc = "0.2"
 
 [build-dependencies]
 prost-build = "0.13"

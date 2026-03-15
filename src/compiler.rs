@@ -100,6 +100,7 @@ impl Compiler {
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 convert-linalg-to-loops,\
                 convert-scf-to-cf,\
+                lower-affine,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
                 finalize-memref-to-llvm,\
@@ -115,6 +116,9 @@ impl Compiler {
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
 
         // ---- Create ExecutionEngine -------------------------------------------
+        // Ensure libmlir_runner_utils.so is loaded globally so the ORC JIT
+        // can resolve `memrefCopy` emitted by padded conv2d bufferization.
+        ensure_runner_utils_loaded();
         let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
 
         Ok(CompiledGraph::new(
@@ -144,6 +148,30 @@ impl Compiler {
         build_module(&context, &module, trace, outputs)?;
         Ok(module.as_operation().to_string())
     }
+}
+
+/// Ensure `libmlir_c_runner_utils.so` is loaded into the process's global
+/// dynamic-linker namespace before the ORC JIT tries to link it.
+///
+/// LLVM's ORC JIT resolves external symbols via `DynamicLibrarySearchGenerator`
+/// which scans `dl_iterate_phdr`. `memrefCopy` — emitted by bufferization
+/// lowering for padded conv2d — lives in `libmlir_c_runner_utils.so`.
+/// Loading it with `RTLD_GLOBAL` makes its symbols visible to the JIT's
+/// `GetForCurrentProcess` generator.
+fn ensure_runner_utils_loaded() {
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+
+    static LOADED: OnceLock<()> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        const LIB_PATH: &str = "/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so";
+        // SAFETY: dlopen is thread-safe; we call it once via OnceLock and
+        // never dlclose, so the symbols remain valid for the process lifetime.
+        unsafe {
+            let lib_c = CString::new(LIB_PATH).unwrap();
+            libc::dlopen(lib_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+        }
+    });
 }
 
 /// Create an MLIR context with all dialects and LLVM translations registered.
@@ -1480,6 +1508,51 @@ fn emit_tosa_transpose_2d<'c>(
     Ok(transposed)
 }
 
+// ── Helper: emit tosa.transpose with an arbitrary permutation ────────────────
+//
+// Generalizes emit_tosa_transpose_2d to any rank. `perms` is the permutation
+// (e.g. [0, 2, 3, 1] for NCHW→NHWC). The output shape is derived by applying
+// the permutation to `input_shape`.
+
+fn emit_tosa_transpose<'c>(
+    context: &'c Context,
+    body_block: &Block<'c>,
+    input: melior::ir::Value<'c, 'c>,
+    input_shape: &[u64],
+    perms: &[usize],
+    dtype: DType,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // Compute output shape by applying permutation.
+    let out_shape: Vec<u64> = perms.iter().map(|&p| input_shape[p]).collect();
+    let result_type = make_ranked_tensor_type(context, &out_shape, dtype);
+
+    // Build `array<i32: p0, p1, ...>` attribute.
+    let perms_str = perms
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let attr_str = format!("array<i32: {perms_str}>");
+    let perms_attr = Attribute::parse(context, &attr_str)
+        .ok_or_else(|| CompileError::AttributeParse(attr_str.clone()))?;
+
+    let transposed: melior::ir::Value = body_block
+        .append_operation(
+            OperationBuilder::new("tosa.transpose", location)
+                .add_operands(&[input])
+                .add_results(&[result_type])
+                .add_attributes(&[(Identifier::new(context, "perms"), perms_attr)])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(transposed)
+}
+
 // ── Helper: format a float value for MLIR dense attribute literals ────────────
 //
 // MLIR requires a decimal point or exponent in float literals (e.g. "2.0" not
@@ -2034,6 +2107,223 @@ fn emit_tensor_ops<'c>(
                     emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?;
                 values.insert(node_id, result_val);
             }
+
+            Op::Conv2d {
+                input,
+                kernel,
+                bias,
+                strides,
+                pads,
+                dilations,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone(); // [N, CI, H, W]
+                let kernel_shape = trace.get(*kernel).shape().0.clone(); // [CO, CI, KH, KW]
+
+                let input_val = *values.get(input).expect("input not yet emitted");
+                let kernel_val = *values.get(kernel).expect("kernel not yet emitted");
+
+                // Step 1: Transpose input NCHW → NHWC: perms [0, 2, 3, 1]
+                let input_nhwc = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    input_val,
+                    &input_shape,
+                    &[0, 2, 3, 1],
+                    *dtype,
+                    location,
+                )?;
+                // input_nhwc shape: [N, H, W, CI]
+                let input_nhwc_shape = [
+                    input_shape[0],
+                    input_shape[2],
+                    input_shape[3],
+                    input_shape[1],
+                ];
+
+                // Step 2: Transpose kernel OIHW → OHWI: perms [0, 2, 3, 1]
+                let kernel_ohwi = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    kernel_val,
+                    &kernel_shape,
+                    &[0, 2, 3, 1],
+                    *dtype,
+                    location,
+                )?;
+                // kernel_ohwi shape: [CO, KH, KW, CI]
+
+                // Step 3: Emit bias or a zero-filled constant of shape [CO]
+                let co = kernel_shape[0];
+                let bias_val = if let Some(bias_id) = bias {
+                    *values.get(bias_id).expect("bias not yet emitted")
+                } else {
+                    // Zero bias constant: dense<0.0> : tensor<COxT>
+                    let zero_str = match dtype {
+                        DType::F32 => format!("dense<0.0> : tensor<{co}xf32>"),
+                        DType::F64 => format!("dense<0.0> : tensor<{co}xf64>"),
+                        DType::I32 => format!("dense<0> : tensor<{co}xi32>"),
+                        DType::I64 => format!("dense<0> : tensor<{co}xi64>"),
+                    };
+                    emit_tosa_const_scalar(context, body_block, &zero_str, location)?
+                };
+
+                // Step 4: Compute output shape in NHWC layout: [N, OH, OW, CO]
+                let n = input_shape[0];
+                let oh = shape.0[2];
+                let ow = shape.0[3];
+                let nhwc_out_shape = [n, oh, ow, co];
+                let nhwc_out_type = make_ranked_tensor_type(context, &nhwc_out_shape, *dtype);
+
+                // TOSA conv2d pad order: [pad_top, pad_bottom, pad_left, pad_right]
+                // Our pads: [pad_top, pad_left, pad_bottom, pad_right]
+                let pad_attr_str = format!(
+                    "array<i64: {}, {}, {}, {}>",
+                    pads[0], pads[2], pads[1], pads[3]
+                );
+                let stride_attr_str = format!("array<i64: {}, {}>", strides[0], strides[1]);
+                let dilation_attr_str = format!("array<i64: {}, {}>", dilations[0], dilations[1]);
+
+                let pad_attr = Attribute::parse(context, &pad_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(pad_attr_str.clone()))?;
+                let stride_attr = Attribute::parse(context, &stride_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(stride_attr_str.clone()))?;
+                let dilation_attr = Attribute::parse(context, &dilation_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(dilation_attr_str.clone()))?;
+
+                // acc_type attribute: accumulator type (f32 for float, i32 for int)
+                let acc_type_str = match dtype {
+                    DType::F32 | DType::F64 => "f32",
+                    DType::I32 | DType::I64 => "i32",
+                };
+                let acc_type_attr_str = acc_type_str;
+                let acc_type_attr = Attribute::parse(context, acc_type_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(acc_type_attr_str.to_string()))?;
+
+                // Zero-point operands: scalar tensors of shape [1] with value 0.
+                // For float ops these are 0.0; for int ops these are 0.
+                let zp_str = match dtype {
+                    DType::F32 => "dense<0.0> : tensor<1xf32>",
+                    DType::F64 => "dense<0.0> : tensor<1xf32>", // ZP always f32 in TOSA
+                    DType::I32 | DType::I64 => "dense<0> : tensor<1xi8>",
+                };
+                let input_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
+                let weight_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
+
+                // Emit tosa.conv2d: (input_nhwc, kernel_ohwi, bias, input_zp, weight_zp)
+                let _ = input_nhwc_shape; // used for documentation; shape inferred above
+                let conv_nhwc: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.conv2d", location)
+                            .add_operands(&[input_nhwc, kernel_ohwi, bias_val, input_zp, weight_zp])
+                            .add_results(&[nhwc_out_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "pad"), pad_attr),
+                                (Identifier::new(context, "stride"), stride_attr),
+                                (Identifier::new(context, "dilation"), dilation_attr),
+                                (Identifier::new(context, "acc_type"), acc_type_attr),
+                            ])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 5: Transpose output NHWC → NCHW: perms [0, 3, 1, 2]
+                let result_val = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    conv_nhwc,
+                    &nhwc_out_shape,
+                    &[0, 3, 1, 2],
+                    *dtype,
+                    location,
+                )?;
+
+                values.insert(node_id, result_val);
+            }
+
+            Op::MaxPool2d {
+                input,
+                kernel_size,
+                strides,
+                pads,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone(); // [N, C, H, W]
+                let input_val = *values.get(input).expect("input not yet emitted");
+
+                // Step 1: Transpose input NCHW → NHWC: perms [0, 2, 3, 1]
+                let input_nhwc = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    input_val,
+                    &input_shape,
+                    &[0, 2, 3, 1],
+                    *dtype,
+                    location,
+                )?;
+                // input_nhwc shape: [N, H, W, C]
+
+                // Step 2: Emit tosa.max_pool2d on NHWC input.
+                // Output shape in NHWC: [N, OH, OW, C]
+                let n = input_shape[0];
+                let c = input_shape[1];
+                let oh = shape.0[2];
+                let ow = shape.0[3];
+                let nhwc_out_shape = [n, oh, ow, c];
+                let nhwc_out_type = make_ranked_tensor_type(context, &nhwc_out_shape, *dtype);
+
+                // TOSA max_pool2d attribute order: [KH, KW]
+                let kernel_attr_str = format!("array<i64: {}, {}>", kernel_size[0], kernel_size[1]);
+                // TOSA pad order: [pad_top, pad_bottom, pad_left, pad_right]
+                // Our pads: [pad_top, pad_left, pad_bottom, pad_right]
+                let pad_attr_str = format!(
+                    "array<i64: {}, {}, {}, {}>",
+                    pads[0], pads[2], pads[1], pads[3]
+                );
+                let stride_attr_str = format!("array<i64: {}, {}>", strides[0], strides[1]);
+
+                let kernel_attr = Attribute::parse(context, &kernel_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(kernel_attr_str.clone()))?;
+                let pad_attr = Attribute::parse(context, &pad_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(pad_attr_str.clone()))?;
+                let stride_attr = Attribute::parse(context, &stride_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(stride_attr_str.clone()))?;
+
+                let pool_nhwc: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.max_pool2d", location)
+                            .add_operands(&[input_nhwc])
+                            .add_results(&[nhwc_out_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "kernel"), kernel_attr),
+                                (Identifier::new(context, "pad"), pad_attr),
+                                (Identifier::new(context, "stride"), stride_attr),
+                            ])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 3: Transpose output NHWC → NCHW: perms [0, 3, 1, 2]
+                let result_val = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    pool_nhwc,
+                    &nhwc_out_shape,
+                    &[0, 3, 1, 2],
+                    *dtype,
+                    location,
+                )?;
+
+                values.insert(node_id, result_val);
+            }
         }
     }
 
@@ -2267,6 +2557,7 @@ mod tests {
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 convert-linalg-to-loops,\
                 convert-scf-to-cf,\
+                lower-affine,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
                 finalize-memref-to-llvm,\
@@ -3347,6 +3638,253 @@ mod tests {
         assert_eq!(out.len(), 4);
     }
 
+    // ── Conv2d IR verification tests (task 10.5) ─────────────────────────────
+
+    #[test]
+    fn ir_conv2d_has_tosa_conv2d_and_transpose() {
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let out = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [1, 1]);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[out.id]).expect("build_ir_string");
+        assert!(
+            ir.contains("tosa.conv2d"),
+            "expected tosa.conv2d in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.transpose"),
+            "expected tosa.transpose in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn ir_conv2d_with_bias_no_tosa_const() {
+        // When bias is provided, no zero-fill const for bias should appear
+        // (the user-provided bias tensor is used directly).
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let bias = Tensor::new(&[1], DType::F32);
+        let out = input.conv2d(&kernel, Some(&bias), [1, 1], [0, 0, 0, 0], [1, 1]);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[out.id]).expect("build_ir_string");
+        assert!(
+            ir.contains("tosa.conv2d"),
+            "expected tosa.conv2d in IR:\n{ir}"
+        );
+    }
+
+    // ── Conv2d execution tests (task 10.6) ───────────────────────────────────
+
+    /// Helper: run a conv2d trace and return the output as Vec<f32>.
+    fn run_conv2d_f32(
+        input_data: &[f32],
+        input_shape: &[u64],
+        kernel_data: &[f32],
+        kernel_shape: &[u64],
+        bias_data: Option<(&[f32], &[u64])>,
+        strides: [u64; 2],
+        pads: [u64; 4],
+        dilations: [u64; 2],
+    ) -> Vec<f32> {
+        begin_trace();
+        let input_t = Tensor::new(input_shape, DType::F32);
+        let kernel_t = Tensor::new(kernel_shape, DType::F32);
+        let bias_tensor;
+        let bias_ref = if let Some((_, bshape)) = bias_data {
+            bias_tensor = Tensor::new(bshape, DType::F32);
+            Some(&bias_tensor)
+        } else {
+            None
+        };
+        let out = input_t.conv2d(&kernel_t, bias_ref, strides, pads, dilations);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+
+        let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
+        let kernel_buf = Buffer::from_slice::<f32>(kernel_data, kernel_shape, DType::F32);
+
+        let result = if let Some((bdata, bshape)) = bias_data {
+            let bias_buf = Buffer::from_slice::<f32>(bdata, bshape, DType::F32);
+            compiled.run(&[&input_buf, &kernel_buf, &bias_buf])
+        } else {
+            compiled.run(&[&input_buf, &kernel_buf])
+        };
+        result.as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn run_conv2d_basic_3x3_all_ones_kernel() {
+        // Input [1,1,4,4], kernel [1,1,3,3] all-ones, no pad, stride=1.
+        // Output [1,1,2,2]: each element is the sum of the 3x3 patch.
+        //
+        // Input (row-major):
+        //   1  2  3  4
+        //   5  6  7  8
+        //   9 10 11 12
+        //  13 14 15 16
+        //
+        // Patch sums:
+        //   top-left [0,0]: 1+2+3 + 5+6+7 + 9+10+11 = 54
+        //   top-right [0,1]: 2+3+4 + 6+7+8 + 10+11+12 = 63
+        //   bot-left [1,0]: 5+6+7 + 9+10+11 + 13+14+15 = 90
+        //   bot-right [1,1]: 6+7+8 + 10+11+12 + 14+15+16 = 99
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let kernel = vec![1.0f32; 9];
+        let out = run_conv2d_f32(
+            &input,
+            &[1, 1, 4, 4],
+            &kernel,
+            &[1, 1, 3, 3],
+            None,
+            [1, 1],
+            [0, 0, 0, 0],
+            [1, 1],
+        );
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 54.0);
+        assert_eq!(out[1], 63.0);
+        assert_eq!(out[2], 90.0);
+        assert_eq!(out[3], 99.0);
+    }
+
+    #[test]
+    fn run_conv2d_with_padding() {
+        // Same 4x4 input and 3x3 all-ones kernel, but pad=1 on all sides.
+        // Output should be [1,1,4,4] (same spatial size as input).
+        // We only verify the shape (element count) and the center element.
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let kernel = vec![1.0f32; 9];
+        let out = run_conv2d_f32(
+            &input,
+            &[1, 1, 4, 4],
+            &kernel,
+            &[1, 1, 3, 3],
+            None,
+            [1, 1],
+            [1, 1, 1, 1],
+            [1, 1],
+        );
+        assert_eq!(out.len(), 16, "expected 4x4 output with pad=1");
+        // Center element [1,1] (0-indexed) with pad=1 is the same as the
+        // no-pad top-left element.
+        assert_eq!(out[5], 54.0); // row=1, col=1 in 4x4 layout
+    }
+
+    #[test]
+    fn run_conv2d_with_stride2() {
+        // Input [1,1,5,5], kernel [1,1,3,3] all-ones, no pad, stride=2.
+        // TOSA requires (H + pads - dilation*(KH-1) - 1) % stride == 0:
+        //   (5 + 0 - 1*2 - 1) = 2, and 2 % 2 = 0 ✓
+        // OH = OW = 2/2 + 1 = 2. Output [1,1,2,2].
+        //
+        // Input (5x5, values 1..25):
+        //    1  2  3  4  5
+        //    6  7  8  9 10
+        //   11 12 13 14 15
+        //   16 17 18 19 20
+        //   21 22 23 24 25
+        //
+        // Patch sums (stride=2):
+        //   [0:3,0:3] = 1+2+3+6+7+8+11+12+13 = 63
+        //   [0:3,2:5] = 3+4+5+8+9+10+13+14+15 = 81
+        //   [2:5,0:3] = 11+12+13+16+17+18+21+22+23 = 153
+        //   [2:5,2:5] = 13+14+15+18+19+20+23+24+25 = 171
+        let input: Vec<f32> = (1..=25).map(|x| x as f32).collect();
+        let kernel = vec![1.0f32; 9];
+        let out = run_conv2d_f32(
+            &input,
+            &[1, 1, 5, 5],
+            &kernel,
+            &[1, 1, 3, 3],
+            None,
+            [2, 2],
+            [0, 0, 0, 0],
+            [1, 1],
+        );
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 63.0);
+        assert_eq!(out[1], 81.0);
+        assert_eq!(out[2], 153.0);
+        assert_eq!(out[3], 171.0);
+    }
+
+    #[test]
+    fn run_conv2d_with_bias() {
+        // Same basic 3x3 conv, add bias=[10.0].
+        // Expected: [54+10, 63+10, 90+10, 99+10] = [64, 73, 100, 109]
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let kernel = vec![1.0f32; 9];
+        let bias = vec![10.0f32];
+        let out = run_conv2d_f32(
+            &input,
+            &[1, 1, 4, 4],
+            &kernel,
+            &[1, 1, 3, 3],
+            Some((&bias, &[1])),
+            [1, 1],
+            [0, 0, 0, 0],
+            [1, 1],
+        );
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 64.0);
+        assert_eq!(out[1], 73.0);
+        assert_eq!(out[2], 100.0);
+        assert_eq!(out[3], 109.0);
+    }
+
+    #[test]
+    fn run_conv2d_multi_channel() {
+        // Input [1, 2, 3, 3], kernel [3, 2, 2, 2] all-ones.
+        // No pad, stride=1. Output [1, 3, 2, 2].
+        // Each output element is the sum over both input channels of the 2x2 patch.
+        //
+        // Input channel 0 (3x3):
+        //   1 2 3
+        //   4 5 6
+        //   7 8 9
+        // Input channel 1 (3x3):
+        //   10 11 12
+        //   13 14 15
+        //   16 17 18
+        //
+        // 2x2 patch sums (channel 0):
+        //   [0,0]=1+2+4+5=12, [0,1]=2+3+5+6=16, [1,0]=4+5+7+8=24, [1,1]=5+6+8+9=28
+        // 2x2 patch sums (channel 1):
+        //   [0,0]=10+11+13+14=48, [0,1]=11+12+14+15=52, [1,0]=13+14+16+17=60, [1,1]=14+15+17+18=64
+        //
+        // Each of the 3 output channels uses the same all-ones kernel, so each
+        // output channel element = sum_ch0 + sum_ch1.
+        // Output [0,*,*]: 60, 68, 84, 92
+        // Output [1,*,*]: same (kernel identical)
+        // Output [2,*,*]: same
+        let input_data: Vec<f32> = (1..=18).map(|x| x as f32).collect();
+        let kernel_data = vec![1.0f32; 3 * 2 * 2 * 2]; // all ones
+        let out = run_conv2d_f32(
+            &input_data,
+            &[1, 2, 3, 3],
+            &kernel_data,
+            &[3, 2, 2, 2],
+            None,
+            [1, 1],
+            [0, 0, 0, 0],
+            [1, 1],
+        );
+        assert_eq!(out.len(), 3 * 2 * 2);
+        // All 3 output channels are identical since all kernels are ones.
+        let expected = [60.0f32, 68.0, 84.0, 92.0];
+        for ch in 0..3 {
+            for i in 0..4 {
+                assert_eq!(out[ch * 4 + i], expected[i], "mismatch at ch={ch}, i={i}");
+            }
+        }
+    }
+
     // ── Empty/error cases ────────────────────────────────────────────────────
 
     #[test]
@@ -3366,5 +3904,137 @@ mod tests {
         let trace = take_trace();
         let result = Compiler::compile(&trace, &[]);
         assert!(result.is_err());
+    }
+
+    // ── MaxPool2d IR verification tests (task 11.5) ───────────────────────────
+
+    #[test]
+    fn ir_max_pool2d_has_tosa_max_pool2d_and_transpose() {
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let out = input.max_pool2d([2, 2], [2, 2], [0, 0, 0, 0]);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[out.id]).expect("build_ir_string");
+        assert!(
+            ir.contains("tosa.max_pool2d"),
+            "expected tosa.max_pool2d in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.transpose"),
+            "expected tosa.transpose in IR:\n{ir}"
+        );
+        assert!(
+            !ir.contains("linalg.generic"),
+            "unexpected linalg.generic in IR:\n{ir}"
+        );
+    }
+
+    // ── MaxPool2d execution tests (task 11.6) ─────────────────────────────────
+
+    /// Helper: run a max_pool2d trace and return the output as Vec<f32>.
+    fn run_max_pool2d_f32(
+        input_data: &[f32],
+        input_shape: &[u64],
+        kernel_size: [u64; 2],
+        strides: [u64; 2],
+        pads: [u64; 4],
+    ) -> Vec<f32> {
+        begin_trace();
+        let input_t = Tensor::new(input_shape, DType::F32);
+        let out = input_t.max_pool2d(kernel_size, strides, pads);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
+        compiled.run(&[&input_buf]).as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn run_max_pool2d_basic_2x2_stride2() {
+        // Input [1, 1, 4, 4], kernel=2x2, stride=2, no pad → output [1, 1, 2, 2].
+        // Each output element is the max of the corresponding 2x2 patch.
+        //
+        // Input (row-major):
+        //    1  2  3  4
+        //    5  6  7  8
+        //    9 10 11 12
+        //   13 14 15 16
+        //
+        // Patch maxes (stride=2):
+        //   top-left [0,0]: max(1,2,5,6) = 6
+        //   top-right [0,1]: max(3,4,7,8) = 8
+        //   bot-left [1,0]: max(9,10,13,14) = 14
+        //   bot-right [1,1]: max(11,12,15,16) = 16
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let out = run_max_pool2d_f32(&input, &[1, 1, 4, 4], [2, 2], [2, 2], [0, 0, 0, 0]);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 6.0);
+        assert_eq!(out[1], 8.0);
+        assert_eq!(out[2], 14.0);
+        assert_eq!(out[3], 16.0);
+    }
+
+    #[test]
+    fn run_max_pool2d_with_padding_shape() {
+        // Input [1, 1, 4, 4], kernel=3x3, stride=1, pad=1 all sides.
+        // OH = (4 + 1 + 1 - 3) / 1 + 1 = 3 + 1 = 4 → output [1, 1, 4, 4].
+        // Verify output shape and the center element.
+        //
+        // Center element [1, 1] (row=1, col=1) in a 3x3 window starting at (-1,-1)
+        // covers rows [0,2], cols [0,2] of the padded input (pad=0 fills -inf).
+        // That window (no extra pad rows/cols) = rows 0..2, cols 0..2:
+        //   1  2  3
+        //   5  6  7
+        //   9 10 11
+        // max = 11.0
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let out = run_max_pool2d_f32(&input, &[1, 1, 4, 4], [3, 3], [1, 1], [1, 1, 1, 1]);
+        assert_eq!(out.len(), 16, "expected [1,1,4,4] output with pad=1");
+        assert_eq!(out[5], 11.0, "center element mismatch"); // row=1, col=1 in 4x4
+    }
+
+    #[test]
+    fn run_max_pool2d_batch_and_channel_independence() {
+        // Input [2, 2, 4, 4], kernel=2x2, stride=2, no pad → output [2, 2, 2, 2].
+        // Batch 0, channel 0: values 1..16; Batch 0, channel 1: values 17..32
+        // Batch 1, channel 0: values 33..48; Batch 1, channel 1: values 49..64
+        // Each 2x2 patch max: check all 4 patches per (batch, channel).
+        let input: Vec<f32> = (1..=64).map(|x| x as f32).collect();
+        let out = run_max_pool2d_f32(&input, &[2, 2, 4, 4], [2, 2], [2, 2], [0, 0, 0, 0]);
+        assert_eq!(out.len(), 16); // 2 * 2 * 2 * 2
+
+        // Layout is NCHW: [N=2, C=2, OH=2, OW=2]
+        // out[n * 8 + c * 4 + oh * 2 + ow]
+        //
+        // Batch 0, ch 0 (input values 1..16):
+        //   patch(0,0)=max(1,2,5,6)=6, patch(0,1)=max(3,4,7,8)=8
+        //   patch(1,0)=max(9,10,13,14)=14, patch(1,1)=max(11,12,15,16)=16
+        assert_eq!(out[0], 6.0);
+        assert_eq!(out[1], 8.0);
+        assert_eq!(out[2], 14.0);
+        assert_eq!(out[3], 16.0);
+
+        // Batch 0, ch 1 (input values 17..32):
+        //   patch(0,0)=max(17,18,21,22)=22, patch(0,1)=max(19,20,23,24)=24
+        //   patch(1,0)=max(25,26,29,30)=30, patch(1,1)=max(27,28,31,32)=32
+        assert_eq!(out[4], 22.0);
+        assert_eq!(out[5], 24.0);
+        assert_eq!(out[6], 30.0);
+        assert_eq!(out[7], 32.0);
+
+        // Batch 1, ch 0 (input values 33..48):
+        //   patch(0,0)=max(33,34,37,38)=38, patch(0,1)=max(35,36,39,40)=40
+        //   patch(1,0)=max(41,42,45,46)=46, patch(1,1)=max(43,44,47,48)=48
+        assert_eq!(out[8], 38.0);
+        assert_eq!(out[9], 40.0);
+        assert_eq!(out[10], 46.0);
+        assert_eq!(out[11], 48.0);
+
+        // Batch 1, ch 1 (input values 49..64):
+        //   patch(0,0)=max(49,50,53,54)=54, patch(0,1)=max(51,52,55,56)=56
+        //   patch(1,0)=max(57,58,61,62)=62, patch(1,1)=max(59,60,63,64)=64
+        assert_eq!(out[12], 54.0);
+        assert_eq!(out[13], 56.0);
+        assert_eq!(out[14], 62.0);
+        assert_eq!(out[15], 64.0);
     }
 }

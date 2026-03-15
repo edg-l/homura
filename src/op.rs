@@ -97,6 +97,26 @@ pub enum Op {
         shape: Shape,
         dtype: DType,
     },
+    /// 2D convolution (NCHW layout).
+    Conv2d {
+        input: NodeId,        // [N, CI, H, W]
+        kernel: NodeId,       // [CO, CI, KH, KW]
+        bias: Option<NodeId>, // [CO] (optional)
+        strides: [u64; 2],    // [stride_h, stride_w]
+        pads: [u64; 4],       // [pad_top, pad_left, pad_bottom, pad_right]
+        dilations: [u64; 2],  // [dilation_h, dilation_w]
+        shape: Shape,         // output shape [N, CO, OH, OW]
+        dtype: DType,
+    },
+    /// 2D max pooling (NCHW layout).
+    MaxPool2d {
+        input: NodeId,         // [N, C, H, W]
+        kernel_size: [u64; 2], // [KH, KW]
+        strides: [u64; 2],     // [stride_h, stride_w]
+        pads: [u64; 4],        // [pad_top, pad_left, pad_bottom, pad_right]
+        shape: Shape,          // output shape [N, C, OH, OW]
+        dtype: DType,
+    },
     /// General matrix multiply: alpha * (A @ B) + beta * C.
     ///
     /// Equivalent to the ONNX Gemm op. The output shape is [M, N].
@@ -129,6 +149,8 @@ impl Op {
             Op::ReduceSum { shape, .. } => shape,
             Op::ReduceMax { shape, .. } => shape,
             Op::Reshape { shape, .. } => shape,
+            Op::Conv2d { shape, .. } => shape,
+            Op::MaxPool2d { shape, .. } => shape,
             Op::Gemm { shape, .. } => shape,
         }
     }
@@ -148,6 +170,8 @@ impl Op {
             Op::ReduceSum { dtype, .. } => *dtype,
             Op::ReduceMax { dtype, .. } => *dtype,
             Op::Reshape { dtype, .. } => *dtype,
+            Op::Conv2d { dtype, .. } => *dtype,
+            Op::MaxPool2d { dtype, .. } => *dtype,
             Op::Gemm { dtype, .. } => *dtype,
         }
     }

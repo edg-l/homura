@@ -254,6 +254,88 @@ impl std::ops::Neg for Tensor {
 }
 
 impl Tensor {
+    pub fn conv2d(
+        &self,
+        kernel: &Tensor,
+        bias: Option<&Tensor>,
+        strides: [u64; 2],
+        pads: [u64; 4],
+        dilations: [u64; 2],
+    ) -> Tensor {
+        assert_eq!(self.shape.rank(), 4, "conv2d requires rank-4 input (NCHW)");
+        assert_eq!(
+            kernel.shape.rank(),
+            4,
+            "conv2d requires rank-4 kernel (OIHW)"
+        );
+        assert_eq!(
+            self.shape.0[1], kernel.shape.0[1],
+            "conv2d: input channels ({}) != kernel input channels ({})",
+            self.shape.0[1], kernel.shape.0[1]
+        );
+        assert_eq!(self.dtype, kernel.dtype, "dtype mismatch in conv2d");
+
+        let n = self.shape.0[0];
+        let h = self.shape.0[2];
+        let w = self.shape.0[3];
+        let co = kernel.shape.0[0];
+        let kh = kernel.shape.0[2];
+        let kw = kernel.shape.0[3];
+
+        // OH = (H + pad_top + pad_bottom - dilation_h * (KH - 1) - 1) / stride_h + 1
+        let oh = (h + pads[0] + pads[2] - dilations[0] * (kh - 1) - 1) / strides[0] + 1;
+        let ow = (w + pads[1] + pads[3] - dilations[1] * (kw - 1) - 1) / strides[1] + 1;
+        let output_shape = Shape(vec![n, co, oh, ow]);
+
+        let id = trace::record(Op::Conv2d {
+            input: self.id,
+            kernel: kernel.id,
+            bias: bias.map(|b| b.id),
+            strides,
+            pads,
+            dilations,
+            shape: output_shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype: self.dtype,
+        }
+    }
+
+    pub fn max_pool2d(&self, kernel_size: [u64; 2], strides: [u64; 2], pads: [u64; 4]) -> Tensor {
+        assert_eq!(
+            self.shape.rank(),
+            4,
+            "max_pool2d requires rank-4 input (NCHW)"
+        );
+
+        let n = self.shape.0[0];
+        let c = self.shape.0[1];
+        let h = self.shape.0[2];
+        let w = self.shape.0[3];
+        let [kh, kw] = kernel_size;
+        // OH = (H + pad_top + pad_bottom - KH) / stride_h + 1
+        let oh = (h + pads[0] + pads[2] - kh) / strides[0] + 1;
+        let ow = (w + pads[1] + pads[3] - kw) / strides[1] + 1;
+        let output_shape = Shape(vec![n, c, oh, ow]);
+
+        let id = trace::record(Op::MaxPool2d {
+            input: self.id,
+            kernel_size,
+            strides,
+            pads,
+            shape: output_shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype: self.dtype,
+        }
+    }
+
     pub fn gemm(
         &self,
         rhs: &Tensor,
@@ -529,6 +611,153 @@ mod tests {
         assert_eq!(a.id.0, 0);
         assert_eq!(trace.input_count(), 1);
         assert_eq!(trace.ops().len(), 1);
+    }
+
+    // ── MaxPool2d trace tests (task 11.3) ────────────────────────────────────
+
+    #[test]
+    fn max_pool2d_records_correct_op_and_shape() {
+        begin_trace();
+        // input: [1, 1, 4, 4], kernel=2x2, stride=2, no pad → output: [1, 1, 2, 2]
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let out = input.max_pool2d([2, 2], [2, 2], [0, 0, 0, 0]);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 1, 2, 2]);
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::MaxPool2d {
+                kernel_size,
+                strides,
+                pads,
+                shape,
+                dtype,
+                ..
+            } => {
+                assert_eq!(*kernel_size, [2u64, 2]);
+                assert_eq!(*strides, [2u64, 2]);
+                assert_eq!(*pads, [0u64, 0, 0, 0]);
+                assert_eq!(shape.0, vec![1u64, 1, 2, 2]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::MaxPool2d, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn max_pool2d_output_shape_with_padding() {
+        begin_trace();
+        // input: [1, 1, 4, 4], kernel=2x2, stride=1, pad=1 all sides
+        // OH = (4 + 1 + 1 - 2) / 1 + 1 = 4/1 + 1 = 5
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let out = input.max_pool2d([2, 2], [1, 1], [1, 1, 1, 1]);
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 1, 5, 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_pool2d requires rank-4 input")]
+    fn max_pool2d_rank3_input_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 4, 4], DType::F32);
+        let _ = input.max_pool2d([2, 2], [1, 1], [0, 0, 0, 0]);
+        let _ = take_trace();
+    }
+
+    // ── Conv2d trace tests (task 10.3) ───────────────────────────────────────
+
+    #[test]
+    fn conv2d_records_correct_op_and_shape() {
+        begin_trace();
+        // input: [1, 1, 4, 4], kernel: [1, 1, 3, 3]
+        // no padding, stride=1, dilation=1 → output: [1, 1, 2, 2]
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let out = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [1, 1]);
+        let trace = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 1, 2, 2]);
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::Conv2d {
+                bias,
+                strides,
+                pads,
+                dilations,
+                shape,
+                dtype,
+                ..
+            } => {
+                assert!(bias.is_none());
+                assert_eq!(*strides, [1u64, 1]);
+                assert_eq!(*pads, [0u64, 0, 0, 0]);
+                assert_eq!(*dilations, [1u64, 1]);
+                assert_eq!(shape.0, vec![1u64, 1, 2, 2]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::Conv2d, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn conv2d_records_bias() {
+        begin_trace();
+        let input = Tensor::new(&[1, 2, 5, 5], DType::F32);
+        let kernel = Tensor::new(&[3, 2, 3, 3], DType::F32);
+        let bias = Tensor::new(&[3], DType::F32);
+        let out = input.conv2d(&kernel, Some(&bias), [1, 1], [0, 0, 0, 0], [1, 1]);
+        let trace = take_trace();
+        // output: [1, 3, 3, 3]
+        assert_eq!(out.shape().0, vec![1u64, 3, 3, 3]);
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::Conv2d { bias, .. } => {
+                assert!(bias.is_some(), "expected bias to be recorded");
+            }
+            _ => panic!("expected Op::Conv2d"),
+        }
+    }
+
+    #[test]
+    fn conv2d_output_shape_with_padding() {
+        begin_trace();
+        // input: [1, 1, 4, 4], kernel: [1, 1, 3, 3], pad=1 on all sides, stride=1
+        // OH = (4 + 1 + 1 - 1*(3-1) - 1) / 1 + 1 = (4 + 2 - 2 - 1) / 1 + 1 = 3/1 + 1 = 4
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let out = input.conv2d(&kernel, None, [1, 1], [1, 1, 1, 1], [1, 1]);
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 1, 4, 4]);
+    }
+
+    #[test]
+    fn conv2d_output_shape_with_stride() {
+        begin_trace();
+        // input: [1, 1, 4, 4], kernel: [1, 1, 3, 3], no pad, stride=2
+        // OH = (4 + 0 + 0 - 1*(3-1) - 1) / 2 + 1 = (4 - 2 - 1) / 2 + 1 = 1/2 + 1 = 1
+        let input = Tensor::new(&[1, 1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let out = input.conv2d(&kernel, None, [2, 2], [0, 0, 0, 0], [1, 1]);
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 1, 1, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "conv2d requires rank-4 input")]
+    fn conv2d_rank3_input_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let _ = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [1, 1]);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "input channels")]
+    fn conv2d_channel_mismatch_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 2, 4, 4], DType::F32);
+        let kernel = Tensor::new(&[1, 3, 3, 3], DType::F32); // CI=3, but input has CI=2
+        let _ = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [1, 1]);
+        let _ = take_trace();
     }
 
     // ── Gemm trace tests (task 6.3) ───────────────────────────────────────────
