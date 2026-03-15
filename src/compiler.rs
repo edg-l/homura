@@ -102,6 +102,7 @@ impl Compiler {
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 fold-memref-alias-ops,\
                 convert-linalg-to-affine-loops,\
+                fold-memref-alias-ops,\
                 func.func(affine-loop-invariant-code-motion,affine-scalrep),\
                 lower-affine,\
                 convert-scf-to-cf,\
@@ -4726,4 +4727,15 @@ mod tests {
             out_slice[3]
         );
     }
+
+    // NOTE: affine-loop-fusion was investigated and found unsafe for our pipeline.
+    // Two root causes:
+    // 1. memref.expand_shape aliases: fusion doesn't track that expand_shape creates
+    //    an alias to the original buffer (affects softmax, reductions).
+    //    Fix: run fold-memref-alias-ops before fusion to eliminate expand_shape.
+    // 2. memref.subview aliases: conv2d/maxpool2d padding uses subview into a padded
+    //    buffer. fusion merges the fill-zeros loop with the copy-input loop, breaking
+    //    pad semantics. fold-memref-alias-ops can't resolve strided subviews.
+    //    No fix available — this is a fundamental limitation of affine fusion with
+    //    subview aliasing from one-shot-bufferize.
 }
