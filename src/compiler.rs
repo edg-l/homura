@@ -41,6 +41,10 @@ pub enum CompileError {
     NoOutputs,
     /// Failed to parse an MLIR attribute string.
     AttributeParse(String),
+    /// Failed to emit an object file from LLVM IR.
+    ObjectEmit(String),
+    /// Failed to link the object file into a shared library.
+    Link(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -51,6 +55,8 @@ impl std::fmt::Display for CompileError {
             Self::EmptyTrace => write!(f, "trace is empty"),
             Self::NoOutputs => write!(f, "no output nodes specified"),
             Self::AttributeParse(s) => write!(f, "failed to parse MLIR attribute: {s}"),
+            Self::ObjectEmit(s) => write!(f, "object emit failed: {s}"),
+            Self::Link(s) => write!(f, "link failed: {s}"),
         }
     }
 }
@@ -97,7 +103,7 @@ impl Compiler {
             let cache = CompilationCache::new();
             if let Some((so_path, meta_path)) = cache.get(key) {
                 if let Some(meta) = CompilationCache::load_meta(&meta_path) {
-                    match CompiledGraph::from_cached_lib(&so_path, meta.num_inputs, meta.outputs) {
+                    match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                         Ok(graph) => return Ok(graph),
                         Err(e) => {
                             // Cache entry is unloadable (corrupt/stale). Fall
@@ -157,18 +163,43 @@ impl Compiler {
         let mut module = module;
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
 
-        // ---- Create ExecutionEngine -------------------------------------------
-        // Ensure libmlir_runner_utils.so is loaded globally so the ORC JIT
-        // can resolve `memrefCopy` emitted by padded conv2d bufferization.
-        ensure_runner_utils_loaded();
-        // enable_object_dump=true is required for dump_to_object_file to work.
-        let engine = melior::ExecutionEngine::new(&module, 3, &[], true);
-        let graph = CompiledGraph::new(engine, num_inputs, output_descs);
+        // ---- AOT: emit object file, link to .so, dlopen ----------------------
+        let tmp_dir = tempfile_dir().ok_or_else(|| {
+            CompileError::ObjectEmit("cannot determine temp directory".into())
+        })?;
 
-        // ---- Cache store (on miss) -------------------------------------------
+        // Use PID + nanosecond timestamp for a collision-resistant suffix.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let suffix = format!("{}_{:08x}", std::process::id(), nanos);
+        let tmp_obj = tmp_dir.join(format!("homura_{suffix}.o"));
+        let tmp_so = tmp_dir.join(format!("homura_{suffix}.so"));
+
+        emit_object_file(&module, &tmp_obj)?;
+        link_shared_lib(&tmp_obj, &tmp_so)?;
+        std::fs::remove_file(&tmp_obj).ok(); // .o is no longer needed
+
+        // If caching, copy the .so to the cache before dlopen (dlopen keeps
+        // the inode alive, so the file can be unlinked after).
         if let Some(key) = cache_key {
-            store_native_cache(key, &graph);
+            let cache = crate::cache::CompilationCache::new();
+            let meta = crate::cache::CacheMeta {
+                num_inputs,
+                outputs: output_descs
+                    .iter()
+                    .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
+                    .collect(),
+            };
+            if let Err(e) = cache.store(key, &tmp_so, &meta) {
+                eprintln!("homura cache: failed to write cache entry: {e}");
+            }
         }
+
+        let graph = CompiledGraph::load(&tmp_so, num_inputs, output_descs)
+            .map_err(CompileError::ObjectEmit)?;
+        std::fs::remove_file(&tmp_so).ok(); // safe: inode kept alive by dlopen
 
         Ok(graph)
     }
@@ -194,123 +225,293 @@ impl Compiler {
     }
 }
 
-/// Ensure `libmlir_c_runner_utils.so` is loaded into the process's global
-/// dynamic-linker namespace before the ORC JIT tries to link it.
+/// Translate a lowered MLIR module to native code and emit an object file.
 ///
-/// LLVM's ORC JIT resolves external symbols via `DynamicLibrarySearchGenerator`
-/// which scans `dl_iterate_phdr`. `memrefCopy` — emitted by bufferization
-/// lowering for padded conv2d — lives in `libmlir_c_runner_utils.so`.
-/// Loading it with `RTLD_GLOBAL` makes its symbols visible to the JIT's
-/// `GetForCurrentProcess` generator.
-fn ensure_runner_utils_loaded() {
-    use std::ffi::CString;
+/// Initialises LLVM targets on first call (via `OnceLock`), translates the
+/// module to LLVM IR, runs the O3 optimisation pipeline, and writes a PIC
+/// object file to `output_path`.
+fn emit_object_file(
+    module: &melior::ir::Module,
+    output_path: &std::path::Path,
+) -> Result<(), CompileError> {
+    use crate::llvm_ffi::mlirTranslateModuleToLLVMIR;
+    use llvm_sys::core::*;
+    use llvm_sys::error::LLVMGetErrorMessage;
+    use llvm_sys::target::*;
+    use llvm_sys::target_machine::*;
+    use llvm_sys::transforms::pass_builder::*;
+    use std::ffi::{CStr, CString};
     use std::sync::OnceLock;
 
-    static LOADED: OnceLock<()> = OnceLock::new();
-    LOADED.get_or_init(|| {
-        const DEFAULT_PATH: &str = "/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so";
-        let lib_path =
-            std::env::var("MLIR_RUNNER_UTILS_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_string());
-        // SAFETY: dlopen is thread-safe; we call it once via OnceLock and
-        // never dlclose, so the symbols remain valid for the process lifetime.
-        unsafe {
-            let lib_c = CString::new(lib_path.as_str()).unwrap();
-            let handle = libc::dlopen(lib_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
-            if handle.is_null() {
-                eprintln!(
-                    "warning: failed to load {lib_path} — conv2d/padded ops may fail at JIT link time. \
-                     Set MLIR_RUNNER_UTILS_PATH to override."
-                );
-            }
+    unsafe {
+        // Initialise all targets once per process.
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            LLVM_InitializeAllTargets();
+            LLVM_InitializeAllTargetInfos();
+            LLVM_InitializeAllTargetMCs();
+            LLVM_InitializeAllAsmPrinters();
+        });
+
+        // Create LLVM context and translate MLIR → LLVM IR.
+        let llvm_ctx = LLVMContextCreate();
+        let llvm_module =
+            mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_ctx);
+        if llvm_module.is_null() {
+            LLVMContextDispose(llvm_ctx);
+            return Err(CompileError::ObjectEmit(
+                "mlirTranslateModuleToLLVMIR returned null".into(),
+            ));
         }
-    });
+
+        // Emit the packed wrapper `_mlir__mlir_ciface_compute(void** args)` so
+        // the runtime can call it with the same double-indirection convention
+        // as MLIR's ExecutionEngine::invoke_packed. The direct `_mlir_ciface_compute`
+        // is generated by the `convert-func-to-llvm` pass but takes individual
+        // MemRef-pointer args; the packed wrapper loads each from args[i] and calls it.
+        if let Err(e) = emit_packed_wrapper(llvm_module, llvm_ctx) {
+            LLVMDisposeModule(llvm_module);
+            LLVMContextDispose(llvm_ctx);
+            return Err(CompileError::ObjectEmit(format!("emit_packed_wrapper: {e}")));
+        }
+
+        // Get host CPU name and features for optimal codegen (enables AVX2/SSE4.2).
+        let cpu = LLVMGetHostCPUName();
+        let features = LLVMGetHostCPUFeatures();
+
+        // Resolve target from the default triple.
+        let triple = LLVMGetDefaultTargetTriple();
+        let mut target = std::ptr::null_mut();
+        let mut error_msg = std::ptr::null_mut();
+        if LLVMGetTargetFromTriple(triple, &mut target, &mut error_msg) != 0 {
+            let msg = CStr::from_ptr(error_msg).to_string_lossy().into_owned();
+            LLVMDisposeMessage(error_msg);
+            LLVMDisposeMessage(triple);
+            LLVMDisposeMessage(cpu);
+            LLVMDisposeMessage(features);
+            LLVMDisposeModule(llvm_module);
+            LLVMContextDispose(llvm_ctx);
+            return Err(CompileError::ObjectEmit(format!(
+                "LLVMGetTargetFromTriple: {msg}"
+            )));
+        }
+
+        // Create a PIC target machine at aggressive optimisation level.
+        let machine = LLVMCreateTargetMachine(
+            target,
+            triple,
+            cpu,
+            features,
+            LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+            LLVMRelocMode::LLVMRelocPIC,
+            LLVMCodeModel::LLVMCodeModelDefault,
+        );
+
+        // Run O3 optimisation passes.
+        let opts = LLVMCreatePassBuilderOptions();
+        let passes = CString::new("default<O3>").unwrap();
+        let pass_error = LLVMRunPasses(llvm_module, passes.as_ptr(), machine, opts);
+        if !pass_error.is_null() {
+            let msg_ptr = LLVMGetErrorMessage(pass_error);
+            let msg = CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            LLVMDisposeMessage(msg_ptr);
+            LLVMDisposePassBuilderOptions(opts);
+            LLVMDisposeTargetMachine(machine);
+            LLVMDisposeMessage(triple);
+            LLVMDisposeMessage(cpu);
+            LLVMDisposeMessage(features);
+            LLVMDisposeModule(llvm_module);
+            LLVMContextDispose(llvm_ctx);
+            return Err(CompileError::ObjectEmit(format!("LLVMRunPasses: {msg}")));
+        }
+        LLVMDisposePassBuilderOptions(opts);
+
+        // Emit the object file.
+        let filename = CString::new(output_path.to_str().unwrap()).unwrap();
+        let mut emit_error = std::ptr::null_mut();
+        let failed = LLVMTargetMachineEmitToFile(
+            machine,
+            llvm_module,
+            filename.as_ptr().cast_mut(),
+            LLVMCodeGenFileType::LLVMObjectFile,
+            &mut emit_error,
+        );
+
+        LLVMDisposeTargetMachine(machine);
+        LLVMDisposeMessage(triple);
+        LLVMDisposeMessage(cpu);
+        LLVMDisposeMessage(features);
+        LLVMDisposeModule(llvm_module);
+        LLVMContextDispose(llvm_ctx);
+
+        if failed != 0 {
+            let msg = if emit_error.is_null() {
+                "unknown error".to_string()
+            } else {
+                let s = CStr::from_ptr(emit_error).to_string_lossy().into_owned();
+                LLVMDisposeMessage(emit_error);
+                s
+            };
+            return Err(CompileError::ObjectEmit(format!(
+                "LLVMTargetMachineEmitToFile: {msg}"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
-/// Compile the JIT-compiled graph to a native `.so` and store it in the cache
-/// alongside a metadata sidecar.
+/// Emit the packed-argument wrapper `_mlir__mlir_ciface_compute(void** args)`
+/// into an already-translated LLVM module.
 ///
-/// Steps:
-/// 1. Dump the object file to a temp path via `dump_to_object_file`.
-/// 2. Link it to a `.so` with `cc -shared`.
-/// 3. Store the `.so` and metadata via `CompilationCache::store`.
+/// MLIR's `convert-func-to-llvm` pass emits `_mlir_ciface_compute(ptr0, ptr1, ...)`
+/// which takes each MemRef descriptor pointer as a separate argument.
+/// The packed wrapper takes a single `void**` argument and indexes into it,
+/// matching the calling convention that the runtime uses (`invoke_packed`).
 ///
-/// Non-fatal: on any error, a warning is printed and the caller's `CompiledGraph`
-/// (which is already valid for the current process) continues to work.
-fn store_native_cache(key: &str, graph: &CompiledGraph) {
-    use crate::cache::CacheMeta;
+/// Implementation:
+/// ```c
+/// void _mlir__mlir_ciface_compute(void** args) {
+///     _mlir_ciface_compute(args[0], args[1], ..., args[N-1]);
+/// }
+/// ```
+unsafe fn emit_packed_wrapper(
+    llvm_module: llvm_sys::prelude::LLVMModuleRef,
+    llvm_ctx: llvm_sys::prelude::LLVMContextRef,
+) -> Result<(), String> {
+    use llvm_sys::core::*;
+    use std::ffi::CString;
 
-    let cache = CompilationCache::new();
+    unsafe {
 
-    // Use a temp directory so partial files are not mistaken for valid cache entries.
-    let tmp_dir = match tempfile_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("homura cache: cannot determine temp dir, skipping cache write");
-            return;
-        }
-    };
-
-    let obj_path = tmp_dir.join(format!("{key}.o"));
-    let so_path = tmp_dir.join(format!("{key}.so"));
-
-    let obj_str = match obj_path.to_str() {
-        Some(s) => s.to_string(),
-        None => {
-            eprintln!("homura cache: non-UTF-8 temp path, skipping cache write");
-            return;
-        }
-    };
-
-    // Step 1: dump object file.
-    graph.dump_to_object_file(&obj_str);
-    if !obj_path.exists() {
-        // dump_to_object_file may silently fail for models that reference external
-        // symbols (e.g. memrefCopy from libmlir_c_runner_utils). This is a known
-        // limitation — the cache simply won't be populated for these models.
-        return;
+    // Look up the direct C interface function.
+    let ciface_name = CString::new("_mlir_ciface_compute").unwrap();
+    let ciface_fn = LLVMGetNamedFunction(llvm_module, ciface_name.as_ptr());
+    if ciface_fn.is_null() {
+        return Err("_mlir_ciface_compute not found in LLVM module".into());
     }
 
-    // Step 2: link to .so.
-    let cc_status = std::process::Command::new("cc")
+    // Determine how many arguments it takes.
+    let n_params = LLVMCountParams(ciface_fn) as usize;
+    if n_params == 0 {
+        return Err("_mlir_ciface_compute has 0 params".into());
+    }
+
+    // Build types: ptr_ty = i8* (opaque pointer), void_ty
+    let ptr_ty = LLVMPointerTypeInContext(llvm_ctx, 0);
+    let void_ty = LLVMVoidTypeInContext(llvm_ctx);
+
+    // Signature: void wrapper(i8** args)
+    let mut wrapper_param_types = [ptr_ty];
+    let wrapper_fn_ty = LLVMFunctionType(void_ty, wrapper_param_types.as_mut_ptr(), 1, 0);
+
+    let packed_name = CString::new("_mlir__mlir_ciface_compute").unwrap();
+    let wrapper_fn = LLVMAddFunction(llvm_module, packed_name.as_ptr(), wrapper_fn_ty);
+
+    // Set internal linkage so the optimiser can inline it.
+    LLVMSetLinkage(wrapper_fn, llvm_sys::LLVMLinkage::LLVMExternalLinkage);
+
+    // Build the function body.
+    let entry_bb_name = CString::new("entry").unwrap();
+    let builder = LLVMCreateBuilderInContext(llvm_ctx);
+    let entry_bb = LLVMAppendBasicBlockInContext(llvm_ctx, wrapper_fn, entry_bb_name.as_ptr());
+    LLVMPositionBuilderAtEnd(builder, entry_bb);
+
+    // args_ptr = first parameter (i8**)
+    let args_ptr = LLVMGetParam(wrapper_fn, 0);
+
+    // Load each arg[i] and pass to ciface function.
+    //
+    // The runtime passes args as Vec<*mut ()> where each args[i] is
+    // &mut (ptr_to_memref_descriptor) — i.e., double indirection.
+    // _mlir_ciface_compute takes single pointers to MemRefDescriptors.
+    // So we must load args[i] (pointer-to-pointer) and then dereference again.
+    let mut call_args: Vec<llvm_sys::prelude::LLVMValueRef> = Vec::with_capacity(n_params);
+    for i in 0..n_params {
+        // GEP: &args[i]  (args_ptr is void** = ptr<ptr>)
+        let idx = LLVMConstInt(LLVMInt64TypeInContext(llvm_ctx), i as u64, 0);
+        let gep_name = CString::new(format!("gep_{i}")).unwrap();
+        let elem_ptr = LLVMBuildInBoundsGEP2(
+            builder,
+            ptr_ty,
+            args_ptr,
+            [idx].as_mut_ptr(),
+            1,
+            gep_name.as_ptr(),
+        );
+        // Load args[i]: gets a void* which is itself a ptr-to-MemRefDescriptor
+        let pp_name = CString::new(format!("pp_{i}")).unwrap();
+        let pp_val = LLVMBuildLoad2(builder, ptr_ty, elem_ptr, pp_name.as_ptr());
+        // Dereference once more: load *args[i] to get the MemRefDescriptor pointer
+        let arg_name = CString::new(format!("arg_{i}")).unwrap();
+        let arg_val = LLVMBuildLoad2(builder, ptr_ty, pp_val, arg_name.as_ptr());
+        call_args.push(arg_val);
+    }
+
+    // Get the function type of _mlir_ciface_compute for the call instruction.
+    let ciface_fn_ty = LLVMGlobalGetValueType(ciface_fn);
+    let call_name = CString::new("").unwrap();
+    LLVMBuildCall2(
+        builder,
+        ciface_fn_ty,
+        ciface_fn,
+        call_args.as_mut_ptr(),
+        n_params as u32,
+        call_name.as_ptr(),
+    );
+    LLVMBuildRetVoid(builder);
+
+    LLVMDisposeBuilder(builder);
+    Ok(())
+
+    } // end unsafe
+}
+
+/// Return the path to `libmlir_c_runner_utils.so`.
+///
+/// Reads `MLIR_RUNNER_UTILS_PATH` if set, otherwise falls back to the
+/// well-known LLVM 21 install path on this system.
+fn runner_utils_lib_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("MLIR_RUNNER_UTILS_PATH") {
+        return std::path::PathBuf::from(path);
+    }
+    std::path::PathBuf::from("/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so")
+}
+
+/// Link an object file into a shared library.
+///
+/// Links `runner_utils` by full path and bakes its directory into the
+/// `.so`'s `DT_RUNPATH` so the dynamic linker finds it at dlopen time
+/// without requiring `LD_LIBRARY_PATH`.
+fn link_shared_lib(
+    obj_path: &std::path::Path,
+    so_path: &std::path::Path,
+) -> Result<(), CompileError> {
+    let runner_utils_path = runner_utils_lib_path();
+    let runner_utils_dir = runner_utils_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/usr/lib/llvm/21/lib64"))
+        .to_str()
+        .unwrap_or("/usr/lib/llvm/21/lib64");
+
+    let status = std::process::Command::new("cc")
         .args([
             "-shared",
             "-fPIC",
             "-o",
-            so_path.to_str().unwrap_or_default(),
-            &obj_str,
+            so_path.to_str().unwrap(),
+            obj_path.to_str().unwrap(),
+            runner_utils_path.to_str().unwrap(),
             "-lm",
+            &format!("-Wl,-rpath,{runner_utils_dir}"),
         ])
-        .status();
+        .status()
+        .map_err(|e| CompileError::Link(format!("failed to run cc: {e}")))?;
 
-    let _ = std::fs::remove_file(&obj_path); // clean up .o regardless
-
-    match cc_status {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("homura cache: cc exited with {s}, skipping cache write");
-            return;
-        }
-        Err(e) => {
-            eprintln!("homura cache: failed to run cc: {e}, skipping cache write");
-            return;
-        }
+    if !status.success() {
+        return Err(CompileError::Link(format!("cc exited with {status}")));
     }
-
-    // Step 3: store .so + metadata.
-    let meta = CacheMeta {
-        num_inputs: graph.num_inputs(),
-        outputs: graph
-            .outputs()
-            .iter()
-            .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
-            .collect(),
-    };
-
-    if let Err(e) = cache.store(key, &so_path, &meta) {
-        eprintln!("homura cache: failed to write cache entry: {e}");
-    }
-
-    let _ = std::fs::remove_file(&so_path);
+    Ok(())
 }
 
 /// Return a temp directory path for staging cache files.
@@ -4551,479 +4752,52 @@ mod tests {
 
     // ── TOSA spike tests (milestone 2, task 1.2) ──────────────────────────────
     //
-    // These tests validate that the TOSA → linalg → LLVM → JIT pipeline works
-    // end-to-end. They build MLIR modules by hand (not via the trace compiler)
-    // to keep the TOSA lowering path isolated from the existing linalg path.
-    //
-    // Pass pipeline (TOSA lowering prepended to the existing chain):
-    //   tosa-make-broadcastable, tosa-to-linalg-named, tosa-to-linalg,
-    //   tosa-to-arith, tosa-to-tensor,
-    //   one-shot-bufferize{…}, convert-linalg-to-loops, convert-scf-to-cf,
-    //   convert-math-to-llvm, finalize-memref-to-llvm, convert-arith-to-llvm,
-    //   convert-index-to-llvm, convert-cf-to-llvm, convert-func-to-llvm,
-    //   reconcile-unrealized-casts
-
-    /// Build and run the TOSA lowering pass pipeline on a module.
-    ///
-    /// Returns `Err(String)` with the pass error message if any pass fails.
-    fn run_tosa_pipeline(module: &mut Module, context: &Context) -> Result<(), String> {
-        register_all_passes();
-        let pm = pass::PassManager::new(context);
-        parse_pass_pipeline(
-            pm.as_operation_pass_manager(),
-            "builtin.module(\
-                func.func(\
-                    tosa-make-broadcastable,\
-                    tosa-to-linalg-named,\
-                    tosa-to-linalg,\
-                    tosa-to-arith,\
-                    tosa-to-tensor\
-                ),\
-                one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
-                convert-linalg-to-loops,\
-                convert-scf-to-cf,\
-                lower-affine,\
-                convert-math-to-llvm,\
-                expand-strided-metadata,\
-                finalize-memref-to-llvm,\
-                convert-arith-to-llvm,\
-                convert-index-to-llvm,\
-                convert-cf-to-llvm,\
-                convert-func-to-llvm,\
-                reconcile-unrealized-casts\
-            )",
-        )
-        .map_err(|e| format!("pipeline parse failed: {e}"))?;
-        pm.run(module).map_err(|e| format!("pass failed: {e}"))?;
-        Ok(())
-    }
-
-    /// Execute a compiled module's `compute` function with the given flat f32
-    /// input slices and return the flat f32 output.
-    ///
-    /// All buffers must have the same flat element count `n`.
-    unsafe fn jit_run_f32(
-        engine: &melior::ExecutionEngine,
-        inputs: &[&[f32]],
-        n: usize,
-    ) -> Vec<f32> {
-        unsafe {
-            use crate::runtime::build_memref_descriptor;
-
-            let shape = vec![n as i64];
-            let strides = vec![1i64];
-
-            // Build input descriptors (treat &[f32] data as *mut u8).
-            let mut input_data_vecs: Vec<Vec<f32>> = inputs.iter().map(|s| s.to_vec()).collect();
-            let mut input_descs: Vec<Vec<u8>> = input_data_vecs
-                .iter_mut()
-                .map(|v| build_memref_descriptor(v.as_mut_ptr() as *mut u8, &shape, &strides))
-                .collect();
-
-            // Allocate output buffer.
-            let mut output_data: Vec<f32> = vec![0.0f32; n];
-            let mut output_desc =
-                build_memref_descriptor(output_data.as_mut_ptr() as *mut u8, &shape, &strides);
-
-            // Build args array: &mut ptr_to_desc for each descriptor.
-            let mut desc_ptrs: Vec<*mut u8> =
-                input_descs.iter_mut().map(|d| d.as_mut_ptr()).collect();
-            let mut out_desc_ptr = output_desc.as_mut_ptr();
-
-            let mut args: Vec<*mut ()> = desc_ptrs
-                .iter_mut()
-                .map(|p| p as *mut *mut u8 as *mut ())
-                .collect();
-            args.push(&mut out_desc_ptr as *mut *mut u8 as *mut ());
-
-            engine
-                .invoke_packed("compute", &mut args)
-                .expect("JIT invocation failed");
-
-            output_data
-        }
-    }
+    // These tests validate that the TOSA → linalg → LLVM → AOT pipeline works
+    // end-to-end. They use Compiler::compile so they also validate the full
+    // TOSA lowering path.
 
     // ── spike_tosa_add_pipeline ───────────────────────────────────────────────
     //
-    // Validates that:
-    //   - A hand-built MLIR module using tosa.add compiles through the TOSA
-    //     lowering pipeline without errors.
-    //   - The JIT-executed result matches the expected element-wise sum.
-    //
-    // IR shape:
-    //   func @compute(%a: memref<4xf32>, %b: memref<4xf32>, %out: memref<4xf32>)
-    //     %ta = bufferization.to_tensor %a restrict : memref<4xf32>
-    //     %tb = bufferization.to_tensor %b restrict : memref<4xf32>
-    //     %tc = tosa.add %ta, %tb : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-    //     %mc = bufferization.to_buffer %tc : tensor<4xf32> -> memref<4xf32>
-    //     memref.copy %mc, %out : memref<4xf32> to memref<4xf32>
-    //     return
+    // Validates that a tosa.add-based trace compiles and executes correctly
+    // through the AOT pipeline.
     #[test]
     fn spike_tosa_add_pipeline() {
-        let context = create_context();
-        let location = Location::unknown(&context);
-        let mut module = Module::new(location);
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
 
-        let f32_type = melior::ir::r#type::IntegerType::new(&context, 32);
-        // Use f32 — obtain via DType helper.
-        let f32_mlir = DType::F32.to_mlir_type(&context);
-        let tensor_type: melior::ir::Type = RankedTensorType::new(&[4u64], f32_mlir, None).into();
-        let memref_type: melior::ir::Type = MemRefType::new(f32_mlir, &[4i64], None, None).into();
-        let _ = f32_type; // silence unused warning
-
-        {
-            // Function: (%a: memref<4xf32>, %b: memref<4xf32>, %out: memref<4xf32>) -> ()
-            let arg_types = [
-                (memref_type, location),
-                (memref_type, location),
-                (memref_type, location),
-            ];
-            let function_type =
-                FunctionType::new(&context, &[memref_type, memref_type, memref_type], &[]);
-
-            let body_block = Block::new(&arg_types);
-
-            // bufferization.to_tensor %a restrict
-            let ta: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("bufferization.to_tensor", location)
-                        .add_operands(&[body_block.argument(0).unwrap().into()])
-                        .add_results(&[tensor_type])
-                        .add_attributes(&[(
-                            Identifier::new(&context, "restrict"),
-                            Attribute::unit(&context),
-                        )])
-                        .build()
-                        .expect("bufferization.to_tensor a"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // bufferization.to_tensor %b restrict
-            let tb: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("bufferization.to_tensor", location)
-                        .add_operands(&[body_block.argument(1).unwrap().into()])
-                        .add_results(&[tensor_type])
-                        .add_attributes(&[(
-                            Identifier::new(&context, "restrict"),
-                            Attribute::unit(&context),
-                        )])
-                        .build()
-                        .expect("bufferization.to_tensor b"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // tosa.add %ta, %tb
-            let tc: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("tosa.add", location)
-                        .add_operands(&[ta, tb])
-                        .add_results(&[tensor_type])
-                        .build()
-                        .expect("tosa.add"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // bufferization.to_buffer %tc
-            let mc: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("bufferization.to_buffer", location)
-                        .add_operands(&[tc])
-                        .add_results(&[memref_type])
-                        .build()
-                        .expect("bufferization.to_buffer"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // memref.copy %mc, %out
-            body_block.append_operation(
-                OperationBuilder::new("memref.copy", location)
-                    .add_operands(&[mc, body_block.argument(2).unwrap().into()])
-                    .build()
-                    .expect("memref.copy"),
-            );
-
-            body_block.append_operation(func::r#return(&[], location));
-
-            let region = Region::new();
-            region.append_block(body_block);
-
-            let function = func::func(
-                &context,
-                StringAttribute::new(&context, "compute"),
-                TypeAttribute::new(function_type.into()),
-                region,
-                &[(
-                    Identifier::new(&context, "llvm.emit_c_interface"),
-                    Attribute::unit(&context),
-                )],
-                location,
-            );
-            module.body().append_operation(function);
-        }
-
-        assert!(
-            module.as_operation().verify(),
-            "MLIR module verification failed before passes"
-        );
-
-        run_tosa_pipeline(&mut module, &context).expect("TOSA pipeline failed");
-
-        // JIT execute: [1,2,3,4] + [10,20,30,40] = [11,22,33,44]
-        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
-        let a = [1.0f32, 2.0, 3.0, 4.0];
-        let b = [10.0f32, 20.0, 30.0, 40.0];
-        let result = unsafe { jit_run_f32(&engine, &[&a, &b], 4) };
-        assert_eq!(result, vec![11.0f32, 22.0, 33.0, 44.0]);
+        let graph = Compiler::compile(&trace, &[c.id], None).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+        let result = graph.run(&[&a_buf, &b_buf]);
+        assert_eq!(result[0].as_slice::<f32>(), &[11.0f32, 22.0, 33.0, 44.0]);
     }
 
     // ── spike_tosa_mixed_pipeline ─────────────────────────────────────────────
     //
-    // Validates that tosa.add and linalg.generic can coexist in the same
-    // module and both lower correctly through the mixed pipeline.
+    // Validates that a trace mixing TOSA ops (add) and linalg fallback (div)
+    // compiles and executes correctly through the AOT pipeline.
     //
-    // IR shape:
-    //   func @compute(%a: memref<4xf32>, %b: memref<4xf32>,
-    //                 %c: memref<4xf32>, %out: memref<4xf32>)
-    //     %ta = bufferization.to_tensor %a restrict
-    //     %tb = bufferization.to_tensor %b restrict
-    //     %tc = bufferization.to_tensor %c restrict
-    //     %tsum = tosa.add %ta, %tb          -- tosa op
-    //     %tdiv = linalg.generic(%tsum, %tc) -- divide sum by c
-    //     %mc = bufferization.to_buffer %tdiv
-    //     memref.copy %mc, %out
-    //     return
-    //
-    // Input: a=[2,4,6,8], b=[0,0,0,0] (so tosa.add gives [2,4,6,8]),
-    //        c=[1,2,3,4] (linalg div gives [2,2,2,2]).
+    // Computation: (a + b) / c  with a=[2,4,6,8], b=[0,0,0,0], c=[1,2,3,4]
+    // Expected: [2,2,2,2]
     #[test]
     fn spike_tosa_mixed_pipeline() {
-        let context = create_context();
-        let location = Location::unknown(&context);
-        let mut module = Module::new(location);
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = Tensor::new(&[4], DType::F32);
+        let sum = &a + &b;
+        let result_t = &sum / &c;
+        let trace = take_trace();
 
-        let f32_mlir = DType::F32.to_mlir_type(&context);
-        let tensor_type: melior::ir::Type = RankedTensorType::new(&[4u64], f32_mlir, None).into();
-        let memref_type: melior::ir::Type = MemRefType::new(f32_mlir, &[4i64], None, None).into();
-
-        {
-            // Function: (%a, %b, %c, %out : all memref<4xf32>) -> ()
-            let arg_types = [
-                (memref_type, location),
-                (memref_type, location),
-                (memref_type, location),
-                (memref_type, location),
-            ];
-            let function_type = FunctionType::new(
-                &context,
-                &[memref_type, memref_type, memref_type, memref_type],
-                &[],
-            );
-
-            let body_block = Block::new(&arg_types);
-
-            // bufferization.to_tensor for each input
-            let to_tensor = |arg_idx: usize| -> melior::ir::Value {
-                body_block
-                    .append_operation(
-                        OperationBuilder::new("bufferization.to_tensor", location)
-                            .add_operands(&[body_block.argument(arg_idx).unwrap().into()])
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[(
-                                Identifier::new(&context, "restrict"),
-                                Attribute::unit(&context),
-                            )])
-                            .build()
-                            .expect("bufferization.to_tensor"),
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into()
-            };
-
-            let ta = to_tensor(0);
-            let tb = to_tensor(1);
-            let tc = to_tensor(2);
-
-            // tosa.add %ta, %tb  -> %tsum
-            let tsum: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("tosa.add", location)
-                        .add_operands(&[ta, tb])
-                        .add_results(&[tensor_type])
-                        .build()
-                        .expect("tosa.add"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // linalg.generic: divf(%tsum, %tc) -> %tdiv
-            // tensor.empty for the output slot
-            let init_val: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("tensor.empty", location)
-                        .add_results(&[tensor_type])
-                        .build()
-                        .expect("tensor.empty"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            let identity_map = make_identity_map(&context, 1).expect("identity map");
-            let indexing_maps =
-                ArrayAttribute::new(&context, &[identity_map, identity_map, identity_map]);
-            let iterator_types = make_iterator_types(&context, 1).expect("iterator types");
-            let segment_sizes =
-                Attribute::parse(&context, "array<i32: 2, 1>").expect("segment sizes");
-
-            let linalg_region = {
-                let linalg_block = Block::new(&[
-                    (f32_mlir, location),
-                    (f32_mlir, location),
-                    (f32_mlir, location),
-                ]);
-                let lhs_elem: melior::ir::Value = linalg_block.argument(0).unwrap().into();
-                let rhs_elem: melior::ir::Value = linalg_block.argument(1).unwrap().into();
-                let div_val: melior::ir::Value = linalg_block
-                    .append_operation(arith::divf(lhs_elem, rhs_elem, location))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                linalg_block.append_operation(
-                    OperationBuilder::new("linalg.yield", location)
-                        .add_operands(&[div_val])
-                        .build()
-                        .expect("linalg.yield"),
-                );
-                let r = Region::new();
-                r.append_block(linalg_block);
-                r
-            };
-
-            let tdiv: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("linalg.generic", location)
-                        .add_operands(&[tsum, tc, init_val])
-                        .add_results(&[tensor_type])
-                        .add_attributes(&[
-                            (
-                                Identifier::new(&context, "indexing_maps"),
-                                indexing_maps.into(),
-                            ),
-                            (Identifier::new(&context, "iterator_types"), iterator_types),
-                            (
-                                Identifier::new(&context, "operand_segment_sizes"),
-                                segment_sizes,
-                            ),
-                        ])
-                        .add_regions([linalg_region])
-                        .build()
-                        .expect("linalg.generic"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // bufferization.to_buffer %tdiv
-            let mc: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("bufferization.to_buffer", location)
-                        .add_operands(&[tdiv])
-                        .add_results(&[memref_type])
-                        .build()
-                        .expect("bufferization.to_buffer"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-
-            // memref.copy %mc, %out
-            body_block.append_operation(
-                OperationBuilder::new("memref.copy", location)
-                    .add_operands(&[mc, body_block.argument(3).unwrap().into()])
-                    .build()
-                    .expect("memref.copy"),
-            );
-
-            body_block.append_operation(func::r#return(&[], location));
-
-            let region = Region::new();
-            region.append_block(body_block);
-
-            let function = func::func(
-                &context,
-                StringAttribute::new(&context, "compute"),
-                TypeAttribute::new(function_type.into()),
-                region,
-                &[(
-                    Identifier::new(&context, "llvm.emit_c_interface"),
-                    Attribute::unit(&context),
-                )],
-                location,
-            );
-            module.body().append_operation(function);
-        }
-
-        assert!(
-            module.as_operation().verify(),
-            "MLIR module verification failed before passes"
-        );
-
-        run_tosa_pipeline(&mut module, &context).expect("TOSA mixed pipeline failed");
-
-        // JIT execute: a=[2,4,6,8], b=[0,0,0,0] -> tosa.add=[2,4,6,8]
-        //              c=[1,2,3,4] -> linalg div=[2,2,2,2]
-        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
-        let a = [2.0f32, 4.0, 6.0, 8.0];
-        let b = [0.0f32, 0.0, 0.0, 0.0];
-        let c = [1.0f32, 2.0, 3.0, 4.0];
-        let result = unsafe {
-            use crate::runtime::build_memref_descriptor;
-            let shape = vec![4i64];
-            let strides = vec![1i64];
-
-            let mut a_data = a.to_vec();
-            let mut b_data = b.to_vec();
-            let mut c_data = c.to_vec();
-            let mut out_data = vec![0.0f32; 4];
-
-            let mut a_desc =
-                build_memref_descriptor(a_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut b_desc =
-                build_memref_descriptor(b_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut c_desc =
-                build_memref_descriptor(c_data.as_mut_ptr() as *mut u8, &shape, &strides);
-            let mut out_desc =
-                build_memref_descriptor(out_data.as_mut_ptr() as *mut u8, &shape, &strides);
-
-            let mut a_ptr = a_desc.as_mut_ptr();
-            let mut b_ptr = b_desc.as_mut_ptr();
-            let mut c_ptr = c_desc.as_mut_ptr();
-            let mut out_ptr = out_desc.as_mut_ptr();
-
-            let mut args: Vec<*mut ()> = vec![
-                &mut a_ptr as *mut *mut u8 as *mut (),
-                &mut b_ptr as *mut *mut u8 as *mut (),
-                &mut c_ptr as *mut *mut u8 as *mut (),
-                &mut out_ptr as *mut *mut u8 as *mut (),
-            ];
-            engine
-                .invoke_packed("compute", &mut args)
-                .expect("JIT invocation failed");
-            out_data
-        };
-        assert_eq!(result, vec![2.0f32, 2.0, 2.0, 2.0]);
+        let graph = Compiler::compile(&trace, &[result_t.id], None).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[2.0, 4.0, 6.0, 8.0], &[4], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[0.0, 0.0, 0.0, 0.0], &[4], DType::F32);
+        let c_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let result = graph.run(&[&a_buf, &b_buf, &c_buf]);
+        assert_eq!(result[0].as_slice::<f32>(), &[2.0f32, 2.0, 2.0, 2.0]);
     }
 
     // ── IR verification tests (task 2.10) ─────────────────────────────────────

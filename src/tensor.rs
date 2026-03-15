@@ -1024,7 +1024,7 @@ impl Tensor {
     pub fn eval(&self, inputs: &[Buffer]) -> Buffer {
         let trace = crate::trace::take_trace();
         let compiled =
-            crate::Compiler::compile(&trace, &[self.id]).expect("compilation failed in eval");
+            crate::Compiler::compile(&trace, &[self.id], None).expect("compilation failed in eval");
         let mut outputs = compiled.run(&inputs.iter().collect::<Vec<&Buffer>>());
         outputs.remove(0)
     }
@@ -1530,7 +1530,7 @@ mod tests {
         let a = Tensor::new(&[2, 3], DType::F32);
         let b = a.softmax(-1);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         // [[1, 2, 3], [1, 2, 3]]
         let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 1.0, 2.0, 3.0], &[2, 3], DType::F32);
         let result = compiled.run(&[&a_buf]);
@@ -1550,7 +1550,7 @@ mod tests {
         let a = Tensor::new(&[3], DType::F32);
         let b = a.softmax(-1);
         let trace = take_trace();
-        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let compiled = Compiler::compile(&trace, &[b.id], None).expect("compile failed");
         // Large values that would overflow exp() without the max subtraction trick
         let a_buf = Buffer::from_slice::<f32>(&[1000.0, 1000.0, 1000.0], &[3], DType::F32);
         let result = compiled.run(&[&a_buf]);

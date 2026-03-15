@@ -1,5 +1,6 @@
 pub mod cache;
 mod compiler;
+mod llvm_ffi;
 pub mod dtype;
 pub mod generate;
 pub mod onnx;
