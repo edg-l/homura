@@ -38,13 +38,26 @@ homura run model.onnx --input data.bin --shape 1,1,28,28  # run with data
 
 Operations aren't executed eagerly. They're recorded into a trace — a flat list of ops — then compiled all at once into optimized machine code via MLIR.
 
-```
-Tensor ops  -->  Trace (Vec<Op>)  -->  MLIR (TOSA + linalg)  -->  LLVM  -->  JIT
+```mermaid
+flowchart LR
+    A["Tensor ops\n(Rust API)"] --> B["Trace\n(Vec&lt;Op&gt;)"]
+    B --> C["MLIR\n(TOSA + linalg)"]
+    C --> D["LLVM IR"]
+    D --> E["JIT\nmachine code"]
 ```
 
-The compiler emits [TOSA](https://mlir.llvm.org/docs/Dialects/TOSA/) dialect ops as the primary IR (add, sub, mul, matmul, reshape, etc.), with `linalg.generic` fallback for ops TOSA doesn't cover (float div, integer matmul). TOSA's well-tested lowering passes handle conversion to linalg, then bufferization and LLVM lowering produce the final machine code.
+The compiler emits [TOSA](https://mlir.llvm.org/docs/Dialects/TOSA/) dialect ops as the primary IR (add, sub, mul, matmul, conv2d, reshape, etc.), with `linalg.generic` fallback for ops TOSA doesn't cover (float div, integer matmul). TOSA's well-tested lowering passes handle conversion to linalg, then bufferization and LLVM lowering produce the final machine code.
 
 For ONNX models, the `Model` API parses the protobuf, replays the graph through the tracing system, compiles, and provides a simple `load`/`run` interface.
+
+```mermaid
+flowchart LR
+    A[".onnx file"] --> B["prost\nparser"]
+    B --> C["mapper:\nreplay via\nTensor API"]
+    C --> D["Trace"]
+    D --> E["Compiler"]
+    E --> F["JIT"]
+```
 
 See [docs/design.md](docs/design.md) for a detailed walkthrough of the architecture, MLIR lowering pipeline, and JIT ABI.
 

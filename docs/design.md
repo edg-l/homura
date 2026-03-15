@@ -4,12 +4,26 @@ Homura is a Rust ML inference framework that traces tensor operations into a com
 
 ## The Big Picture
 
-```
-User code             Trace              MLIR                  Machine code
-─────────────────     ──────────────     ───────────────────   ──────────────
-let a = Tensor(...)   Op::Input(a)       bufferization.to_     fadd loop over
-let b = Tensor(...)   Op::Input(b)         tensor %arg0        raw memory
-let c = &a + &b       Op::Add(a,b)       tosa.add %t0, %t1    (JIT compiled)
+```mermaid
+flowchart LR
+    subgraph User Code
+        A["let a = Tensor::new(...)
+let b = Tensor::new(...)
+let c = &a + &b"]
+    end
+    subgraph Trace
+        B["Op::Input(a)
+Op::Input(b)
+Op::Add(a, b)"]
+    end
+    subgraph MLIR
+        C["tosa.add %t0, %t1"]
+    end
+    subgraph JIT
+        D["fadd loop over
+raw memory"]
+    end
+    A --> B --> C --> D
 ```
 
 Nothing runs until you say so. You write math, Homura writes it down, then compiles and runs it all at once.
@@ -80,66 +94,32 @@ Key things to notice:
 
 The MLIR IR goes through a multi-stage pipeline that progressively lowers abstractions:
 
-```
-tosa.* ops on tensors
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ TOSA lowering passes (function-level)       │
-│   tosa-make-broadcastable                   │
-│     Auto-inserts reshapes for broadcast.    │
-│   tosa-to-linalg-named                      │
-│     Structured ops (matmul, conv) → named   │
-│     linalg ops.                             │
-│   tosa-to-linalg                            │
-│     Element-wise ops → linalg.generic.      │
-│   tosa-to-arith / tosa-to-tensor            │
-│     Remaining TOSA ops → arith/tensor.      │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ one-shot-bufferize                          │
-│   Converts tensor ops to memref ops.        │
-│   Allocates memory for intermediates.       │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ convert-linalg-to-loops                     │
-│   Turns linalg.generic into scf.for loops   │
-│   with explicit load/store operations.      │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ convert-scf-to-cf                           │
-│   Structured loops (for/if) become          │
-│   unstructured branches (br/cond_br).       │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ convert-math-to-llvm                        │
-│ expand-strided-metadata                     │
-│ finalize-memref-to-llvm                     │
-│ convert-arith-to-llvm                       │
-│ convert-index-to-llvm                       │
-│ convert-cf-to-llvm                          │
-│ convert-func-to-llvm                        │
-│   Convert everything remaining to LLVM      │
-│   dialect.                                  │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ reconcile-unrealized-casts                  │
-│   Final cleanup: resolves any remaining     │
-│   type casts left over from lowering.       │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-    LLVM IR → JIT compiled machine code
+```mermaid
+flowchart TD
+    A["tosa.* ops on tensors"] --> B
+
+    subgraph TOSA["TOSA lowering (function-level)"]
+        B["tosa-make-broadcastable\nauto-insert reshapes for broadcast"]
+        B --> B2["tosa-to-linalg-named\nconv, matmul → named linalg ops"]
+        B2 --> B3["tosa-to-linalg\nelement-wise → linalg.generic"]
+        B3 --> B4["tosa-to-arith / tosa-to-tensor\nremaining TOSA → arith/tensor"]
+    end
+
+    B4 --> C["one-shot-bufferize\ntensor → memref, allocate intermediates"]
+    C --> D["convert-linalg-to-loops\nlinalg.generic → scf.for loops"]
+    D --> E["convert-scf-to-cf\nstructured loops → branches"]
+    E --> F["lower-affine\naffine ops from conv2d pad lowering"]
+
+    subgraph LLVM["LLVM lowering"]
+        G["convert-math-to-llvm"]
+        G --> G2["expand-strided-metadata"]
+        G2 --> G3["finalize-memref-to-llvm"]
+        G3 --> G4["convert-arith/index/cf/func-to-llvm"]
+    end
+
+    F --> G
+    G4 --> H["reconcile-unrealized-casts"]
+    H --> I["LLVM IR → JIT machine code"]
 ```
 
 The exact pipeline string passed to MLIR:
@@ -216,27 +196,32 @@ The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Archite
 
 Homura can load and run ONNX models directly:
 
-```
-ONNX .proto file
-    │  prost-build (build.rs)
-    ▼
-ModelProto (protobuf)
-    │  parser.rs: parse_model()
-    ▼
-OnnxModel { nodes, weights, inputs }
-    │  mapper.rs: map_graph()
-    ▼
-begin_trace() → replay ops via Tensor API → take_trace()
-    │  compiler.rs: Compiler::compile()
-    ▼
-CompiledGraph + weights → Model { compiled, weights, num_dynamic_inputs }
+```mermaid
+flowchart TD
+    A[".onnx file\n(protobuf)"] -->|"prost: decode"| B["ModelProto"]
+    B -->|"parser.rs:\nparse_model()"| C["OnnxModel\n{nodes, weights, inputs}"]
+    C -->|"mapper.rs:\nmap_graph()"| D["begin_trace()\nreplay ops via Tensor API\ntake_trace()"]
+    D -->|"Compiler::compile()"| E["CompiledGraph"]
+    E --> F["Model\n{compiled, weights,\nnum_dynamic_inputs}"]
+    F -->|"model.run(&[input])"| G["Output Buffer"]
 ```
 
 The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. ONNX initializers become weight inputs; graph inputs become dynamic inputs. The `Model` struct owns the weights and prepends them to user-provided dynamic inputs at run time.
 
 **Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Conv (with auto_pad=SAME_UPPER), MaxPool.
 
-**NCHW ↔ NHWC layout handling:** Homura uses NCHW layout internally (matching ONNX). TOSA spatial ops require NHWC. The compiler emits `tosa.transpose([0,2,3,1])` before and `tosa.transpose([0,3,1,2])` after each spatial op. For Conv kernels: OIHW → OHWI via `tosa.transpose([0,2,3,1])`.
+**NCHW / NHWC layout handling:**
+
+Homura uses NCHW internally (matching ONNX). TOSA spatial ops require NHWC. The compiler transposes at the boundary:
+
+```mermaid
+flowchart LR
+    A["NCHW input"] -->|"transpose\n[0,2,3,1]"| B["NHWC"]
+    B --> C["tosa.conv2d /\ntosa.max_pool2d"]
+    C -->|"transpose\n[0,3,1,2]"| D["NCHW output"]
+```
+
+For Conv kernels: OIHW → OHWI via `tosa.transpose([0,2,3,1])`.
 
 **MaxPool floor-division compatibility:** ONNX allows incomplete last windows (floor division). TOSA requires exact divisibility of `(H + pad - K) / stride`. The compiler adds right/bottom padding to satisfy TOSA, then `tosa.slice` to crop back to the ONNX-expected output size.
 
