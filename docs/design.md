@@ -1,6 +1,6 @@
 # Homura Design Document
 
-Homura is a Rust ML inference framework that traces tensor operations into a computation graph, compiles them through MLIR, and JIT-executes the result. Think of it as a mini JAX or tinygrad in Rust.
+Homura is a Rust ML inference framework that traces tensor operations into a computation graph, compiles them through MLIR to native shared libraries, and loads them via dlopen for execution.
 
 ## The Big Picture
 
@@ -15,8 +15,8 @@ flowchart LR
     subgraph MLIR
         C["tosa.add %t0, %t1"]
     end
-    subgraph JIT
-        D["fadd loop over<br>raw memory"]
+    subgraph AOT
+        D["LLVM IR → .so"]
     end
     A --> B --> C --> D
 ```
@@ -64,14 +64,11 @@ func.func @compute(%arg0: memref<4xf32>,   // input a
                     %arg2: memref<4xf32>)   // output c
     attributes { llvm.emit_c_interface } {
 
-  // Convert memref args to tensors (boundary conversion)
   %t0 = bufferization.to_tensor %arg0 restrict : memref<4xf32> to tensor<4xf32>
   %t1 = bufferization.to_tensor %arg1 restrict : memref<4xf32> to tensor<4xf32>
 
-  // The actual computation: TOSA add
   %result = tosa.add %t0, %t1 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
 
-  // Convert result back to memref and copy to output argument
   %out_memref = bufferization.to_buffer %result : tensor<4xf32> to memref<4xf32>
   memref.copy %out_memref, %arg2 : memref<4xf32> to memref<4xf32>
   return
@@ -80,12 +77,12 @@ func.func @compute(%arg0: memref<4xf32>,   // input a
 
 Key things to notice:
 
-- **The function takes memref arguments** (pointers to memory), not tensors. This is the JIT calling convention.
+- **The function takes memref arguments** (pointers to memory), not tensors. This is the ABI for the compiled shared library.
 - **Internally everything is tensors.** `bufferization.to_tensor` at the boundary converts memrefs to tensors; `bufferization.to_buffer` converts back.
 - **TOSA ops are high-level.** `tosa.add` says "add these tensors" without specifying loops. MLIR's lowering passes decide how to execute it.
-- **linalg.generic fallback** for ops TOSA doesn't support (float division, integer matmul).
+- **linalg.generic fallback** for ops TOSA doesn't support (float division, integer matmul, gather, batched matmul).
 
-### 3. Lowering — From High-Level IR to Machine Code
+### 3. Lowering — From High-Level IR to LLVM Dialect
 
 The MLIR IR goes through a multi-stage pipeline that progressively lowers abstractions:
 
@@ -103,13 +100,13 @@ flowchart TD
     B4 --> OPT1["canonicalize + cse<br>simplify linalg IR"]
     OPT1 --> C["one-shot-bufferize<br>tensor → memref"]
     C --> BUF["buffer-hoisting +<br>promote-buffers-to-stack"]
-    BUF --> D["convert-linalg-to-loops<br>linalg.generic → scf.for loops"]
-    D --> LICM["affine-loop-invariant-<br>code-motion"]
-    LICM --> F["lower-affine<br>affine ops from conv2d pad lowering"]
+    BUF --> D["convert-linalg-to-affine-loops"]
+    D --> LICM["affine-loop-invariant-code-motion<br>+ affine-scalrep"]
+    LICM --> F["lower-affine"]
     F --> E["convert-scf-to-cf<br>structured loops → branches"]
     E --> OPT2["canonicalize + cse + sccp<br>final cleanup"]
 
-    subgraph LLVM["LLVM lowering"]
+    subgraph LLVM_LOWER["LLVM dialect lowering"]
         G["convert-math-to-llvm"]
         G --> G2["expand-strided-metadata"]
         G2 --> G3["finalize-memref-to-llvm"]
@@ -118,45 +115,35 @@ flowchart TD
 
     OPT2 --> G
     G4 --> H["reconcile-unrealized-casts"]
-    H --> I["LLVM IR → JIT -O3"]
 ```
 
-The exact pipeline string passed to MLIR:
-```
-builtin.module(
-    func.func(
-        tosa-make-broadcastable,
-        tosa-to-linalg-named,
-        tosa-to-linalg,
-        tosa-to-arith,
-        tosa-to-tensor),
-    func.func(canonicalize, cse),
-    one-shot-bufferize{
-        function-boundary-type-conversion=identity-layout-map
-        unknown-type-conversion=identity-layout-map},
-    func.func(buffer-hoisting, promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),
-    convert-linalg-to-loops,
-    func.func(affine-loop-invariant-code-motion),
-    lower-affine,
-    convert-scf-to-cf,
-    canonicalize, cse, sccp,
-    convert-math-to-llvm,
-    expand-strided-metadata,
-    finalize-memref-to-llvm,
-    convert-arith-to-llvm,
-    convert-index-to-llvm,
-    convert-cf-to-llvm,
-    convert-func-to-llvm,
-    reconcile-unrealized-casts)
+### 4. AOT Compilation — From LLVM Dialect to Native Code
+
+After the MLIR pass pipeline produces LLVM dialect IR, the module is compiled ahead-of-time to a native shared library:
+
+```mermaid
+flowchart LR
+    A["MLIR module<br>(LLVM dialect)"] -->|mlirTranslateModuleToLLVMIR| B["LLVM IR"]
+    B -->|"LLVMRunPasses<br>default&lt;O3&gt;"| C["Optimized LLVM IR"]
+    C -->|LLVMTargetMachineEmitToFile| D[".o object file"]
+    D -->|"cc -shared<br>-lmlir_c_runner_utils"| E[".so shared library"]
+    E -->|dlopen + dlsym| F["Function pointer"]
 ```
 
-TOSA passes are function-level (nested under `func.func()`). Optimization passes run at two stages: after TOSA lowering (`canonicalize`+`cse` to simplify linalg IR, `buffer-hoisting`+`promote-buffers-to-stack` for memory), and after loop lowering (`affine-loop-invariant-code-motion`, then `canonicalize`+`cse`+`sccp` for final cleanup). The JIT ExecutionEngine uses LLVM `-O3`.
+Key details:
 
-### 4. Execution — Running the Machine Code
+- **Host CPU optimization**: `LLVMGetHostCPUName()` + `LLVMGetHostCPUFeatures()` enable AVX2/SSE4.2/etc. vectorization for the specific machine.
+- **LLVM O3 pipeline**: `LLVMRunPasses("default<O3>")` runs the full optimization suite — loop vectorization, SLP vectorization, inlining, unrolling, dead code elimination.
+- **Runner utils linking**: The `.so` is linked against `libmlir_c_runner_utils.so` (provides `memrefCopy` for padded convolution/pooling) with `-Wl,-rpath` baked in so it resolves at dlopen time.
+- **Compilation cache**: The `.so` is stored in `~/.cache/homura/` keyed by hash of model bytes + input shapes + compiler fingerprint (LLVM version, homura version, CPU features). Subsequent runs with matching shapes load the cached `.so` via dlopen — near instant.
 
-`CompiledGraph::run(inputs)` marshals Rust data into the format the JIT-compiled function expects, calls it, and extracts the result.
+### 5. Execution — Running the Native Code
 
-The JIT ABI uses **N-D memref descriptors** — C structs that describe a region of memory with shape and stride information. The `llvm.emit_c_interface` attribute causes MLIR to generate a C-compatible wrapper that accepts pointers to these descriptors. The `invoke_packed` mechanism requires **double indirection**: each argument slot holds a pointer to a pointer to a descriptor.
+`CompiledGraph::run(inputs)` marshals Rust data into the format the compiled function expects, calls it via the dlopen'd function pointer, and extracts the results.
+
+The native ABI uses **N-D memref descriptors** — C structs that describe a region of memory with shape and stride information. The `llvm.emit_c_interface` attribute causes MLIR to generate a C-compatible wrapper `_mlir__mlir_ciface_compute` that accepts a packed array of pointers to these descriptors. This is the symbol loaded via `dlsym`.
+
+Multiple outputs are supported: each output gets a trailing memref argument. GPT-2 produces 25 outputs (logits + 24 KV cache tensors).
 
 ## TOSA Backend
 
@@ -164,39 +151,36 @@ The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Archite
 
 **TOSA op mapping:**
 
-| Homura op   | TOSA op              | Notes                                  |
-|-------------|----------------------|----------------------------------------|
-| Add         | tosa.add             |                                        |
-| Sub         | tosa.sub             |                                        |
-| Mul         | tosa.mul             | shift operand: `tosa.const` tensor<1xi8> |
-| Neg         | tosa.negate          | zero-point operands set to 0           |
-| Relu        | tosa.clamp           | min_val=0, max_val=max_float           |
-| Exp         | tosa.exp             |                                        |
-| Tanh        | tosa.tanh            |                                        |
-| Matmul (f)  | tosa.matmul          | 3D only; 2D wraps with tosa.reshape    |
-| Gemm        | tosa.matmul + add    | optional transpose via tosa.transpose  |
-| Reshape     | tosa.reshape         | target shape via tosa.const_shape      |
-| Conv2d      | tosa.conv2d          | NCHW↔NHWC transpose at boundary; pad+slice for divisibility |
-| MaxPool2d   | tosa.max_pool2d      | NCHW↔NHWC; tosa.slice for floor-div   |
-| GlobalAvgPool | tosa.avg_pool2d    | NCHW↔NHWC; kernel = spatial dims       |
-| BatchNorm   | composed             | sub + rsqrt + mul + add (TOSA primitives) |
-| ReduceSum   | tosa.reduce_sum      | keepdim=false adds tosa.reshape after  |
-| ReduceMax   | tosa.reduce_max      | keepdim=false adds tosa.reshape after  |
-| Div         | linalg.generic       | TOSA has no float div                  |
-| Matmul (i)  | linalg.generic       | tosa.matmul is float-only              |
-
-**LLVM 21 TOSA specifics:**
-
-| Op             | What docs say           | What LLVM 21 requires                       |
-|----------------|-------------------------|---------------------------------------------|
-| `tosa.mul`     | shift is i8 attribute   | shift is 3rd operand `tensor<1xi8>`         |
-| `tosa.negate`  | single operand          | 3 operands (input, input1_zp, output_zp)    |
-| `tosa.clamp`   | separate fp/int attrs   | unified min_val/max_val attributes           |
-| `tosa.reshape` | shape is attribute      | shape is operand via `tosa.const_shape`      |
-| `tosa.slice`   | start/size as attrs     | 3 operands: input, start, size via `tosa.const_shape` |
-| `tosa.conv2d`  | 3 operands              | 5 operands: input, weight, bias, input_zp, weight_zp; requires `acc_type` |
-| `tosa.max_pool2d` | no `acc_type`        | requires `acc_type` attribute; strict divisibility |
-| `tosa.avg_pool2d` | 1 operand            | 3 operands: input, input_zp, output_zp; requires `acc_type` |
+| Homura op     | MLIR approach            | Notes                                  |
+|---------------|--------------------------|----------------------------------------|
+| Add           | tosa.add                 |                                        |
+| Sub           | tosa.sub                 |                                        |
+| Mul           | tosa.mul                 | shift operand: tensor<1xi8>            |
+| Neg           | tosa.negate              | zero-point operands set to 0           |
+| Relu          | tosa.clamp               | min_val=0, max_val=max_float           |
+| Exp           | tosa.exp                 |                                        |
+| Tanh          | tosa.tanh                |                                        |
+| Pow           | tosa.pow                 | FP-only, two operands                  |
+| Sqrt          | linalg.generic + math.sqrt | no tosa.sqrt exists                  |
+| Cast          | linalg.generic + arith   | tosa.cast has no I64 support           |
+| Matmul (2D f) | tosa.matmul             | 3D only; 2D wraps with tosa.reshape    |
+| Matmul (batch)| linalg.generic           | broadcast-aware affine maps for any rank |
+| Matmul (int)  | linalg.generic           | tosa.matmul is float-only              |
+| Gemm          | tosa.matmul + add        | optional transpose via tosa.transpose  |
+| Reshape       | tosa.reshape             | target shape via tosa.const_shape      |
+| Gather        | linalg.generic           | tosa.gather is 3D+I32 only             |
+| Slice         | tosa.slice / linalg.generic | tosa.slice for stride=1 only        |
+| Concat        | tosa.concat              | variadic inputs                        |
+| Transpose     | tosa.transpose           | perms as DenseI32ArrayAttr             |
+| Where         | tosa.select              | condition cast to i1 via arith.cmpi    |
+| ReduceSum     | tosa.reduce_sum          | keepdim=false adds tosa.reshape        |
+| ReduceMax     | tosa.reduce_max          | keepdim=false adds tosa.reshape        |
+| ReduceMean    | tosa.reduce_sum + reciprocal + mul | sequential single-axis      |
+| Conv2d        | tosa.conv2d              | NCHW↔NHWC transpose; pad+slice        |
+| MaxPool2d     | tosa.max_pool2d          | NCHW↔NHWC; tosa.slice for floor-div   |
+| GlobalAvgPool | tosa.avg_pool2d          | NCHW↔NHWC; kernel = spatial dims       |
+| BatchNorm     | composed                 | sub + rsqrt + mul + add                |
+| Div           | linalg.generic           | TOSA has no float div                  |
 
 ## ONNX Support
 
@@ -205,16 +189,20 @@ Homura can load and run ONNX models directly:
 ```mermaid
 flowchart TD
     A[".onnx file<br>(protobuf)"] -->|"prost: decode"| B["ModelProto"]
-    B -->|"parser.rs:<br>parse_model()"| C["OnnxModel<br>{nodes, weights, inputs}"]
-    C -->|"mapper.rs:<br>map_graph()"| D["begin_trace()<br>replay ops via Tensor API<br>take_trace()"]
-    D -->|"Compiler::compile()"| E["CompiledGraph"]
-    E --> F["Model<br>{compiled, weights,<br>num_dynamic_inputs}"]
-    F -->|"model.run(&[input])"| G["Output Buffer"]
+    B -->|"parser.rs"| C["OnnxModel<br>{nodes, weights, inputs}"]
+    C -->|"mapper.rs:<br>replay via Tensor API"| D["Trace"]
+    D -->|"Compiler::compile()"| E[".so via AOT"]
+    E --> F["Model<br>{compiled, weights}"]
+    F -->|"model.run(&[input])"| G["Vec&lt;Buffer&gt;"]
 ```
 
-The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. ONNX initializers become weight inputs; graph inputs become dynamic inputs. The `Model` struct owns the weights and prepends them to user-provided dynamic inputs at run time.
+The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. A general constant folding pass evaluates ops at trace time when all inputs are known constants (enabling Shape → Gather → Unsqueeze → Concat → Reshape chains for GPT-2 attention).
 
-**Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Conv (with auto_pad=SAME_UPPER), MaxPool, BatchNormalization, GlobalAveragePool.
+**Supported ONNX ops (25):** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, Pow, Sqrt, Cast, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Where, Conv, MaxPool, BatchNormalization, GlobalAveragePool, ReduceMean, ReduceSum, ReduceMax, Constant, Shape, ConstantOfShape, Range, Squeeze, Unsqueeze.
+
+**Symbolic dimensions:** Models with dynamic dimensions (like GPT-2's `batch_size`, `sequence_length`) are parsed without error. Compilation is deferred to the first `run()` call, which resolves symbolic dims from actual input tensor shapes. The model auto-recompiles when input shapes change.
+
+**Multiple outputs:** `Model::run()` returns `Vec<Buffer>`. GPT-2 produces 25 outputs (logits + 24 KV cache tensors).
 
 **NCHW / NHWC layout handling:**
 
@@ -227,114 +215,104 @@ flowchart LR
     C -->|"transpose<br>[0,3,1,2]"| D["NCHW output"]
 ```
 
-For Conv kernels: OIHW → OHWI via `tosa.transpose([0,2,3,1])`.
+## Compilation Cache
 
-**Floor-division compatibility (Conv2d, MaxPool2d):** ONNX allows incomplete last windows (floor division). TOSA requires exact divisibility of `(H + pad - K) / stride`. The compiler adds right/bottom padding to satisfy TOSA, then `tosa.slice` to crop back to the ONNX-expected output size.
+Compiled `.so` files are cached on disk at `~/.cache/homura/` (or `HOMURA_CACHE_DIR`). The cache key is a hash of:
+- Model bytes (any model change invalidates)
+- Input shapes (different seq_len = different compilation)
+- Compiler fingerprint: homura version, LLVM version, host CPU name + features
 
-**BatchNorm decomposition:** BatchNorm is not a TOSA primitive. The compiler composes it from TOSA ops: reshape params `[C]→[1,C,1,1]`, then `tosa.sub` (x-mean), `tosa.add` (var+eps), `tosa.rsqrt`, `tosa.mul` (normalize), `tosa.mul` (scale), `tosa.add` (bias).
+On cache hit, compilation is skipped entirely — the `.so` is loaded via dlopen in milliseconds. Power-of-2 bucket padding for sequence lengths limits the number of unique compilations to at most 6 (32, 64, 128, 256, 512, 1024).
 
-## How Chained Operations Work
+`homura clean-cache` removes all cached files.
 
-For `d = (a + b) + c`, the trace records four ops and the compiler emits two TOSA add operations:
+## Text Generation
 
+For transformer models, Homura provides a generation loop:
+
+```rust
+let gen = Generator::load("tests/fixtures/").unwrap();
+let text = gen.generate("The meaning of life is", 50);
 ```
-Trace:
-  0: Input(a)
-  1: Input(b)
-  2: Add(0, 1)     ← a + b
-  3: Input(c)
-  4: Add(2, 3)     ← (a + b) + c
-```
 
-The compiler walks the trace linearly, maintaining a `NodeId → Value` map. When it hits `Add(2, 3)`, it looks up the tensor value for node 2 (the result of the first add) and node 3 (input c), then emits a second `tosa.add` that consumes the first one's output.
-
-After TOSA lowering, bufferization, and loop conversion, this becomes two loops with an intermediate buffer. MLIR's optimization passes could potentially fuse these into a single loop.
+Uses a byte-level BPE tokenizer (GPT-2 compatible, loads `vocab.json` + `merges.txt`). The generation loop does full-sequence recompute per token with greedy sampling (argmax). Each unique sequence length triggers one compilation (cached for subsequent use).
 
 ## Architecture Decisions
 
+### AOT compilation, not JIT
+
+The original design used MLIR's ExecutionEngine (JIT). This was replaced with ahead-of-time compilation to native `.so` files because:
+- The JIT took ~33s for GPT-2 with no way to cache the result
+- `dump_to_object_file` failed silently for models using `memrefCopy`
+- AOT produces a standard `.so` that can be cached on disk and loaded instantly
+
+The AOT path: MLIR → `mlirTranslateModuleToLLVMIR` → `LLVMRunPasses("default<O3>")` → `LLVMTargetMachineEmitToFile` → `cc -shared` → dlopen. Uses `llvm-sys` for LLVM C API bindings.
+
 ### Deferred tracing, not eager execution
 
-Operations record to a trace instead of executing immediately. This lets the compiler see the entire computation graph before generating code, enabling global optimizations. The trade-off is a two-phase API (`begin_trace/take_trace` then `compile/run`), but it's the same pattern JAX and `torch.compile` use.
+Operations record to a trace instead of executing immediately. This lets the compiler see the entire computation graph before generating code, enabling global optimizations. The same pattern as JAX and `torch.compile`.
 
 ### Thread-local trace, not explicit context
 
-The trace is stored in a thread-local variable rather than an explicit context object. This keeps the API clean — `&a + &b` just works without passing a graph builder around. Each thread gets its own isolated trace.
-
-### Flat Vec\<Op\> with NodeId indices, not a recursive tree
-
-Operations are stored in a flat vector. Each `Op` references its inputs by `NodeId` (a `u32` index). This is more memory-efficient than `Box<Op>` trees and enforces a DAG structure (operations can only reference earlier operations). The linear layout also makes the compiler's trace walk simple.
-
-### Memref function boundary, tensor internals
-
-The generated function takes `memref` arguments (matching the JIT's C ABI) but uses `tensor` types internally. `bufferization.to_tensor` and `bufferization.to_buffer` convert at the boundary. This keeps the runtime ABI unchanged while letting the compiler work with high-level tensor abstractions.
+The trace is stored in a thread-local variable rather than an explicit context object. `&a + &b` just works without passing a graph builder around.
 
 ### TOSA as primary backend, linalg.generic as fallback
 
-TOSA provides native ops for most ML operations with well-tested lowering passes. For ops TOSA doesn't support (float div, integer matmul), we fall back to hand-rolled `linalg.generic`. Both paths coexist in the same module — TOSA passes are no-ops when no TOSA ops are present.
+TOSA provides native ops for most ML operations with well-tested lowering passes. For ops TOSA doesn't support (float div, integer matmul, gather, batched matmul, cast with I64), we fall back to `linalg.generic`.
 
 ### ONNX graph replay through Tensor API
 
-Rather than building a separate ONNX-to-MLIR compiler, the ONNX mapper replays the graph through the existing Tensor API. This reuses shape inference, broadcasting, dtype validation, and the entire compilation pipeline. The ONNX layer is a "robot user."
+Rather than building a separate ONNX-to-MLIR compiler, the ONNX mapper replays the graph through the existing Tensor API. This reuses shape inference, broadcasting, dtype validation, and the entire compilation pipeline.
 
 ## Source Layout
 
 ```
 src/
 ├── lib.rs          Public API re-exports
-├── dtype.rs        DType enum (F32, F64, I32, I64) with MLIR type conversion
+├── dtype.rs        DType enum (F32, F64, I32, I64)
 ├── shape.rs        Shape wrapper over Vec<u64> with broadcast
-├── main.rs         CLI: `homura info` (model inspector) and `homura run` (inference)
-├── op.rs           NodeId and Op enum (Input, Add, Sub, Mul, Div, Neg, Relu,
-│                   Exp, Tanh, Matmul, ReduceSum, ReduceMax, Reshape, Gemm,
-│                   Conv2d, MaxPool2d, GlobalAvgPool, BatchNorm)
-├── trace.rs        Thread-local Trace context, begin_trace/take_trace/record
-├── tensor.rs       Tensor handle with operator overloads, matmul, gemm, conv2d,
-│                   max_pool2d, global_avg_pool, batch_norm, reshape, reductions,
-│                   softmax, eval sugar
-├── compiler.rs     Trace → MLIR IR emission (TOSA + linalg), pass pipeline,
-│                   ExecutionEngine, N-D transpose helper
-├── runtime.rs      N-D MemRefDescriptor, Buffer, CompiledGraph::run()
+├── main.rs         CLI: homura info / run / clean-cache
+├── op.rs           NodeId and Op enum (28 variants)
+├── trace.rs        Thread-local Trace context
+├── tensor.rs       Tensor handle with operator overloads
+├── compiler.rs     Trace → MLIR → LLVM IR → .so (AOT pipeline)
+├── runtime.rs      MemRefDescriptor, Buffer, CompiledGraph (dlopen)
+├── cache.rs        Disk-based .so compilation cache
+├── tokenizer.rs    Byte-level BPE tokenizer (GPT-2)
+├── generate.rs     Autoregressive text generation loop
+├── llvm_ffi.rs     FFI for mlirTranslateModuleToLLVMIR
 └── onnx/
-    ├── mod.rs      Public API: Model struct (load/run)
-    ├── proto.rs    Re-export prost-generated protobuf types
-    ├── parser.rs   ONNX ModelProto → internal OnnxModel representation
-    └── mapper.rs   Walk ONNX graph, replay through Tensor API
+    ├── mod.rs      Model struct (load/run), symbolic dim resolution
+    ├── proto.rs    Prost-generated protobuf types
+    ├── parser.rs   ONNX ModelProto → OnnxModel
+    └── mapper.rs   Walk ONNX graph, replay via Tensor API, constant folding
 
-proto/
-└── onnx.proto3     Vendored ONNX protobuf definition
+scripts/
+└── download_gpt2.sh  Download GPT-2 ONNX models + tokenizer
 
-build.rs            prost-build compilation of .proto files
-
-examples/
-├── add.rs          Element-wise add demo
-├── ops.rs          All element-wise ops demo
-├── mlp.rs          Hand-coded MLP demo
-└── onnx_mnist.rs   MNIST digit classifier (loads image, runs model)
-
-tests/fixtures/
-├── mnist-12.onnx       Real ONNX Model Zoo MNIST CNN
-├── resnet18-v1-7.onnx  Real ONNX Model Zoo ResNet-18
-└── digit7.png          Test image for end-to-end test
+tests/fixtures/       MNIST, ResNet-18, GPT-2 model files + tokenizer data
 ```
 
 ## Dependencies
 
-- **melior** — Rust bindings for MLIR's C API. Used for all IR construction, pass management, and JIT execution. TOSA support via `ods-dialects` feature.
-- **mlir-sys** — Low-level FFI bindings to `libMLIR-C.so`. Patched to support shared LLVM/MLIR libraries.
+- **melior** — Rust bindings for MLIR's C API. IR construction and pass management. TOSA support via `ods-dialects` feature.
+- **mlir-sys** — Low-level FFI to `libMLIR-C.so`. Patched for shared LLVM/MLIR libraries.
+- **llvm-sys** — LLVM C API bindings for AOT compilation (target machine, pass builder, object emission).
 - **prost** / **prost-build** — Protobuf compilation for ONNX model parsing.
-- **protobuf-src** — Vendored protoc compiler (no system dependency).
-- **clap** — CLI argument parsing (`homura info` / `homura run`).
-- **libc** — dlopen for `libmlir_c_runner_utils.so` (needed by conv2d pad lowering).
-- **image** (dev-dependency) — Image loading for the MNIST example and e2e test.
-- Requires **LLVM 21** with MLIR C API support.
+- **protobuf-src** — Vendored protoc compiler.
+- **clap** — CLI argument parsing.
+- **libc** — dlopen/dlsym for loading compiled `.so` files.
+- **serde_json** — Parsing `vocab.json` for the BPE tokenizer.
+- **fancy-regex** — Pre-tokenization regex (GPT-2 BPE requires lookahead).
+- Requires **LLVM 21** with `libMLIR-C.so` and `libmlir_c_runner_utils.so`.
 
 ## Current Limitations
 
-- **CPU JIT only** — no GPU backend
-- **Single output** — `compile()` accepts only one output node
-- **Static shapes only** — no dynamic/variable dimensions
-- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, which raises SIGFPE
-- **No autograd** — forward pass only, no gradient computation
+- **CPU only** — no GPU backend
+- **No KV cache feeding** — generation uses full-sequence recompute per token
+- **No dynamic shapes at runtime** — shapes fixed at first `run()`, auto-recompiles on change
+- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, raises SIGFPE
+- **No autograd** — forward pass only
 
 ## Roadmap
 
@@ -344,20 +322,20 @@ N-D tensors, matmul, broadcast, softmax, eval sugar.
 
 ### Milestone 2: Run real ONNX models (complete)
 
-TOSA backend, ONNX parsing, Gemm, Reshape, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
+TOSA backend, ONNX parsing, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
 
-### Milestone 3: Run a transformer on CPU
+### Milestone 3: Run GPT-2 on CPU (complete)
 
-Add transformer ops (Gather, LayerNorm, GELU, Transpose, comparison/Where, Concat, Split, Unsqueeze, Cast). Compilation cache to avoid recompiling on every load. BPE tokenizer integration. Target: GPT-2 small with fixed seq_len, full-sequence recompute per token.
+17 new ONNX ops, symbolic dimensions, multiple outputs, batched matmul, BPE tokenizer, generation loop, AOT compilation with native `.so` caching. GPT-2 (124M) runs end-to-end — 42s cold compile, 2.5s warm cache.
 
 ### Milestone 4: GPU backend
 
-Swap `convert-linalg-to-loops` for GPU tiling/mapping passes. Target CUDA (`gpu-to-nvvm`) or Vulkan (`gpu-to-spirv`). GPU memory management. The TOSA/linalg IR is already GPU-ready.
+Swap `convert-linalg-to-loops` for GPU tiling/mapping passes. Target CUDA (`gpu-to-nvvm`) or Vulkan (`gpu-to-spirv`). GPU memory management.
 
 ### Milestone 5: Dynamic shapes + KV cache
 
-Dynamic/symbolic dimensions in Shape, Trace, Compiler. KV cache with stateful model runs (mutable key/value buffers across `run()` calls). Goal: interactive-speed token generation on GPU.
+Dynamic/symbolic dimensions in Shape, Trace, Compiler. KV cache with the `decoder_with_past_model.onnx` for incremental generation. Goal: interactive-speed token generation on GPU.
 
 ### Milestone 6: Production-grade
 
-Quantization (int8/int4), graph optimizations (op fusion, constant folding), memory planning, multi-model support (LLaMA, Mistral, Phi), streaming token output, multi-GPU / tensor parallelism.
+Quantization (int8/int4), graph optimizations (op fusion, constant folding), memory planning, multi-model support (LLaMA, Mistral, Phi), streaming output, multi-GPU.
