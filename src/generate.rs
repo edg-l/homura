@@ -38,7 +38,9 @@ impl Generator {
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
 
+        eprintln!("[homura] loading model: {}", model_path.display());
         let model = Model::load(&model_path)?;
+        eprintln!("[homura] loading tokenizer");
         let tokenizer = Tokenizer::from_files(
             vocab_path.to_str().unwrap(),
             merges_path.to_str().unwrap(),
@@ -52,6 +54,8 @@ impl Generator {
     ///
     /// Stops early on EOS token (token ID 50256).
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> String {
+        use std::time::Instant;
+
         let prompt_ids: Vec<i64> = self
             .tokenizer
             .encode(prompt)
@@ -63,12 +67,20 @@ impl Generator {
             return String::new();
         }
 
+        eprintln!(
+            "[homura] prompt: {} tokens, generating up to {} new tokens",
+            prompt_ids.len(),
+            max_new_tokens
+        );
+
         let prompt_len = prompt_ids.len();
         let mut token_ids = prompt_ids;
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let gen_start = Instant::now();
 
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
             let seq_len = token_ids.len();
+            let step_start = Instant::now();
 
             let input_ids = Buffer::from_slice::<i64>(
                 &token_ids,
@@ -85,7 +97,7 @@ impl Generator {
             let outputs = match self.model.run(&[&input_ids, &attention_mask]) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("generate: model run failed at seq_len={seq_len}: {e}");
+                    eprintln!("[homura] model run failed at seq_len={seq_len}: {e}");
                     break;
                 }
             };
@@ -94,7 +106,19 @@ impl Generator {
             let logits = &outputs[0];
             let next_token = argmax_last_token(logits, seq_len);
 
+            let token_text = self.tokenizer.decode(&[next_token]);
+            let elapsed = step_start.elapsed();
+            eprintln!(
+                "[homura] token {}/{}: {:?} (seq_len={}, {:.2}s)",
+                step + 1,
+                max_new_tokens,
+                token_text,
+                seq_len,
+                elapsed.as_secs_f64()
+            );
+
             if next_token == EOS_TOKEN_ID {
+                eprintln!("[homura] EOS token reached");
                 break;
             }
 
@@ -102,8 +126,20 @@ impl Generator {
             token_ids.push(next_token as i64);
         }
 
+        let total = gen_start.elapsed();
+        eprintln!(
+            "[homura] generated {} tokens in {:.2}s ({:.2}s/token)",
+            generated_ids.len(),
+            total.as_secs_f64(),
+            if generated_ids.is_empty() {
+                0.0
+            } else {
+                total.as_secs_f64() / generated_ids.len() as f64
+            }
+        );
+
         // Drop the prompt tokens, decode only the generated portion.
-        let _ = prompt_len; // used above to initialise token_ids
+        let _ = prompt_len;
         self.tokenizer.decode(&generated_ids)
     }
 }
@@ -114,13 +150,19 @@ impl Generator {
 /// Returns the token ID with the highest logit value.
 fn argmax_last_token(logits: &Buffer, seq_len: usize) -> u32 {
     const VOCAB_SIZE: usize = 50257;
+    argmax_at_position(logits, seq_len - 1, VOCAB_SIZE)
+}
 
-    // Interpret the raw bytes as f32 slice.
+/// Return the argmax over the vocab dimension at a specific sequence position.
+///
+/// `logits` buffer has shape `[1, seq_len, vocab_size]` with F32 dtype.
+/// `pos` is the zero-based sequence position to read from.
+/// `vocab_size` is the size of the vocabulary dimension.
+/// Returns the token ID with the highest logit value.
+pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32 {
     let data = logits.as_slice::<f32>();
-
-    // Last position starts at offset (seq_len - 1) * VOCAB_SIZE.
-    let offset = (seq_len - 1) * VOCAB_SIZE;
-    let slice = &data[offset..offset + VOCAB_SIZE];
+    let offset = pos * vocab_size;
+    let slice = &data[offset..offset + vocab_size];
 
     slice
         .iter()

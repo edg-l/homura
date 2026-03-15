@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use homura::generate::Generator;
+use homura::kv_generate::{KvGenerator, has_with_past_model};
 use homura::onnx::parser;
 use homura::{Buffer, DType, Model};
 
@@ -203,13 +204,29 @@ fn cmd_generate(
 
     eprintln!("Loading generator from {}...", model_dir.display());
     let t_load = Instant::now();
-    let generator = Generator::load(model_dir_str)?;
-    eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
 
-    eprintln!("Generating up to {max_tokens} tokens...");
-    let t_gen = Instant::now();
-    let generated = generator.generate(prompt, max_tokens);
-    eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+    // Prefer the two-model KV cache approach when a with-past model is present.
+    let generated = if has_with_past_model(&model_dir) {
+        eprintln!("(using KV cache generator — two-model approach)");
+        let generator = KvGenerator::load(model_dir_str, 1024, 50256)?;
+        eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        eprintln!("Generating up to {max_tokens} tokens...");
+        let t_gen = Instant::now();
+        let text = generator.generate(prompt, max_tokens);
+        eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+        text
+    } else {
+        eprintln!("(using full-recompute generator — no with-past model found)");
+        let generator = Generator::load(model_dir_str)?;
+        eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+        eprintln!("Generating up to {max_tokens} tokens...");
+        let t_gen = Instant::now();
+        let text = generator.generate(prompt, max_tokens);
+        eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+        text
+    };
 
     // Print full text (prompt + generated) to stdout.
     println!("{}{}", prompt, generated);

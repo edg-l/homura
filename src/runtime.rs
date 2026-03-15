@@ -98,6 +98,32 @@ impl Buffer {
         &self.strides
     }
 
+    /// Reinterpret the raw bytes as a mutable typed slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_of::<T>()` does not match the buffer's dtype element size.
+    pub fn as_slice_mut<T: Copy + 'static>(&mut self) -> &mut [T] {
+        let elem_size = std::mem::size_of::<T>();
+        assert_eq!(
+            elem_size,
+            self.dtype.size_bytes(),
+            "type size {} does not match dtype {:?} (size {})",
+            elem_size,
+            self.dtype,
+            self.dtype.size_bytes(),
+        );
+        if self.data.is_empty() {
+            return &mut [];
+        }
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.data.as_mut_ptr() as *mut T,
+                self.data.len() / elem_size,
+            )
+        }
+    }
+
     /// Mutable access to the raw byte storage.
     pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
         &mut self.data

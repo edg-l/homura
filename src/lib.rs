@@ -3,6 +3,7 @@ mod compiler;
 mod llvm_ffi;
 pub mod dtype;
 pub mod generate;
+pub mod kv_generate;
 pub mod onnx;
 pub mod op;
 mod runtime;
