@@ -295,13 +295,8 @@ mod tests {
     // ── Task 13.1 (optional): real mnist-12.onnx test ─────────────────────────
 
     #[test]
-    fn run_real_mnist_model_if_available() {
-        let path = "tests/fixtures/mnist-12.onnx";
-        if !std::path::Path::new(path).exists() {
-            eprintln!("skipping: {path} not found (download with scripts/download_mnist.sh)");
-            return;
-        }
-        let model = Model::load(path).expect("load failed");
+    fn load_and_run_mnist_12() {
+        let model = Model::load("tests/fixtures/mnist-12.onnx").expect("load failed");
         let input = Buffer::from_slice::<f32>(&vec![0.0f32; 784], &[1, 1, 28, 28], DType::F32);
         let output = model.run(&[&input]).expect("run failed");
         let out = output.as_slice::<f32>();

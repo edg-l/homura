@@ -2296,8 +2296,8 @@ fn emit_tensor_ops<'c>(
                 // ONNX uses floor division (drops incomplete last window).
                 // Add right/bottom padding to satisfy TOSA, then slice to correct size.
                 // TOSA pads max_pool2d with -inf, so extra elements never win the max.
-                let mut pad_top = pads[0];
-                let mut pad_left = pads[1];
+                let pad_top = pads[0];
+                let pad_left = pads[1];
                 let mut pad_bottom = pads[2];
                 let mut pad_right = pads[3];
                 let rem_h = (in_h + pad_top + pad_bottom - kh) % sh;
