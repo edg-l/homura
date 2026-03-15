@@ -860,16 +860,38 @@ where
     let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
 
     // tensor.empty() for the output slot.
-    let init_val = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // For dynamic output shapes, provide (source_tensor, dim_index) for each `?` dim.
+    let init_val = if output_shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = output_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| {
+                // Right-align: dim i in output maps to offset position in each operand.
+                let lhs_offset = output_shape.len().saturating_sub(lhs_shape.len());
+                let _rhs_offset = output_shape.len().saturating_sub(rhs_shape.len());
+                // Pick the operand where this dim is NOT broadcast (not size 1).
+                // Prefer lhs; fall back to rhs.
+                if i >= lhs_offset && lhs_shape[i - lhs_offset] != 1 {
+                    (lhs_val, i)
+                } else {
+                    (rhs_val, i)
+                }
+            })
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, output_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // linalg body: 3 block args (lhs_elem, rhs_elem, out_elem).
     let linalg_region = {
@@ -1498,16 +1520,30 @@ fn emit_matmul<'c>(
     let rhs_val = *values.get(&rhs).expect("rhs node not yet emitted");
 
     // tensor.empty() for the [M, N] accumulator.
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // output_shape = [M, N]; M comes from lhs dim 0, N comes from rhs dim 1.
+    let init_val: melior::ir::Value = if output_shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = output_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| {
+                // [M, N]: M is from lhs dim 0, N is from rhs dim 1.
+                if i == 0 { (lhs_val, 0) } else { (rhs_val, 1) }
+            })
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, output_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // Zero constant for the fill.
     let zero_val: melior::ir::Value = match dtype {
@@ -1759,16 +1795,50 @@ fn emit_batched_matmul<'c>(
         .ok_or_else(|| CompileError::AttributeParse(format!("failed to parse {iter_str}")))?;
 
     // tensor.empty() for the output accumulator.
-    let empty_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[out_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // output_shape = [...batch..., M, N].
+    // M comes from lhs (dim n_batch in lhs), N from rhs (last dim in rhs).
+    let empty_val: melior::ir::Value = if output_shape.contains(&DIM_DYNAMIC) {
+        let lhs_n_batch = lhs_shape.len() - 2;
+        let rhs_n_batch = rhs_shape.len() - 2;
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = output_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| {
+                // Batch dims: right-align from lhs or rhs batch dims.
+                // M dim: from lhs at its n_batch position.
+                // N dim: from rhs at last position.
+                if i < n_batch {
+                    // Batch dim — right-align against lhs batch dims.
+                    let batch_offset = n_batch - lhs_n_batch;
+                    if i >= batch_offset {
+                        (lhs_val, i - batch_offset)
+                    } else {
+                        let rhs_batch_offset = n_batch - rhs_n_batch;
+                        (rhs_val, i - rhs_batch_offset)
+                    }
+                } else if i == n_batch {
+                    // M dim from lhs.
+                    (lhs_val, lhs_n_batch)
+                } else {
+                    // N dim from rhs (last dim).
+                    (rhs_val, rhs_shape.len() - 1)
+                }
+            })
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, output_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[out_tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // Zero constant for the fill.
     let zero_val: melior::ir::Value = match dtype {
@@ -1924,16 +1994,40 @@ fn emit_reduction<'c>(
     let input_val = *values.get(&input).expect("input node not yet emitted");
 
     // tensor.empty() for the output accumulator.
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[output_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // For dynamic output shapes: each `?` dim in output corresponds to a non-reduced
+    // dim in the input. Map output dim index back to input dim index.
+    let init_val: melior::ir::Value = if output_shape.contains(&DIM_DYNAMIC) {
+        // Build a mapping: output dim j -> input dim index.
+        // output has the reduced dim removed (or zeroed for keepdim).
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = output_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(out_i, _)| {
+                // Find the corresponding input dim for output dim out_i.
+                let in_dim = if keepdim {
+                    // keepdim: output rank == input rank; reduced dim has value 0 (not ?).
+                    out_i
+                } else {
+                    // !keepdim: output rank == input_rank - 1; reduced dim was removed.
+                    if out_i < dim { out_i } else { out_i + 1 }
+                };
+                (input_val, in_dim)
+            })
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, output_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[output_tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // Build the identity constant for fill.
     let identity_val: melior::ir::Value = if is_max {
@@ -2462,16 +2556,26 @@ fn emit_unary_linalg_math<'c>(
 
     let input_val = *values.get(&input).expect("input node not yet emitted");
 
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init_val: melior::ir::Value = if shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| (input_val, i))
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // linalg body: 2 block args (in_elem, out_elem); yield math_op(in_elem).
     let linalg_region = {
@@ -2566,16 +2670,26 @@ fn emit_cast<'c>(
 
     let input_val = *values.get(&input).expect("input node not yet emitted");
 
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[dst_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init_val: melior::ir::Value = if shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| (input_val, i))
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, shape, dst_dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[dst_tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // Select arith cast op name.
     let cast_op = match (src_dtype, dst_dtype) {
@@ -2857,16 +2971,26 @@ fn emit_strided_slice<'c>(
     let elem_type = dtype.to_mlir_type(context);
     let out_tensor_type = make_ranked_tensor_type(context, out_shape, dtype);
 
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[out_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    let init_val: melior::ir::Value = if out_shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = out_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| (input, i))
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, out_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[out_tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     let out_map = make_identity_map(context, out_rank)?;
     let indexing_maps = ArrayAttribute::new(context, &[out_map]);
@@ -3056,16 +3180,39 @@ fn emit_gather<'c>(
     let out_tensor_type = make_ranked_tensor_type(context, out_shape, dtype);
 
     // Emit tensor.empty for the output.
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[out_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
+    // Output shape = data_shape[0..axis] ++ indices_shape ++ data_shape[axis+1..].
+    // For dynamic dims, source from data_val or indices_val accordingly.
+    let init_val: melior::ir::Value = if out_shape.contains(&DIM_DYNAMIC) {
+        let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = out_shape
+            .iter()
+            .enumerate()
+            .filter(|&(_, d)| *d == DIM_DYNAMIC)
+            .map(|(i, _)| {
+                if i < axis {
+                    // Pre-axis dim from data.
+                    (data_val, i)
+                } else if i < axis + idx_rank {
+                    // Indices dim.
+                    (indices_val, i - axis)
+                } else {
+                    // Post-axis dim from data.
+                    (data_val, i - idx_rank + 1)
+                }
+            })
+            .collect();
+        emit_tensor_empty_dynamic(context, body_block, out_shape, dtype, &sources, location)?
+    } else {
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[out_tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    };
 
     // linalg.generic: output-only (identity map). data and indices are captured
     // SSA values used via tensor.extract inside the body.
@@ -3461,21 +3608,10 @@ fn emit_tensor_ops<'c>(
                 dtype,
             } => {
                 let input_shape = trace.get(*input).shape();
-                let result_val = match dtype {
-                    DType::F32 | DType::F64 => emit_tosa_reduce(
-                        context,
-                        body_block,
-                        &values,
-                        "tosa.reduce_sum",
-                        *input,
-                        &input_shape.0,
-                        &shape.0,
-                        *dim,
-                        *keepdim,
-                        *dtype,
-                        location,
-                    )?,
-                    DType::I32 | DType::I64 => emit_reduction(
+                // Route to linalg.generic when input has dynamic dims — tosa.reduce_sum
+                // requires static shapes to set the reduced dim to 1 in the output type.
+                let result_val = if input_shape.has_dynamic_dims() {
+                    emit_reduction(
                         context,
                         body_block,
                         &values,
@@ -3487,7 +3623,36 @@ fn emit_tensor_ops<'c>(
                         *dtype,
                         location,
                         false,
-                    )?,
+                    )?
+                } else {
+                    match dtype {
+                        DType::F32 | DType::F64 => emit_tosa_reduce(
+                            context,
+                            body_block,
+                            &values,
+                            "tosa.reduce_sum",
+                            *input,
+                            &input_shape.0,
+                            &shape.0,
+                            *dim,
+                            *keepdim,
+                            *dtype,
+                            location,
+                        )?,
+                        DType::I32 | DType::I64 => emit_reduction(
+                            context,
+                            body_block,
+                            &values,
+                            *input,
+                            &input_shape.0,
+                            &shape.0,
+                            *dim,
+                            *keepdim,
+                            *dtype,
+                            location,
+                            false,
+                        )?,
+                    }
                 };
                 values.insert(node_id, result_val);
             }
@@ -3500,21 +3665,10 @@ fn emit_tensor_ops<'c>(
                 dtype,
             } => {
                 let input_shape = trace.get(*input).shape();
-                let result_val = match dtype {
-                    DType::F32 | DType::F64 => emit_tosa_reduce(
-                        context,
-                        body_block,
-                        &values,
-                        "tosa.reduce_max",
-                        *input,
-                        &input_shape.0,
-                        &shape.0,
-                        *dim,
-                        *keepdim,
-                        *dtype,
-                        location,
-                    )?,
-                    DType::I32 | DType::I64 => emit_reduction(
+                // Route to linalg.generic when input has dynamic dims — tosa.reduce_max
+                // requires static shapes.
+                let result_val = if input_shape.has_dynamic_dims() {
+                    emit_reduction(
                         context,
                         body_block,
                         &values,
@@ -3526,7 +3680,36 @@ fn emit_tensor_ops<'c>(
                         *dtype,
                         location,
                         true,
-                    )?,
+                    )?
+                } else {
+                    match dtype {
+                        DType::F32 | DType::F64 => emit_tosa_reduce(
+                            context,
+                            body_block,
+                            &values,
+                            "tosa.reduce_max",
+                            *input,
+                            &input_shape.0,
+                            &shape.0,
+                            *dim,
+                            *keepdim,
+                            *dtype,
+                            location,
+                        )?,
+                        DType::I32 | DType::I64 => emit_reduction(
+                            context,
+                            body_block,
+                            &values,
+                            *input,
+                            &input_shape.0,
+                            &shape.0,
+                            *dim,
+                            *keepdim,
+                            *dtype,
+                            location,
+                            true,
+                        )?,
+                    }
                 };
                 values.insert(node_id, result_val);
             }
@@ -3641,8 +3824,68 @@ fn emit_tensor_ops<'c>(
                 dtype,
             } => {
                 let input_val = *values.get(input).expect("input not yet emitted");
-                let result_val =
-                    emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?;
+                let input_shape = trace.get(*input).shape().0.clone();
+                let result_val = if shape.0.contains(&DIM_DYNAMIC)
+                    || input_shape.contains(&DIM_DYNAMIC)
+                {
+                    // Dynamic reshape: use tensor.expand_shape or tensor.collapse_shape.
+                    let in_rank = input_shape.len();
+                    let out_rank = shape.0.len();
+                    if out_rank > in_rank {
+                        // Expanding: use tensor.expand_shape.
+                        // promote_rank_with_reshape handles this for prepending dims.
+                        let (expanded, _) = promote_rank_with_reshape(
+                            context,
+                            body_block,
+                            input_val,
+                            &input_shape,
+                            out_rank,
+                            *dtype,
+                            location,
+                        )?;
+                        expanded
+                    } else if out_rank < in_rank {
+                        // Collapsing: use tensor.collapse_shape.
+                        // Build reassociation: map each output dim to a range of input dims.
+                        // Simple case: collapse all remaining dims into the last output dim.
+                        let prefix = out_rank - 1;
+                        let mut reassoc_parts: Vec<String> = (0..prefix)
+                            .map(|i| format!("[{i}]"))
+                            .collect();
+                        let last_group: Vec<String> = (prefix..in_rank)
+                            .map(|i| i.to_string())
+                            .collect();
+                        reassoc_parts.push(format!("[{}]", last_group.join(", ")));
+                        let reassoc_str = format!("[{}]", reassoc_parts.join(", "));
+                        let reassoc_attr = Attribute::parse(context, &reassoc_str)
+                            .ok_or_else(|| CompileError::AttributeParse(reassoc_str.clone()))?;
+
+                        let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.collapse_shape", location)
+                                    .add_operands(&[input_val])
+                                    .add_results(&[out_type])
+                                    .add_attributes(&[(
+                                        Identifier::new(context, "reassociation"),
+                                        reassoc_attr,
+                                    )])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    } else {
+                        // Same rank: fall back to tosa.reshape for static dims in shape,
+                        // or emit a linalg.generic copy if all dims match.
+                        // For simplicity, if same rank just emit tosa.reshape —
+                        // same-rank reshape with ? dims shouldn't occur in practice.
+                        emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?
+                    }
+                } else {
+                    emit_tosa_reshape(context, body_block, input_val, &shape.0, *dtype, location)?
+                };
                 values.insert(node_id, result_val);
             }
 
@@ -4359,18 +4602,170 @@ fn emit_tensor_ops<'c>(
                 dtype,
             } => {
                 let input_shape = trace.get(*input).shape().0.clone();
-                let result_val = emit_reduce_mean(
-                    context,
-                    body_block,
-                    &values,
-                    *input,
-                    &input_shape,
-                    &shape.0,
-                    axes,
-                    *keepdim,
-                    *dtype,
-                    location,
-                )?;
+                // When input has dynamic dims, tosa.reduce_sum cannot produce a valid
+                // static output type. Fall back to linalg.generic-based reduction.
+                let result_val = if input_shape.contains(&DIM_DYNAMIC) {
+                    // Perform sequential single-axis reductions using emit_reduction.
+                    let mut current_val = *values.get(input).expect("input not emitted");
+                    let mut current_shape = input_shape.clone();
+
+                    // We need NodeId lookups to work — insert intermediate values.
+                    // Reduce each axis sequentially (all keepdim=true for intermediates).
+                    let n_axes = axes.len();
+                    for (step, &ax) in axes.iter().enumerate() {
+                        let ax_usize = ax as usize;
+                        let is_last = step == n_axes - 1;
+                        let this_keepdim = if is_last { *keepdim } else { true };
+
+                        let mut out_shape = current_shape.clone();
+                        if this_keepdim {
+                            out_shape[ax_usize] = 1;
+                        } else {
+                            out_shape.remove(ax_usize);
+                        }
+
+                        // Use a fake NodeId to pass current_val through emit_reduction
+                        // by inserting it into values temporarily.
+                        let fake_id = NodeId(u32::MAX - step as u32);
+                        values.insert(fake_id, current_val);
+                        let sum_val = emit_reduction(
+                            context,
+                            body_block,
+                            &values,
+                            fake_id,
+                            &current_shape,
+                            &out_shape,
+                            ax_usize,
+                            this_keepdim,
+                            *dtype,
+                            location,
+                            false,
+                        )?;
+                        values.remove(&fake_id);
+                        current_val = sum_val;
+                        current_shape = out_shape;
+                    }
+
+                    // Divide by total number of elements reduced (product of reduced axes).
+                    // The reduced axes must be static for meaningful mean computation;
+                    // dynamic batch/seq dims in non-reduced positions are fine.
+                    let total_reduced: u64 = axes
+                        .iter()
+                        .map(|&a| input_shape[a as usize])
+                        .filter(|&d| d != DIM_DYNAMIC)
+                        .product();
+                    let recip = 1.0 / total_reduced as f64;
+
+                    let elem_type = dtype.to_mlir_type(context);
+                    let out_tensor_type = make_ranked_tensor_type(context, &current_shape, *dtype);
+                    let recip_val: melior::ir::Value = match dtype {
+                        DType::F32 | DType::F64 => body_block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, elem_type, recip).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                        DType::I32 | DType::I64 => body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(elem_type, recip as i64).into(),
+                                location,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into(),
+                    };
+
+                    let out_rank = current_shape.len();
+                    let scale_sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = current_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, d)| *d == DIM_DYNAMIC)
+                        .map(|(i, _)| (current_val, i))
+                        .collect();
+                    let scale_init = if current_shape.contains(&DIM_DYNAMIC) {
+                        emit_tensor_empty_dynamic(context, body_block, &current_shape, *dtype, &scale_sources, location)?
+                    } else {
+                        body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.empty", location)
+                                    .add_results(&[out_tensor_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    };
+
+                    let in_map = make_identity_map(context, out_rank)?;
+                    let out_map = make_identity_map(context, out_rank)?;
+                    let indexing_maps = ArrayAttribute::new(context, &[in_map, out_map]);
+                    let iterator_types = make_iterator_types(context, out_rank)?;
+                    let segment_sizes = Attribute::parse(context, "array<i32: 1, 1>").ok_or_else(|| {
+                        CompileError::AttributeParse("segment sizes".into())
+                    })?;
+
+                    let scale_region = {
+                        let scale_block = Block::new(&[(elem_type, location), (elem_type, location)]);
+                        let in_elem: melior::ir::Value = scale_block.argument(0).unwrap().into();
+                        let result: melior::ir::Value = match dtype {
+                            DType::F32 | DType::F64 => scale_block
+                                .append_operation(arith::mulf(in_elem, recip_val, location))
+                                .result(0)
+                                .unwrap()
+                                .into(),
+                            DType::I32 | DType::I64 => scale_block
+                                .append_operation(arith::muli(in_elem, recip_val, location))
+                                .result(0)
+                                .unwrap()
+                                .into(),
+                        };
+                        scale_block.append_operation(
+                            OperationBuilder::new("linalg.yield", location)
+                                .add_operands(&[result])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        );
+                        let r = Region::new();
+                        r.append_block(scale_block);
+                        r
+                    };
+
+                    body_block
+                        .append_operation(
+                            OperationBuilder::new("linalg.generic", location)
+                                .add_operands(&[current_val, scale_init])
+                                .add_results(&[out_tensor_type])
+                                .add_attributes(&[
+                                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                                    (Identifier::new(context, "iterator_types"), iterator_types),
+                                    (Identifier::new(context, "operand_segment_sizes"), segment_sizes),
+                                ])
+                                .add_regions([scale_region])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into()
+                } else {
+                    emit_reduce_mean(
+                        context,
+                        body_block,
+                        &values,
+                        *input,
+                        &input_shape,
+                        &shape.0,
+                        axes,
+                        *keepdim,
+                        *dtype,
+                        location,
+                    )?
+                };
                 values.insert(node_id, result_val);
             }
 
@@ -4423,9 +4818,10 @@ fn emit_tensor_ops<'c>(
                 }
 
                 let all_stride_one = steps.iter().all(|&s| s == 1);
+                let input_has_dynamic = input_shape.contains(&DIM_DYNAMIC);
 
-                let result_val = if all_stride_one {
-                    // Use tosa.slice for stride-1 case.
+                let result_val = if all_stride_one && !input_has_dynamic {
+                    // Use tosa.slice for stride-1 case with static shapes.
                     emit_tosa_slice(
                         context,
                         body_block,
@@ -4437,7 +4833,7 @@ fn emit_tensor_ops<'c>(
                         location,
                     )?
                 } else {
-                    // Strided slice: use linalg.generic with linalg.index.
+                    // Strided slice or dynamic input: use linalg.generic with linalg.index.
                     emit_strided_slice(
                         context,
                         body_block,
@@ -4460,31 +4856,184 @@ fn emit_tensor_ops<'c>(
                 shape,
                 dtype,
             } => {
-                let ax = *axis as i32;
+                let ax = *axis as usize;
                 let tensor_type = make_ranked_tensor_type(context, &shape.0, *dtype);
-                let mut operands: Vec<melior::ir::Value> = Vec::new();
-                for &inp in inputs {
-                    operands.push(*values.get(&inp).expect("concat: input not emitted"));
-                }
+                let input_vals: Vec<melior::ir::Value<'c, 'c>> = inputs
+                    .iter()
+                    .map(|&inp| *values.get(&inp).expect("concat: input not emitted"))
+                    .collect();
 
-                // tosa.concat requires i32 axis attribute.
-                let axis_attr = IntegerAttribute::new(
-                    melior::ir::r#type::IntegerType::new(context, 32).into(),
-                    ax as i64,
-                );
+                let any_dynamic = shape.0.contains(&DIM_DYNAMIC)
+                    || inputs.iter().any(|&inp| {
+                        trace.get(inp).shape().0.contains(&DIM_DYNAMIC)
+                    });
 
-                let result_val: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tosa.concat", location)
-                            .add_operands(&operands)
-                            .add_results(&[tensor_type])
-                            .add_attributes(&[(Identifier::new(context, "axis"), axis_attr.into())])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let result_val: melior::ir::Value = if any_dynamic {
+                    // Dynamic concat: build output via tensor.insert_slice.
+                    let rank = shape.0.len();
+                    let index_type = melior::ir::Type::parse(context, "index")
+                        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+
+                    // Compute total size of the concat axis at runtime via arith.addi.
+                    // First, get each input's size along the concat axis.
+                    let mut input_axis_dims: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                    for &inp_val in &input_vals {
+                        let dim_val =
+                            emit_tensor_dim(context, body_block, inp_val, ax, location)?;
+                        input_axis_dims.push(dim_val);
+                    }
+
+                    // Sum them up.
+                    let total_axis_dim: melior::ir::Value<'c, 'c> =
+                        input_axis_dims.iter().skip(1).fold(input_axis_dims[0], |acc, &d| {
+                            body_block
+                                .append_operation(arith::addi(acc, d, location))
+                                .result(0)
+                                .unwrap()
+                                .into()
+                        });
+
+                    // Build dynamic_dim_sources for tensor.empty: for each ? dim in
+                    // output shape, source from a representative input or total_axis_dim.
+                    // We need to handle `total_axis_dim` as a pre-computed value.
+                    // Use emit_tensor_dim for all non-concat dims from the first input,
+                    // and total_axis_dim for the concat axis.
+                    let mut dyn_dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                    for (i, &d) in shape.0.iter().enumerate() {
+                        if d == DIM_DYNAMIC {
+                            if i == ax {
+                                dyn_dim_vals.push(total_axis_dim);
+                            } else {
+                                // Use the first input's dim for non-concat axes.
+                                let dv = emit_tensor_dim(
+                                    context,
+                                    body_block,
+                                    input_vals[0],
+                                    i,
+                                    location,
+                                )?;
+                                dyn_dim_vals.push(dv);
+                            }
+                        }
+                    }
+
+                    let empty_val: melior::ir::Value<'c, 'c> = body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.empty", location)
+                                .add_operands(&dyn_dim_vals)
+                                .add_results(&[tensor_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    // Insert each input slice in sequence, tracking offset along concat axis.
+                    let zero_idx: melior::ir::Value<'c, 'c> = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, 0).into(),
+                            location,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let mut current = empty_val;
+                    let mut offset: melior::ir::Value<'c, 'c> = zero_idx;
+
+                    for (inp_idx, &inp_val) in input_vals.iter().enumerate() {
+                        let inp_shape = trace.get(inputs[inp_idx]).shape().0.clone();
+
+                        // Build static_offsets, static_sizes, static_strides for this slice.
+                        // All offsets are 0 except the concat axis which is `offset` (dynamic).
+                        // Sizes match the input shape for each dim (? dims are dynamic).
+                        // Strides are all 1.
+
+                        // static_offsets: i64::MIN for dynamic positions, else 0.
+                        // The concat axis is always dynamic (offset is runtime).
+                        let static_offsets: Vec<i64> = (0..rank)
+                            .map(|i| if i == ax { i64::MIN } else { 0 })
+                            .collect();
+                        let so_str = static_offsets.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                        let static_offsets_attr = Attribute::parse(context, &format!("array<i64: {so_str}>"))
+                            .ok_or_else(|| CompileError::AttributeParse("static_offsets".into()))?;
+
+                        // static_sizes: i64::MIN for dynamic dims, else the static value.
+                        let static_sizes: Vec<i64> = inp_shape
+                            .iter()
+                            .map(|&d| if d == DIM_DYNAMIC { i64::MIN } else { d as i64 })
+                            .collect();
+                        let ss_str = static_sizes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                        let static_sizes_attr = Attribute::parse(context, &format!("array<i64: {ss_str}>"))
+                            .ok_or_else(|| CompileError::AttributeParse("static_sizes".into()))?;
+
+                        let static_strides_str = vec!["1"; rank].join(", ");
+                        let static_strides_attr = Attribute::parse(context, &format!("array<i64: {static_strides_str}>"))
+                            .ok_or_else(|| CompileError::AttributeParse("static_strides".into()))?;
+
+                        // Dynamic operands: concat-axis offset first, then any dynamic size dims.
+                        let mut dynamic_ops: Vec<melior::ir::Value<'c, 'c>> = vec![offset];
+                        for (i, &d) in inp_shape.iter().enumerate() {
+                            if d == DIM_DYNAMIC {
+                                let dv = emit_tensor_dim(context, body_block, inp_val, i, location)?;
+                                dynamic_ops.push(dv);
+                            }
+                        }
+
+                        let inp_type = make_ranked_tensor_type(context, &inp_shape, *dtype);
+                        let dest_type = tensor_type; // mutable current tensor type
+
+                        current = body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.insert_slice", location)
+                                    .add_operands(&[inp_val, current])
+                                    .add_operands(&dynamic_ops)
+                                    .add_results(&[dest_type])
+                                    .add_attributes(&[
+                                        (Identifier::new(context, "static_offsets"), static_offsets_attr),
+                                        (Identifier::new(context, "static_sizes"), static_sizes_attr),
+                                        (Identifier::new(context, "static_strides"), static_strides_attr),
+                                    ])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let _ = (inp_type, index_type);
+
+                        // Advance offset by this input's concat-axis size.
+                        let inp_axis_dim = input_axis_dims[inp_idx];
+                        offset = body_block
+                            .append_operation(arith::addi(offset, inp_axis_dim, location))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                    }
+
+                    current
+                } else {
+                    // Static concat: use tosa.concat.
+                    let ax_i32 = ax as i32;
+                    let axis_attr = IntegerAttribute::new(
+                        melior::ir::r#type::IntegerType::new(context, 32).into(),
+                        ax_i32 as i64,
+                    );
+                    body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.concat", location)
+                                .add_operands(&input_vals)
+                                .add_results(&[tensor_type])
+                                .add_attributes(&[(Identifier::new(context, "axis"), axis_attr.into())])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into()
+                };
 
                 values.insert(node_id, result_val);
             }
@@ -4579,16 +5128,48 @@ fn emit_tensor_ops<'c>(
                 // linalg.generic: cast I64 → i1 (cmpi ne 0).
                 let i64_tensor_type =
                     make_ranked_tensor_type(context, &shape.0, DType::I64);
-                let i1_init: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.empty", location)
-                            .add_results(&[i1_tensor_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let i1_init: melior::ir::Value = if shape.0.contains(&DIM_DYNAMIC) {
+                    // For dynamic dims in output, source from cond_promoted (which has
+                    // the same shape as the output after rank promotion).
+                    let sources: Vec<(melior::ir::Value<'c, 'c>, usize)> = shape.0
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, d)| *d == DIM_DYNAMIC)
+                        .map(|(i, _)| (cond_promoted, i))
+                        .collect();
+                    // i1 tensor uses RankedTensorType directly — use emit_tensor_empty_dynamic
+                    // but we need to build the i1 type manually.
+                    let index_type = melior::ir::Type::parse(context, "index")
+                        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+                    let mut dyn_dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                    for &(src_tensor, src_dim_idx) in &sources {
+                        let dv = emit_tensor_dim(context, body_block, src_tensor, src_dim_idx, location)?;
+                        dyn_dim_vals.push(dv);
+                    }
+                    let _ = index_type;
+                    body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.empty", location)
+                                .add_operands(&dyn_dim_vals)
+                                .add_results(&[i1_tensor_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into()
+                } else {
+                    body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.empty", location)
+                                .add_results(&[i1_tensor_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into()
+                };
 
                 let cond_map = make_broadcast_map(context, &cond_promoted_shape, &shape.0)?;
                 let out_i1_map = make_identity_map(context, out_rank)?;
