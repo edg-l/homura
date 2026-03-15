@@ -2,12 +2,15 @@
 
 ## Status
 
-The dynamic dimension infrastructure is in place. The GPT-2 decode model (with-past)
-gets through parsing, tracing, and most of MLIR emission, but hits remaining edge cases
-in the compiler codegen. Each fix is small and follows the same pattern.
+The decode model (GPT-2 with-past) now **compiles successfully** through the entire
+MLIR pipeline: trace → emission → verification → TOSA → linalg → SCF → LLVM IR → .so.
 
-**Last error:** `'tensor.extract' op incorrect number of indices for extract_element`
-during decode model compilation.
+**Current blocker:** Segfault during JIT execution of the compiled decode model.
+The crash is inside the generated machine code. All MLIR passes complete, the LLVM IR
+is clean (no leftover unrealized_conversion_cast, affine.apply, etc.), but at runtime
+something accesses invalid memory.
+
+**Commit:** `be5338c` — all codegen fixes landed, tests pass (388/388).
 
 ## What works
 
@@ -16,20 +19,20 @@ during decode model compilation.
 - [x] Shape::broadcast handles DIM_DYNAMIC
 - [x] Shape::num_elements panics on dynamic, concrete_num_elements returns Option
 - [x] emit_tensor_dim / emit_tensor_empty_dynamic helpers
-- [x] promote_rank_with_reshape handles DIM_DYNAMIC
-- [x] emit_tosa_reshape falls back to tensor.cast for dynamic shapes
+- [x] promote_rank_with_reshape handles DIM_DYNAMIC (tensor.expand_shape with output_shape operands)
+- [x] emit_tosa_reshape falls back to tensor.cast for same-rank dynamic shapes
 - [x] emit_binary_elementwise handles dynamic output shapes
 - [x] emit_batched_matmul handles dynamic dims
 - [x] emit_reduction handles dynamic dims (falls back to linalg.generic)
 - [x] emit_strided_slice handles dynamic dims
-- [x] Concat with dynamic dims uses tensor.insert_slice
-- [x] Where i1 conversion handles dynamic dims
+- [x] Concat with dynamic dims uses tensor.insert_slice (with operandSegmentSizes)
+- [x] Where i1 conversion handles dynamic dims (dim_to_mlir for i1 tensor type)
 - [x] Gather handles dynamic dims
 - [x] Cast handles dynamic dims
 - [x] Op::ShapeOf + codegen (tensor.dim + tensor.from_elements)
 - [x] Op::ConstantOfShape + codegen (tensor.extract + tensor.empty + linalg.fill)
-- [x] Op::Range + codegen (tensor.generate + arith.ceildivsi)
-- [x] Op::DynamicSlice + codegen (tensor.extract_slice)
+- [x] Op::Range + codegen (handles 0-D and 1-D scalar tensor.extract)
+- [x] Op::DynamicSlice + codegen (tensor.extract_slice with operandSegmentSizes)
 - [x] Op::Reshape extended with shape_tensor (tensor.reshape)
 - [x] Mapper conditional tracing: Shape, ConstantOfShape, Range, Reshape, Slice
 - [x] Sentinel guard in eval_gather_constant
@@ -42,84 +45,91 @@ during decode model compilation.
 - [x] Tensor::slice skips normalization for dynamic dims
 - [x] KvGenerator uses load_with_dynamic_dims for decode model
 - [x] Prefill works (bucket-padded prompt → KV cache)
+- [x] Decode model compiles (MLIR verification passes)
+- [x] MLIR pass pipeline succeeds (LLVM IR generated, .so emitted)
 
-## Remaining: compiler DIM_DYNAMIC edge cases
+## Fixes applied in be5338c
 
-Each of these follows the same pattern: a codegen helper emits an MLIR op that
-assumes static shapes. When a tensor has DIM_DYNAMIC dims, the op either:
-1. Produces an invalid attribute (u64::MAX in a dense<> literal)
-2. Uses wrong index count for tensor.extract on reshaped tensors
-3. Passes static shape where MLIR expects dynamic operands
+1. **Range codegen 0-D extract**: `tensor.extract %t[]` (no indices) for rank-0 tensors,
+   `tensor.extract %t[%c0]` for rank-1. Uses `trace.ops()[id].shape().rank()` to decide.
 
-### To debug
+2. **tensor.expand_shape dynamic output_shape**: `promote_rank_with_reshape` now emits
+   `tensor.dim` SSA values for each DIM_DYNAMIC position and passes them as operands.
 
-- [ ] Enable IR dump on verification failure (add eprintln of module.to_string()
-      before the verify call in compiler.rs) to see exactly which op fails
-- [ ] Search the dumped IR for the first verification error
-- [ ] Fix the specific codegen site
+3. **2D matmul with dynamic dims**: `emit_tosa_matmul_2d_values` uses
+   `promote_rank_with_reshape` (expand_shape) for 2D→3D and `tensor.collapse_shape`
+   for 3D→2D when dims are dynamic. Static case still uses `tosa.reshape`.
 
-### Known patterns that may need fixes
+4. **Op::Matmul dispatch**: Dynamic-dim 2D matmuls route through `emit_batched_matmul`
+   (linalg.generic) instead of the tosa.matmul 2D→3D→2D path.
 
-- [ ] **tensor.extract on 0-D vs 1-D tensors**: Range/ConstantOfShape extract
-      scalars from 1-element tensors. If the tensor is 0-D (`tensor<i64>`), extract
-      uses `tensor.extract %t[] : tensor<i64>` (no indices). If 1-D (`tensor<1xi64>`),
-      extract uses `tensor.extract %t[%c0] : tensor<1xi64>`. The mapper may produce
-      either representation — codegen must handle both.
+5. **operandSegmentSizes**: `tensor.insert_slice` and `tensor.extract_slice` now emit
+   the required `operandSegmentSizes` attribute for proper operand segmentation.
 
-- [ ] **emit_tosa_matmul (2D float path)**: Lines 1498-1523 call emit_tosa_reshape
-      to add/remove batch dim. When M, K, or N is DIM_DYNAMIC, the reshape produces
-      a tensor.cast which may have wrong rank. The 2D matmul path should fall through
-      to emit_batched_matmul for dynamic shapes.
+6. **i1 tensor type**: `RankedTensorType::new` for Where's i1 condition tensor now uses
+   `dim_to_mlir()` instead of raw `shape.0` (was producing `-1` instead of `kDynamic`).
 
-- [ ] **emit_tosa_reduce keepdim=false reshape**: Line 2333 calls emit_tosa_reshape
-      after reduction. When output has dynamic dims, this now falls back to tensor.cast,
-      but the rank may differ (reduce removes a dim). May need tensor.collapse_shape.
+7. **Pass pipeline**: `convert-linalg-to-affine-loops` → `convert-linalg-to-loops`
+   (affine loops can't handle dynamic bounds). Extra `lower-affine` after
+   `expand-strided-metadata` to catch late-introduced affine.apply ops.
 
-- [ ] **ReduceMean scaling**: Lines 2874, 2899 call emit_tosa_reshape for the
-      reciprocal constant. If any dim is dynamic, tensor.cast may not suffice.
+8. **Model API**: Added `Model::run_with_output_shapes()` and `Model::output_descs()`.
+   KvGenerator decode step uses explicit output shapes instead of auto-inference.
 
-- [ ] **Gemm path**: The Gemm codegen calls emit_tosa_matmul_2d_values which
-      internally calls emit_tosa_reshape. If Gemm inputs have dynamic dims, this
-      path may fail.
+## Remaining: JIT runtime segfault
 
-- [ ] **Softmax Div**: The softmax's division step emits a linalg.generic with
-      broadcast map. If the reduced dim is dynamic, the broadcast may not work.
+### Symptoms
 
-- [ ] **BatchNorm reshapes**: Lines 4170-4194 reshape parameters [C] → [1,C,1,1].
-      Shouldn't be affected by dynamic seq dims but verify.
+- Decode model .so loads and `_mlir__mlir_ciface_compute` is called
+- Crash happens inside the generated machine code (no Rust backtrace)
+- Prefill (static shapes) works fine with the same pass pipeline
+- All 388 unit tests pass
 
-- [ ] **tosa.const_scalar**: Used in matmul zero-points, negate zero-points,
-      mul shift. These are always static scalars — should be fine.
+### Likely root causes
 
-### Fix strategy
+1. **tensor.reshape lowering**: The decode model has ~145 `tensor.reshape` ops with
+   dynamic shape tensors. These lower to memref reinterpretation (no copy, just new
+   strides/offsets). If any shape tensor value is wrong at runtime (e.g., still
+   contains DIM_DYNAMIC sentinel), the memref descriptor gets absurd dimensions.
 
-For each failure:
-1. Add IR dump before verify (`eprintln!("{}", module.as_operation().to_string())`)
-2. Find the failing op in the dump
-3. Trace back to which emit function produced it
-4. Add DIM_DYNAMIC guard (same pattern as emit_tosa_reshape)
-5. Remove IR dump, run tests
+2. **tensor.cast for same-rank dynamic reshapes**: `emit_tosa_reshape` falls back to
+   `tensor.cast` which is a no-op at runtime — just reinterprets the type. If the
+   actual runtime shape doesn't match the declared tensor type, subsequent code
+   computes wrong offsets.
 
-### Testing
+3. **tensor.collapse_shape strides**: The matmul 3D→2D collapse may produce wrong
+   strides when the batch dimension is 1 but M/N are dynamic.
 
-After all fixes:
-```sh
-# Clean cache and run with fresh compilation
-cargo run --release -- clean-cache
-cargo run --release -- run tests/fixtures/ --prompt "Hello" --max-tokens 5
+### Debug plan
 
-# Expected: prefill ~7s (cached), decode ~X s per token, NO recompilation per token
-```
+- [ ] Run under gdb to get faulting instruction address
+- [ ] Cross-reference with LLVM IR dump (`HOMURA_DUMP_IR=1` → `/tmp/homura_post_passes.mlir`)
+- [ ] Trace back to which tensor.reshape / tensor.cast / collapse_shape produced the bad descriptor
+- [ ] Optionally: write a minimal test with a small dynamic-dim model to isolate the crash
+
+### IR dump
+
+Set `HOMURA_DUMP_IR=1` to dump:
+- `/tmp/homura_pre_passes.mlir` — MLIR before lowering passes
+- `/tmp/homura_post_passes.mlir` — LLVM dialect IR after all passes
+
+### Items from original TODO not yet hit (may be fine)
+
+- [ ] **emit_tosa_reduce keepdim=false reshape**: Rank-changing with dynamic dims.
+      Not triggered yet — may need tensor.collapse_shape if encountered.
+- [ ] **ReduceMean scaling**: Reciprocal constant reshape with dynamic dims.
+- [ ] **Softmax Div**: Broadcast map with dynamic reduced dim.
+- [ ] **BatchNorm reshapes**: Likely fine (dynamic is seq dim, not channel).
 
 ## Performance targets
 
 | Phase | Time | Notes |
 |-------|------|-------|
 | Load models | ~2.3s | Parse ONNX (2 models) + tokenizer |
-| Prefill (cold) | ~28s | First-ever compile for this bucket |
+| Prefill (cold) | ~28-30s | First-ever compile for this bucket |
 | Prefill (warm) | ~7.5s | Cache hit: dlopen + inference |
-| Decode (cold) | ~?s | First-ever compile for decode model |
-| Decode (warm) | ~0.85s/token | Cache hit: dlopen + inference |
+| Decode (cold) | ~? | First-ever compile for decode model (compiles now!) |
+| Decode (warm) | ~0.85s/token | Cache hit: dlopen + inference (blocked by segfault) |
 
 The decode model compiles ONCE (dynamic past_sequence_length). After that,
 every token is just inference — no recompilation.
