@@ -2182,17 +2182,42 @@ fn emit_tensor_ops<'c>(
                 };
 
                 // Step 4: Compute output shape in NHWC layout: [N, OH, OW, CO]
+                // TOSA requires (H + pad_top + pad_bottom - eff_KH) % stride == 0.
+                // ONNX uses floor division (drops incomplete last window).
+                // Add extra bottom/right padding to satisfy TOSA, then slice to correct size.
                 let n = input_shape[0];
-                let oh = shape.0[2];
-                let ow = shape.0[3];
-                let nhwc_out_shape = [n, oh, ow, co];
-                let nhwc_out_type = make_ranked_tensor_type(context, &nhwc_out_shape, *dtype);
+                let h = input_shape[2];
+                let w = input_shape[3];
+                let kh = kernel_shape[2];
+                let kw = kernel_shape[3];
+                let oh = shape.0[2]; // target ONNX output height
+                let ow = shape.0[3]; // target ONNX output width
+
+                let pad_top = pads[0];
+                let pad_left = pads[1];
+                let mut pad_bottom = pads[2];
+                let mut pad_right = pads[3];
+                let eff_kh = dilations[0] * (kh - 1) + 1;
+                let eff_kw = dilations[1] * (kw - 1) + 1;
+                let rem_h = (h + pad_top + pad_bottom - eff_kh) % strides[0];
+                let rem_w = (w + pad_left + pad_right - eff_kw) % strides[1];
+                if rem_h != 0 {
+                    pad_bottom += strides[0] - rem_h;
+                }
+                if rem_w != 0 {
+                    pad_right += strides[1] - rem_w;
+                }
+                let tosa_oh = (h + pad_top + pad_bottom - eff_kh) / strides[0] + 1;
+                let tosa_ow = (w + pad_left + pad_right - eff_kw) / strides[1] + 1;
+                let needs_slice = tosa_oh != oh || tosa_ow != ow;
+
+                let nhwc_tosa_shape = [n, tosa_oh, tosa_ow, co];
+                let nhwc_tosa_type = make_ranked_tensor_type(context, &nhwc_tosa_shape, *dtype);
 
                 // TOSA conv2d pad order: [pad_top, pad_bottom, pad_left, pad_right]
-                // Our pads: [pad_top, pad_left, pad_bottom, pad_right]
                 let pad_attr_str = format!(
                     "array<i64: {}, {}, {}, {}>",
-                    pads[0], pads[2], pads[1], pads[3]
+                    pad_top, pad_bottom, pad_left, pad_right
                 );
                 let stride_attr_str = format!("array<i64: {}, {}>", strides[0], strides[1]);
                 let dilation_attr_str = format!("array<i64: {}, {}>", dilations[0], dilations[1]);
@@ -2225,11 +2250,11 @@ fn emit_tensor_ops<'c>(
                 let weight_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
 
                 // Emit tosa.conv2d: (input_nhwc, kernel_ohwi, bias, input_zp, weight_zp)
-                let conv_nhwc: melior::ir::Value = body_block
+                let mut conv_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.conv2d", location)
                             .add_operands(&[input_nhwc, kernel_ohwi, bias_val, input_zp, weight_zp])
-                            .add_results(&[nhwc_out_type])
+                            .add_results(&[nhwc_tosa_type])
                             .add_attributes(&[
                                 (Identifier::new(context, "pad"), pad_attr),
                                 (Identifier::new(context, "stride"), stride_attr),
@@ -2243,11 +2268,324 @@ fn emit_tensor_ops<'c>(
                     .unwrap()
                     .into();
 
+                // If we added extra padding, slice back to the ONNX-expected size.
+                if needs_slice {
+                    let nhwc_out_shape_slice = [n, oh, ow, co];
+                    let rank = 4usize;
+                    let shape_type_str = format!("!tosa.shape<{rank}>");
+                    let shape_type = melior::ir::Type::parse(context, &shape_type_str)
+                        .ok_or_else(|| CompileError::AttributeParse(shape_type_str.clone()))?;
+
+                    let start_vals_str = format!("dense<[0, 0, 0, 0]> : tensor<{rank}xindex>");
+                    let start_attr = Attribute::parse(context, &start_vals_str)
+                        .ok_or_else(|| CompileError::AttributeParse(start_vals_str.clone()))?;
+                    let start_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.const_shape", location)
+                                .add_results(&[shape_type])
+                                .add_attributes(&[(Identifier::new(context, "values"), start_attr)])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let size_vals_str =
+                        format!("dense<[{n}, {oh}, {ow}, {co}]> : tensor<{rank}xindex>");
+                    let size_attr = Attribute::parse(context, &size_vals_str)
+                        .ok_or_else(|| CompileError::AttributeParse(size_vals_str.clone()))?;
+                    let size_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.const_shape", location)
+                                .add_results(&[shape_type])
+                                .add_attributes(&[(Identifier::new(context, "values"), size_attr)])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let slice_type =
+                        make_ranked_tensor_type(context, &nhwc_out_shape_slice, *dtype);
+                    conv_nhwc = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.slice", location)
+                                .add_operands(&[conv_nhwc, start_val, size_val])
+                                .add_results(&[slice_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                }
+
+                let nhwc_out_shape = [n, oh, ow, co];
+
                 // Step 5: Transpose output NHWC → NCHW: perms [0, 3, 1, 2]
                 let result_val = emit_tosa_transpose(
                     context,
                     body_block,
                     conv_nhwc,
+                    &nhwc_out_shape,
+                    &[0, 3, 1, 2],
+                    *dtype,
+                    location,
+                )?;
+
+                values.insert(node_id, result_val);
+            }
+
+            Op::BatchNorm {
+                input,
+                scale,
+                bias,
+                mean,
+                var,
+                epsilon,
+                shape,
+                dtype,
+            } => {
+                let input_val = *values.get(input).expect("input not yet emitted");
+                let scale_val = *values.get(scale).expect("scale not yet emitted");
+                let bias_val = *values.get(bias).expect("bias not yet emitted");
+                let mean_val = *values.get(mean).expect("mean not yet emitted");
+                let var_val = *values.get(var).expect("var not yet emitted");
+
+                let input_shape = &shape.0; // same as input shape
+                let c = input_shape[1];
+                let param_shape_4d = [1u64, c, 1, 1];
+
+                // Step 1: reshape [C] params to [1, C, 1, 1] for NCHW broadcast
+                let mean_4d = emit_tosa_reshape(
+                    context,
+                    body_block,
+                    mean_val,
+                    &param_shape_4d,
+                    *dtype,
+                    location,
+                )?;
+                let var_4d = emit_tosa_reshape(
+                    context,
+                    body_block,
+                    var_val,
+                    &param_shape_4d,
+                    *dtype,
+                    location,
+                )?;
+                let scale_4d = emit_tosa_reshape(
+                    context,
+                    body_block,
+                    scale_val,
+                    &param_shape_4d,
+                    *dtype,
+                    location,
+                )?;
+                let bias_4d = emit_tosa_reshape(
+                    context,
+                    body_block,
+                    bias_val,
+                    &param_shape_4d,
+                    *dtype,
+                    location,
+                )?;
+
+                // Step 2: x - mean  →  shape: input_shape
+                let out_type = make_ranked_tensor_type(context, input_shape, *dtype);
+                let x_minus_mean: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.sub", location)
+                            .add_operands(&[input_val, mean_4d])
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 3: var + eps  →  shape: [1, C, 1, 1]
+                let eps_str = match dtype {
+                    DType::F32 => format!(
+                        "dense<{}> : tensor<1x{}x1x1xf32>",
+                        format_float(*epsilon),
+                        c
+                    ),
+                    DType::F64 => format!(
+                        "dense<{}> : tensor<1x{}x1x1xf64>",
+                        format_float(*epsilon),
+                        c
+                    ),
+                    DType::I32 => format!("dense<{}> : tensor<1x{}x1x1xi32>", *epsilon as i64, c),
+                    DType::I64 => format!("dense<{}> : tensor<1x{}x1x1xi64>", *epsilon as i64, c),
+                };
+                let eps_val = emit_tosa_const_scalar(context, body_block, &eps_str, location)?;
+
+                let var_eps_type = make_ranked_tensor_type(context, &param_shape_4d, *dtype);
+                let var_plus_eps: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.add", location)
+                            .add_operands(&[var_4d, eps_val])
+                            .add_results(&[var_eps_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 4: rsqrt(var + eps)  →  shape: [1, C, 1, 1]
+                let inv_std: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.rsqrt", location)
+                            .add_operands(&[var_plus_eps])
+                            .add_results(&[var_eps_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 5: normalize = (x - mean) * rsqrt(var + eps)
+                // tosa.mul requires shift operand
+                let shift_val = emit_tosa_const_scalar(
+                    context,
+                    body_block,
+                    "dense<0> : tensor<1xi8>",
+                    location,
+                )?;
+                let normalized: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.mul", location)
+                            .add_operands(&[x_minus_mean, inv_std, shift_val])
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 6: scale * normalized
+                let shift_val2 = emit_tosa_const_scalar(
+                    context,
+                    body_block,
+                    "dense<0> : tensor<1xi8>",
+                    location,
+                )?;
+                let scaled: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.mul", location)
+                            .add_operands(&[scale_4d, normalized, shift_val2])
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 7: + bias
+                let result_val: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.add", location)
+                            .add_operands(&[scaled, bias_4d])
+                            .add_results(&[out_type])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                values.insert(node_id, result_val);
+            }
+
+            Op::GlobalAvgPool {
+                input,
+                shape,
+                dtype,
+            } => {
+                let input_shape = trace.get(*input).shape().0.clone(); // [N, C, H, W]
+                let input_val = *values.get(input).expect("input not yet emitted");
+
+                let n = input_shape[0];
+                let c = input_shape[1];
+                let h = input_shape[2];
+                let w = input_shape[3];
+                let _ = shape; // output shape [N, C, 1, 1] — used via nhwc_out_shape below
+
+                // Step 1: Transpose NCHW → NHWC: perms [0, 2, 3, 1]
+                let input_nhwc = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    input_val,
+                    &input_shape,
+                    &[0, 2, 3, 1],
+                    *dtype,
+                    location,
+                )?;
+                // input_nhwc shape: [N, H, W, C]
+
+                // Step 2: Emit tosa.avg_pool2d with kernel = [H, W], stride = [1, 1], pad = [0, 0, 0, 0].
+                // NHWC output shape: [N, 1, 1, C]
+                let nhwc_out_shape = [n, 1u64, 1u64, c];
+                let nhwc_out_type = make_ranked_tensor_type(context, &nhwc_out_shape, *dtype);
+
+                let kernel_attr_str = format!("array<i64: {h}, {w}>");
+                let pad_attr_str = "array<i64: 0, 0, 0, 0>".to_string();
+                let stride_attr_str = "array<i64: 1, 1>".to_string();
+                let acc_type_str = match dtype {
+                    DType::F32 | DType::F64 => "f32",
+                    DType::I32 | DType::I64 => "i32",
+                };
+
+                let kernel_attr = Attribute::parse(context, &kernel_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(kernel_attr_str.clone()))?;
+                let pad_attr = Attribute::parse(context, &pad_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(pad_attr_str.clone()))?;
+                let stride_attr = Attribute::parse(context, &stride_attr_str)
+                    .ok_or_else(|| CompileError::AttributeParse(stride_attr_str.clone()))?;
+                let acc_type_attr = Attribute::parse(context, acc_type_str)
+                    .ok_or_else(|| CompileError::AttributeParse(acc_type_str.to_string()))?;
+
+                // tosa.avg_pool2d takes 3 operands: (input, input_zp, output_zp).
+                // For unquantized use, both zero-point tensors are 0.
+                let zp_dense = match dtype {
+                    DType::F32 => "dense<0.0> : tensor<1xf32>",
+                    DType::F64 => "dense<0.0> : tensor<1xf64>",
+                    DType::I32 => "dense<0> : tensor<1xi32>",
+                    DType::I64 => "dense<0> : tensor<1xi64>",
+                };
+                let input_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+                let output_zp = emit_tosa_const_scalar(context, body_block, zp_dense, location)?;
+
+                let pool_nhwc: melior::ir::Value = body_block
+                    .append_operation(
+                        OperationBuilder::new("tosa.avg_pool2d", location)
+                            .add_operands(&[input_nhwc, input_zp, output_zp])
+                            .add_results(&[nhwc_out_type])
+                            .add_attributes(&[
+                                (Identifier::new(context, "kernel"), kernel_attr),
+                                (Identifier::new(context, "pad"), pad_attr),
+                                (Identifier::new(context, "stride"), stride_attr),
+                                (Identifier::new(context, "acc_type"), acc_type_attr),
+                            ])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+
+                // Step 3: Transpose NHWC → NCHW: perms [0, 3, 1, 2]
+                let result_val = emit_tosa_transpose(
+                    context,
+                    body_block,
+                    pool_nhwc,
                     &nhwc_out_shape,
                     &[0, 3, 1, 2],
                     *dtype,
@@ -4137,5 +4475,248 @@ mod tests {
         assert_eq!(out[13], 56.0);
         assert_eq!(out[14], 62.0);
         assert_eq!(out[15], 64.0);
+    }
+
+    // ── BatchNorm IR verification test (task 87) ──────────────────────────────
+
+    #[test]
+    fn batch_norm_emits_tosa_rsqrt() {
+        begin_trace();
+        let input = Tensor::new(&[1, 2, 4, 4], DType::F32);
+        let scale = Tensor::new(&[2], DType::F32);
+        let bias = Tensor::new(&[2], DType::F32);
+        let mean = Tensor::new(&[2], DType::F32);
+        let var = Tensor::new(&[2], DType::F32);
+        let out = input.batch_norm(&scale, &bias, &mean, &var, 1e-5);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[out.id]).expect("build_ir_string failed");
+        assert!(
+            ir.contains("tosa.rsqrt"),
+            "IR should contain tosa.rsqrt:\n{ir}"
+        );
+        assert!(ir.contains("tosa.sub"), "IR should contain tosa.sub:\n{ir}");
+        assert!(ir.contains("tosa.mul"), "IR should contain tosa.mul:\n{ir}");
+    }
+
+    // ── BatchNorm execution tests (task 88) ───────────────────────────────────
+
+    /// Helper: run batch_norm with the given data and params, return output as Vec<f32>.
+    ///
+    /// `input_data` is NCHW-ordered. `scale`, `bias`, `mean`, `var` have length C.
+    fn run_batch_norm_f32(
+        input_data: &[f32],
+        input_shape: &[u64],
+        scale_data: &[f32],
+        bias_data: &[f32],
+        mean_data: &[f32],
+        var_data: &[f32],
+        epsilon: f64,
+    ) -> Vec<f32> {
+        let c = scale_data.len() as u64;
+        begin_trace();
+        let input_t = Tensor::new(input_shape, DType::F32);
+        let scale_t = Tensor::new(&[c], DType::F32);
+        let bias_t = Tensor::new(&[c], DType::F32);
+        let mean_t = Tensor::new(&[c], DType::F32);
+        let var_t = Tensor::new(&[c], DType::F32);
+        let out = input_t.batch_norm(&scale_t, &bias_t, &mean_t, &var_t, epsilon);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let input_buf = Buffer::from_slice::<f32>(input_data, input_shape, DType::F32);
+        let scale_buf = Buffer::from_slice::<f32>(scale_data, &[c], DType::F32);
+        let bias_buf = Buffer::from_slice::<f32>(bias_data, &[c], DType::F32);
+        let mean_buf = Buffer::from_slice::<f32>(mean_data, &[c], DType::F32);
+        let var_buf = Buffer::from_slice::<f32>(var_data, &[c], DType::F32);
+        compiled
+            .run(&[&input_buf, &scale_buf, &bias_buf, &mean_buf, &var_buf])
+            .as_slice::<f32>()
+            .to_vec()
+    }
+
+    #[test]
+    fn run_batch_norm_basic() {
+        // 1 batch, 2 channels, 1x1 spatial.
+        // input: ch0=1.0, ch1=4.0
+        // mean: ch0=0.0, ch1=2.0; var: ch0=1.0, ch1=4.0; eps=0.0 (use 1e-7)
+        // scale: ch0=1.0, ch1=2.0; bias: ch0=0.0, ch1=1.0
+        //
+        // ch0: (1.0 - 0.0) / sqrt(1.0 + 1e-7) * 1.0 + 0.0 ≈ 1.0
+        // ch1: (4.0 - 2.0) / sqrt(4.0 + 1e-7) * 2.0 + 1.0 ≈ 2.0/2.0 * 2.0 + 1.0 = 3.0
+        let out = run_batch_norm_f32(
+            &[1.0, 4.0],
+            &[1, 2, 1, 1],
+            &[1.0, 2.0], // scale
+            &[0.0, 1.0], // bias
+            &[0.0, 2.0], // mean
+            &[1.0, 4.0], // var
+            1e-7,
+        );
+        assert_eq!(out.len(), 2);
+        assert!(
+            (out[0] - 1.0f32).abs() < 1e-4,
+            "ch0 expected ~1.0, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - 3.0f32).abs() < 1e-4,
+            "ch1 expected ~3.0, got {}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn run_batch_norm_zero_mean_unit_var() {
+        // With mean=0, var=1, scale=1, bias=0, output should equal input.
+        let input: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+        let out = run_batch_norm_f32(
+            &input,
+            &[1, 2, 2, 2],
+            &[1.0, 1.0], // scale
+            &[0.0, 0.0], // bias
+            &[0.0, 0.0], // mean
+            &[1.0, 1.0], // var
+            1e-7,
+        );
+        assert_eq!(out.len(), 8);
+        for (i, (&expected, &got)) in input.iter().zip(out.iter()).enumerate() {
+            // With var=1+eps, output ≈ input but slightly < 1.0x due to rsqrt(1+eps).
+            assert!(
+                (got - expected).abs() < 0.01,
+                "element {i}: expected ~{expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_batch_norm_shape_preserved() {
+        // Verify output shape equals input shape: [2, 3, 4, 4].
+        let total = 2 * 3 * 4 * 4;
+        let input: Vec<f32> = vec![1.0f32; total];
+        let out = run_batch_norm_f32(
+            &input,
+            &[2, 3, 4, 4],
+            &[1.0, 1.0, 1.0], // scale for 3 channels
+            &[0.0, 0.0, 0.0], // bias
+            &[0.0, 0.0, 0.0], // mean
+            &[1.0, 1.0, 1.0], // var
+            1e-5,
+        );
+        assert_eq!(
+            out.len(),
+            total,
+            "output should have same number of elements as input"
+        );
+    }
+
+    #[test]
+    fn run_batch_norm_varying_epsilon() {
+        // Larger epsilon shrinks the output toward bias.
+        // input=1.0, mean=0.0, var=0.0 (degenerate), scale=1.0, bias=0.0
+        // With eps=1.0: out = 1.0 / sqrt(0.0 + 1.0) = 1.0
+        // With eps=4.0: out = 1.0 / sqrt(0.0 + 4.0) = 0.5
+        let out_eps1 =
+            run_batch_norm_f32(&[1.0], &[1, 1, 1, 1], &[1.0], &[0.0], &[0.0], &[0.0], 1.0);
+        let out_eps4 =
+            run_batch_norm_f32(&[1.0], &[1, 1, 1, 1], &[1.0], &[0.0], &[0.0], &[0.0], 4.0);
+        assert!(
+            (out_eps1[0] - 1.0f32).abs() < 1e-5,
+            "eps=1.0: expected ~1.0, got {}",
+            out_eps1[0]
+        );
+        assert!(
+            (out_eps4[0] - 0.5f32).abs() < 1e-5,
+            "eps=4.0: expected ~0.5, got {}",
+            out_eps4[0]
+        );
+    }
+
+    // ── GlobalAvgPool IR verification test (task 93) ──────────────────────────
+
+    #[test]
+    fn global_avg_pool_emits_tosa_avg_pool2d() {
+        begin_trace();
+        let input = Tensor::new(&[1, 4, 6, 6], DType::F32);
+        let out = input.global_avg_pool();
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[out.id]).expect("build_ir_string failed");
+        assert!(
+            ir.contains("tosa.avg_pool2d"),
+            "expected tosa.avg_pool2d in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.transpose"),
+            "expected tosa.transpose in IR:\n{ir}"
+        );
+    }
+
+    // ── GlobalAvgPool execution tests (task 94) ───────────────────────────────
+
+    #[test]
+    fn run_global_avg_pool_basic() {
+        // 1 batch, 1 channel, 2x2 spatial: values [1, 2, 3, 4] → avg = 2.5
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 2, 2], DType::F32);
+        let out = input.global_avg_pool();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        let input_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2], DType::F32);
+        let result = compiled.run(&[&input_buf]);
+        let out_slice = result.as_slice::<f32>();
+        // Output shape [1, 1, 1, 1] → single element = mean(1,2,3,4) = 2.5
+        assert_eq!(out_slice.len(), 1, "expected 1 output element");
+        assert!(
+            (out_slice[0] - 2.5f32).abs() < 1e-5,
+            "expected 2.5, got {}",
+            out_slice[0]
+        );
+    }
+
+    #[test]
+    fn run_global_avg_pool_batch_feature_maps() {
+        // 2 batches, 2 channels, 2x2 spatial.
+        // NCHW layout: [N=2, C=2, H=2, W=2]
+        // batch0 ch0: 1,2,3,4 → avg=2.5
+        // batch0 ch1: 10,20,30,40 → avg=25.0
+        // batch1 ch0: 0,0,0,4 → avg=1.0
+        // batch1 ch1: 5,5,5,5 → avg=5.0
+        begin_trace();
+        let input = Tensor::new(&[2, 2, 2, 2], DType::F32);
+        let out = input.global_avg_pool();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[out.id]).expect("compile failed");
+        #[rustfmt::skip]
+        let data: Vec<f32> = vec![
+            // batch 0
+            1.0, 2.0, 3.0, 4.0,   // ch0
+            10.0, 20.0, 30.0, 40.0, // ch1
+            // batch 1
+            0.0, 0.0, 0.0, 4.0,   // ch0
+            5.0, 5.0, 5.0, 5.0,   // ch1
+        ];
+        let input_buf = Buffer::from_slice::<f32>(&data, &[2, 2, 2, 2], DType::F32);
+        let result = compiled.run(&[&input_buf]);
+        let out_slice = result.as_slice::<f32>();
+        // Output shape [2, 2, 1, 1] → 4 elements in NCHW order
+        assert_eq!(out_slice.len(), 4, "expected 4 output elements");
+        assert!(
+            (out_slice[0] - 2.5f32).abs() < 1e-4,
+            "batch0 ch0: expected 2.5, got {}",
+            out_slice[0]
+        );
+        assert!(
+            (out_slice[1] - 25.0f32).abs() < 1e-4,
+            "batch0 ch1: expected 25.0, got {}",
+            out_slice[1]
+        );
+        assert!(
+            (out_slice[2] - 1.0f32).abs() < 1e-4,
+            "batch1 ch0: expected 1.0, got {}",
+            out_slice[2]
+        );
+        assert!(
+            (out_slice[3] - 5.0f32).abs() < 1e-4,
+            "batch1 ch1: expected 5.0, got {}",
+            out_slice[3]
+        );
     }
 }

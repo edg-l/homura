@@ -65,6 +65,8 @@ See [docs/design.md](docs/design.md) for a detailed walkthrough of the architect
 
 Requires LLVM 21 with MLIR C API support (`libMLIR-C.so`).
 
+Large test fixtures (e.g. `resnet18-v1-7.onnx`) are stored with [Git LFS](https://git-lfs.com/). Run `git lfs install` before cloning to fetch them automatically.
+
 ```sh
 cargo build
 ```
@@ -73,12 +75,13 @@ cargo build
 
 ```sh
 cargo run -- info tests/fixtures/mnist-12.onnx    # inspect ONNX model
-cargo run -- run tests/fixtures/mnist-12.onnx     # run inference
+cargo run -- run tests/fixtures/mnist-12.onnx     # run MNIST inference
+cargo run -- run tests/fixtures/resnet18-v1-7.onnx # run ResNet-18 inference
 cargo run --example onnx_mnist -- digit.png       # classify a digit image
 cargo run --example add                           # element-wise add demo
 cargo run --example ops                           # all ops demo
 cargo run --example mlp                           # hand-coded MLP
-cargo test                                        # 241 tests
+cargo test                                        # 261 tests
 ```
 
 ## Current status
@@ -88,6 +91,8 @@ cargo test                                        # 241 tests
 - Matmul, Gemm (general matrix multiply with transpose/scaling)
 - Conv2d (NCHW layout, padding, stride, dilation)
 - MaxPool2d (NCHW layout, padding, stride)
+- GlobalAvgPool (NCHW, via tosa.avg_pool2d)
+- BatchNorm (composed from TOSA primitives)
 - Reductions: ReduceSum, ReduceMax (with keepdim)
 - Reshape (with -1 dimension inference), Flatten
 - Softmax (composed from reductions + exp)
@@ -95,13 +100,14 @@ cargo test                                        # 241 tests
 - ONNX model loading and inference (`Model::load` / `Model::run`)
 - CLI: `homura info` / `homura run`
 - MNIST CNN end-to-end (mnist-12.onnx classifies digits correctly)
+- ResNet-18 end-to-end (resnet18-v1-7.onnx runs 1000-class classification)
 - CPU JIT via MLIR ExecutionEngine
 
 ## Roadmap
 
 **Milestone 1** (complete) — N-D tensors, matmul, broadcast, softmax, eval sugar. Runs a hand-coded MLP.
 
-**Milestone 2** (in progress) — TOSA backend, ONNX loading, Conv2d, MaxPool2d, MNIST CNN (done). BatchNorm, GlobalAvgPool, ResNet-18 (remaining).
+**Milestone 2** (complete) — TOSA backend, ONNX loading, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
 
 **Milestone 3** — GPU backend (swap linalg-to-loops for GPU tiling passes)
 

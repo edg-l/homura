@@ -7,7 +7,24 @@ use homura::{Buffer, DType, Model};
 
 // Ops that homura currently supports.
 const SUPPORTED_OPS: &[&str] = &[
-    "Add", "Sub", "Mul", "Div", "Relu", "MatMul", "Gemm", "Conv", "MaxPool", "Reshape",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Neg",
+    "Relu",
+    "Exp",
+    "Tanh",
+    "Softmax",
+    "MatMul",
+    "Gemm",
+    "Conv",
+    "MaxPool",
+    "Reshape",
+    "Flatten",
+    "Clip",
+    "BatchNormalization",
+    "GlobalAveragePool",
 ];
 
 #[derive(Parser)]

@@ -117,6 +117,28 @@ pub enum Op {
         shape: Shape,          // output shape [N, C, OH, OW]
         dtype: DType,
     },
+    /// Global average pooling (NCHW layout) — averages all spatial dims.
+    ///
+    /// Input shape: [N, C, H, W]. Output shape: [N, C, 1, 1].
+    GlobalAvgPool {
+        input: NodeId, // [N, C, H, W]
+        shape: Shape,  // output shape [N, C, 1, 1]
+        dtype: DType,
+    },
+    /// Batch normalization: scale * (x - mean) / sqrt(var + epsilon) + bias.
+    ///
+    /// All parameter tensors (scale, bias, mean, var) have shape [C] where C is
+    /// the channel dimension (dim 1 for NCHW inputs).
+    BatchNorm {
+        input: NodeId,
+        scale: NodeId,
+        bias: NodeId,
+        mean: NodeId,
+        var: NodeId,
+        epsilon: f64,
+        shape: Shape,
+        dtype: DType,
+    },
     /// General matrix multiply: alpha * (A @ B) + beta * C.
     ///
     /// Equivalent to the ONNX Gemm op. The output shape is [M, N].
@@ -151,6 +173,8 @@ impl Op {
             Op::Reshape { shape, .. } => shape,
             Op::Conv2d { shape, .. } => shape,
             Op::MaxPool2d { shape, .. } => shape,
+            Op::GlobalAvgPool { shape, .. } => shape,
+            Op::BatchNorm { shape, .. } => shape,
             Op::Gemm { shape, .. } => shape,
         }
     }
@@ -172,6 +196,8 @@ impl Op {
             Op::Reshape { dtype, .. } => *dtype,
             Op::Conv2d { dtype, .. } => *dtype,
             Op::MaxPool2d { dtype, .. } => *dtype,
+            Op::GlobalAvgPool { dtype, .. } => *dtype,
+            Op::BatchNorm { dtype, .. } => *dtype,
             Op::Gemm { dtype, .. } => *dtype,
         }
     }

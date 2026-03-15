@@ -349,6 +349,31 @@ fn map_node(
             let result = x.reshape(&[dim0 as i64, dim1 as i64]);
             tensors.insert(node.outputs[0].clone(), result);
         }
+        "BatchNormalization" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            let scale = get_tensor(tensors, &node.inputs[1])?;
+            let bias = get_tensor(tensors, &node.inputs[2])?;
+            let mean = get_tensor(tensors, &node.inputs[3])?;
+            let var = get_tensor(tensors, &node.inputs[4])?;
+            let epsilon = node
+                .attributes
+                .get("epsilon")
+                .and_then(|attr| {
+                    if let OnnxAttribute::Float(v) = attr {
+                        Some(*v as f64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1e-5);
+            let result = x.batch_norm(&scale, &bias, &mean, &var, epsilon);
+            tensors.insert(node.outputs[0].clone(), result);
+        }
+        "GlobalAveragePool" => {
+            let x = get_tensor(tensors, &node.inputs[0])?;
+            let result = x.global_avg_pool();
+            tensors.insert(node.outputs[0].clone(), result);
+        }
         "Clip" => {
             // In opset 11+, min/max are optional inputs (not attributes).
             // Map Clip(x) with exactly 1 input → relu (x clipped to [0, ∞)).
@@ -1222,5 +1247,86 @@ mod tests {
         let out = trace.get(output_ids[0]);
         // axis=0: [1, 2*3*4] = [1, 24]
         assert_eq!(out.shape().0, vec![1, 24]);
+    }
+
+    // ── Task 16.1/16.3: BatchNormalization mapping ──────────────────────────
+
+    #[test]
+    fn map_batch_normalization() {
+        let c = 3u64;
+        let ones = vec![1.0f32; c as usize];
+        let zeros = vec![0.0f32; c as usize];
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "BatchNormalization",
+                &["X", "scale", "bias", "mean", "var"],
+                &["Y"],
+                vec![("epsilon", OnnxAttribute::Float(1e-5))],
+            )],
+            initializers: vec![
+                make_weight("scale", &ones, &[c]),
+                make_weight("bias", &zeros, &[c]),
+                make_weight("mean", &zeros, &[c]),
+                make_weight("var", &ones, &[c]),
+            ],
+            dynamic_inputs: vec![make_dynamic("X", &[1, c, 4, 4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
+        assert_eq!(weights.len(), 4);
+        let out = trace.get(output_ids[0]);
+        assert!(
+            matches!(out, Op::BatchNorm { .. }),
+            "expected Op::BatchNorm, got {:?}",
+            out
+        );
+        // Output shape matches input
+        assert_eq!(out.shape().0, vec![1, c, 4, 4]);
+    }
+
+    #[test]
+    fn map_batch_normalization_default_epsilon() {
+        let c = 2u64;
+        let ones = vec![1.0f32; c as usize];
+        let zeros = vec![0.0f32; c as usize];
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "BatchNormalization",
+                &["X", "scale", "bias", "mean", "var"],
+                &["Y"],
+                vec![], // no epsilon attr → default 1e-5
+            )],
+            initializers: vec![
+                make_weight("scale", &ones, &[c]),
+                make_weight("bias", &zeros, &[c]),
+                make_weight("mean", &zeros, &[c]),
+                make_weight("var", &ones, &[c]),
+            ],
+            dynamic_inputs: vec![make_dynamic("X", &[1, c, 2, 2], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        let out = trace.get(output_ids[0]);
+        assert_eq!(out.shape().0, vec![1, c, 2, 2]);
+    }
+
+    // ── Task 16.2/16.3: GlobalAveragePool mapping ───────────────────────────
+
+    #[test]
+    fn map_global_average_pool() {
+        let model = OnnxModel {
+            nodes: vec![make_node("GlobalAveragePool", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[1, 3, 7, 7], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        let out = trace.get(output_ids[0]);
+        assert!(
+            matches!(out, Op::GlobalAvgPool { .. }),
+            "expected Op::GlobalAvgPool, got {:?}",
+            out
+        );
+        assert_eq!(out.shape().0, vec![1, 3, 1, 1]);
     }
 }

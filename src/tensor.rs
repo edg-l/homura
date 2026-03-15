@@ -358,6 +358,79 @@ impl Tensor {
         }
     }
 
+    /// Global average pooling over spatial dims — averages H and W, producing [N, C, 1, 1].
+    ///
+    /// Input must be rank 4 (NCHW layout).
+    pub fn global_avg_pool(&self) -> Tensor {
+        assert_eq!(
+            self.shape.rank(),
+            4,
+            "global_avg_pool requires rank-4 input (NCHW)"
+        );
+        let n = self.shape.0[0];
+        let c = self.shape.0[1];
+        let output_shape = Shape(vec![n, c, 1, 1]);
+        let id = trace::record(Op::GlobalAvgPool {
+            input: self.id,
+            shape: output_shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: output_shape,
+            dtype: self.dtype,
+        }
+    }
+
+    /// Batch normalization: `scale * (x - mean) / sqrt(var + epsilon) + bias`.
+    ///
+    /// Input must be at least rank 2 (channel dimension is dim 1). All
+    /// parameter tensors (`scale`, `bias`, `mean`, `var`) must have the same
+    /// dtype as the input and shape `[C]` where `C = input.shape()[1]`.
+    pub fn batch_norm(
+        &self,
+        scale: &Tensor,
+        bias: &Tensor,
+        mean: &Tensor,
+        var: &Tensor,
+        epsilon: f64,
+    ) -> Tensor {
+        assert!(
+            self.shape.rank() >= 2,
+            "batch_norm requires rank >= 2, got {}",
+            self.shape.rank()
+        );
+        assert_eq!(
+            self.dtype, scale.dtype,
+            "dtype mismatch in batch_norm (scale)"
+        );
+        assert_eq!(
+            self.dtype, bias.dtype,
+            "dtype mismatch in batch_norm (bias)"
+        );
+        assert_eq!(
+            self.dtype, mean.dtype,
+            "dtype mismatch in batch_norm (mean)"
+        );
+        assert_eq!(self.dtype, var.dtype, "dtype mismatch in batch_norm (var)");
+
+        let id = trace::record(Op::BatchNorm {
+            input: self.id,
+            scale: scale.id,
+            bias: bias.id,
+            mean: mean.id,
+            var: var.id,
+            epsilon,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        });
+        Tensor {
+            id,
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+        }
+    }
+
     pub fn gemm(
         &self,
         rhs: &Tensor,
@@ -682,6 +755,149 @@ mod tests {
         begin_trace();
         let input = Tensor::new(&[1, 4, 4], DType::F32);
         let _ = input.max_pool2d([2, 2], [1, 1], [0, 0, 0, 0]);
+        let _ = take_trace();
+    }
+
+    // ── BatchNorm trace tests (task 85) ──────────────────────────────────────
+
+    #[test]
+    fn batch_norm_records_correct_op() {
+        begin_trace();
+        // input: [2, 3, 4, 4] — batch=2, channels=3, spatial=4x4
+        let input = Tensor::new(&[2, 3, 4, 4], DType::F32);
+        let scale = Tensor::new(&[3], DType::F32);
+        let bias = Tensor::new(&[3], DType::F32);
+        let mean = Tensor::new(&[3], DType::F32);
+        let var = Tensor::new(&[3], DType::F32);
+        let out = input.batch_norm(&scale, &bias, &mean, &var, 1e-5);
+        let trace = take_trace();
+        // 5 inputs + 1 batch_norm op
+        assert_eq!(trace.ops().len(), 6);
+        assert_eq!(trace.input_count(), 5);
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::BatchNorm {
+                epsilon,
+                shape,
+                dtype,
+                ..
+            } => {
+                assert!((epsilon - 1e-5f64).abs() < 1e-10, "epsilon mismatch");
+                assert_eq!(shape.0, vec![2u64, 3, 4, 4]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::BatchNorm, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn batch_norm_output_shape_matches_input() {
+        begin_trace();
+        let input = Tensor::new(&[1, 4, 8, 8], DType::F32);
+        let scale = Tensor::new(&[4], DType::F32);
+        let bias = Tensor::new(&[4], DType::F32);
+        let mean = Tensor::new(&[4], DType::F32);
+        let var = Tensor::new(&[4], DType::F32);
+        let out = input.batch_norm(&scale, &bias, &mean, &var, 1e-5);
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![1u64, 4, 8, 8]);
+    }
+
+    #[test]
+    fn batch_norm_records_five_inputs() {
+        begin_trace();
+        let input = Tensor::new(&[1, 2, 3, 3], DType::F32);
+        let scale = Tensor::new(&[2], DType::F32);
+        let bias = Tensor::new(&[2], DType::F32);
+        let mean = Tensor::new(&[2], DType::F32);
+        let var = Tensor::new(&[2], DType::F32);
+        let out = input.batch_norm(&scale, &bias, &mean, &var, 1e-3);
+        let trace = take_trace();
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::BatchNorm {
+                input: inp_id,
+                scale: scale_id,
+                bias: bias_id,
+                mean: mean_id,
+                var: var_id,
+                epsilon,
+                ..
+            } => {
+                assert_eq!(inp_id.0, 0);
+                assert_eq!(scale_id.0, 1);
+                assert_eq!(bias_id.0, 2);
+                assert_eq!(mean_id.0, 3);
+                assert_eq!(var_id.0, 4);
+                assert!((epsilon - 1e-3f64).abs() < 1e-10);
+            }
+            _ => panic!("expected Op::BatchNorm"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "batch_norm requires rank >= 2")]
+    fn batch_norm_rank1_panics() {
+        begin_trace();
+        let input = Tensor::new(&[4], DType::F32);
+        let scale = Tensor::new(&[4], DType::F32);
+        let bias = Tensor::new(&[4], DType::F32);
+        let mean = Tensor::new(&[4], DType::F32);
+        let var = Tensor::new(&[4], DType::F32);
+        let _ = input.batch_norm(&scale, &bias, &mean, &var, 1e-5);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch in batch_norm")]
+    fn batch_norm_dtype_mismatch_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 2, 4, 4], DType::F32);
+        let scale = Tensor::new(&[2], DType::I32);
+        let bias = Tensor::new(&[2], DType::F32);
+        let mean = Tensor::new(&[2], DType::F32);
+        let var = Tensor::new(&[2], DType::F32);
+        let _ = input.batch_norm(&scale, &bias, &mean, &var, 1e-5);
+        let _ = take_trace();
+    }
+
+    // ── GlobalAvgPool trace tests (task 91) ──────────────────────────────────
+
+    #[test]
+    fn global_avg_pool_records_correct_op() {
+        begin_trace();
+        let input = Tensor::new(&[2, 4, 8, 8], DType::F32);
+        let out = input.global_avg_pool();
+        let trace = take_trace();
+        // 1 input op + 1 global_avg_pool op
+        assert_eq!(trace.ops().len(), 2);
+        assert_eq!(trace.input_count(), 1);
+        let op = &trace.ops()[out.id.0 as usize];
+        match op {
+            Op::GlobalAvgPool { shape, dtype, .. } => {
+                assert_eq!(shape.0, vec![2u64, 4, 1, 1]);
+                assert_eq!(*dtype, DType::F32);
+            }
+            _ => panic!("expected Op::GlobalAvgPool, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn global_avg_pool_output_shape_is_n_c_1_1() {
+        begin_trace();
+        // Arbitrary spatial dimensions should both collapse to 1.
+        let input = Tensor::new(&[3, 16, 7, 7], DType::F32);
+        let out = input.global_avg_pool();
+        let _ = take_trace();
+        assert_eq!(out.shape().0, vec![3u64, 16, 1, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "global_avg_pool requires rank-4 input")]
+    fn global_avg_pool_rank3_input_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 4, 4], DType::F32);
+        let _ = input.global_avg_pool();
         let _ = take_trace();
     }
 
