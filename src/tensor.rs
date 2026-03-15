@@ -283,8 +283,20 @@ impl Tensor {
         let kw = kernel.shape.0[3];
 
         // OH = (H + pad_top + pad_bottom - dilation_h * (KH - 1) - 1) / stride_h + 1
-        let oh = (h + pads[0] + pads[2] - dilations[0] * (kh - 1) - 1) / strides[0] + 1;
-        let ow = (w + pads[1] + pads[3] - dilations[1] * (kw - 1) - 1) / strides[1] + 1;
+        let eff_kh = dilations[0] * (kh - 1) + 1;
+        let eff_kw = dilations[1] * (kw - 1) + 1;
+        assert!(
+            h + pads[0] + pads[2] >= eff_kh,
+            "conv2d: effective kernel height ({eff_kh}) exceeds padded input height ({})",
+            h + pads[0] + pads[2]
+        );
+        assert!(
+            w + pads[1] + pads[3] >= eff_kw,
+            "conv2d: effective kernel width ({eff_kw}) exceeds padded input width ({})",
+            w + pads[1] + pads[3]
+        );
+        let oh = (h + pads[0] + pads[2] - eff_kh) / strides[0] + 1;
+        let ow = (w + pads[1] + pads[3] - eff_kw) / strides[1] + 1;
         let output_shape = Shape(vec![n, co, oh, ow]);
 
         let id = trace::record(Op::Conv2d {
@@ -317,6 +329,16 @@ impl Tensor {
         let w = self.shape.0[3];
         let [kh, kw] = kernel_size;
         // OH = (H + pad_top + pad_bottom - KH) / stride_h + 1
+        assert!(
+            h + pads[0] + pads[2] >= kh,
+            "max_pool2d: kernel height ({kh}) exceeds padded input height ({})",
+            h + pads[0] + pads[2]
+        );
+        assert!(
+            w + pads[1] + pads[3] >= kw,
+            "max_pool2d: kernel width ({kw}) exceeds padded input width ({})",
+            w + pads[1] + pads[3]
+        );
         let oh = (h + pads[0] + pads[2] - kh) / strides[0] + 1;
         let ow = (w + pads[1] + pads[3] - kw) / strides[1] + 1;
         let output_shape = Shape(vec![n, c, oh, ow]);
@@ -1144,6 +1166,38 @@ mod tests {
         begin_trace();
         let a = Tensor::new(&[12], DType::F32);
         let _ = a.reshape(&[0, 12]);
+        let _ = take_trace();
+    }
+
+    // ── Overflow guard regression tests ──────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "effective kernel height")]
+    fn conv2d_kernel_too_large_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 5, 5], DType::F32);
+        let _ = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [1, 1]);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "kernel height")]
+    fn max_pool2d_kernel_too_large_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let _ = input.max_pool2d([5, 5], [1, 1], [0, 0, 0, 0]);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "effective kernel height")]
+    fn conv2d_dilated_kernel_too_large_panics() {
+        begin_trace();
+        let input = Tensor::new(&[1, 1, 3, 3], DType::F32);
+        let kernel = Tensor::new(&[1, 1, 2, 2], DType::F32);
+        // dilation=3: effective kernel = 3*(2-1)+1 = 4 > 3
+        let _ = input.conv2d(&kernel, None, [1, 1], [0, 0, 0, 0], [3, 3]);
         let _ = take_trace();
     }
 }

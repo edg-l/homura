@@ -199,6 +199,22 @@ fn map_node(
             tensors.insert(node.outputs[0].clone(), result);
         }
         "Conv" => {
+            let group = node
+                .attributes
+                .get("group")
+                .and_then(|a| {
+                    if let OnnxAttribute::Int(v) = a {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(1);
+            if group != 1 {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Conv: group={group} (grouped/depthwise conv) not supported"
+                )));
+            }
             let x = get_tensor(tensors, &node.inputs[0])?;
             let w = get_tensor(tensors, &node.inputs[1])?;
             let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
@@ -254,7 +270,19 @@ fn map_node(
                     "Reshape: shape input '{shape_name}' must be a static initializer"
                 ))
             })?;
-            let target_shape: Vec<i64> = shape_buf.as_slice::<i64>().to_vec();
+            let target_shape: Vec<i64> = match shape_buf.dtype() {
+                crate::DType::I64 => shape_buf.as_slice::<i64>().to_vec(),
+                crate::DType::I32 => shape_buf
+                    .as_slice::<i32>()
+                    .iter()
+                    .map(|&v| v as i64)
+                    .collect(),
+                other => {
+                    return Err(OnnxError::UnsupportedOp(format!(
+                        "Reshape: shape tensor has unsupported dtype {other:?}"
+                    )));
+                }
+            };
             let result = x.reshape(&target_shape);
             tensors.insert(node.outputs[0].clone(), result);
         }
@@ -273,8 +301,23 @@ fn map_node(
                 .unwrap_or(1) as usize;
             // Flatten: merge dims [0..axis) into one, [axis..) into another.
             let shape = &x.shape().0;
-            let dim0: u64 = shape[..axis].iter().product();
-            let dim1: u64 = shape[axis..].iter().product();
+            assert!(
+                axis <= shape.len(),
+                "Flatten: axis {axis} out of range for rank {}",
+                shape.len()
+            );
+            // ONNX Flatten always produces a 2D output.
+            // axis==0 → [1, total], axis==rank → [total, 1].
+            let dim0: u64 = if axis == 0 {
+                1
+            } else {
+                shape[..axis].iter().product()
+            };
+            let dim1: u64 = if axis == shape.len() {
+                1
+            } else {
+                shape[axis..].iter().product()
+            };
             let result = x.reshape(&[dim0 as i64, dim1 as i64]);
             tensors.insert(node.outputs[0].clone(), result);
         }
@@ -1069,5 +1112,69 @@ mod tests {
         let out = trace.get(output_ids[0]);
         // Default axis=1: [2, 3*4] = [2, 12]
         assert_eq!(out.shape().0, vec![2, 12]);
+    }
+
+    // ── Regression tests for code review fixes ───────────────────────────────
+
+    #[test]
+    fn map_conv_grouped_returns_error() {
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "Conv",
+                &["X", "W"],
+                &["Y"],
+                vec![
+                    ("kernel_shape", OnnxAttribute::Ints(vec![3, 3])),
+                    ("group", OnnxAttribute::Int(2)),
+                ],
+            )],
+            initializers: vec![make_weight("W", &[1.0; 18], &[2, 1, 3, 3])],
+            dynamic_inputs: vec![make_dynamic("X", &[1, 2, 5, 5], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let result = map_graph(&model);
+        assert!(result.is_err(), "grouped conv should return error");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("group=2"),
+            "error should mention group, got: {msg}"
+        );
+    }
+
+    fn make_i32_weight(name: &str, data: &[i32], shape: &[u64]) -> (String, Buffer) {
+        let buf = Buffer::from_slice::<i32>(data, shape, DType::I32);
+        (name.to_string(), buf)
+    }
+
+    #[test]
+    fn map_reshape_with_i32_shape_tensor() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Reshape", &["X", "shape"], &["Y"], vec![])],
+            initializers: vec![make_i32_weight("shape", &[3, 4], &[2])],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 6], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("i32 shape should work");
+        let out = trace.get(output_ids[0]);
+        assert_eq!(out.shape().0, vec![3, 4]);
+    }
+
+    #[test]
+    fn map_flatten_axis_zero() {
+        let model = OnnxModel {
+            nodes: vec![make_node(
+                "Flatten",
+                &["X"],
+                &["Y"],
+                vec![("axis", OnnxAttribute::Int(0))],
+            )],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        let out = trace.get(output_ids[0]);
+        // axis=0: [1, 2*3*4] = [1, 24]
+        assert_eq!(out.shape().0, vec![1, 24]);
     }
 }

@@ -164,12 +164,20 @@ fn ensure_runner_utils_loaded() {
 
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
-        const LIB_PATH: &str = "/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so";
+        const DEFAULT_PATH: &str = "/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so";
+        let lib_path =
+            std::env::var("MLIR_RUNNER_UTILS_PATH").unwrap_or_else(|_| DEFAULT_PATH.to_string());
         // SAFETY: dlopen is thread-safe; we call it once via OnceLock and
         // never dlclose, so the symbols remain valid for the process lifetime.
         unsafe {
-            let lib_c = CString::new(LIB_PATH).unwrap();
-            libc::dlopen(lib_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+            let lib_c = CString::new(lib_path.as_str()).unwrap();
+            let handle = libc::dlopen(lib_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+            if handle.is_null() {
+                eprintln!(
+                    "warning: failed to load {lib_path} — conv2d/padded ops may fail at JIT link time. \
+                     Set MLIR_RUNNER_UTILS_PATH to override."
+                );
+            }
         }
     });
 }
@@ -1523,6 +1531,16 @@ fn emit_tosa_transpose<'c>(
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    // Validate permutation.
+    debug_assert_eq!(
+        perms.len(),
+        input_shape.len(),
+        "perms length must match rank"
+    );
+    debug_assert!(
+        perms.iter().all(|&p| p < input_shape.len()),
+        "perms index out of bounds"
+    );
     // Compute output shape by applying permutation.
     let out_shape: Vec<u64> = perms.iter().map(|&p| input_shape[p]).collect();
     let result_type = make_ranked_tensor_type(context, &out_shape, dtype);
@@ -2135,12 +2153,6 @@ fn emit_tensor_ops<'c>(
                     location,
                 )?;
                 // input_nhwc shape: [N, H, W, CI]
-                let input_nhwc_shape = [
-                    input_shape[0],
-                    input_shape[2],
-                    input_shape[3],
-                    input_shape[1],
-                ];
 
                 // Step 2: Transpose kernel OIHW → OHWI: perms [0, 2, 3, 1]
                 let kernel_ohwi = emit_tosa_transpose(
@@ -2206,13 +2218,13 @@ fn emit_tensor_ops<'c>(
                 let zp_str = match dtype {
                     DType::F32 => "dense<0.0> : tensor<1xf32>",
                     DType::F64 => "dense<0.0> : tensor<1xf32>", // ZP always f32 in TOSA
-                    DType::I32 | DType::I64 => "dense<0> : tensor<1xi8>",
+                    DType::I32 => "dense<0> : tensor<1xi32>",
+                    DType::I64 => "dense<0> : tensor<1xi64>",
                 };
                 let input_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
                 let weight_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
 
                 // Emit tosa.conv2d: (input_nhwc, kernel_ohwi, bias, input_zp, weight_zp)
-                let _ = input_nhwc_shape; // used for documentation; shape inferred above
                 let conv_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.conv2d", location)
@@ -2294,6 +2306,14 @@ fn emit_tensor_ops<'c>(
                 let stride_attr = Attribute::parse(context, &stride_attr_str)
                     .ok_or_else(|| CompileError::AttributeParse(stride_attr_str.clone()))?;
 
+                // acc_type attribute (same derivation as conv2d)
+                let pool_acc_type_str = match dtype {
+                    DType::F32 | DType::F64 => "f32",
+                    DType::I32 | DType::I64 => "i32",
+                };
+                let pool_acc_type_attr = Attribute::parse(context, pool_acc_type_str)
+                    .ok_or_else(|| CompileError::AttributeParse(pool_acc_type_str.to_string()))?;
+
                 let pool_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.max_pool2d", location)
@@ -2303,6 +2323,7 @@ fn emit_tensor_ops<'c>(
                                 (Identifier::new(context, "kernel"), kernel_attr),
                                 (Identifier::new(context, "pad"), pad_attr),
                                 (Identifier::new(context, "stride"), stride_attr),
+                                (Identifier::new(context, "acc_type"), pool_acc_type_attr),
                             ])
                             .build()
                             .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
