@@ -39,13 +39,25 @@ impl CompilationCache {
         Self { cache_dir }
     }
 
-    /// Compute a cache key from model bytes and input shapes.
+    /// Return the cache directory path.
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// Compute a cache key from model bytes, input shapes, and compiler fingerprint.
     ///
-    /// Uses a 64-bit FNV-style hash seeded via `DefaultHasher`. Collisions
-    /// are benign (they cause a cache miss, not corruption) and vanishingly
-    /// rare in practice.
+    /// The fingerprint includes LLVM version, homura crate version, and host CPU
+    /// features, so cached `.so` files are automatically invalidated when any of
+    /// these change.
+    ///
+    /// Uses a 64-bit hash via `DefaultHasher`. Collisions are benign (cache miss,
+    /// not corruption) and vanishingly rare in practice.
     pub fn cache_key(model_bytes: &[u8], input_shapes: &[&[u64]]) -> String {
         let mut hasher = DefaultHasher::new();
+
+        // Compiler fingerprint: invalidates cache on LLVM/homura/CPU changes.
+        compiler_fingerprint().hash(&mut hasher);
+
         model_bytes.hash(&mut hasher);
         for shape in input_shapes {
             shape.hash(&mut hasher);
@@ -247,6 +259,46 @@ fn dirs_cache_dir() -> Option<PathBuf> {
 pub fn bucket_pad(len: usize) -> usize {
     const BUCKETS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
     *BUCKETS.iter().find(|&&b| b >= len).unwrap_or(&1024)
+}
+
+// ── Compiler fingerprint ──────────────────────────────────────────────────────
+
+/// Returns a string that changes whenever the compilation environment changes,
+/// invalidating cached `.so` files. Includes:
+/// - Homura crate version (codegen changes)
+/// - LLVM version (backend changes)
+/// - Host CPU name + features (AVX2, SSE4.2, etc.)
+fn compiler_fingerprint() -> String {
+    use std::sync::OnceLock;
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            let homura_version = env!("CARGO_PKG_VERSION");
+            let (cpu, features, llvm_version) = unsafe {
+                use llvm_sys::core::LLVMDisposeMessage;
+                use llvm_sys::target_machine::{LLVMGetHostCPUFeatures, LLVMGetHostCPUName};
+                use std::ffi::CStr;
+
+                let cpu_ptr = LLVMGetHostCPUName();
+                let feat_ptr = LLVMGetHostCPUFeatures();
+                let cpu = CStr::from_ptr(cpu_ptr).to_string_lossy().into_owned();
+                let feat = CStr::from_ptr(feat_ptr).to_string_lossy().into_owned();
+                LLVMDisposeMessage(cpu_ptr);
+                LLVMDisposeMessage(feat_ptr);
+
+                // LLVM version from the linked library
+                let ver = llvm_sys::core::LLVMGetVersion;
+                let mut major = 0u32;
+                let mut minor = 0u32;
+                let mut patch = 0u32;
+                ver(&mut major, &mut minor, &mut patch);
+                let llvm_ver = format!("{major}.{minor}.{patch}");
+
+                (cpu, feat, llvm_ver)
+            };
+            format!("homura={homura_version};llvm={llvm_version};cpu={cpu};features={features}")
+        })
+        .clone()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

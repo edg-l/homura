@@ -43,6 +43,8 @@ enum Commands {
         /// Path to the ONNX model file
         model: PathBuf,
     },
+    /// Clear the compilation cache (~/.cache/homura/ or HOMURA_CACHE_DIR)
+    CleanCache,
     /// Run inference on an ONNX model
     Run {
         /// Path to the ONNX model file or directory (for text generation)
@@ -76,6 +78,7 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Info { model } => cmd_info(&model),
+        Commands::CleanCache => cmd_clean_cache(),
         Commands::Run {
             model,
             input,
@@ -96,6 +99,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+// ── clean-cache ──────────────────────────────────────────────────────────────
+
+fn cmd_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let cache = homura::cache::CompilationCache::new();
+    let dir = cache.cache_dir();
+    if !dir.exists() {
+        println!("Cache directory does not exist: {}", dir.display());
+        return Ok(());
+    }
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_file() {
+            bytes += meta.len();
+            std::fs::remove_file(entry.path())?;
+            count += 1;
+        }
+    }
+    println!("Removed {count} cached files ({:.1} MB)", bytes as f64 / 1_048_576.0);
+    Ok(())
 }
 
 // ── info ─────────────────────────────────────────────────────────────────────
