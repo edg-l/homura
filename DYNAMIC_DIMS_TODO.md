@@ -135,6 +135,49 @@ or `expand_shape`/`collapse_shape` with dynamic dims in production.
 - First entries at `rbx+0x00..0x10` are NULL (not valid memref pointers)
 - `rbx+0x10` contains a valid heap pointer (0x555595...) in the offset field
 
+### Crash traced to specific MLIR ops (line ~589 of pre-passes IR)
+
+The crash is in the **QKV attention head reshape + transpose**:
+
+```mlir
+// line 589: reshape QKV: [batch, seq, 2304] → [batch, seq, 12, 64]
+%reshape_84 = tensor.reshape %312(%337)
+    : (tensor<?x?x?xf32>, tensor<4xi64>) -> tensor<?x?x?x?xf32>
+
+// line 590: transpose to [batch, heads, seq, head_dim]
+%338 = tosa.transpose %reshape_84 {perms = array<i32: 0, 2, 1, 3>}
+    : (tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+```
+
+The lowered code's memcpy loop (from the transpose) has wrong stride values.
+The value `192 = 3 × 64 = 3 × head_dim` appears where a full stride should be.
+This suggests `tensor.reshape`'s memref view computes `stride[2] = head_dim = 64`
+correctly but stride[1] comes out wrong.
+
+For reshape `[?, ?, 2304] → [?, ?, 12, 64]`, the correct strides should be
+`[seq*2304, 2304, 64, 1]`. If the reshape lowering produces `[seq*2304, 192, 64, 1]`
+(where 192 = 3*64 instead of 12*64=768), that would explain 192 appearing as a
+base address in the copy loop.
+
+Wait: 192 = 3*64. But the reshape splits dim 2 (size 2304) into [12, 64].
+The correct stride for the "12" dimension should be 64 (since elements for
+different heads are 64 apart). And stride for the "seq" dimension should be
+2304. So the view strides are `[seq*2304, 2304, 64, 1]`. This is what
+`memref.reshape` should produce.
+
+The value 192 doesn't match any expected stride for this reshape. It DOES match
+`3 * head_dim` which is a stride from a DIFFERENT reshape (the one that splits
+QKV: `[?, ?, 768] → [?, ?, 3, 12, 64]` or similar). The buffer reuse hypothesis
+may be correct after all: the shape buffer `alloc_28` was overwritten with values
+from a DIFFERENT reshape by the time THIS reshape's copy loop executes.
+
+### Next step: minimal reproducer
+
+Extract lines 1-600 of the pre-passes MLIR, add `func.return` after the transpose,
+and run through `mlir-cpu-runner` with concrete inputs. If mlir-cpu-runner also
+crashes, it's an MLIR `memref.reshape` lowering bug (or buffer reuse). If not,
+it's our descriptor construction.
+
 ### Ruled out causes
 
 - **memref<0xi64> dangling pointers**: Fixed (use sentinel), crash unchanged.
