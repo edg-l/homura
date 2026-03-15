@@ -40,10 +40,10 @@ Operations aren't executed eagerly. They're recorded into a trace — a flat lis
 
 ```mermaid
 flowchart LR
-    A["Tensor ops\n(Rust API)"] --> B["Trace\n(Vec&lt;Op&gt;)"]
-    B --> C["MLIR\n(TOSA + linalg)"]
+    A["Tensor ops<br>(Rust API)"] --> B["Trace<br>(Vec&lt;Op&gt;)"]
+    B --> C["MLIR<br>(TOSA + linalg)"]
     C --> D["LLVM IR"]
-    D --> E["JIT\nmachine code"]
+    D --> E["JIT<br>machine code"]
 ```
 
 The compiler emits [TOSA](https://mlir.llvm.org/docs/Dialects/TOSA/) dialect ops as the primary IR (add, sub, mul, matmul, conv2d, reshape, etc.), with `linalg.generic` fallback for ops TOSA doesn't cover (float div, integer matmul). TOSA's well-tested lowering passes handle conversion to linalg, then bufferization and LLVM lowering produce the final machine code.
@@ -52,8 +52,8 @@ For ONNX models, the `Model` API parses the protobuf, replays the graph through 
 
 ```mermaid
 flowchart LR
-    A[".onnx file"] --> B["prost\nparser"]
-    B --> C["mapper:\nreplay via\nTensor API"]
+    A[".onnx file"] --> B["prost<br>parser"]
+    B --> C["mapper:<br>replay via<br>Tensor API"]
     C --> D["Trace"]
     D --> E["Compiler"]
     E --> F["JIT"]

@@ -7,21 +7,16 @@ Homura is a Rust ML inference framework that traces tensor operations into a com
 ```mermaid
 flowchart LR
     subgraph User Code
-        A["let a = Tensor::new(...)
-let b = Tensor::new(...)
-let c = &a + &b"]
+        A["let a = Tensor::new(...)<br>let b = Tensor::new(...)<br>let c = &a + &b"]
     end
     subgraph Trace
-        B["Op::Input(a)
-Op::Input(b)
-Op::Add(a, b)"]
+        B["Op::Input(a)<br>Op::Input(b)<br>Op::Add(a, b)"]
     end
     subgraph MLIR
         C["tosa.add %t0, %t1"]
     end
     subgraph JIT
-        D["fadd loop over
-raw memory"]
+        D["fadd loop over<br>raw memory"]
     end
     A --> B --> C --> D
 ```
@@ -99,16 +94,16 @@ flowchart TD
     A["tosa.* ops on tensors"] --> B
 
     subgraph TOSA["TOSA lowering (function-level)"]
-        B["tosa-make-broadcastable\nauto-insert reshapes for broadcast"]
-        B --> B2["tosa-to-linalg-named\nconv, matmul → named linalg ops"]
-        B2 --> B3["tosa-to-linalg\nelement-wise → linalg.generic"]
-        B3 --> B4["tosa-to-arith / tosa-to-tensor\nremaining TOSA → arith/tensor"]
+        B["tosa-make-broadcastable<br>auto-insert reshapes for broadcast"]
+        B --> B2["tosa-to-linalg-named<br>conv, matmul → named linalg ops"]
+        B2 --> B3["tosa-to-linalg<br>element-wise → linalg.generic"]
+        B3 --> B4["tosa-to-arith / tosa-to-tensor<br>remaining TOSA → arith/tensor"]
     end
 
-    B4 --> C["one-shot-bufferize\ntensor → memref, allocate intermediates"]
-    C --> D["convert-linalg-to-loops\nlinalg.generic → scf.for loops"]
-    D --> E["convert-scf-to-cf\nstructured loops → branches"]
-    E --> F["lower-affine\naffine ops from conv2d pad lowering"]
+    B4 --> C["one-shot-bufferize<br>tensor → memref, allocate intermediates"]
+    C --> D["convert-linalg-to-loops<br>linalg.generic → scf.for loops"]
+    D --> E["convert-scf-to-cf<br>structured loops → branches"]
+    E --> F["lower-affine<br>affine ops from conv2d pad lowering"]
 
     subgraph LLVM["LLVM lowering"]
         G["convert-math-to-llvm"]
@@ -198,11 +193,11 @@ Homura can load and run ONNX models directly:
 
 ```mermaid
 flowchart TD
-    A[".onnx file\n(protobuf)"] -->|"prost: decode"| B["ModelProto"]
-    B -->|"parser.rs:\nparse_model()"| C["OnnxModel\n{nodes, weights, inputs}"]
-    C -->|"mapper.rs:\nmap_graph()"| D["begin_trace()\nreplay ops via Tensor API\ntake_trace()"]
+    A[".onnx file<br>(protobuf)"] -->|"prost: decode"| B["ModelProto"]
+    B -->|"parser.rs:<br>parse_model()"| C["OnnxModel<br>{nodes, weights, inputs}"]
+    C -->|"mapper.rs:<br>map_graph()"| D["begin_trace()<br>replay ops via Tensor API<br>take_trace()"]
     D -->|"Compiler::compile()"| E["CompiledGraph"]
-    E --> F["Model\n{compiled, weights,\nnum_dynamic_inputs}"]
+    E --> F["Model<br>{compiled, weights,<br>num_dynamic_inputs}"]
     F -->|"model.run(&[input])"| G["Output Buffer"]
 ```
 
@@ -216,9 +211,9 @@ Homura uses NCHW internally (matching ONNX). TOSA spatial ops require NHWC. The 
 
 ```mermaid
 flowchart LR
-    A["NCHW input"] -->|"transpose\n[0,2,3,1]"| B["NHWC"]
-    B --> C["tosa.conv2d /\ntosa.max_pool2d"]
-    C -->|"transpose\n[0,3,1,2]"| D["NCHW output"]
+    A["NCHW input"] -->|"transpose<br>[0,2,3,1]"| B["NHWC"]
+    B --> C["tosa.conv2d /<br>tosa.max_pool2d"]
+    C -->|"transpose<br>[0,3,1,2]"| D["NCHW output"]
 ```
 
 For Conv kernels: OIHW → OHWI via `tosa.transpose([0,2,3,1])`.
