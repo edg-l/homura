@@ -1253,224 +1253,6 @@ fn promote_rank_with_reshape<'c>(
     Ok((expanded, new_shape))
 }
 
-/// Compute reassociation groups for reshape between shapes of different rank.
-/// `smaller` has fewer dims, `larger` has more dims.
-/// Returns groups of indices into `larger`, one group per dim in `smaller`.
-/// Returns None if the pattern can't be determined.
-fn compute_reassociation(smaller: &[u64], larger: &[u64]) -> Option<Vec<Vec<usize>>> {
-    // Walk left-to-right matching smaller dims to groups of larger dims
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut l_idx = 0;
-
-    for s_idx in 0..smaller.len() {
-        if l_idx >= larger.len() {
-            return None; // ran out of larger dims
-        }
-        let mut group = vec![l_idx];
-
-        let s_dim = smaller[s_idx];
-        let l_dim = larger[l_idx];
-
-        if s_dim != DIM_DYNAMIC && l_dim != DIM_DYNAMIC && s_dim == l_dim {
-            // 1:1 match
-            l_idx += 1;
-        } else if s_dim != DIM_DYNAMIC && l_dim != DIM_DYNAMIC {
-            // Static dims differ — accumulate product from larger side
-            let mut product = l_dim;
-            l_idx += 1;
-            while product < s_dim && l_idx < larger.len() {
-                group.push(l_idx);
-                let next = larger[l_idx];
-                if next == DIM_DYNAMIC {
-                    // Can't verify product with dynamic dim
-                    l_idx += 1;
-                    break;
-                }
-                product *= next;
-                l_idx += 1;
-            }
-            if product != s_dim && !group.iter().any(|&i| larger[i] == DIM_DYNAMIC) {
-                return None; // product mismatch
-            }
-        } else {
-            // Dynamic dim(s) involved — use rank difference heuristic:
-            // This group absorbs enough larger dims so that remaining
-            // smaller dims map 1:1 to remaining larger dims.
-            let s_remaining = smaller.len() - s_idx;
-            let l_remaining = larger.len() - l_idx;
-            let group_size = l_remaining - s_remaining + 1;
-            for k in 1..group_size {
-                group.push(l_idx + k);
-            }
-            l_idx += group_size;
-        }
-
-        groups.push(group);
-    }
-
-    if l_idx != larger.len() {
-        return None; // leftover larger dims
-    }
-    Some(groups)
-}
-
-/// Emit tensor.expand_shape with dynamic output dims extracted from a shape tensor.
-#[allow(clippy::too_many_arguments)]
-fn emit_expand_shape_from_tensor<'c>(
-    context: &'c Context,
-    body_block: &Block<'c>,
-    input_val: melior::ir::Value<'c, 'c>,
-    input_shape: &[u64],
-    output_shape: &[u64],
-    shape_tensor_val: melior::ir::Value<'c, 'c>,
-    dtype: DType,
-    location: Location<'c>,
-) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
-    let groups = compute_reassociation(input_shape, output_shape)
-        .ok_or_else(|| CompileError::AttributeParse(
-            format!("cannot compute reassociation for expand {:?} → {:?}", input_shape, output_shape)
-        ))?;
-
-    // Build reassociation attribute: [[0, 1], [2], ...]
-    let reassoc_parts: Vec<String> = groups.iter()
-        .map(|g| format!("[{}]", g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")))
-        .collect();
-    let reassoc_str = format!("[{}]", reassoc_parts.join(", "));
-    let reassoc_attr = Attribute::parse(context, &reassoc_str)
-        .ok_or_else(|| CompileError::AttributeParse(reassoc_str.clone()))?;
-
-    // Refine output_shape: MLIR requires that if an input dim is static and its
-    // group has a single output dim, that output dim must also be static.
-    // Propagate static input dims to 1:1 output groups.
-    let mut refined_output: Vec<u64> = output_shape.to_vec();
-    for (in_idx, group) in groups.iter().enumerate() {
-        if group.len() == 1 && input_shape[in_idx] != DIM_DYNAMIC {
-            refined_output[group[0]] = input_shape[in_idx];
-        }
-    }
-
-    // Build static_output_shape attribute
-    let dims_str = refined_output.iter()
-        .map(|&d| if d == DIM_DYNAMIC { i64::MIN.to_string() } else { d.to_string() })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let static_shape_attr_str = format!("array<i64: {dims_str}>");
-    let static_shape_attr = Attribute::parse(context, &static_shape_attr_str)
-        .ok_or_else(|| CompileError::AttributeParse(static_shape_attr_str.clone()))?;
-
-    // For each DIM_DYNAMIC in refined output, extract from shape tensor
-    let index_type = melior::ir::Type::parse(context, "index")
-        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
-    let i64_type = DType::I64.to_mlir_type(context);
-    let mut output_shape_vals: Vec<melior::ir::Value> = Vec::new();
-    for (i, &d) in refined_output.iter().enumerate() {
-        if d == DIM_DYNAMIC {
-            let ci: melior::ir::Value = body_block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(index_type, i as i64).into(),
-                    location,
-                ))
-                .result(0).unwrap().into();
-            let dim_i64: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("tensor.extract", location)
-                        .add_operands(&[shape_tensor_val, ci])
-                        .add_results(&[i64_type])
-                        .build()
-                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                )
-                .result(0).unwrap().into();
-            let dim_idx: melior::ir::Value = body_block
-                .append_operation(
-                    OperationBuilder::new("arith.index_cast", location)
-                        .add_operands(&[dim_i64])
-                        .add_results(&[index_type])
-                        .build()
-                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                )
-                .result(0).unwrap().into();
-            output_shape_vals.push(dim_idx);
-        }
-    }
-
-    let out_type = make_ranked_tensor_type(context, &refined_output, dtype);
-    let mut operands = vec![input_val];
-    operands.extend(output_shape_vals);
-
-    let expanded: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.expand_shape", location)
-                .add_operands(&operands)
-                .add_results(&[out_type])
-                .add_attributes(&[
-                    (Identifier::new(context, "reassociation"), reassoc_attr),
-                    (Identifier::new(context, "static_output_shape"), static_shape_attr),
-                ])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0).unwrap().into();
-
-    Ok(expanded)
-}
-
-/// Emit tensor.collapse_shape with computed reassociation.
-fn emit_collapse_shape<'c>(
-    context: &'c Context,
-    body_block: &Block<'c>,
-    input_val: melior::ir::Value<'c, 'c>,
-    input_shape: &[u64],
-    output_shape: &[u64],
-    dtype: DType,
-    location: Location<'c>,
-) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
-    // For collapse, output is smaller, input is larger
-    let groups = compute_reassociation(output_shape, input_shape)
-        .ok_or_else(|| CompileError::AttributeParse(
-            format!("cannot compute reassociation for collapse {:?} → {:?}", input_shape, output_shape)
-        ))?;
-
-    let reassoc_parts: Vec<String> = groups.iter()
-        .map(|g| format!("[{}]", g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")))
-        .collect();
-    let reassoc_str = format!("[{}]", reassoc_parts.join(", "));
-    let reassoc_attr = Attribute::parse(context, &reassoc_str)
-        .ok_or_else(|| CompileError::AttributeParse(reassoc_str.clone()))?;
-
-    // Compute accurate output shape: for each group, if all input dims in the group
-    // are static, the output dim is their product. Otherwise it's DIM_DYNAMIC.
-    // This is needed because the caller's output_shape may have DIM_DYNAMIC where a
-    // static value can be inferred (e.g., collapsing [?, ?, 4] → [?, 4], not [?, ?]).
-    let inferred_output_shape: Vec<u64> = groups.iter()
-        .map(|g| {
-            let product = g.iter().try_fold(1u64, |acc, &i| {
-                let d = input_shape[i];
-                if d == DIM_DYNAMIC { None } else { Some(acc * d) }
-            });
-            product.unwrap_or(DIM_DYNAMIC)
-        })
-        .collect();
-
-    let out_type = make_ranked_tensor_type(context, &inferred_output_shape, dtype);
-
-    let collapsed: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.collapse_shape", location)
-                .add_operands(&[input_val])
-                .add_results(&[out_type])
-                .add_attributes(&[(
-                    Identifier::new(context, "reassociation"),
-                    reassoc_attr,
-                )])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0).unwrap().into();
-
-    Ok(collapsed)
-}
-
 // ── Helper: emit tosa.add or tosa.sub ────────────────────────────────────────
 //
 // Promotes operands to matching rank (via tosa.reshape) before emitting.
@@ -4180,52 +3962,21 @@ fn emit_tensor_ops<'c>(
                 let input_val = *values.get(input).expect("input not yet emitted");
                 let input_shape = trace.get(*input).shape().0.clone();
 
-                // Dynamic reshape via shape tensor: use expand/collapse/cast instead of
-                // tensor.reshape to avoid the one-shot-bufferize shape buffer reuse bug.
+                // Dynamic reshape via shape tensor: emit `tensor.reshape %input(%shape_tensor)`.
                 if let Some(st_id) = shape_tensor {
                     let shape_val = *values.get(st_id).expect("shape_tensor not yet emitted");
-                    let in_rank = input_shape.len();
-                    let out_rank = shape.0.len();
-                    let inner_val = if out_rank > in_rank {
-                        // Expand: fewer dims → more dims
-                        emit_expand_shape_from_tensor(
-                            context, body_block, input_val, &input_shape,
-                            &shape.0, shape_val, *dtype, location,
-                        )?
-                    } else if out_rank < in_rank {
-                        // Collapse: more dims → fewer dims
-                        emit_collapse_shape(
-                            context, body_block, input_val, &input_shape,
-                            &shape.0, *dtype, location,
-                        )?
-                    } else {
-                        // Same rank: tensor.cast to declared output type
-                        let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
-                        body_block
-                            .append_operation(
-                                OperationBuilder::new("tensor.cast", location)
-                                    .add_operands(&[input_val])
-                                    .add_results(&[out_type])
-                                    .build()
-                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                            )
-                            .result(0).unwrap().into()
-                    };
-                    // Add a tensor.cast to coerce to the declared output type.
-                    // This handles cases where expand/collapse infers more-precise static
-                    // dims than the declared shape (e.g., collapse produces tensor<?x4xf32>
-                    // but caller declared [?, ?]). tensor.cast is a no-op if types match;
-                    // canonicalize will fold it away.
-                    let declared_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                    let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
                     let result_val: melior::ir::Value = body_block
                         .append_operation(
-                            OperationBuilder::new("tensor.cast", location)
-                                .add_operands(&[inner_val])
-                                .add_results(&[declared_type])
+                            OperationBuilder::new("tensor.reshape", location)
+                                .add_operands(&[input_val, shape_val])
+                                .add_results(&[out_type])
                                 .build()
                                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
                         )
-                        .result(0).unwrap().into();
+                        .result(0)
+                        .unwrap()
+                        .into();
                     values.insert(node_id, result_val);
                     continue; // skip the static path below
                 }
