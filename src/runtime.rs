@@ -176,7 +176,16 @@ pub(crate) fn build_memref_descriptor(
     let total = 24 + 16 * n;
     let mut buf = vec![0u8; total];
 
-    let ptr_val = data_ptr as u64;
+    // For zero-element memrefs (e.g., memref<0xi64> for scalar shape),
+    // the data pointer from an empty Vec is dangling. Use a valid aligned
+    // address — the pointer is never dereferenced for 0-element tensors,
+    // but MLIR's generated code may still read it into a descriptor.
+    static EMPTY_BUF: [u64; 1] = [0];
+    let ptr_val = if data_ptr.is_null() || shape.iter().any(|&d| d == 0) {
+        EMPTY_BUF.as_ptr() as u64
+    } else {
+        data_ptr as u64
+    };
     buf[0..8].copy_from_slice(&ptr_val.to_ne_bytes()); // allocated_ptr
     buf[8..16].copy_from_slice(&ptr_val.to_ne_bytes()); // aligned_ptr
     buf[16..24].copy_from_slice(&0i64.to_ne_bytes()); // offset = 0
