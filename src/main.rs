@@ -1,7 +1,9 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use homura::generate::Generator;
 use homura::onnx::parser;
 use homura::{Buffer, DType, Model};
 
@@ -43,7 +45,7 @@ enum Commands {
     },
     /// Run inference on an ONNX model
     Run {
-        /// Path to the ONNX model file
+        /// Path to the ONNX model file or directory (for text generation)
         model: PathBuf,
         /// Raw binary f32 input file, or - for stdin. Uses all-zeros if omitted.
         #[arg(long)]
@@ -54,6 +56,12 @@ enum Commands {
         /// Write raw f32 output to this file. Prints as text if omitted.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Text prompt for generation (enables text generation mode)
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Maximum number of tokens to generate (default: 100)
+        #[arg(long, default_value = "100")]
+        max_tokens: usize,
     },
 }
 
@@ -73,12 +81,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             input,
             shape,
             output,
-        } => cmd_run(
-            &model,
-            input.as_deref(),
-            shape.as_deref(),
-            output.as_deref(),
-        ),
+            prompt,
+            max_tokens,
+        } => {
+            if let Some(prompt_text) = prompt {
+                cmd_generate(&model, &prompt_text, max_tokens)
+            } else {
+                cmd_run(
+                    &model,
+                    input.as_deref(),
+                    shape.as_deref(),
+                    output.as_deref(),
+                )
+            }
+        }
     }
 }
 
@@ -133,6 +149,43 @@ fn cmd_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("Warning: model contains unsupported ops (marked above).");
     }
+
+    Ok(())
+}
+
+// ── generate ─────────────────────────────────────────────────────────────────
+
+fn cmd_generate(
+    model_path: &std::path::Path,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve model directory: if given a file, use its parent.
+    let model_dir = if model_path.is_dir() {
+        model_path.to_path_buf()
+    } else {
+        model_path
+            .parent()
+            .ok_or("cannot determine model directory from path")?
+            .to_path_buf()
+    };
+
+    let model_dir_str = model_dir
+        .to_str()
+        .ok_or("model path is not valid UTF-8")?;
+
+    eprintln!("Loading generator from {}...", model_dir.display());
+    let t_load = Instant::now();
+    let generator = Generator::load(model_dir_str)?;
+    eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+
+    eprintln!("Generating up to {max_tokens} tokens...");
+    let t_gen = Instant::now();
+    let generated = generator.generate(prompt, max_tokens);
+    eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+
+    // Print full text (prompt + generated) to stdout.
+    println!("{}{}", prompt, generated);
 
     Ok(())
 }
@@ -269,5 +322,66 @@ fn read_input_bytes(src: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         Ok(buf)
     } else {
         Ok(std::fs::read(src)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_run_prompt_parses() {
+        let cli = Cli::try_parse_from([
+            "homura",
+            "run",
+            "tests/fixtures",
+            "--prompt",
+            "The meaning of life is",
+            "--max-tokens",
+            "50",
+        ])
+        .expect("failed to parse CLI");
+
+        match cli.command {
+            Commands::Run {
+                model,
+                prompt,
+                max_tokens,
+                ..
+            } => {
+                assert_eq!(model, PathBuf::from("tests/fixtures"));
+                assert_eq!(prompt.as_deref(), Some("The meaning of life is"));
+                assert_eq!(max_tokens, 50);
+            }
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_run_default_max_tokens() {
+        let cli = Cli::try_parse_from(["homura", "run", "model.onnx", "--prompt", "hello"])
+            .expect("failed to parse CLI");
+
+        match cli.command {
+            Commands::Run { max_tokens, .. } => {
+                assert_eq!(max_tokens, 100);
+            }
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_run_no_prompt_keeps_existing_behavior() {
+        let cli = Cli::try_parse_from(["homura", "run", "model.onnx"])
+            .expect("failed to parse CLI");
+
+        match cli.command {
+            Commands::Run { prompt, input, .. } => {
+                assert!(prompt.is_none());
+                assert!(input.is_none());
+            }
+            _ => panic!("expected Run subcommand"),
+        }
     }
 }
