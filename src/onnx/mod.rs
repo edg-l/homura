@@ -222,6 +222,74 @@ impl Model {
             Ok(state.compiled.run(&all_args))
         }
     }
+
+    /// Returns the compiled output descriptors, or `None` if not yet compiled.
+    pub fn output_descs(&self) -> Option<Vec<OutputDesc>> {
+        let guard = self.state.lock().unwrap();
+        guard.as_ref().map(|s| s.compiled.output_descs().to_vec())
+    }
+
+    /// Run inference with caller-provided output shapes.
+    ///
+    /// Use this when the model has dynamic output dimensions and the caller
+    /// knows the exact output shapes (e.g., KV cache decode step).
+    pub fn run_with_output_shapes(
+        &self,
+        inputs: &[&Buffer],
+        output_shapes: &[Shape],
+    ) -> Result<Vec<Buffer>, OnnxError> {
+        if inputs.len() != self.num_dynamic_inputs {
+            return Err(OnnxError::WrongInputCount {
+                expected: self.num_dynamic_inputs,
+                got: inputs.len(),
+            });
+        }
+
+        let mut guard = self.state.lock().unwrap();
+
+        if guard.is_none() {
+            let parsed = self
+                .parsed
+                .as_ref()
+                .expect("parsed model must be present when state is None");
+            let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
+            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+        }
+
+        // Recompile if non-dynamic dims changed.
+        if self.parsed.is_some() {
+            let shapes_changed = {
+                let state = guard.as_ref().unwrap();
+                inputs.iter().enumerate().any(|(i, buf)| {
+                    let compiled_shape = &state.input_shapes[i];
+                    buf.shape()
+                        .0
+                        .iter()
+                        .zip(compiled_shape.0.iter())
+                        .any(|(actual, compiled)| {
+                            *compiled != DIM_DYNAMIC && actual != compiled
+                        })
+                })
+            };
+            if shapes_changed {
+                let parsed = self
+                    .parsed
+                    .as_ref()
+                    .expect("parsed model must be present when symbolic dims exist");
+                let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
+                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+            }
+        }
+
+        let state = guard.as_ref().unwrap();
+        let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + state.weights.len());
+        all_args.extend_from_slice(inputs);
+        for w in &state.weights {
+            all_args.push(w);
+        }
+
+        Ok(state.compiled.run_dynamic(&all_args, output_shapes))
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -422,23 +490,39 @@ fn compute_concrete_output_shapes(
                     // For concat along past_len: output = sum of inputs along that axis.
                     // But since we don't know the operation, we use the heuristic:
                     // sum all dynamic dim values from inputs that have a dynamic dim at the same position.
+                    // Strategy 1: look for dynamic input dims at the same position
+                    // and sum their runtime values (handles concat case).
                     let mut total: u64 = 0;
-                    let mut found = false;
+                    let mut found_dynamic = false;
                     for (inp_idx, inp_shape) in compiled_input_shapes.iter().enumerate() {
                         if out_dim_idx < inp_shape.0.len()
                             && inp_shape.0[out_dim_idx] == DIM_DYNAMIC
                         {
-                            // This input has a dynamic dim at the same position.
-                            // Use the actual runtime size from the input buffer.
                             if let Some(buf) = inputs.get(inp_idx) {
                                 if out_dim_idx < buf.shape().0.len() {
                                     total += buf.shape().0[out_dim_idx];
-                                    found = true;
+                                    found_dynamic = true;
                                 }
                             }
                         }
                     }
-                    if found { total } else { DIM_DYNAMIC }
+                    if found_dynamic {
+                        return total;
+                    }
+
+                    // Strategy 2: look for any input whose runtime shape at
+                    // this position can serve as the value. This handles cases
+                    // like logits [?, ?, vocab] where the ? dims come from
+                    // static input_ids [1, 1] — the output should also be [1, 1, vocab].
+                    for (inp_idx, _) in compiled_input_shapes.iter().enumerate() {
+                        if let Some(buf) = inputs.get(inp_idx) {
+                            if out_dim_idx < buf.shape().0.len() {
+                                return buf.shape().0[out_dim_idx];
+                            }
+                        }
+                    }
+
+                    DIM_DYNAMIC
                 })
                 .collect();
             Shape(dims)

@@ -141,9 +141,8 @@ impl Compiler {
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 fold-memref-alias-ops,\
-                convert-linalg-to-affine-loops,\
+                convert-linalg-to-loops,\
                 fold-memref-alias-ops,\
-                func.func(affine-loop-invariant-code-motion,affine-scalrep),\
                 lower-affine,\
                 convert-scf-to-cf,\
                 canonicalize,\
@@ -151,6 +150,7 @@ impl Compiler {
                 sccp,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
+                lower-affine,\
                 finalize-memref-to-llvm,\
                 convert-arith-to-llvm,\
                 convert-index-to-llvm,\
@@ -163,6 +163,12 @@ impl Compiler {
 
         let mut module = module;
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
+
+        // Dump pre-lowering IR to /tmp for debugging dynamic shapes
+        if std::env::var("HOMURA_DUMP_IR").is_ok() {
+            let _ = std::fs::write("/tmp/homura_post_passes.mlir", module.as_operation().to_string());
+            eprintln!("[homura] post-pass IR dumped to /tmp/homura_post_passes.mlir");
+        }
 
         // ---- AOT: emit object file, link to .so, dlopen ----------------------
         let tmp_dir = tempfile_dir().ok_or_else(|| {
@@ -634,7 +640,16 @@ fn build_module<'c>(
         module.body().append_operation(function);
     }
 
+    // Dump pre-pass MLIR for debugging when HOMURA_DUMP_IR is set
+    if std::env::var("HOMURA_DUMP_IR").is_ok() {
+        let _ = std::fs::write("/tmp/homura_pre_passes.mlir", module.as_operation().to_string());
+        eprintln!("[homura] pre-pass IR dumped to /tmp/homura_pre_passes.mlir");
+    }
+
     if !module.as_operation().verify() {
+        let ir = module.as_operation().to_string();
+        let _ = std::fs::write("/tmp/homura_failed.mlir", &ir);
+        eprintln!("[homura] MLIR verification failed — IR dumped to /tmp/homura_failed.mlir");
         return Err(CompileError::Verification);
     }
 
@@ -1035,7 +1050,9 @@ fn emit_tosa_reshape<'c>(
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     // If any dim is DIM_DYNAMIC, tosa.const_shape can't represent it.
-    // Fall back to tensor.cast (same rank) or tensor.expand/collapse_shape.
+    // Fall back to tensor.cast (same rank only — rank-changing reshapes
+    // with dynamic dims must use tensor.expand_shape / tensor.collapse_shape
+    // at their specific call sites).
     if target_shape.iter().any(|&d| d == DIM_DYNAMIC) {
         let out_type = make_ranked_tensor_type(context, target_shape, dtype);
         let result: melior::ir::Value = body_block
@@ -1178,10 +1195,46 @@ fn promote_rank_with_reshape<'c>(
         .ok_or_else(|| CompileError::AttributeParse(static_shape_attr_str.clone()))?;
     let _ = n;
 
+    // For each dynamic dim in the output shape, provide a runtime SSA value
+    // via tensor.dim on the input tensor.
+    let index_type = melior::ir::Type::parse(context, "index")
+        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+    let mut output_shape_vals: Vec<melior::ir::Value> = Vec::new();
+    for (i, &d) in new_shape.iter().enumerate() {
+        if d == DIM_DYNAMIC {
+            // This dim comes from val_shape at position (i - prefix).
+            let orig_idx = i - prefix;
+            let dim_idx: melior::ir::Value = body_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(index_type, orig_idx as i64).into(),
+                    location,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let dim_val: melior::ir::Value = body_block
+                .append_operation(
+                    OperationBuilder::new("tensor.dim", location)
+                        .add_operands(&[val, dim_idx])
+                        .add_results(&[index_type])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            output_shape_vals.push(dim_val);
+        }
+    }
+
+    let mut operands = vec![val];
+    operands.extend(output_shape_vals);
+
     let expanded = body_block
         .append_operation(
             OperationBuilder::new("tensor.expand_shape", location)
-                .add_operands(&[val])
+                .add_operands(&operands)
                 .add_results(&[new_tensor_type])
                 .add_attributes(&[
                     (Identifier::new(context, "reassociation"), reassoc_attr),
@@ -1510,11 +1563,24 @@ fn emit_tosa_matmul_2d_values<'c>(
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
     let m = lhs_shape[0];
-    let k = lhs_shape[1];
+    let _k = lhs_shape[1];
     let n = rhs_shape[1];
 
-    let lhs_3d = emit_tosa_reshape(context, body_block, lhs_val, &[1, m, k], dtype, location)?;
-    let rhs_3d = emit_tosa_reshape(context, body_block, rhs_val, &[1, k, n], dtype, location)?;
+    let has_dynamic = lhs_shape.iter().chain(rhs_shape.iter()).any(|&d| d == DIM_DYNAMIC);
+
+    // 2D→3D: prepend batch=1.
+    // For dynamic shapes, use promote_rank_with_reshape (tensor.expand_shape).
+    // For static shapes, use emit_tosa_reshape (tosa.reshape with tosa.const_shape).
+    let lhs_3d = if has_dynamic {
+        promote_rank_with_reshape(context, body_block, lhs_val, lhs_shape, 3, dtype, location)?.0
+    } else {
+        emit_tosa_reshape(context, body_block, lhs_val, &[1, lhs_shape[0], lhs_shape[1]], dtype, location)?
+    };
+    let rhs_3d = if has_dynamic {
+        promote_rank_with_reshape(context, body_block, rhs_val, rhs_shape, 3, dtype, location)?.0
+    } else {
+        emit_tosa_reshape(context, body_block, rhs_val, &[1, rhs_shape[0], rhs_shape[1]], dtype, location)?
+    };
 
     let zp_dense = match dtype {
         DType::F32 => "dense<0.0> : tensor<1xf32>",
@@ -1538,7 +1604,31 @@ fn emit_tosa_matmul_2d_values<'c>(
         .unwrap()
         .into();
 
-    let result_val = emit_tosa_reshape(context, body_block, out_3d, output_shape, dtype, location)?;
+    // 3D→2D: collapse the batch dim via tensor.collapse_shape (handles dynamic dims).
+    let result_val = if has_dynamic || output_shape.iter().any(|&d| d == DIM_DYNAMIC) {
+        let out_type = make_ranked_tensor_type(context, output_shape, dtype);
+        // reassociation: [[0, 1], [2]] — merge batch + M into M, keep N.
+        let reassoc_str = "[[0, 1], [2]]";
+        let reassoc_attr = Attribute::parse(context, reassoc_str)
+            .ok_or_else(|| CompileError::AttributeParse(reassoc_str.into()))?;
+        body_block
+            .append_operation(
+                OperationBuilder::new("tensor.collapse_shape", location)
+                    .add_operands(&[out_3d])
+                    .add_results(&[out_type])
+                    .add_attributes(&[(
+                        Identifier::new(context, "reassociation"),
+                        reassoc_attr,
+                    )])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into()
+    } else {
+        emit_tosa_reshape(context, body_block, out_3d, output_shape, dtype, location)?
+    };
     Ok(result_val)
 }
 
@@ -3594,8 +3684,11 @@ fn emit_tensor_ops<'c>(
             } => {
                 let lhs_shape = trace.get(*lhs).shape();
                 let rhs_shape = trace.get(*rhs).shape();
-                let result_val = if lhs_shape.rank() == 2 && rhs_shape.rank() == 2 {
-                    // 2D path: use tosa.matmul for float, linalg.matmul for integer.
+                let has_dynamic = lhs_shape.has_dynamic_dims()
+                    || rhs_shape.has_dynamic_dims()
+                    || shape.has_dynamic_dims();
+                let result_val = if lhs_shape.rank() == 2 && rhs_shape.rank() == 2 && !has_dynamic {
+                    // 2D static path: use tosa.matmul for float, linalg.matmul for integer.
                     match dtype {
                         DType::F32 | DType::F64 => emit_tosa_matmul(
                             context,
@@ -5045,25 +5138,45 @@ fn emit_tensor_ops<'c>(
                         let static_strides_attr = Attribute::parse(context, &format!("array<i64: {static_strides_str}>"))
                             .ok_or_else(|| CompileError::AttributeParse("static_strides".into()))?;
 
-                        // Dynamic operands: concat-axis offset first, then any dynamic size dims.
-                        let mut dynamic_ops: Vec<melior::ir::Value<'c, 'c>> = vec![offset];
+                        // Separate dynamic offsets, sizes, and strides.
+                        // Dynamic offsets: concat axis has a runtime offset.
+                        let dynamic_offsets: Vec<melior::ir::Value<'c, 'c>> = vec![offset];
+                        // Dynamic sizes: any DIM_DYNAMIC dims in the input shape.
+                        let mut dynamic_sizes: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
                         for (i, &d) in inp_shape.iter().enumerate() {
                             if d == DIM_DYNAMIC {
                                 let dv = emit_tensor_dim(context, body_block, inp_val, i, location)?;
-                                dynamic_ops.push(dv);
+                                dynamic_sizes.push(dv);
                             }
                         }
+                        // Dynamic strides: none (all static 1).
+                        let dynamic_strides: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+
+                        let n_dyn_offsets = dynamic_offsets.len() as i32;
+                        let n_dyn_sizes = dynamic_sizes.len() as i32;
+                        let n_dyn_strides = dynamic_strides.len() as i32;
+
+                        let seg_sizes_str = format!(
+                            "array<i32: 1, 1, {n_dyn_offsets}, {n_dyn_sizes}, {n_dyn_strides}>"
+                        );
+                        let seg_sizes_attr = Attribute::parse(context, &seg_sizes_str)
+                            .ok_or_else(|| CompileError::AttributeParse(seg_sizes_str.clone()))?;
 
                         let inp_type = make_ranked_tensor_type(context, &inp_shape, *dtype);
-                        let dest_type = tensor_type; // mutable current tensor type
+                        let dest_type = tensor_type;
+
+                        let mut all_operands: Vec<melior::ir::Value<'c, 'c>> = vec![inp_val, current];
+                        all_operands.extend(dynamic_offsets);
+                        all_operands.extend(dynamic_sizes);
+                        all_operands.extend(dynamic_strides);
 
                         current = body_block
                             .append_operation(
                                 OperationBuilder::new("tensor.insert_slice", location)
-                                    .add_operands(&[inp_val, current])
-                                    .add_operands(&dynamic_ops)
+                                    .add_operands(&all_operands)
                                     .add_results(&[dest_type])
                                     .add_attributes(&[
+                                        (Identifier::new(context, "operandSegmentSizes"), seg_sizes_attr),
                                         (Identifier::new(context, "static_offsets"), static_offsets_attr),
                                         (Identifier::new(context, "static_sizes"), static_sizes_attr),
                                         (Identifier::new(context, "static_strides"), static_strides_attr),
@@ -5183,8 +5296,9 @@ fn emit_tensor_ops<'c>(
                 let i1_type = melior::ir::Type::parse(context, "i1")
                     .ok_or_else(|| CompileError::AttributeParse("i1 type".into()))?;
                 let i64_type = DType::I64.to_mlir_type(context);
+                let i1_shape: Vec<u64> = shape.0.iter().map(|&d| dim_to_mlir(d)).collect();
                 let i1_tensor_type: melior::ir::Type<'c> =
-                    RankedTensorType::new(&shape.0, i1_type, None).into();
+                    RankedTensorType::new(&i1_shape, i1_type, None).into();
 
                 // Emit zero constant for comparison.
                 let zero_val: melior::ir::Value = body_block
@@ -5589,8 +5703,9 @@ fn emit_tensor_ops<'c>(
 
             // ── Range ─────────────────────────────────────────────────────────
             //
-            // Inputs are 1-element rank-1 tensors (tensor<1xDtype>).
-            // 1. Extract scalars: tensor.extract %t[%c0]
+            // Inputs are scalar tensors — either 0-D (tensor<Dtype>) or
+            // 1-element rank-1 (tensor<1xDtype>).
+            // 1. Extract scalars: tensor.extract %t[] (0-D) or %t[%c0] (1-D)
             // 2. Compute length: ceil((limit - start) / delta), clamped >= 0
             // 3. tensor.empty(%len_idx) : tensor<?xDtype>
             // 4. linalg.generic body: out[i] = start + i * delta
@@ -5609,50 +5724,44 @@ fn emit_tensor_ops<'c>(
                 let index_type = melior::ir::Type::parse(context, "index")
                     .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
 
-                // Extract scalar from 1-element tensor.
-                let c0: melior::ir::Value = body_block
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(index_type, 0).into(),
-                        location,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
+                // Extract scalar from 0-D (tensor<Dtype>) or 1-D (tensor<1xDtype>).
+                // 0-D: tensor.extract %t[] (no indices)
+                // 1-D: tensor.extract %t[%c0]
+                macro_rules! extract_scalar {
+                    ($tv:expr, $nid:expr) => {{
+                        let rank = trace.ops()[$nid.0 as usize].shape().rank();
+                        let operands: Vec<melior::ir::Value> = if rank == 0 {
+                            vec![$tv]
+                        } else {
+                            let c0: melior::ir::Value = body_block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(index_type, 0).into(),
+                                    location,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            vec![$tv, c0]
+                        };
+                        let r: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.extract", location)
+                                    .add_operands(&operands)
+                                    .add_results(&[elem_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        r
+                    }};
+                }
 
-                let s: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.extract", location)
-                            .add_operands(&[start_val, c0])
-                            .add_results(&[elem_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let l: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.extract", location)
-                            .add_operands(&[limit_val, c0])
-                            .add_results(&[elem_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let d: melior::ir::Value = body_block
-                    .append_operation(
-                        OperationBuilder::new("tensor.extract", location)
-                            .add_operands(&[delta_val, c0])
-                            .add_results(&[elem_type])
-                            .build()
-                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let s = extract_scalar!(start_val, start);
+                let l = extract_scalar!(limit_val, limit);
+                let d = extract_scalar!(delta_val, delta);
 
                 // Compute length as an index value.
                 // For integers: diff = l - s; len = max(0, ceildiv(diff, d))
@@ -6088,27 +6197,27 @@ fn emit_tensor_ops<'c>(
                     static_offsets[ax] = i64::MIN;
                 }
 
-                // Dynamic operand list for tensor.extract_slice:
-                //   [dynamic_offsets..., dynamic_sizes...]
-                // dynamic offsets: one per sliced axis (in axis order)
-                // dynamic sizes: one per sliced axis + one per non-sliced dynamic dim
-                let mut dynamic_ops: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                // Build separate dynamic offset, size, stride operand lists.
+                let mut dynamic_offsets: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                let mut dynamic_sizes: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+                let dynamic_strides: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
 
                 // offsets: sliced axes contribute dynamic offsets
                 for &ax in &normalized_axes {
                     let pos = normalized_axes.iter().position(|&a| a == ax).unwrap();
-                    dynamic_ops.push(sliced_offset[pos]);
+                    dynamic_offsets.push(sliced_offset[pos]);
                 }
 
-                // sizes: sliced axes first (dynamic size from end-start),
+                // sizes: sliced axes (dynamic size from end-start),
                 // then non-sliced DIM_DYNAMIC axes (from tensor.dim).
+                // Iterate dims in order; only push for dynamic entries.
                 for (d_idx, &in_dim) in input_shape.iter().enumerate() {
                     if normalized_axes.contains(&d_idx) {
                         let pos = normalized_axes.iter().position(|&a| a == d_idx).unwrap();
-                        dynamic_ops.push(sliced_size[pos]);
+                        dynamic_sizes.push(sliced_size[pos]);
                     } else if in_dim == DIM_DYNAMIC {
                         let dim_v = emit_tensor_dim(context, body_block, input_val, d_idx, location)?;
-                        dynamic_ops.push(dim_v);
+                        dynamic_sizes.push(dim_v);
                     }
                 }
 
@@ -6128,15 +6237,29 @@ fn emit_tensor_ops<'c>(
                     Attribute::parse(context, &format!("array<i64: {sst_str}>"))
                         .ok_or_else(|| CompileError::AttributeParse("static_strides".into()))?;
 
+                let seg_sizes_str = format!(
+                    "array<i32: 1, {}, {}, {}>",
+                    dynamic_offsets.len(),
+                    dynamic_sizes.len(),
+                    dynamic_strides.len(),
+                );
+                let seg_sizes_attr = Attribute::parse(context, &seg_sizes_str)
+                    .ok_or_else(|| CompileError::AttributeParse(seg_sizes_str.clone()))?;
+
                 let result_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+
+                let mut all_operands: Vec<melior::ir::Value<'c, 'c>> = vec![input_val];
+                all_operands.extend(dynamic_offsets);
+                all_operands.extend(dynamic_sizes);
+                all_operands.extend(dynamic_strides);
 
                 let result_val: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tensor.extract_slice", location)
-                            .add_operands(&[input_val])
-                            .add_operands(&dynamic_ops)
+                            .add_operands(&all_operands)
                             .add_results(&[result_type])
                             .add_attributes(&[
+                                (Identifier::new(context, "operandSegmentSizes"), seg_sizes_attr),
                                 (Identifier::new(context, "static_offsets"), static_offsets_attr),
                                 (Identifier::new(context, "static_sizes"), static_sizes_attr),
                                 (Identifier::new(context, "static_strides"), static_strides_attr),

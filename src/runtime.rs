@@ -196,6 +196,7 @@ pub(crate) fn build_memref_descriptor(
 // ── CompiledGraph ─────────────────────────────────────────────────────────────
 
 /// Metadata for a single output tensor of a compiled graph.
+#[derive(Clone)]
 pub struct OutputDesc {
     pub shape: Shape,
     pub dtype: DType,

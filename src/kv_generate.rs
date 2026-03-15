@@ -423,7 +423,24 @@ impl KvGenerator {
         }
         args.push(&attention_mask);
 
-        let outputs = self.decode_model.run(&args)?;
+        // Build concrete output shapes for the dynamic model.
+        // Output 0: logits [1, 1, vocab_size]
+        // Outputs 1..kv_count: KV [1, heads, past_len+1, head_dim]
+        let kv_count = self.config.num_kv_tensors;
+        let out_seq_len = (max_len + 1) as u64;
+        let mut output_shapes: Vec<crate::shape::Shape> = Vec::with_capacity(1 + kv_count);
+        // Get vocab_size from the compiled model's output desc (last dim of logits).
+        let vocab_size_dim = self
+            .decode_model
+            .output_descs()
+            .and_then(|descs| descs.first().and_then(|d| d.shape.0.last().copied()))
+            .unwrap_or(50257);
+        output_shapes.push(crate::shape::Shape(vec![1, 1, vocab_size_dim]));
+        for _ in 0..kv_count {
+            output_shapes.push(crate::shape::Shape(vec![1, heads as u64, out_seq_len, head_dim as u64]));
+        }
+
+        let outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
 
         // logits: [1, 1, vocab_size] — only one position, read at index 0
         let logits = &outputs[0];
