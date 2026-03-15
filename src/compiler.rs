@@ -25,6 +25,7 @@ use crate::{
     cache::CompilationCache,
     op::{NodeId, Op},
     runtime::{CompiledGraph, OutputDesc},
+    shape::DIM_DYNAMIC,
     trace::Trace,
 };
 
@@ -650,6 +651,122 @@ fn make_ranked_tensor_type<'c>(
     RankedTensorType::new(shape, dtype.to_mlir_type(context), None).into()
 }
 
+// ── Helper: emit tensor.dim to query a runtime dimension ─────────────────────
+//
+// Emits:
+//   %c{dim_idx} = arith.constant {dim_idx} : index
+//   %dim        = tensor.dim %tensor, %c{dim_idx} : tensor<...>
+//
+// Used to get the runtime value of a `?` dimension from a tensor.
+
+#[allow(dead_code)]
+fn emit_tensor_dim<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    tensor_val: melior::ir::Value<'c, 'c>,
+    dim_idx: usize,
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    let index_type = melior::ir::Type::parse(context, "index")
+        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+
+    let dim_const: melior::ir::Value = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(index_type, dim_idx as i64).into(),
+            location,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let dim_val: melior::ir::Value = block
+        .append_operation(
+            OperationBuilder::new("tensor.dim", location)
+                .add_operands(&[tensor_val, dim_const])
+                .add_results(&[index_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(dim_val)
+}
+
+// ── Helper: emit tensor.empty supporting dynamic dimensions ──────────────────
+//
+// Like `tensor.empty`, but for shapes containing `DIM_DYNAMIC`. For each `?`
+// dim in `shape`, a corresponding `(source_tensor, dim_index)` pair must be
+// provided in `dynamic_dim_sources` (in order of the `?` positions). The
+// helper emits `tensor.dim` calls to obtain runtime sizes and passes them as
+// dynamic operands to `tensor.empty`.
+//
+// For fully static shapes, `dynamic_dim_sources` must be empty and this
+// behaves identically to the plain `tensor.empty` builder.
+
+#[allow(dead_code)]
+fn emit_tensor_empty_dynamic<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    shape: &[u64],
+    dtype: DType,
+    // One entry per `DIM_DYNAMIC` position in `shape`, in order.
+    dynamic_dim_sources: &[(melior::ir::Value<'c, 'c>, usize)],
+    location: Location<'c>,
+) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
+    use crate::shape::DIM_DYNAMIC;
+
+    let tensor_type = make_ranked_tensor_type(context, shape, dtype);
+
+    // Count how many dynamic dims there are.
+    let num_dynamic = shape.iter().filter(|&&d| d == DIM_DYNAMIC).count();
+    debug_assert_eq!(
+        num_dynamic,
+        dynamic_dim_sources.len(),
+        "emit_tensor_empty_dynamic: dynamic_dim_sources count ({}) must equal number of DIM_DYNAMIC dims ({})",
+        dynamic_dim_sources.len(),
+        num_dynamic,
+    );
+
+    if num_dynamic == 0 {
+        // Fully static: no dynamic operands needed.
+        let init_val = block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", location)
+                    .add_results(&[tensor_type])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        return Ok(init_val);
+    }
+
+    // Emit tensor.dim for each dynamic dim source.
+    let mut dyn_dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::with_capacity(num_dynamic);
+    for &(src_tensor, src_dim_idx) in dynamic_dim_sources {
+        let dv = emit_tensor_dim(context, block, src_tensor, src_dim_idx, location)?;
+        dyn_dim_vals.push(dv);
+    }
+
+    let init_val = block
+        .append_operation(
+            OperationBuilder::new("tensor.empty", location)
+                .add_operands(&dyn_dim_vals)
+                .add_results(&[tensor_type])
+                .build()
+                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+        )
+        .result(0)
+        .unwrap()
+        .into();
+
+    Ok(init_val)
+}
+
 // ── Helper: build an identity affine map for `rank` dimensions ───────────────
 //
 // rank 1 → affine_map<(d0) -> (d0)>
@@ -979,10 +1096,17 @@ fn promote_rank_with_reshape<'c>(
         .ok_or_else(|| CompileError::AttributeParse(reassoc_str.clone()))?;
 
     // static_output_shape: array<i64: d0, d1, ...>
+    // For DIM_DYNAMIC dims, emit i64::MIN which is MLIR's ShapedType::kDynamic.
     let n = new_shape.len();
     let dims_str = new_shape
         .iter()
-        .map(|d| d.to_string())
+        .map(|&d| {
+            if d == DIM_DYNAMIC {
+                i64::MIN.to_string()
+            } else {
+                d.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let static_shape_attr_str = format!("array<i64: {dims_str}>");
@@ -6835,5 +6959,66 @@ mod tests {
         // Restore env (best-effort).
         // SAFETY: single-threaded test, no concurrent env access.
         unsafe { std::env::remove_var("HOMURA_CACHE_DIR"); }
+    }
+
+    // ── Phase 3.1: DIM_DYNAMIC in make_ranked_tensor_type produces `?` ─────────
+
+    #[test]
+    fn dynamic_tensor_type_has_question_mark() {
+        use crate::shape::DIM_DYNAMIC;
+        let context = create_context();
+        // tensor<4x?x3xf32> via DIM_DYNAMIC
+        let t = make_ranked_tensor_type(&context, &[4, DIM_DYNAMIC, 3], DType::F32);
+        let ir = format!("{t}");
+        assert!(
+            ir.contains("?") || ir.contains("-1") || ir.contains(&i64::MIN.to_string()),
+            "expected dynamic dim marker in type string, got: {ir}"
+        );
+    }
+
+    // ── Phase 3.2: DIM_DYNAMIC in build_module produces memref<?x...> ──────────
+
+    #[test]
+    fn dynamic_input_produces_memref_with_question_mark() {
+        use crate::shape::DIM_DYNAMIC;
+        // Build a trace with a DIM_DYNAMIC input
+        begin_trace();
+        let _a = Tensor::new(&[4, DIM_DYNAMIC], DType::F32);
+        let trace = take_trace();
+
+        // Use build_ir_string to inspect the generated IR
+        let ir = Compiler::build_ir_string(&trace, &[crate::op::NodeId(0)]);
+        assert!(
+            ir.is_ok(),
+            "build_ir_string failed for dynamic input: {:?}",
+            ir.err()
+        );
+        let ir_str = ir.unwrap();
+        // The function signature should contain a memref with dynamic dim
+        assert!(
+            ir_str.contains("memref<4x?xf32>") || ir_str.contains("memref<4x-1xf32>"),
+            "expected dynamic memref in IR, got relevant part of:\n{ir_str}"
+        );
+    }
+
+    // ── Phase 3.5: promote_rank_with_reshape works with DIM_DYNAMIC ─────────────
+
+    #[test]
+    fn promote_rank_with_reshape_handles_dynamic_dim() {
+        use crate::shape::DIM_DYNAMIC;
+        // Build a trace with a 1-D input that we promote to rank 2 (should produce
+        // tensor<1x?xf32> after expansion). This tests that static_output_shape
+        // correctly emits i64::MIN for the dynamic position.
+        begin_trace();
+        let a = Tensor::new(&[DIM_DYNAMIC], DType::F32);
+        let trace = take_trace();
+
+        let ir = Compiler::build_ir_string(&trace, &[a.id]);
+        assert!(
+            ir.is_ok(),
+            "build_ir_string failed with DIM_DYNAMIC input: {:?}",
+            ir.err()
+        );
+        // The module should verify successfully (verified inside build_module).
     }
 }

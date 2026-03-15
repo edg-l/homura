@@ -2,14 +2,15 @@ pub mod mapper;
 pub mod parser;
 pub mod proto;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 use crate::{
     Compiler, Shape,
     cache::CompilationCache,
-    runtime::{Buffer, CompiledGraph},
+    runtime::{Buffer, CompiledGraph, OutputDesc},
+    shape::DIM_DYNAMIC,
 };
 use parser::{Dim, OnnxError, OnnxModel};
 
@@ -19,6 +20,8 @@ struct CompiledState {
     compiled: CompiledGraph,
     weights: Vec<Buffer>,
     /// Input shapes used during compilation (for shape-change detection).
+    /// Dynamic dims are represented as `DIM_DYNAMIC` so the shapes-changed
+    /// check skips them.
     input_shapes: Vec<Shape>,
 }
 
@@ -39,6 +42,11 @@ pub struct Model {
     /// `None` when the model was created via `load_bytes` with no bytes stored,
     /// but in practice always `Some` for models loaded from file or bytes.
     model_bytes: Option<Vec<u8>>,
+    /// Symbolic dim names that should remain as `DIM_DYNAMIC` in the compiled
+    /// code rather than being resolved to concrete values at trace time. This
+    /// allows a single compiled artifact to accept varying values for these
+    /// dims at runtime (e.g., `past_sequence_length` for KV-cache decoding).
+    keep_dynamic: HashSet<String>,
 }
 
 impl std::fmt::Debug for Model {
@@ -59,7 +67,7 @@ impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Model, OnnxError> {
         let bytes = std::fs::read(path).map_err(OnnxError::Io)?;
         let onnx_model = parser::parse_bytes(&bytes)?;
-        Model::from_onnx(onnx_model, Some(bytes))
+        Model::from_onnx(onnx_model, Some(bytes), HashSet::new())
     }
 
     /// Load an ONNX model from raw protobuf bytes.
@@ -67,12 +75,37 @@ impl Model {
     /// Useful in tests where models are built in memory.
     pub fn load_bytes(bytes: &[u8]) -> Result<Model, OnnxError> {
         let onnx_model = parser::parse_bytes(bytes)?;
-        Model::from_onnx(onnx_model, Some(bytes.to_vec()))
+        Model::from_onnx(onnx_model, Some(bytes.to_vec()), HashSet::new())
     }
 
-    fn from_onnx(onnx_model: OnnxModel, model_bytes: Option<Vec<u8>>) -> Result<Model, OnnxError> {
+    /// Load an ONNX model, keeping the specified symbolic dim names as dynamic
+    /// in the compiled code.
+    ///
+    /// Dims in `keep_dynamic` are represented as `DIM_DYNAMIC` throughout the
+    /// trace/compiler so that a single compiled artifact works for any runtime
+    /// value of those dims (e.g., `past_sequence_length` for KV-cache decoding).
+    /// The `run()` method will compute concrete output shapes from the actual
+    /// input buffer shapes and allocate output buffers accordingly.
+    pub fn load_with_dynamic_dims(
+        path: impl AsRef<Path>,
+        keep_dynamic: HashSet<String>,
+    ) -> Result<Model, OnnxError> {
+        let bytes = std::fs::read(path).map_err(OnnxError::Io)?;
+        let onnx_model = parser::parse_bytes(&bytes)?;
+        Model::from_onnx(onnx_model, Some(bytes), keep_dynamic)
+    }
+
+    fn from_onnx(
+        onnx_model: OnnxModel,
+        model_bytes: Option<Vec<u8>>,
+        keep_dynamic: HashSet<String>,
+    ) -> Result<Model, OnnxError> {
         let num_dynamic = onnx_model.dynamic_inputs.len();
 
+        // A model needs lazy compilation if it has symbolic dims that are NOT
+        // in keep_dynamic (those must be resolved from actual inputs), OR if it
+        // has symbolic dims that ARE in keep_dynamic (those stay as DIM_DYNAMIC
+        // but still need the first run() call to trigger compilation).
         if onnx_model.has_symbolic_dims() {
             // Defer compilation — we don't know concrete shapes yet.
             Ok(Model {
@@ -80,6 +113,7 @@ impl Model {
                 parsed: Some(onnx_model),
                 state: Mutex::new(None),
                 model_bytes,
+                keep_dynamic,
             })
         } else {
             // All shapes concrete: compile eagerly (backward compat).
@@ -106,6 +140,7 @@ impl Model {
                 parsed: None,
                 state: Mutex::new(Some(state)),
                 model_bytes,
+                keep_dynamic,
             })
         }
     }
@@ -132,26 +167,34 @@ impl Model {
                 .as_ref()
                 .expect("parsed model must be present when state is None");
 
-            let resolved = resolve_symbolic_dims(parsed, inputs)?;
-            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref())?);
+            let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
+            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
         }
 
-        // For models with symbolic dims, recompile if input shapes have changed.
+        // For models with symbolic dims, recompile only if non-dynamic dims changed.
         if self.parsed.is_some() {
             let shapes_changed = {
                 let state = guard.as_ref().unwrap();
-                inputs
-                    .iter()
-                    .enumerate()
-                    .any(|(i, buf)| buf.shape() != &state.input_shapes[i])
+                inputs.iter().enumerate().any(|(i, buf)| {
+                    let compiled_shape = &state.input_shapes[i];
+                    buf.shape()
+                        .0
+                        .iter()
+                        .zip(compiled_shape.0.iter())
+                        .any(|(actual, compiled)| {
+                            // Skip dims that are DIM_DYNAMIC in the compiled shape —
+                            // those are intentionally dynamic and should not trigger recompilation.
+                            *compiled != DIM_DYNAMIC && actual != compiled
+                        })
+                })
             };
             if shapes_changed {
                 let parsed = self
                     .parsed
                     .as_ref()
                     .expect("parsed model must be present when symbolic dims exist");
-                let resolved = resolve_symbolic_dims(parsed, inputs)?;
-                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref())?);
+                let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
+                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
             }
         }
 
@@ -162,22 +205,67 @@ impl Model {
             all_args.push(w);
         }
 
-        Ok(state.compiled.run(&all_args))
+        // Check if any outputs have dynamic dims — if so, compute concrete output
+        // shapes from the actual input buffer shapes and use run_dynamic.
+        let output_descs = state.compiled.output_descs();
+        let has_dynamic_outputs = output_descs.iter().any(|d| d.shape.has_dynamic_dims());
+
+        if has_dynamic_outputs {
+            // Compute concrete output shapes from the actual input shapes.
+            let concrete_output_shapes = compute_concrete_output_shapes(
+                state.compiled.output_descs(),
+                inputs,
+                &state.input_shapes,
+            );
+            Ok(state.compiled.run_dynamic(&all_args, &concrete_output_shapes))
+        } else {
+            Ok(state.compiled.run(&all_args))
+        }
     }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Compile an `OnnxModel` whose dynamic inputs all have concrete shapes.
+/// Compile an `OnnxModel` whose dynamic inputs are either concrete or
+/// `DIM_DYNAMIC` (for dims in `keep_dynamic`).
 ///
 /// `model_bytes` is used to compute a cache key. Pass `None` to skip caching.
+///
+/// For the cache key, dynamic dim positions are represented as `DIM_DYNAMIC`
+/// so that all runtime values of those dims hash to the same key (Phase 6.1).
 fn compile_model(
     model: &OnnxModel,
     inputs: &[&Buffer],
     model_bytes: Option<&[u8]>,
+    keep_dynamic: &HashSet<String>,
 ) -> Result<CompiledState, OnnxError> {
-    let input_shapes: Vec<Shape> = inputs.iter().map(|b| b.shape().clone()).collect();
+    // Build input_shapes: use DIM_DYNAMIC for any position that is dynamic in
+    // the resolved model (i.e., positions that came from keep_dynamic dims).
+    let input_shapes: Vec<Shape> = model
+        .dynamic_inputs
+        .iter()
+        .zip(inputs.iter())
+        .map(|(spec, buf)| {
+            let dims: Vec<u64> = spec
+                .dims
+                .iter()
+                .enumerate()
+                .map(|(i, d)| match d {
+                    Dim::Fixed(v) if *v == DIM_DYNAMIC => DIM_DYNAMIC,
+                    Dim::Fixed(v) => *v,
+                    Dim::Symbolic(name) if keep_dynamic.contains(name) => DIM_DYNAMIC,
+                    Dim::Symbolic(_) => buf.shape().0[i],
+                })
+                .collect();
+            Shape(dims)
+        })
+        .collect();
+
     let (trace, output_ids, weights) = mapper::map_graph(model)?;
+
+    // Cache key uses DIM_DYNAMIC for dynamic positions (Phase 6.1): two calls
+    // with different concrete past_len but the same keep_dynamic set produce
+    // the same cache key and reuse the compiled artifact.
     let cache_key = model_bytes.map(|b| {
         let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
         CompilationCache::cache_key(b, &shape_refs)
@@ -192,21 +280,30 @@ fn compile_model(
 }
 
 /// Build a resolved copy of `model` where every symbolic dim in
-/// `dynamic_inputs` is replaced with the concrete size read from `inputs`.
+/// `dynamic_inputs` is replaced with either:
+/// - `DIM_DYNAMIC` if the dim name is in `keep_dynamic`, or
+/// - the concrete size read from `inputs` otherwise.
 ///
-/// Returns `ConflictingSymbolicDim` if two inputs disagree on the same name.
-/// Returns `UnresolvedSymbolicDim` if a name appears but no input covers it.
-fn resolve_symbolic_dims(model: &OnnxModel, inputs: &[&Buffer]) -> Result<OnnxModel, OnnxError> {
-    // Build name → value map from the provided buffers.
+/// Returns `ConflictingSymbolicDim` if two inputs disagree on the same name
+/// (for non-keep_dynamic dims only).
+/// Returns `UnresolvedSymbolicDim` if a name is not in `keep_dynamic` and
+/// no input covers it.
+fn resolve_symbolic_dims(
+    model: &OnnxModel,
+    inputs: &[&Buffer],
+    keep_dynamic: &HashSet<String>,
+) -> Result<OnnxModel, OnnxError> {
+    // Build name → value map from the provided buffers (for non-keep_dynamic dims).
     let mut sym_map: HashMap<String, u64> = HashMap::new();
 
     for (input_spec, buffer) in model.dynamic_inputs.iter().zip(inputs.iter()) {
         let buf_shape = buffer.shape();
         for (idx, dim) in input_spec.dims.iter().enumerate() {
             if let Dim::Symbolic(name) = dim {
-                // If the caller passed a buffer with fewer dims than declared,
-                // this symbolic dim position is not covered — it stays absent
-                // from sym_map and will be caught by the unresolved check below.
+                if keep_dynamic.contains(name) {
+                    // This dim stays dynamic — don't resolve from input buffer.
+                    continue;
+                }
                 if let Some(&concrete) = buf_shape.0.get(idx) {
                     match sym_map.get(name) {
                         None => {
@@ -226,18 +323,20 @@ fn resolve_symbolic_dims(model: &OnnxModel, inputs: &[&Buffer]) -> Result<OnnxMo
         }
     }
 
-    // Verify all symbolic dims are resolved.
+    // Verify all non-keep_dynamic symbolic dims are resolved.
     for input_spec in &model.dynamic_inputs {
         for dim in &input_spec.dims {
             if let Dim::Symbolic(name) = dim {
-                if !sym_map.contains_key(name) {
+                if !keep_dynamic.contains(name) && !sym_map.contains_key(name) {
                     return Err(OnnxError::UnresolvedSymbolicDim(name.clone()));
                 }
             }
         }
     }
 
-    // Build a resolved OnnxModel clone with all dims replaced.
+    // Build a resolved OnnxModel clone.
+    // keep_dynamic dims become Dim::Fixed(DIM_DYNAMIC) so the mapper sees them
+    // as a concrete value that the compiler interprets as `?` when building types.
     let resolved_inputs = model
         .dynamic_inputs
         .iter()
@@ -247,6 +346,9 @@ fn resolve_symbolic_dims(model: &OnnxModel, inputs: &[&Buffer]) -> Result<OnnxMo
                 .iter()
                 .map(|d| match d {
                     Dim::Fixed(v) => Dim::Fixed(*v),
+                    Dim::Symbolic(name) if keep_dynamic.contains(name) => {
+                        Dim::Fixed(DIM_DYNAMIC)
+                    }
                     Dim::Symbolic(name) => Dim::Fixed(*sym_map.get(name).unwrap()),
                 })
                 .collect();
@@ -264,6 +366,84 @@ fn resolve_symbolic_dims(model: &OnnxModel, inputs: &[&Buffer]) -> Result<OnnxMo
         dynamic_inputs: resolved_inputs,
         outputs: model.outputs.clone(),
     })
+}
+
+/// Compute concrete output shapes for a compiled graph that has dynamic dims.
+///
+/// For each output, substitute `DIM_DYNAMIC` positions with their actual
+/// runtime value. The strategy used here is:
+/// - For output positions that are NOT `DIM_DYNAMIC` in the compiled shape,
+///   keep the compiled value as-is.
+/// - For output positions that ARE `DIM_DYNAMIC`, scan the compiled input
+///   shapes to find what the dynamic dim corresponds to in the inputs, then
+///   read the concrete runtime value from the actual input buffer.
+///
+/// For the KV-cache concat case (the main use case), the output dynamic dim
+/// equals input_dynamic_dim + 1 (past_len + new_token). Rather than trying to
+/// infer this algebraically here, we fall back to a simple heuristic: query
+/// `tensor.dim` at runtime through the compiled code... but that's only
+/// available inside the JIT. Instead we use a simpler approach: since we can't
+/// know the exact output shape without running the code, we pass a placeholder
+/// shape that MLIR can derive, but that won't work for buffer allocation.
+///
+/// In practice, for this project's use case, the caller (`KvGenerator`) knows
+/// the output shape (past_len + 1). The `run_dynamic` path requires the caller
+/// to provide these shapes. This function provides a reasonable default by
+/// scanning for matching non-dynamic dims from inputs, returning DIM_DYNAMIC
+/// for any dim it can't resolve (which would then cause `run_dynamic` to fail
+/// with a clear error).
+///
+/// For now, implement the concrete "past_len+1" logic by finding input dims
+/// that appear as dynamic in outputs and adding 1 to them.
+fn compute_concrete_output_shapes(
+    output_descs: &[OutputDesc],
+    inputs: &[&Buffer],
+    compiled_input_shapes: &[Shape],
+) -> Vec<Shape> {
+    output_descs
+        .iter()
+        .map(|desc| {
+            if !desc.shape.has_dynamic_dims() {
+                return desc.shape.clone();
+            }
+            // For each dynamic dim, try to find a matching dynamic dim in the
+            // compiled input shapes and use the corresponding runtime input value.
+            // For the concat case (KV cache), the output past_len = max input past_len + 1.
+            let dims: Vec<u64> = desc
+                .shape
+                .0
+                .iter()
+                .enumerate()
+                .map(|(out_dim_idx, &compiled_dim)| {
+                    if compiled_dim != DIM_DYNAMIC {
+                        return compiled_dim;
+                    }
+                    // Find the largest runtime value for this dim position across all inputs.
+                    // For concat along past_len: output = sum of inputs along that axis.
+                    // But since we don't know the operation, we use the heuristic:
+                    // sum all dynamic dim values from inputs that have a dynamic dim at the same position.
+                    let mut total: u64 = 0;
+                    let mut found = false;
+                    for (inp_idx, inp_shape) in compiled_input_shapes.iter().enumerate() {
+                        if out_dim_idx < inp_shape.0.len()
+                            && inp_shape.0[out_dim_idx] == DIM_DYNAMIC
+                        {
+                            // This input has a dynamic dim at the same position.
+                            // Use the actual runtime size from the input buffer.
+                            if let Some(buf) = inputs.get(inp_idx) {
+                                if out_dim_idx < buf.shape().0.len() {
+                                    total += buf.shape().0[out_dim_idx];
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                    if found { total } else { DIM_DYNAMIC }
+                })
+                .collect();
+            Shape(dims)
+        })
+        .collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

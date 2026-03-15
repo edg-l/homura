@@ -2,6 +2,7 @@ use std::path::Path;
 use std::slice;
 
 use crate::{DType, Shape};
+use crate::shape::DIM_DYNAMIC;
 
 // ── Buffer ────────────────────────────────────────────────────────────────────
 
@@ -19,7 +20,17 @@ impl Buffer {
     /// Allocate a zero-initialised buffer for the given shape and dtype.
     ///
     /// Strides are row-major: for shape [a, b, c] → strides = [b*c, c, 1].
+    ///
+    /// # Panics
+    ///
+    /// Panics if any dim is `DIM_DYNAMIC` (use `run_dynamic` on `CompiledGraph`
+    /// to provide concrete output shapes for dynamic models).
     pub fn new(shape: &[u64], dtype: DType) -> Self {
+        assert!(
+            !shape.iter().any(|&d| d == DIM_DYNAMIC),
+            "Buffer::new called with DIM_DYNAMIC in shape {:?}; use CompiledGraph::run_dynamic instead",
+            shape
+        );
         let s = Shape(shape.to_vec());
         let strides = row_major_strides(shape);
         let num_bytes = s.num_elements() as usize * dtype.size_bytes();
@@ -185,7 +196,7 @@ pub(crate) fn build_memref_descriptor(
 // ── CompiledGraph ─────────────────────────────────────────────────────────────
 
 /// Metadata for a single output tensor of a compiled graph.
-pub(crate) struct OutputDesc {
+pub struct OutputDesc {
     pub shape: Shape,
     pub dtype: DType,
 }
@@ -261,13 +272,59 @@ impl CompiledGraph {
         Ok(Self { _lib: lib, func, num_inputs, outputs })
     }
 
+    /// Return the output descriptors (shape + dtype) for all outputs.
+    pub fn output_descs(&self) -> &[OutputDesc] {
+        &self.outputs
+    }
+
+    /// Execute the graph with caller-provided concrete output shapes.
+    ///
+    /// Use this when the compiled graph has dynamic dimensions in its outputs:
+    /// the compiled code only reads/writes through the provided memref
+    /// descriptors, so the shapes in `output_shapes` govern buffer allocation.
+    ///
+    /// `output_shapes` must have exactly `self.outputs.len()` entries, one per
+    /// output. All dims must be concrete (no `DIM_DYNAMIC`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of inputs or output shapes doesn't match.
+    pub fn run_dynamic(&self, inputs: &[&Buffer], output_shapes: &[Shape]) -> Vec<Buffer> {
+        assert_eq!(
+            inputs.len(),
+            self.num_inputs,
+            "run_dynamic: expected {} inputs, got {}",
+            self.num_inputs,
+            inputs.len()
+        );
+        assert_eq!(
+            output_shapes.len(),
+            self.outputs.len(),
+            "run_dynamic: expected {} output shapes, got {}",
+            self.outputs.len(),
+            output_shapes.len()
+        );
+
+        // Allocate output buffers using the caller-provided concrete shapes.
+        let mut output_bufs: Vec<Buffer> = output_shapes
+            .iter()
+            .zip(self.outputs.iter())
+            .map(|(shape, desc)| Buffer::new(shape.0.as_slice(), desc.dtype))
+            .collect();
+
+        // Build and call — reuse the shared JIT call logic.
+        self.run_with_output_bufs(inputs, &mut output_bufs);
+        output_bufs
+    }
+
     /// Execute the graph with the given input `Buffer`s. Returns all outputs as
     /// owned `Buffer`s in the same order as the `outputs` slice passed to
     /// `Compiler::compile`.
     ///
     /// # Panics
     ///
-    /// Panics if the number of inputs doesn't match the compiled graph.
+    /// Panics if the number of inputs doesn't match the compiled graph, or if
+    /// any output shape contains `DIM_DYNAMIC` (use `run_dynamic` instead).
     pub fn run(&self, inputs: &[&Buffer]) -> Vec<Buffer> {
         assert_eq!(
             inputs.len(),
@@ -283,6 +340,13 @@ impl CompiledGraph {
             .iter()
             .map(|desc| Buffer::new(desc.shape.0.as_slice(), desc.dtype))
             .collect();
+
+        self.run_with_output_bufs(inputs, &mut output_bufs);
+        output_bufs
+    }
+
+    /// Shared JIT-call implementation for `run` and `run_dynamic`.
+    fn run_with_output_bufs(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
 
         // Build memref descriptors for inputs. The function only reads inputs,
         // so the const→mut cast is safe.
@@ -328,8 +392,6 @@ impl CompiledGraph {
         unsafe {
             (self.func)(args.as_mut_ptr());
         }
-
-        output_bufs
     }
 }
 
