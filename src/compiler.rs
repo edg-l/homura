@@ -535,6 +535,7 @@ fn emit_linalg_pad_nhwc<'c>(
     orig_w: u64,
     pad_top: u64,
     pad_left: u64,
+    pad_value: Option<&str>, // e.g. "0.0 : f32" or "-3.40282347E+38 : f32" for -inf; None = zero
     dtype: DType,
     location: Location<'c>,
 ) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
@@ -707,20 +708,26 @@ fn emit_linalg_pad_nhwc<'c>(
         .unwrap()
         .into();
 
-    // Zero constant for the out-of-bounds case.
-    let zero_val: melior::ir::Value = {
-        let zero_str = match dtype {
-            DType::F32 | DType::F64 => "0.0",
-            DType::I32 | DType::I64 => "0",
+    // Constant for the out-of-bounds case (zero for conv2d, -inf for max_pool2d).
+    let pad_fill_val: melior::ir::Value = {
+        let attr_str = match pad_value {
+            Some(s) => s.to_string(),
+            None => {
+                let zero_str = match dtype {
+                    DType::F32 | DType::F64 => "0.0",
+                    DType::I32 | DType::I64 => "0",
+                };
+                let type_str = match dtype {
+                    DType::F32 => "f32",
+                    DType::F64 => "f64",
+                    DType::I32 => "i32",
+                    DType::I64 => "i64",
+                };
+                format!("{zero_str} : {type_str}")
+            }
         };
-        let zero_type_str = match dtype {
-            DType::F32 => "f32",
-            DType::F64 => "f64",
-            DType::I32 => "i32",
-            DType::I64 => "i64",
-        };
-        let attr = Attribute::parse(context, &format!("{zero_str} : {zero_type_str}"))
-            .ok_or_else(|| CompileError::AttributeParse("zero attr".into()))?;
+        let attr = Attribute::parse(context, &attr_str)
+            .ok_or_else(|| CompileError::AttributeParse("pad fill attr".into()))?;
         linalg_block
             .append_operation(
                 OperationBuilder::new("arith.constant", location)
@@ -738,7 +745,7 @@ fn emit_linalg_pad_nhwc<'c>(
     let val: melior::ir::Value = linalg_block
         .append_operation(
             OperationBuilder::new("arith.select", location)
-                .add_operands(&[ok, extracted, zero_val])
+                .add_operands(&[ok, extracted, pad_fill_val])
                 .add_results(&[elem_type])
                 .build()
                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
@@ -2508,6 +2515,7 @@ fn emit_tensor_ops<'c>(
                             w,
                             pad_top,
                             pad_left,
+                            None, // zero-fill for conv2d
                             *dtype,
                             location,
                         )?;
@@ -2970,34 +2978,94 @@ fn emit_tensor_ops<'c>(
                 let sh = strides[0];
                 let sw = strides[1];
 
-                // TOSA requires (H + pad_top + pad_bottom - KH) % stride == 0.
-                // ONNX uses floor division (drops incomplete last window).
-                // Add right/bottom padding to satisfy TOSA, then slice to correct size.
-                // TOSA pads max_pool2d with -inf, so extra elements never win the max.
                 let pad_top = pads[0];
                 let pad_left = pads[1];
-                let mut pad_bottom = pads[2];
-                let mut pad_right = pads[3];
-                let rem_h = (in_h + pad_top + pad_bottom - kh) % sh;
-                let rem_w = (in_w + pad_left + pad_right - kw) % sw;
+                let pad_bottom = pads[2];
+                let pad_right = pads[3];
+
+                // Pre-pad with -inf via linalg.generic if any pad is non-zero,
+                // so tosa.max_pool2d gets pad=0. This avoids tensor.pad which
+                // bufferizes to memref.subview+memref.copy (breaks affine fusion).
+                let (pool_input, pool_h, pool_w) =
+                    if pad_top != 0 || pad_bottom != 0 || pad_left != 0 || pad_right != 0 {
+                        let padded_h = in_h + pad_top + pad_bottom;
+                        let padded_w = in_w + pad_left + pad_right;
+                        let padded_shape = [n, padded_h, padded_w, c];
+                        let neg_inf_str = match dtype {
+                            DType::F32 => "-3.40282347E+38 : f32",
+                            DType::F64 => "-1.7976931348623157E+308 : f64",
+                            DType::I32 => "-2147483648 : i32",
+                            DType::I64 => "-9223372036854775808 : i64",
+                        };
+                        let padded_val = emit_linalg_pad_nhwc(
+                            context,
+                            body_block,
+                            input_nhwc,
+                            &padded_shape,
+                            in_h,
+                            in_w,
+                            pad_top,
+                            pad_left,
+                            Some(neg_inf_str),
+                            *dtype,
+                            location,
+                        )?;
+                        (padded_val, padded_h, padded_w)
+                    } else {
+                        (input_nhwc, in_h, in_w)
+                    };
+
+                // TOSA requires (H - KH) % stride == 0 (with pad=0 now).
+                // ONNX uses floor division. Add extra -inf padding for divisibility.
+                let mut extra_bottom = 0u64;
+                let mut extra_right = 0u64;
+                let rem_h = (pool_h - kh) % sh;
+                let rem_w = (pool_w - kw) % sw;
                 if rem_h != 0 {
-                    pad_bottom += sh - rem_h;
+                    extra_bottom = sh - rem_h;
                 }
                 if rem_w != 0 {
-                    pad_right += sw - rem_w;
+                    extra_right = sw - rem_w;
                 }
-                // TOSA output with the (possibly enlarged) padding.
-                let tosa_oh = (in_h + pad_top + pad_bottom - kh) / sh + 1;
-                let tosa_ow = (in_w + pad_left + pad_right - kw) / sw + 1;
+                let (final_input, final_h, final_w) = if extra_bottom != 0 || extra_right != 0 {
+                    // Need another pad for TOSA divisibility (also with -inf)
+                    let final_h = pool_h + extra_bottom;
+                    let final_w = pool_w + extra_right;
+                    let final_shape = [n, final_h, final_w, c];
+                    let neg_inf_str = match dtype {
+                        DType::F32 => "-3.40282347E+38 : f32",
+                        DType::F64 => "-1.7976931348623157E+308 : f64",
+                        DType::I32 => "-2147483648 : i32",
+                        DType::I64 => "-9223372036854775808 : i64",
+                    };
+                    let v = emit_linalg_pad_nhwc(
+                        context,
+                        body_block,
+                        pool_input,
+                        &final_shape,
+                        pool_h,
+                        pool_w,
+                        0,  // no additional top pad
+                        0,  // no additional left pad
+                        Some(neg_inf_str),
+                        *dtype,
+                        location,
+                    )?;
+                    (v, final_h, final_w)
+                } else {
+                    (pool_input, pool_h, pool_w)
+                };
+
+                let tosa_oh = (final_h - kh) / sh + 1;
+                let tosa_ow = (final_w - kw) / sw + 1;
                 let needs_slice = tosa_oh != oh || tosa_ow != ow;
 
                 let nhwc_tosa_shape = [n, tosa_oh, tosa_ow, c];
                 let nhwc_tosa_type = make_ranked_tensor_type(context, &nhwc_tosa_shape, *dtype);
 
                 let kernel_attr_str = format!("array<i64: {kh}, {kw}>");
-                // TOSA pad order: [pad_top, pad_bottom, pad_left, pad_right]
-                let pad_attr_str =
-                    format!("array<i64: {pad_top}, {pad_bottom}, {pad_left}, {pad_right}>");
+                // pad=0 since we pre-padded explicitly
+                let pad_attr_str = "array<i64: 0, 0, 0, 0>".to_string();
                 let stride_attr_str = format!("array<i64: {sh}, {sw}>");
 
                 let kernel_attr = Attribute::parse(context, &kernel_attr_str)
@@ -3017,7 +3085,7 @@ fn emit_tensor_ops<'c>(
                 let mut pool_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.max_pool2d", location)
-                            .add_operands(&[input_nhwc])
+                            .add_operands(&[final_input])
                             .add_results(&[nhwc_tosa_type])
                             .add_attributes(&[
                                 (Identifier::new(context, "kernel"), kernel_attr),
