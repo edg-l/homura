@@ -323,4 +323,123 @@ mod tests {
             Ok(_) => panic!("expected Err for 2-output model, got Ok"),
         }
     }
+
+    // ── Multi-op round-trip tests ────────────────────────────────────────────
+
+    #[test]
+    fn load_and_run_relu() {
+        let bytes = encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    op_type: "Relu".into(),
+                    input: vec!["X".into()],
+                    output: vec!["Y".into()],
+                    ..Default::default()
+                }],
+                input: vec![value_info("X", &[4])],
+                output: vec![value_info("Y", &[4])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let model = Model::load_bytes(&bytes).expect("load failed");
+        let x = Buffer::from_slice::<f32>(&[-1.0, 0.0, 3.0, -4.0], &[4], DType::F32);
+        let result = model.run(&[&x]).unwrap();
+        assert_eq!(result.as_slice::<f32>(), &[0.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn load_and_run_add_relu_chain() {
+        let bytes = encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![
+                    NodeProto {
+                        op_type: "Add".into(),
+                        input: vec!["X".into(), "Y".into()],
+                        output: vec!["sum".into()],
+                        ..Default::default()
+                    },
+                    NodeProto {
+                        op_type: "Relu".into(),
+                        input: vec!["sum".into()],
+                        output: vec!["Z".into()],
+                        ..Default::default()
+                    },
+                ],
+                input: vec![value_info("X", &[4]), value_info("Y", &[4])],
+                output: vec![value_info("Z", &[4])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let model = Model::load_bytes(&bytes).expect("load failed");
+        let x = Buffer::from_slice::<f32>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F32);
+        let y = Buffer::from_slice::<f32>(&[5.0, 6.0, -7.0, 8.0], &[4], DType::F32);
+        let result = model.run(&[&x, &y]).unwrap();
+        // add=[6,4,-4,4], relu=[6,4,0,4]
+        assert_eq!(result.as_slice::<f32>(), &[6.0, 4.0, 0.0, 4.0]);
+    }
+
+    #[test]
+    fn load_and_run_two_weight_chain() {
+        // input → Add(W1) → Add(W2) → output
+        let w1_raw: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let w2_raw: Vec<u8> = [10.0f32, 20.0, 30.0, 40.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let bytes = encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![
+                    NodeProto {
+                        op_type: "Add".into(),
+                        input: vec!["X".into(), "W1".into()],
+                        output: vec!["mid".into()],
+                        ..Default::default()
+                    },
+                    NodeProto {
+                        op_type: "Add".into(),
+                        input: vec!["mid".into(), "W2".into()],
+                        output: vec!["Z".into()],
+                        ..Default::default()
+                    },
+                ],
+                initializer: vec![
+                    TensorProto {
+                        name: "W1".into(),
+                        dims: vec![4],
+                        data_type: 1,
+                        raw_data: w1_raw,
+                        ..Default::default()
+                    },
+                    TensorProto {
+                        name: "W2".into(),
+                        dims: vec![4],
+                        data_type: 1,
+                        raw_data: w2_raw,
+                        ..Default::default()
+                    },
+                ],
+                input: vec![
+                    value_info("X", &[4]),
+                    value_info("W1", &[4]),
+                    value_info("W2", &[4]),
+                ],
+                output: vec![value_info("Z", &[4])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let model = Model::load_bytes(&bytes).expect("load failed");
+        let x = Buffer::from_slice::<f32>(&[100.0, 200.0, 300.0, 400.0], &[4], DType::F32);
+        let result = model.run(&[&x]).unwrap();
+        // x + w1 + w2 = [111, 222, 333, 444]
+        assert_eq!(result.as_slice::<f32>(), &[111.0, 222.0, 333.0, 444.0]);
+    }
 }

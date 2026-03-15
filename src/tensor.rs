@@ -748,4 +748,173 @@ mod tests {
         let result = c.eval(&[a_buf, b_buf]);
         assert_eq!(result.as_slice::<f32>(), &[6.0, 8.0, 10.0, 12.0]);
     }
+
+    // ── Dtype mismatch panic tests ───────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch")]
+    fn add_dtype_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::I32);
+        let _ = &a + &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch")]
+    fn sub_dtype_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::I32);
+        let _ = &a - &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch")]
+    fn mul_dtype_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::I32);
+        let _ = &a * &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch")]
+    fn div_dtype_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::I32);
+        let _ = &a / &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "dtype mismatch")]
+    fn matmul_dtype_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::I32);
+        let _ = a.matmul(&b);
+        let _ = take_trace();
+    }
+
+    // ── Broadcast incompatibility panic tests ────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "broadcast failed")]
+    fn sub_incompatible_shapes_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[8], DType::F32);
+        let _ = &a - &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast failed")]
+    fn mul_incompatible_shapes_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[8], DType::F32);
+        let _ = &a * &b;
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast failed")]
+    fn div_incompatible_shapes_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[8], DType::F32);
+        let _ = &a / &b;
+        let _ = take_trace();
+    }
+
+    // ── Exp/Tanh integer dtype panic tests ───────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "exp requires float dtype")]
+    fn exp_integer_dtype_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::I32);
+        let _ = a.exp();
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "tanh requires float dtype")]
+    fn tanh_integer_dtype_panics() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::I32);
+        let _ = a.tanh();
+        let _ = take_trace();
+    }
+
+    // ── Matmul dimension/rank panic tests ────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "inner dimensions mismatch")]
+    fn matmul_inner_dim_mismatch_panics() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[5, 4], DType::F32);
+        let _ = a.matmul(&b);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "matmul requires rank-2")]
+    fn matmul_rank1_panics() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let _ = a.matmul(&b);
+        let _ = take_trace();
+    }
+
+    // ── Reduce out-of-range panic tests ──────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn reduce_sum_dim_out_of_range_panics() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let _ = a.reduce_sum(10, false);
+        let _ = take_trace();
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn reduce_max_dim_out_of_range_panics() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let _ = a.reduce_max(5, false);
+        let _ = take_trace();
+    }
+
+    // ── Gemm rank assertion tests ────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "gemm requires rank-2")]
+    fn gemm_rank1_panics() {
+        begin_trace();
+        let a = Tensor::new(&[6], DType::F32);
+        let b = Tensor::new(&[3, 4], DType::F32);
+        let _ = a.gemm(&b, None, 1.0, 1.0, false, false);
+        let _ = take_trace();
+    }
+
+    // ── Reshape edge case tests ──────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "dimension must be positive")]
+    fn reshape_zero_dim_panics() {
+        begin_trace();
+        let a = Tensor::new(&[12], DType::F32);
+        let _ = a.reshape(&[0, 12]);
+        let _ = take_trace();
+    }
 }

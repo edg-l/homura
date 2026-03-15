@@ -3301,4 +3301,70 @@ mod tests {
             out[3]
         );
     }
+
+    // ── IR verification: Reshape ─────────────────────────────────────────────
+
+    #[test]
+    fn ir_tosa_reshape() {
+        begin_trace();
+        let a = Tensor::new(&[2, 6], DType::F32);
+        let b = a.reshape(&[3, 4]);
+        let trace = take_trace();
+        let ir = Compiler::build_ir_string(&trace, &[b.id]).expect("failed");
+        assert!(
+            ir.contains("tosa.reshape"),
+            "expected tosa.reshape in IR:\n{ir}"
+        );
+        assert!(
+            ir.contains("tosa.const_shape"),
+            "expected tosa.const_shape in IR:\n{ir}"
+        );
+    }
+
+    // ── Complex multi-op graph compilation ───────────────────────────────────
+
+    #[test]
+    fn compile_long_chain() {
+        // Verify that a long chain of ops compiles without errors
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let c = &a + &b;
+        let c = (&c * &a).relu();
+        let c = &c - &b;
+        let c = -&c;
+        let c = c.tanh();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[0.5, 0.5, 0.5, 0.5], &[4], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        let out = result.as_slice::<f32>();
+        // a+b=[1.5,2.5,3.5,4.5], *a=[1.5,5,10.5,18], relu=same, -b=[1,4.5,10,17.5]
+        // neg=[-1,-4.5,-10,-17.5], tanh=[-0.762,-0.9998,-1.0,-1.0]
+        assert!((out[0] - (-1.0_f32).tanh()).abs() < 1e-3);
+        assert!(out[3] < -0.999);
+        assert_eq!(out.len(), 4);
+    }
+
+    // ── Empty/error cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn compile_empty_trace_returns_error() {
+        let trace = {
+            begin_trace();
+            take_trace()
+        };
+        let result = Compiler::compile(&trace, &[NodeId(0)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compile_no_outputs_returns_error() {
+        begin_trace();
+        let _a = Tensor::new(&[4], DType::F32);
+        let trace = take_trace();
+        let result = Compiler::compile(&trace, &[]);
+        assert!(result.is_err());
+    }
 }

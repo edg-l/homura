@@ -700,4 +700,155 @@ mod tests {
             "second call should succeed but got an error"
         );
     }
+
+    // ── Missing op mapping tests ─────────────────────────────────────────────
+
+    #[test]
+    fn map_sub_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Sub", &["X", "Y"], &["Z"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![
+                make_dynamic("X", &[4], DType::F32),
+                make_dynamic("Y", &[4], DType::F32),
+            ],
+            outputs: vec!["Z".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Sub { .. }),
+            "expected Op::Sub, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    #[test]
+    fn map_mul_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Mul", &["X", "Y"], &["Z"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![
+                make_dynamic("X", &[4], DType::F32),
+                make_dynamic("Y", &[4], DType::F32),
+            ],
+            outputs: vec!["Z".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Mul { .. }),
+            "expected Op::Mul, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    #[test]
+    fn map_div_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Div", &["X", "Y"], &["Z"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![
+                make_dynamic("X", &[4], DType::F32),
+                make_dynamic("Y", &[4], DType::F32),
+            ],
+            outputs: vec!["Z".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Div { .. }),
+            "expected Op::Div, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    #[test]
+    fn map_neg_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Neg", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Neg { .. }),
+            "expected Op::Neg, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    #[test]
+    fn map_exp_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Exp", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Exp { .. }),
+            "expected Op::Exp, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    #[test]
+    fn map_tanh_graph() {
+        let model = OnnxModel {
+            nodes: vec![make_node("Tanh", &["X"], &["Y"], vec![])],
+            initializers: vec![],
+            dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        assert!(
+            matches!(trace.get(output_ids[0]), Op::Tanh { .. }),
+            "expected Op::Tanh, got {:?}",
+            trace.get(output_ids[0])
+        );
+    }
+
+    // ── Multi-op chain tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn map_add_relu_chain() {
+        let model = OnnxModel {
+            nodes: vec![
+                make_node("Add", &["X", "Y"], &["sum"], vec![]),
+                make_node("Relu", &["sum"], &["Z"], vec![]),
+            ],
+            initializers: vec![],
+            dynamic_inputs: vec![
+                make_dynamic("X", &[4], DType::F32),
+                make_dynamic("Y", &[4], DType::F32),
+            ],
+            outputs: vec!["Z".to_string()],
+        };
+        let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
+        // Input(X), Input(Y), Add, Relu → 4 ops
+        assert_eq!(trace.ops().len(), 4);
+        assert!(matches!(trace.get(output_ids[0]), Op::Relu { .. }));
+    }
+
+    #[test]
+    fn map_matmul_add_relu_chain() {
+        let model = OnnxModel {
+            nodes: vec![
+                make_node("MatMul", &["X", "W"], &["mm"], vec![]),
+                make_node("Add", &["mm", "B"], &["biased"], vec![]),
+                make_node("Relu", &["biased"], &["Y"], vec![]),
+            ],
+            initializers: vec![
+                make_weight("W", &[1.0; 12], &[3, 4]),
+                make_weight("B", &[0.0; 4], &[4]),
+            ],
+            dynamic_inputs: vec![make_dynamic("X", &[2, 3], DType::F32)],
+            outputs: vec!["Y".to_string()],
+        };
+        let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
+        assert_eq!(weights.len(), 2);
+        // Input(X), Input(W), Input(B), Matmul, Add, Relu → 6 ops
+        assert_eq!(trace.ops().len(), 6);
+        assert!(matches!(trace.get(output_ids[0]), Op::Relu { .. }));
+    }
 }

@@ -809,4 +809,489 @@ mod tests {
         let result = compiled.run(&[&a_buf]);
         assert_eq!(result.as_slice::<i32>(), &[-1, -4]);
     }
+
+    // ── F64 dtype coverage ───────────────────────────────────────────────────
+
+    #[test]
+    fn run_sub_f64() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F64);
+        let b = Tensor::new(&[4], DType::F64);
+        let c = &a - &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[5.0, 6.0, 7.0, 8.0], &[4], DType::F64);
+        let b_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F64);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[4.0, 4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn run_mul_f64() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F64);
+        let b = Tensor::new(&[4], DType::F64);
+        let c = &a * &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[2.0, 3.0, 4.0, 5.0], &[4], DType::F64);
+        let b_buf = Buffer::from_slice::<f64>(&[1.5, 2.0, 0.5, 3.0], &[4], DType::F64);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[3.0, 6.0, 2.0, 15.0]);
+    }
+
+    #[test]
+    fn run_div_f64() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F64);
+        let b = Tensor::new(&[4], DType::F64);
+        let c = &a / &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F64);
+        let b_buf = Buffer::from_slice::<f64>(&[2.0, 4.0, 5.0, 8.0], &[4], DType::F64);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[5.0, 5.0, 6.0, 5.0]);
+    }
+
+    #[test]
+    fn run_neg_f64() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F64);
+        let b = -&a;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[1.0, -2.0, 3.0, -4.0], &[4], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[-1.0, 2.0, -3.0, 4.0]);
+    }
+
+    #[test]
+    fn run_relu_f64() {
+        begin_trace();
+        let a = Tensor::new(&[4], DType::F64);
+        let b = a.relu();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[-1.0, 0.0, 3.0, -4.0], &[4], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[0.0, 0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn run_exp_f64() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F64);
+        let b = a.exp();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[0.0, 1.0, -1.0], &[3], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f64>();
+        assert!((out[0] - 1.0).abs() < 1e-10);
+        assert!((out[1] - std::f64::consts::E).abs() < 1e-10);
+        assert!((out[2] - 1.0 / std::f64::consts::E).abs() < 1e-10);
+    }
+
+    #[test]
+    fn run_tanh_f64() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F64);
+        let b = a.tanh();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[0.0, 1.0, -1.0], &[3], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f64>();
+        assert!(out[0].abs() < 1e-10);
+        assert!((out[1] - 1.0_f64.tanh()).abs() < 1e-10);
+        assert!((out[2] - (-1.0_f64).tanh()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn run_reduce_sum_f64() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F64);
+        let b = a.reduce_sum(-1, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[6.0, 15.0]);
+    }
+
+    #[test]
+    fn run_reduce_max_f64() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F64);
+        let b = a.reduce_max(-1, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[1.0, 5.0, 3.0, 4.0, 2.0, 6.0], &[2, 3], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn run_reshape_f64() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F64);
+        let b = a.reshape(&[6]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f64>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f64>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    // ── Broadcast tests for Sub, Mul, Div ────────────────────────────────────
+
+    #[test]
+    fn run_sub_broadcast() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3], DType::F32);
+        let c = &a - &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[9.0, 18.0, 27.0, 39.0, 48.0, 57.0]
+        );
+    }
+
+    #[test]
+    fn run_mul_broadcast() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3], DType::F32);
+        let c = &a * &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(
+            result.as_slice::<f32>(),
+            &[10.0, 40.0, 90.0, 40.0, 100.0, 180.0]
+        );
+    }
+
+    #[test]
+    fn run_div_broadcast() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3], DType::F32);
+        let c = &a / &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf =
+            Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[2, 3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[2.0, 5.0, 10.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f32>(), &[5.0, 4.0, 3.0, 20.0, 10.0, 6.0]);
+    }
+
+    // ── Edge value tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn run_div_by_zero_produces_inf() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = Tensor::new(&[3], DType::F32);
+        let c = &a / &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, -1.0, 0.0], &[3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[0.0, 0.0, 0.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        let out = result.as_slice::<f32>();
+        assert!(out[0].is_infinite() && out[0] > 0.0, "1/0 should be +inf");
+        assert!(out[1].is_infinite() && out[1] < 0.0, "-1/0 should be -inf");
+        assert!(out[2].is_nan(), "0/0 should be NaN");
+    }
+
+    #[test]
+    fn run_exp_large_input() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = a.exp();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[100.0, -100.0, 0.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f32>();
+        assert!(out[0].is_infinite(), "exp(100) should overflow to inf");
+        assert!((out[1]).abs() < 1e-30, "exp(-100) should underflow to ~0");
+        assert!((out[2] - 1.0).abs() < 1e-6, "exp(0) = 1");
+    }
+
+    #[test]
+    fn run_tanh_extreme_values() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = a.tanh();
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[100.0, -100.0, 0.0], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f32>();
+        assert!((out[0] - 1.0).abs() < 1e-6, "tanh(100) ≈ 1");
+        assert!((out[1] + 1.0).abs() < 1e-6, "tanh(-100) ≈ -1");
+        assert!(out[2].abs() < 1e-6, "tanh(0) = 0");
+    }
+
+    #[test]
+    fn run_add_nan_propagation() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::F32);
+        let b = Tensor::new(&[3], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[f32::NAN, 1.0, f32::INFINITY], &[3], DType::F32);
+        let b_buf =
+            Buffer::from_slice::<f32>(&[1.0, f32::NAN, f32::NEG_INFINITY], &[3], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        let out = result.as_slice::<f32>();
+        assert!(out[0].is_nan(), "NaN + 1 = NaN");
+        assert!(out[1].is_nan(), "1 + NaN = NaN");
+        assert!(out[2].is_nan(), "inf + -inf = NaN");
+    }
+
+    // ── Single-element and identity tests ────────────────────────────────────
+
+    #[test]
+    fn run_matmul_1x1() {
+        begin_trace();
+        let a = Tensor::new(&[1, 1], DType::F32);
+        let b = Tensor::new(&[1, 1], DType::F32);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[3.0], &[1, 1], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[5.0], &[1, 1], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f32>(), &[15.0]);
+    }
+
+    #[test]
+    fn run_add_single_element() {
+        begin_trace();
+        let a = Tensor::new(&[1], DType::F32);
+        let b = Tensor::new(&[1], DType::F32);
+        let c = &a + &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<f32>(&[3.0], &[1], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[7.0], &[1], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<f32>(), &[10.0]);
+    }
+
+    // ── Complex graph test ───────────────────────────────────────────────────
+
+    #[test]
+    fn run_matmul_bias_relu_reduce() {
+        // x @ w + b → relu → reduce_sum: a multi-op chain
+        begin_trace();
+        let x = Tensor::new(&[2, 3], DType::F32);
+        let w = Tensor::new(&[3, 4], DType::F32);
+        let b = Tensor::new(&[4], DType::F32);
+        let y = x.matmul(&w);
+        let y = &y + &b;
+        let y = y.relu();
+        let y = y.reduce_sum(-1, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[y.id]).expect("compile failed");
+
+        // x = [[1,0,0],[0,1,0]], w = identity-like 3x4 (pad zeros), b = [0,0,0,-10]
+        let x_buf = Buffer::from_slice::<f32>(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3], DType::F32);
+        let w_buf = Buffer::from_slice::<f32>(
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[3, 4],
+            DType::F32,
+        );
+        let b_buf = Buffer::from_slice::<f32>(&[0.0, 0.0, 0.0, -10.0], &[4], DType::F32);
+        let result = compiled.run(&[&x_buf, &w_buf, &b_buf]);
+        // x@w = [[1,0,0,0],[0,1,0,0]], + b = [[1,0,0,-10],[0,1,0,-10]]
+        // relu = [[1,0,0,0],[0,1,0,0]], sum = [1, 1]
+        assert_eq!(result.as_slice::<f32>(), &[1.0, 1.0]);
+    }
+
+    // ── I64 dtype tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn run_add_i64() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::I64);
+        let b = Tensor::new(&[3], DType::I64);
+        let c = &a + &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<i64>(&[1_000_000_000, -500, 0], &[3], DType::I64);
+        let b_buf = Buffer::from_slice::<i64>(&[1_000_000_000, 500, 0], &[3], DType::I64);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<i64>(), &[2_000_000_000, 0, 0]);
+    }
+
+    #[test]
+    fn run_neg_i64() {
+        begin_trace();
+        let a = Tensor::new(&[3], DType::I64);
+        let b = -&a;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<i64>(&[100, -200, 0], &[3], DType::I64);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<i64>(), &[-100, 200, 0]);
+    }
+
+    #[test]
+    fn run_matmul_i64() {
+        begin_trace();
+        let a = Tensor::new(&[2, 2], DType::I64);
+        let b = Tensor::new(&[2, 2], DType::I64);
+        let c = a.matmul(&b);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<i64>(&[1, 2, 3, 4], &[2, 2], DType::I64);
+        let b_buf = Buffer::from_slice::<i64>(&[5, 6, 7, 8], &[2, 2], DType::I64);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        assert_eq!(result.as_slice::<i64>(), &[19, 22, 43, 50]);
+    }
+
+    // ── I32 reduce tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn run_reduce_sum_i32() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::I32);
+        let b = a.reduce_sum(-1, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let a_buf = Buffer::from_slice::<i32>(&[1, 2, 3, 4, 5, 6], &[2, 3], DType::I32);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<i32>(), &[6, 15]);
+    }
+
+    // ── 3D reduce tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn run_reduce_sum_3d_middle_dim() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3, 4], DType::F32);
+        let b = a.reduce_sum(1, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f32>();
+        assert_eq!(out.len(), 8);
+        // batch 0: sum rows [[0,1,2,3],[4,5,6,7],[8,9,10,11]] → [12,15,18,21]
+        assert!((out[0] - 12.0).abs() < 1e-5);
+        assert!((out[3] - 21.0).abs() < 1e-5);
+        // batch 1: → [48,51,54,57]
+        assert!((out[4] - 48.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn run_reduce_max_3d_dim0() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3, 4], DType::F32);
+        let b = a.reduce_max(0, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&data, &[2, 3, 4], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f32>();
+        assert_eq!(out.len(), 12);
+        // max(a[0,i,j], a[1,i,j]) — second batch always larger
+        assert!((out[0] - 12.0).abs() < 1e-5);
+    }
+
+    // ── Chained reshape test ─────────────────────────────────────────────────
+
+    #[test]
+    fn run_chained_reshapes() {
+        begin_trace();
+        let a = Tensor::new(&[24], DType::F32);
+        let b = a.reshape(&[2, 3, 4]);
+        let c = b.reshape(&[6, 4]);
+        let d = c.reshape(&[24]);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[d.id]).expect("compile failed");
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&data, &[24], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        assert_eq!(result.as_slice::<f32>(), data.as_slice());
+    }
+
+    // ── Gemm with bias + alpha + beta combined ───────────────────────────────
+
+    #[test]
+    fn run_gemm_bias_alpha_beta() {
+        begin_trace();
+        let a = Tensor::new(&[2, 3], DType::F32);
+        let b = Tensor::new(&[3, 2], DType::F32);
+        let bias = Tensor::new(&[2], DType::F32);
+        let c = a.gemm(&b, Some(&bias), 2.0, 0.5, false, false);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        // A = I-like, B = I-like → A@B = [[1,0],[0,1]]
+        // 2*[[1,0],[0,1]] + 0.5*[10,20] = [[2,0],[0,2]] + [5,10] = [[7,10],[5,12]]
+        let a_buf = Buffer::from_slice::<f32>(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[3, 2], DType::F32);
+        let bias_buf = Buffer::from_slice::<f32>(&[10.0, 20.0], &[2], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf, &bias_buf]);
+        let out = result.as_slice::<f32>();
+        assert!((out[0] - 7.0).abs() < 1e-4);
+        assert!((out[1] - 10.0).abs() < 1e-4);
+        assert!((out[2] - 5.0).abs() < 1e-4);
+        assert!((out[3] - 12.0).abs() < 1e-4);
+    }
+
+    // ── Broadcast scalar ─────────────────────────────────────────────────────
+
+    #[test]
+    fn run_mul_broadcast_scalar() {
+        begin_trace();
+        let a = Tensor::new(&[3, 4], DType::F32);
+        let b = Tensor::new(&[1], DType::F32);
+        let c = &a * &b;
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[c.id]).expect("compile failed");
+        let a_data: Vec<f32> = (1..=12).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&a_data, &[3, 4], DType::F32);
+        let b_buf = Buffer::from_slice::<f32>(&[2.0], &[1], DType::F32);
+        let result = compiled.run(&[&a_buf, &b_buf]);
+        let expected: Vec<f32> = a_data.iter().map(|x| x * 2.0).collect();
+        assert_eq!(result.as_slice::<f32>(), expected.as_slice());
+    }
+
+    // ── 3D softmax ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_softmax_3d() {
+        begin_trace();
+        let a = Tensor::new(&[2, 2, 3], DType::F32);
+        let b = a.softmax(-1);
+        let trace = take_trace();
+        let compiled = Compiler::compile(&trace, &[b.id]).expect("compile failed");
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let a_buf = Buffer::from_slice::<f32>(&data, &[2, 2, 3], DType::F32);
+        let result = compiled.run(&[&a_buf]);
+        let out = result.as_slice::<f32>();
+        // Each group of 3 should sum to 1.0
+        for i in 0..4 {
+            let sum: f32 = out[i * 3..i * 3 + 3].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5, "group {i} sum={sum}");
+        }
+    }
 }
