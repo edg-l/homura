@@ -2281,23 +2281,46 @@ fn emit_tensor_ops<'c>(
                 // input_nhwc shape: [N, H, W, C]
 
                 // Step 2: Emit tosa.max_pool2d on NHWC input.
-                // Output shape in NHWC: [N, OH, OW, C]
                 let n = input_shape[0];
                 let c = input_shape[1];
-                let oh = shape.0[2];
-                let ow = shape.0[3];
-                let nhwc_out_shape = [n, oh, ow, c];
-                let nhwc_out_type = make_ranked_tensor_type(context, &nhwc_out_shape, *dtype);
+                let in_h = input_shape[2];
+                let in_w = input_shape[3];
+                let oh = shape.0[2]; // target ONNX output height
+                let ow = shape.0[3]; // target ONNX output width
+                let kh = kernel_size[0];
+                let kw = kernel_size[1];
+                let sh = strides[0];
+                let sw = strides[1];
 
-                // TOSA max_pool2d attribute order: [KH, KW]
-                let kernel_attr_str = format!("array<i64: {}, {}>", kernel_size[0], kernel_size[1]);
+                // TOSA requires (H + pad_top + pad_bottom - KH) % stride == 0.
+                // ONNX uses floor division (drops incomplete last window).
+                // Add right/bottom padding to satisfy TOSA, then slice to correct size.
+                // TOSA pads max_pool2d with -inf, so extra elements never win the max.
+                let mut pad_top = pads[0];
+                let mut pad_left = pads[1];
+                let mut pad_bottom = pads[2];
+                let mut pad_right = pads[3];
+                let rem_h = (in_h + pad_top + pad_bottom - kh) % sh;
+                let rem_w = (in_w + pad_left + pad_right - kw) % sw;
+                if rem_h != 0 {
+                    pad_bottom += sh - rem_h;
+                }
+                if rem_w != 0 {
+                    pad_right += sw - rem_w;
+                }
+                // TOSA output with the (possibly enlarged) padding.
+                let tosa_oh = (in_h + pad_top + pad_bottom - kh) / sh + 1;
+                let tosa_ow = (in_w + pad_left + pad_right - kw) / sw + 1;
+                let needs_slice = tosa_oh != oh || tosa_ow != ow;
+
+                let nhwc_tosa_shape = [n, tosa_oh, tosa_ow, c];
+                let nhwc_tosa_type = make_ranked_tensor_type(context, &nhwc_tosa_shape, *dtype);
+
+                let kernel_attr_str = format!("array<i64: {kh}, {kw}>");
                 // TOSA pad order: [pad_top, pad_bottom, pad_left, pad_right]
-                // Our pads: [pad_top, pad_left, pad_bottom, pad_right]
-                let pad_attr_str = format!(
-                    "array<i64: {}, {}, {}, {}>",
-                    pads[0], pads[2], pads[1], pads[3]
-                );
-                let stride_attr_str = format!("array<i64: {}, {}>", strides[0], strides[1]);
+                let pad_attr_str =
+                    format!("array<i64: {pad_top}, {pad_bottom}, {pad_left}, {pad_right}>");
+                let stride_attr_str = format!("array<i64: {sh}, {sw}>");
 
                 let kernel_attr = Attribute::parse(context, &kernel_attr_str)
                     .ok_or_else(|| CompileError::AttributeParse(kernel_attr_str.clone()))?;
@@ -2306,7 +2329,6 @@ fn emit_tensor_ops<'c>(
                 let stride_attr = Attribute::parse(context, &stride_attr_str)
                     .ok_or_else(|| CompileError::AttributeParse(stride_attr_str.clone()))?;
 
-                // acc_type attribute (same derivation as conv2d)
                 let pool_acc_type_str = match dtype {
                     DType::F32 | DType::F64 => "f32",
                     DType::I32 | DType::I64 => "i32",
@@ -2314,11 +2336,11 @@ fn emit_tensor_ops<'c>(
                 let pool_acc_type_attr = Attribute::parse(context, pool_acc_type_str)
                     .ok_or_else(|| CompileError::AttributeParse(pool_acc_type_str.to_string()))?;
 
-                let pool_nhwc: melior::ir::Value = body_block
+                let mut pool_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.max_pool2d", location)
                             .add_operands(&[input_nhwc])
-                            .add_results(&[nhwc_out_type])
+                            .add_results(&[nhwc_tosa_type])
                             .add_attributes(&[
                                 (Identifier::new(context, "kernel"), kernel_attr),
                                 (Identifier::new(context, "pad"), pad_attr),
@@ -2331,6 +2353,64 @@ fn emit_tensor_ops<'c>(
                     .result(0)
                     .unwrap()
                     .into();
+
+                // If we added extra padding, slice back to the ONNX-expected size.
+                // LLVM 21 tosa.slice takes 3 operands: (input, start, size) where
+                // start and size are !tosa.shape<N> produced by tosa.const_shape.
+                if needs_slice {
+                    let nhwc_out_shape_slice = [n, oh, ow, c];
+                    let rank = 4usize;
+                    let shape_type_str = format!("!tosa.shape<{rank}>");
+                    let shape_type = melior::ir::Type::parse(context, &shape_type_str)
+                        .ok_or_else(|| CompileError::AttributeParse(shape_type_str.clone()))?;
+
+                    let start_vals_str = format!("dense<[0, 0, 0, 0]> : tensor<{rank}xindex>");
+                    let start_attr = Attribute::parse(context, &start_vals_str)
+                        .ok_or_else(|| CompileError::AttributeParse(start_vals_str.clone()))?;
+                    let start_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.const_shape", location)
+                                .add_results(&[shape_type])
+                                .add_attributes(&[(Identifier::new(context, "values"), start_attr)])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let size_vals_str =
+                        format!("dense<[{n}, {oh}, {ow}, {c}]> : tensor<{rank}xindex>");
+                    let size_attr = Attribute::parse(context, &size_vals_str)
+                        .ok_or_else(|| CompileError::AttributeParse(size_vals_str.clone()))?;
+                    let size_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.const_shape", location)
+                                .add_results(&[shape_type])
+                                .add_attributes(&[(Identifier::new(context, "values"), size_attr)])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+
+                    let slice_type =
+                        make_ranked_tensor_type(context, &nhwc_out_shape_slice, *dtype);
+                    pool_nhwc = body_block
+                        .append_operation(
+                            OperationBuilder::new("tosa.slice", location)
+                                .add_operands(&[pool_nhwc, start_val, size_val])
+                                .add_results(&[slice_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                }
+
+                let nhwc_out_shape = [n, oh, ow, c];
 
                 // Step 3: Transpose output NHWC → NCHW: perms [0, 3, 1, 2]
                 let result_val = emit_tosa_transpose(

@@ -93,6 +93,225 @@ mod tests {
     use crate::{DType, onnx::proto::*};
     use prost::Message;
 
+    // ── CNN model builder (Task 13.1) ─────────────────────────────────────────
+
+    /// Build a small CNN ONNX model via protobuf:
+    ///
+    /// Input [1,1,8,8]
+    ///   → Conv(kernel=[1,1,3,3], pad=1) → [1,1,8,8]
+    ///   → Relu → [1,1,8,8]
+    ///   → MaxPool(kernel=2×2, stride=2) → [1,1,4,4]
+    ///   → Reshape([1,16]) → [1,16]
+    ///   → MatMul(W:[16,4]) → [1,4]
+    ///   → Add(bias:[4]) → [1,4]
+    ///
+    /// All-ones conv kernel: each output pixel = sum of 3×3 neighbourhood.
+    /// All-ones FC weight: each of the 4 outputs = sum over the 16 spatial values.
+    /// Zero FC bias: output = FC output unchanged.
+    fn make_cnn_model_bytes() -> Vec<u8> {
+        // Conv kernel: [1,1,3,3] all-ones (CO=1, CI=1, KH=3, KW=3).
+        let conv_kernel: Vec<f32> = vec![1.0f32; 1 * 1 * 3 * 3];
+        let conv_kernel_raw: Vec<u8> = conv_kernel.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // Reshape target shape: [1, 16] encoded as I64.
+        let reshape_shape: Vec<i64> = vec![1, 16];
+        let reshape_shape_raw: Vec<u8> =
+            reshape_shape.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // FC weight: [16, 4] all-ones.
+        let fc_weight: Vec<f32> = vec![1.0f32; 16 * 4];
+        let fc_weight_raw: Vec<u8> = fc_weight.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        // FC bias: [4] all-zeros.
+        let fc_bias: Vec<f32> = vec![0.0f32; 4];
+        let fc_bias_raw: Vec<u8> = fc_bias.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        encode(&ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![
+                    // Conv: X, conv_w → conv_out
+                    NodeProto {
+                        op_type: "Conv".into(),
+                        input: vec!["X".into(), "conv_w".into()],
+                        output: vec!["conv_out".into()],
+                        attribute: vec![
+                            AttributeProto {
+                                name: "kernel_shape".into(),
+                                r#type: 7, // INTS
+                                ints: vec![3, 3],
+                                ..Default::default()
+                            },
+                            AttributeProto {
+                                name: "pads".into(),
+                                r#type: 7, // INTS
+                                ints: vec![1, 1, 1, 1],
+                                ..Default::default()
+                            },
+                            AttributeProto {
+                                name: "strides".into(),
+                                r#type: 7, // INTS
+                                ints: vec![1, 1],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    // Relu: conv_out → relu_out
+                    NodeProto {
+                        op_type: "Relu".into(),
+                        input: vec!["conv_out".into()],
+                        output: vec!["relu_out".into()],
+                        ..Default::default()
+                    },
+                    // MaxPool: relu_out → pool_out
+                    NodeProto {
+                        op_type: "MaxPool".into(),
+                        input: vec!["relu_out".into()],
+                        output: vec!["pool_out".into()],
+                        attribute: vec![
+                            AttributeProto {
+                                name: "kernel_shape".into(),
+                                r#type: 7, // INTS
+                                ints: vec![2, 2],
+                                ..Default::default()
+                            },
+                            AttributeProto {
+                                name: "strides".into(),
+                                r#type: 7, // INTS
+                                ints: vec![2, 2],
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    // Reshape: pool_out, reshape_shape → flat_out
+                    NodeProto {
+                        op_type: "Reshape".into(),
+                        input: vec!["pool_out".into(), "reshape_shape".into()],
+                        output: vec!["flat_out".into()],
+                        ..Default::default()
+                    },
+                    // MatMul: flat_out, fc_w → matmul_out
+                    NodeProto {
+                        op_type: "MatMul".into(),
+                        input: vec!["flat_out".into(), "fc_w".into()],
+                        output: vec!["matmul_out".into()],
+                        ..Default::default()
+                    },
+                    // Add: matmul_out, fc_b → output
+                    NodeProto {
+                        op_type: "Add".into(),
+                        input: vec!["matmul_out".into(), "fc_b".into()],
+                        output: vec!["output".into()],
+                        ..Default::default()
+                    },
+                ],
+                initializer: vec![
+                    TensorProto {
+                        name: "conv_w".into(),
+                        dims: vec![1, 1, 3, 3],
+                        data_type: 1, // FLOAT
+                        raw_data: conv_kernel_raw,
+                        ..Default::default()
+                    },
+                    TensorProto {
+                        name: "reshape_shape".into(),
+                        dims: vec![2],
+                        data_type: 7, // INT64
+                        raw_data: reshape_shape_raw,
+                        ..Default::default()
+                    },
+                    TensorProto {
+                        name: "fc_w".into(),
+                        dims: vec![16, 4],
+                        data_type: 1, // FLOAT
+                        raw_data: fc_weight_raw,
+                        ..Default::default()
+                    },
+                    TensorProto {
+                        name: "fc_b".into(),
+                        dims: vec![4],
+                        data_type: 1, // FLOAT
+                        raw_data: fc_bias_raw,
+                        ..Default::default()
+                    },
+                ],
+                input: vec![
+                    value_info("X", &[1, 1, 8, 8]),
+                    value_info("conv_w", &[1, 1, 3, 3]),
+                    value_info("reshape_shape", &[2]),
+                    value_info("fc_w", &[16, 4]),
+                    value_info("fc_b", &[4]),
+                ],
+                output: vec![value_info("output", &[1, 4])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    // ── Task 13.2 + 13.3: CNN pipeline integration test ───────────────────────
+
+    /// Full CNN pipeline: Conv → Relu → MaxPool → Reshape → MatMul → Add.
+    ///
+    /// With all-1.0 input and all-ones conv kernel (pad=1):
+    ///   - Each conv output pixel = sum of its 3×3 neighbourhood.
+    ///   - MaxPool 2×2 stride 2 always picks the maximum of each 2×2 block.
+    ///     Every 2×2 block in the 8×8 feature map contains at least one
+    ///     interior pixel (value 9.0), so all 16 pool outputs = 9.0.
+    ///   - FC weight is all-ones [16,4]: each output = sum(16 × 9.0) = 144.0.
+    ///   - Zero bias: final output = [144.0; 4].
+    #[test]
+    fn load_and_run_cnn_pipeline() {
+        let bytes = make_cnn_model_bytes();
+        let model = Model::load_bytes(&bytes).expect("load failed");
+
+        let input_data: Vec<f32> = vec![1.0f32; 1 * 1 * 8 * 8];
+        let input = Buffer::from_slice::<f32>(&input_data, &[1, 1, 8, 8], DType::F32);
+        let output = model.run(&[&input]).expect("run failed");
+
+        let out = output.as_slice::<f32>();
+
+        // Task 13.3: verify shape and values.
+        assert_eq!(out.len(), 4, "expected 4 output values");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output contains NaN or Inf: {out:?}"
+        );
+        assert!(
+            out.iter().all(|v| *v > 0.0),
+            "expected all-positive output for all-ones input: {out:?}"
+        );
+        // Each output neuron = sum over 16 pool values (each 9.0) × all-ones weight = 144.0.
+        for (i, &v) in out.iter().enumerate() {
+            assert!(
+                (v - 144.0f32).abs() < 1e-3,
+                "output[{i}] = {v}, expected ~144.0"
+            );
+        }
+    }
+
+    // ── Task 13.1 (optional): real mnist-12.onnx test ─────────────────────────
+
+    #[test]
+    fn run_real_mnist_model_if_available() {
+        let path = "tests/fixtures/mnist-12.onnx";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not found (download with scripts/download_mnist.sh)");
+            return;
+        }
+        let model = Model::load(path).expect("load failed");
+        let input = Buffer::from_slice::<f32>(&vec![0.0f32; 784], &[1, 1, 28, 28], DType::F32);
+        let output = model.run(&[&input]).expect("run failed");
+        let out = output.as_slice::<f32>();
+        assert_eq!(out.len(), 10, "expected 10 output logits");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output contains NaN or Inf: {out:?}"
+        );
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn encode(model: &ModelProto) -> Vec<u8> {

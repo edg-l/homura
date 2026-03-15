@@ -223,8 +223,32 @@ fn map_node(
                 None
             };
             let strides = get_ints_attr(&node.attributes, "strides", &[1, 1]);
-            let pads = get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0]);
             let dilations = get_ints_attr(&node.attributes, "dilations", &[1, 1]);
+            let auto_pad = get_str_attr(&node.attributes, "auto_pad", "NOTSET");
+            let pads = if auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER" {
+                // Compute padding so output_size = ceil(input_size / stride).
+                let in_h = x.shape().0[2] as i64;
+                let in_w = x.shape().0[3] as i64;
+                let kh = w.shape().0[2] as i64;
+                let kw = w.shape().0[3] as i64;
+                let sh = strides[0];
+                let sw = strides[1];
+                let dh = dilations[0];
+                let dw = dilations[1];
+                let out_h = (in_h + sh - 1) / sh;
+                let out_w = (in_w + sw - 1) / sw;
+                let pad_h = 0.max((out_h - 1) * sh + dh * (kh - 1) + 1 - in_h);
+                let pad_w = 0.max((out_w - 1) * sw + dw * (kw - 1) + 1 - in_w);
+                if auto_pad == "SAME_UPPER" {
+                    // Extra padding goes to bottom/right.
+                    vec![pad_h / 2, pad_w / 2, pad_h - pad_h / 2, pad_w - pad_w / 2]
+                } else {
+                    // SAME_LOWER: extra padding goes to top/left.
+                    vec![pad_h - pad_h / 2, pad_w - pad_w / 2, pad_h / 2, pad_w / 2]
+                }
+            } else {
+                get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0])
+            };
             let result = x.conv2d(
                 &w,
                 bias.as_ref(),
@@ -249,9 +273,13 @@ fn map_node(
             }
             let strides = get_ints_attr(&node.attributes, "strides", &[1, 1]);
             let pads = get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0]);
+            let kh = kernel_shape[0];
+            let kw = kernel_shape[1];
+            let sh = strides[0];
+            let sw = strides[1];
             let result = x.max_pool2d(
-                [kernel_shape[0] as u64, kernel_shape[1] as u64],
-                [strides[0] as u64, strides[1] as u64],
+                [kh as u64, kw as u64],
+                [sh as u64, sw as u64],
                 [
                     pads[0] as u64,
                     pads[1] as u64,
@@ -340,6 +368,24 @@ fn map_node(
         }
     }
     Ok(())
+}
+
+/// Extract a `String` attribute, returning `default` if missing.
+fn get_str_attr<'a>(
+    attrs: &'a HashMap<String, OnnxAttribute>,
+    name: &str,
+    default: &'a str,
+) -> &'a str {
+    attrs
+        .get(name)
+        .and_then(|attr| {
+            if let OnnxAttribute::String(v) = attr {
+                Some(v.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 /// Extract an `Ints` attribute, returning `default` if missing.
