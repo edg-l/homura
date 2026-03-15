@@ -156,7 +156,6 @@ impl Compiler {
         build_module(&context, &module, trace, outputs)?;
         Ok(module.as_operation().to_string())
     }
-
 }
 
 /// Ensure `libmlir_c_runner_utils.so` is loaded into the process's global
@@ -513,292 +512,6 @@ fn emit_tosa_const_scalar<'c>(
         .into();
 
     Ok(val)
-}
-
-// ── Helper: explicit NHWC padding via linalg.generic ─────────────────────────
-//
-// Emits a `linalg.generic` that pads `input_nhwc` (shape [N, H, W, C]) to
-// `padded_shape` ([N, H+pt+pb, W+pl+pr, C]) using bounds-checked
-// `tensor.extract` + `arith.select` (zero-fill out-of-bounds).
-//
-// Using `linalg.generic` instead of `tensor.pad` avoids the `memref.subview` /
-// `memref.copy` pattern that `tensor.pad` bufferizes to, which breaks
-// affine-loop-fusion after `tosa-to-linalg` lowering.
-
-#[allow(clippy::too_many_arguments)]
-fn emit_linalg_pad_nhwc<'c>(
-    context: &'c Context,
-    body_block: &Block<'c>,
-    input_nhwc: melior::ir::Value<'c, 'c>,
-    padded_shape: &[u64; 4], // [N, padded_H, padded_W, C]
-    orig_h: u64,
-    orig_w: u64,
-    pad_top: u64,
-    pad_left: u64,
-    pad_value: Option<&str>, // e.g. "0.0 : f32" or "-3.40282347E+38 : f32" for -inf; None = zero
-    dtype: DType,
-    location: Location<'c>,
-) -> Result<melior::ir::Value<'c, 'c>, CompileError> {
-    let elem_type = dtype.to_mlir_type(context);
-    let index_type = melior::ir::Type::parse(context, "index")
-        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
-    let i1_type = melior::ir::Type::parse(context, "i1")
-        .ok_or_else(|| CompileError::AttributeParse("i1 type".into()))?;
-    let padded_tensor_type = make_ranked_tensor_type(context, padded_shape, dtype);
-
-    // tensor.empty() for the output slot.
-    let init_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("tensor.empty", location)
-                .add_results(&[padded_tensor_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Build the linalg.generic body block.
-    // It has one block arg: the output element (unused, we overwrite it).
-    let linalg_block = Block::new(&[(elem_type, location)]);
-
-    // Emit: linalg.index 0..3 → loop indices (n, h_out, w_out, c)
-    let idx: Vec<melior::ir::Value> = (0..4u32)
-        .map(|dim| {
-            let dim_attr = Attribute::parse(context, &dim.to_string())
-                .ok_or_else(|| CompileError::AttributeParse(format!("dim {dim}")))?;
-            let v: melior::ir::Value = linalg_block
-                .append_operation(
-                    OperationBuilder::new("linalg.index", location)
-                        .add_results(&[index_type])
-                        .add_attributes(&[(Identifier::new(context, "dim"), dim_attr)])
-                        .build()
-                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-                )
-                .result(0)
-                .unwrap()
-                .into();
-            Ok(v)
-        })
-        .collect::<Result<Vec<_>, CompileError>>()?;
-
-    // Constants for pad_top, pad_left, orig_h, orig_w, 0 (index).
-    let mk_idx_const = |block: &Block<'c>, val: u64| -> Result<melior::ir::Value<'c, 'c>, CompileError> {
-        let attr = Attribute::parse(context, &format!("{val} : index"))
-            .ok_or_else(|| CompileError::AttributeParse(format!("index const {val}")))?;
-        let v: melior::ir::Value = block
-            .append_operation(
-                OperationBuilder::new("arith.constant", location)
-                    .add_results(&[index_type])
-                    .add_attributes(&[(Identifier::new(context, "value"), attr)])
-                    .build()
-                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        Ok(v)
-    };
-
-    let c_pad_top = mk_idx_const(&linalg_block, pad_top)?;
-    let c_pad_left = mk_idx_const(&linalg_block, pad_left)?;
-    let c_orig_h = mk_idx_const(&linalg_block, orig_h)?;
-    let c_orig_w = mk_idx_const(&linalg_block, orig_w)?;
-    let c_zero_idx = mk_idx_const(&linalg_block, 0)?;
-
-    // src_h = h_out - pad_top,  src_w = w_out - pad_left  (wraps on underflow — checked below)
-    let src_h: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.subi", location)
-                .add_operands(&[idx[1], c_pad_top])
-                .add_results(&[index_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    let src_w: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.subi", location)
-                .add_operands(&[idx[2], c_pad_left])
-                .add_results(&[index_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Bounds checks using unsigned comparisons so that underflow-wrapped values
-    // (e.g. h_out=0 minus pad_top=1 wrapping to usize::MAX) are caught by
-    // "src_h < orig_h" (ult).  arith.cmpi predicate is encoded as an i64
-    // integer attribute: ult=6, uge=9.
-    let i64_type = melior::ir::Type::parse(context, "i64")
-        .ok_or_else(|| CompileError::AttributeParse("i64 type".into()))?;
-    let mk_cmpi = |block: &Block<'c>, pred_int: i64, lhs: melior::ir::Value<'c, 'c>, rhs: melior::ir::Value<'c, 'c>| -> Result<melior::ir::Value<'c, 'c>, CompileError> {
-        let pred_attr = IntegerAttribute::new(i64_type, pred_int).into();
-        let v: melior::ir::Value = block
-            .append_operation(
-                OperationBuilder::new("arith.cmpi", location)
-                    .add_operands(&[lhs, rhs])
-                    .add_results(&[i1_type])
-                    .add_attributes(&[(Identifier::new(context, "predicate"), pred_attr)])
-                    .build()
-                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        Ok(v)
-    };
-
-    // src_h < orig_h using unsigned-less-than (predicate 6 = ult)
-    let h_in_range = mk_cmpi(&linalg_block, 6, src_h, c_orig_h)?;
-    // src_w < orig_w using unsigned-less-than (predicate 6 = ult)
-    let w_in_range = mk_cmpi(&linalg_block, 6, src_w, c_orig_w)?;
-
-    // ok = h_in_range && w_in_range
-    let ok: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.andi", location)
-                .add_operands(&[h_in_range, w_in_range])
-                .add_results(&[i1_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Clamp src_h/src_w to 0 so tensor.extract never OOBs (the select will discard the value).
-    let safe_src_h: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.select", location)
-                .add_operands(&[h_in_range, src_h, c_zero_idx])
-                .add_results(&[index_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    let safe_src_w: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.select", location)
-                .add_operands(&[w_in_range, src_w, c_zero_idx])
-                .add_results(&[index_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // tensor.extract %input_nhwc[idx[0], safe_src_h, safe_src_w, idx[3]]
-    let extracted: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("tensor.extract", location)
-                .add_operands(&[input_nhwc, idx[0], safe_src_h, safe_src_w, idx[3]])
-                .add_results(&[elem_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Constant for the out-of-bounds case (zero for conv2d, -inf for max_pool2d).
-    let pad_fill_val: melior::ir::Value = {
-        let attr_str = match pad_value {
-            Some(s) => s.to_string(),
-            None => {
-                let zero_str = match dtype {
-                    DType::F32 | DType::F64 => "0.0",
-                    DType::I32 | DType::I64 => "0",
-                };
-                let type_str = match dtype {
-                    DType::F32 => "f32",
-                    DType::F64 => "f64",
-                    DType::I32 => "i32",
-                    DType::I64 => "i64",
-                };
-                format!("{zero_str} : {type_str}")
-            }
-        };
-        let attr = Attribute::parse(context, &attr_str)
-            .ok_or_else(|| CompileError::AttributeParse("pad fill attr".into()))?;
-        linalg_block
-            .append_operation(
-                OperationBuilder::new("arith.constant", location)
-                    .add_results(&[elem_type])
-                    .add_attributes(&[(Identifier::new(context, "value"), attr)])
-                    .build()
-                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-            )
-            .result(0)
-            .unwrap()
-            .into()
-    };
-
-    // val = arith.select ok, extracted, zero
-    let val: melior::ir::Value = linalg_block
-        .append_operation(
-            OperationBuilder::new("arith.select", location)
-                .add_operands(&[ok, extracted, pad_fill_val])
-                .add_results(&[elem_type])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    // linalg.yield %val
-    linalg_block.append_operation(
-        OperationBuilder::new("linalg.yield", location)
-            .add_operands(&[val])
-            .build()
-            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-    );
-
-    let linalg_region = Region::new();
-    linalg_region.append_block(linalg_block);
-
-    // Identity map (d0,d1,d2,d3) -> (d0,d1,d2,d3) for the single output operand.
-    let out_map = make_identity_map(context, 4)?;
-    let indexing_maps = ArrayAttribute::new(context, &[out_map]);
-    let iterator_types = make_iterator_types(context, 4)?;
-    // operand_segment_sizes: 0 inputs, 1 output
-    let segment_sizes = Attribute::parse(context, "array<i32: 0, 1>").ok_or_else(|| {
-        CompileError::AttributeParse("failed to parse operand_segment_sizes".into())
-    })?;
-
-    let padded_val: melior::ir::Value = body_block
-        .append_operation(
-            OperationBuilder::new("linalg.generic", location)
-                .add_operands(&[init_val])
-                .add_results(&[padded_tensor_type])
-                .add_attributes(&[
-                    (
-                        Identifier::new(context, "indexing_maps"),
-                        indexing_maps.into(),
-                    ),
-                    (Identifier::new(context, "iterator_types"), iterator_types),
-                    (
-                        Identifier::new(context, "operand_segment_sizes"),
-                        segment_sizes,
-                    ),
-                ])
-                .add_regions([linalg_region])
-                .build()
-                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
-        )
-        .result(0)
-        .unwrap()
-        .into();
-
-    Ok(padded_val)
 }
 
 // ── Helper: emit tosa.const_shape + tosa.reshape ─────────────────────────────
@@ -2479,9 +2192,7 @@ fn emit_tensor_ops<'c>(
                 // Step 4: Compute output shape in NHWC layout: [N, OH, OW, CO]
                 // TOSA requires (H + pad_top + pad_bottom - eff_KH) % stride == 0.
                 // ONNX uses floor division (drops incomplete last window).
-                // When padding is non-zero, we explicitly pre-pad input using a
-                // linalg.generic (bounds-checked copy) to avoid tensor.pad, which
-                // prevents affine-loop-fusion after tosa-to-linalg lowering.
+                // Add extra bottom/right padding to satisfy TOSA, then slice to correct size.
                 let n = input_shape[0];
                 let h = input_shape[2];
                 let w = input_shape[3];
@@ -2496,61 +2207,16 @@ fn emit_tensor_ops<'c>(
                 let mut pad_right = pads[3];
                 let eff_kh = dilations[0] * (kh - 1) + 1;
                 let eff_kw = dilations[1] * (kw - 1) + 1;
-
-                // If any pad is non-zero, explicitly pre-pad the NHWC input using
-                // a linalg.generic with bounds-checked indexing + arith.select.
-                // After pre-padding, pass pad=[0,0,0,0] to tosa.conv2d.
-                let (conv_input_nhwc, conv_h, conv_w) =
-                    if pad_top != 0 || pad_bottom != 0 || pad_left != 0 || pad_right != 0 {
-                        let padded_h = h + pad_top + pad_bottom;
-                        let padded_w = w + pad_left + pad_right;
-                        let ci = input_shape[1];
-                        let padded_shape = [n, padded_h, padded_w, ci];
-                        let padded_val = emit_linalg_pad_nhwc(
-                            context,
-                            body_block,
-                            input_nhwc,
-                            &padded_shape,
-                            h,
-                            w,
-                            pad_top,
-                            pad_left,
-                            None, // zero-fill for conv2d
-                            *dtype,
-                            location,
-                        )?;
-                        (padded_val, padded_h, padded_w)
-                    } else {
-                        (input_nhwc, h, w)
-                    };
-
-                // Divisibility fixup: TOSA requires exact stride divisibility.
-                // Use the effective (possibly pre-padded) spatial dims with pad=0.
-                let rem_h = (conv_h - eff_kh) % strides[0];
-                let rem_w = (conv_w - eff_kw) % strides[1];
+                let rem_h = (h + pad_top + pad_bottom - eff_kh) % strides[0];
+                let rem_w = (w + pad_left + pad_right - eff_kw) % strides[1];
                 if rem_h != 0 {
                     pad_bottom += strides[0] - rem_h;
                 }
                 if rem_w != 0 {
                     pad_right += strides[1] - rem_w;
                 }
-
-                // When we pre-padded, any extra divisibility padding is applied via
-                // tosa.conv2d's pad attribute (bottom/right only, top/left already in
-                // the pre-padded tensor). When no pre-padding was done, all four pads
-                // go to tosa.conv2d as before.
-                let (tosa_pad_top, tosa_pad_left, tosa_pad_bottom, tosa_pad_right) =
-                    if pad_top != 0 || pad_left != 0 {
-                        // Pre-padded: top/left consumed; bottom/right are divisibility extras
-                        (0u64, 0u64, pad_bottom - pads[2], pad_right - pads[3])
-                    } else {
-                        (0u64, 0u64, pad_bottom, pad_right)
-                    };
-
-                let tosa_oh =
-                    (conv_h + tosa_pad_top + tosa_pad_bottom - eff_kh) / strides[0] + 1;
-                let tosa_ow =
-                    (conv_w + tosa_pad_left + tosa_pad_right - eff_kw) / strides[1] + 1;
+                let tosa_oh = (h + pad_top + pad_bottom - eff_kh) / strides[0] + 1;
+                let tosa_ow = (w + pad_left + pad_right - eff_kw) / strides[1] + 1;
                 let needs_slice = tosa_oh != oh || tosa_ow != ow;
 
                 let nhwc_tosa_shape = [n, tosa_oh, tosa_ow, co];
@@ -2559,7 +2225,7 @@ fn emit_tensor_ops<'c>(
                 // TOSA conv2d pad order: [pad_top, pad_bottom, pad_left, pad_right]
                 let pad_attr_str = format!(
                     "array<i64: {}, {}, {}, {}>",
-                    tosa_pad_top, tosa_pad_bottom, tosa_pad_left, tosa_pad_right
+                    pad_top, pad_bottom, pad_left, pad_right
                 );
                 let stride_attr_str = format!("array<i64: {}, {}>", strides[0], strides[1]);
                 let dilation_attr_str = format!("array<i64: {}, {}>", dilations[0], dilations[1]);
@@ -2591,17 +2257,11 @@ fn emit_tensor_ops<'c>(
                 let input_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
                 let weight_zp = emit_tosa_const_scalar(context, body_block, zp_str, location)?;
 
-                // Emit tosa.conv2d: (conv_input_nhwc, kernel_ohwi, bias, input_zp, weight_zp)
+                // Emit tosa.conv2d: (input_nhwc, kernel_ohwi, bias, input_zp, weight_zp)
                 let mut conv_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.conv2d", location)
-                            .add_operands(&[
-                                conv_input_nhwc,
-                                kernel_ohwi,
-                                bias_val,
-                                input_zp,
-                                weight_zp,
-                            ])
+                            .add_operands(&[input_nhwc, kernel_ohwi, bias_val, input_zp, weight_zp])
                             .add_results(&[nhwc_tosa_type])
                             .add_attributes(&[
                                 (Identifier::new(context, "pad"), pad_attr),
@@ -2978,94 +2638,34 @@ fn emit_tensor_ops<'c>(
                 let sh = strides[0];
                 let sw = strides[1];
 
+                // TOSA requires (H + pad_top + pad_bottom - KH) % stride == 0.
+                // ONNX uses floor division (drops incomplete last window).
+                // Add right/bottom padding to satisfy TOSA, then slice to correct size.
+                // TOSA pads max_pool2d with -inf, so extra elements never win the max.
                 let pad_top = pads[0];
                 let pad_left = pads[1];
-                let pad_bottom = pads[2];
-                let pad_right = pads[3];
-
-                // Pre-pad with -inf via linalg.generic if any pad is non-zero,
-                // so tosa.max_pool2d gets pad=0. This avoids tensor.pad which
-                // bufferizes to memref.subview+memref.copy (breaks affine fusion).
-                let (pool_input, pool_h, pool_w) =
-                    if pad_top != 0 || pad_bottom != 0 || pad_left != 0 || pad_right != 0 {
-                        let padded_h = in_h + pad_top + pad_bottom;
-                        let padded_w = in_w + pad_left + pad_right;
-                        let padded_shape = [n, padded_h, padded_w, c];
-                        let neg_inf_str = match dtype {
-                            DType::F32 => "-3.40282347E+38 : f32",
-                            DType::F64 => "-1.7976931348623157E+308 : f64",
-                            DType::I32 => "-2147483648 : i32",
-                            DType::I64 => "-9223372036854775808 : i64",
-                        };
-                        let padded_val = emit_linalg_pad_nhwc(
-                            context,
-                            body_block,
-                            input_nhwc,
-                            &padded_shape,
-                            in_h,
-                            in_w,
-                            pad_top,
-                            pad_left,
-                            Some(neg_inf_str),
-                            *dtype,
-                            location,
-                        )?;
-                        (padded_val, padded_h, padded_w)
-                    } else {
-                        (input_nhwc, in_h, in_w)
-                    };
-
-                // TOSA requires (H - KH) % stride == 0 (with pad=0 now).
-                // ONNX uses floor division. Add extra -inf padding for divisibility.
-                let mut extra_bottom = 0u64;
-                let mut extra_right = 0u64;
-                let rem_h = (pool_h - kh) % sh;
-                let rem_w = (pool_w - kw) % sw;
+                let mut pad_bottom = pads[2];
+                let mut pad_right = pads[3];
+                let rem_h = (in_h + pad_top + pad_bottom - kh) % sh;
+                let rem_w = (in_w + pad_left + pad_right - kw) % sw;
                 if rem_h != 0 {
-                    extra_bottom = sh - rem_h;
+                    pad_bottom += sh - rem_h;
                 }
                 if rem_w != 0 {
-                    extra_right = sw - rem_w;
+                    pad_right += sw - rem_w;
                 }
-                let (final_input, final_h, final_w) = if extra_bottom != 0 || extra_right != 0 {
-                    // Need another pad for TOSA divisibility (also with -inf)
-                    let final_h = pool_h + extra_bottom;
-                    let final_w = pool_w + extra_right;
-                    let final_shape = [n, final_h, final_w, c];
-                    let neg_inf_str = match dtype {
-                        DType::F32 => "-3.40282347E+38 : f32",
-                        DType::F64 => "-1.7976931348623157E+308 : f64",
-                        DType::I32 => "-2147483648 : i32",
-                        DType::I64 => "-9223372036854775808 : i64",
-                    };
-                    let v = emit_linalg_pad_nhwc(
-                        context,
-                        body_block,
-                        pool_input,
-                        &final_shape,
-                        pool_h,
-                        pool_w,
-                        0,  // no additional top pad
-                        0,  // no additional left pad
-                        Some(neg_inf_str),
-                        *dtype,
-                        location,
-                    )?;
-                    (v, final_h, final_w)
-                } else {
-                    (pool_input, pool_h, pool_w)
-                };
-
-                let tosa_oh = (final_h - kh) / sh + 1;
-                let tosa_ow = (final_w - kw) / sw + 1;
+                // TOSA output with the (possibly enlarged) padding.
+                let tosa_oh = (in_h + pad_top + pad_bottom - kh) / sh + 1;
+                let tosa_ow = (in_w + pad_left + pad_right - kw) / sw + 1;
                 let needs_slice = tosa_oh != oh || tosa_ow != ow;
 
                 let nhwc_tosa_shape = [n, tosa_oh, tosa_ow, c];
                 let nhwc_tosa_type = make_ranked_tensor_type(context, &nhwc_tosa_shape, *dtype);
 
                 let kernel_attr_str = format!("array<i64: {kh}, {kw}>");
-                // pad=0 since we pre-padded explicitly
-                let pad_attr_str = "array<i64: 0, 0, 0, 0>".to_string();
+                // TOSA pad order: [pad_top, pad_bottom, pad_left, pad_right]
+                let pad_attr_str =
+                    format!("array<i64: {pad_top}, {pad_bottom}, {pad_left}, {pad_right}>");
                 let stride_attr_str = format!("array<i64: {sh}, {sw}>");
 
                 let kernel_attr = Attribute::parse(context, &kernel_attr_str)
@@ -3085,7 +2685,7 @@ fn emit_tensor_ops<'c>(
                 let mut pool_nhwc: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("tosa.max_pool2d", location)
-                            .add_operands(&[final_input])
+                            .add_operands(&[input_nhwc])
                             .add_results(&[nhwc_tosa_type])
                             .add_attributes(&[
                                 (Identifier::new(context, "kernel"), kernel_attr),
