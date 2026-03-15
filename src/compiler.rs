@@ -100,8 +100,9 @@ impl Compiler {
                 func.func(canonicalize,cse),\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
-                convert-linalg-to-loops,\
-                func.func(affine-loop-invariant-code-motion),\
+                fold-memref-alias-ops,\
+                convert-linalg-to-affine-loops,\
+                func.func(affine-loop-invariant-code-motion,affine-scalrep),\
                 lower-affine,\
                 convert-scf-to-cf,\
                 canonicalize,\
