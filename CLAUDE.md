@@ -39,13 +39,16 @@ User code (Tensor ops)  →  Trace (Vec<Op>)  →  MLIR (TOSA + linalg)  →  LL
 
 ```
 func.func(tosa-make-broadcastable, tosa-to-linalg-named, tosa-to-linalg, tosa-to-arith, tosa-to-tensor)
-→ one-shot-bufferize → convert-linalg-to-loops → convert-scf-to-cf → lower-affine
+→ func.func(canonicalize, cse)
+→ one-shot-bufferize → func.func(buffer-hoisting, promote-buffers-to-stack)
+→ convert-linalg-to-loops → func.func(affine-loop-invariant-code-motion)
+→ lower-affine → convert-scf-to-cf → canonicalize → cse → sccp
 → convert-math-to-llvm → expand-strided-metadata → finalize-memref-to-llvm
 → convert-arith-to-llvm → convert-index-to-llvm → convert-cf-to-llvm
 → convert-func-to-llvm → reconcile-unrealized-casts
 ```
 
-TOSA passes are function-level. `lower-affine` is needed for conv2d pad lowering. `expand-strided-metadata` handles `tensor.expand_shape` from broadcast rank promotion.
+TOSA passes are function-level. `canonicalize`+`cse` run after TOSA lowering to simplify linalg IR, and again after scf-to-cf to clean up control flow. `buffer-hoisting`+`promote-buffers-to-stack` optimize buffer placement. `affine-loop-invariant-code-motion` hoists loop invariants. `sccp` does constant propagation. JIT uses LLVM `-O3`. `lower-affine` is needed for conv2d pad lowering. `expand-strided-metadata` handles `tensor.expand_shape` from broadcast rank promotion.
 
 ### JIT ABI
 

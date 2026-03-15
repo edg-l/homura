@@ -100,10 +100,14 @@ flowchart TD
         B3 --> B4["tosa-to-arith / tosa-to-tensor<br>remaining TOSA → arith/tensor"]
     end
 
-    B4 --> C["one-shot-bufferize<br>tensor → memref, allocate intermediates"]
-    C --> D["convert-linalg-to-loops<br>linalg.generic → scf.for loops"]
-    D --> E["convert-scf-to-cf<br>structured loops → branches"]
-    E --> F["lower-affine<br>affine ops from conv2d pad lowering"]
+    B4 --> OPT1["canonicalize + cse<br>simplify linalg IR"]
+    OPT1 --> C["one-shot-bufferize<br>tensor → memref"]
+    C --> BUF["buffer-hoisting +<br>promote-buffers-to-stack"]
+    BUF --> D["convert-linalg-to-loops<br>linalg.generic → scf.for loops"]
+    D --> LICM["affine-loop-invariant-<br>code-motion"]
+    LICM --> F["lower-affine<br>affine ops from conv2d pad lowering"]
+    F --> E["convert-scf-to-cf<br>structured loops → branches"]
+    E --> OPT2["canonicalize + cse + sccp<br>final cleanup"]
 
     subgraph LLVM["LLVM lowering"]
         G["convert-math-to-llvm"]
@@ -112,9 +116,9 @@ flowchart TD
         G3 --> G4["convert-arith/index/cf/func-to-llvm"]
     end
 
-    F --> G
+    OPT2 --> G
     G4 --> H["reconcile-unrealized-casts"]
-    H --> I["LLVM IR → JIT machine code"]
+    H --> I["LLVM IR → JIT -O3"]
 ```
 
 The exact pipeline string passed to MLIR:
@@ -126,12 +130,16 @@ builtin.module(
         tosa-to-linalg,
         tosa-to-arith,
         tosa-to-tensor),
+    func.func(canonicalize, cse),
     one-shot-bufferize{
         function-boundary-type-conversion=identity-layout-map
         unknown-type-conversion=identity-layout-map},
+    func.func(buffer-hoisting, promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),
     convert-linalg-to-loops,
-    convert-scf-to-cf,
+    func.func(affine-loop-invariant-code-motion),
     lower-affine,
+    convert-scf-to-cf,
+    canonicalize, cse, sccp,
     convert-math-to-llvm,
     expand-strided-metadata,
     finalize-memref-to-llvm,
@@ -142,7 +150,7 @@ builtin.module(
     reconcile-unrealized-casts)
 ```
 
-TOSA passes are function-level (nested under `func.func()`). The remaining passes are module-level.
+TOSA passes are function-level (nested under `func.func()`). Optimization passes run at two stages: after TOSA lowering (`canonicalize`+`cse` to simplify linalg IR, `buffer-hoisting`+`promote-buffers-to-stack` for memory), and after loop lowering (`affine-loop-invariant-code-motion`, then `canonicalize`+`cse`+`sccp` for final cleanup). The JIT ExecutionEngine uses LLVM `-O3`.
 
 ### 4. Execution — Running the Machine Code
 

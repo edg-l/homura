@@ -97,10 +97,16 @@ impl Compiler {
                     tosa-to-arith,\
                     tosa-to-tensor\
                 ),\
+                func.func(canonicalize,cse),\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+                func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 convert-linalg-to-loops,\
-                convert-scf-to-cf,\
+                func.func(affine-loop-invariant-code-motion),\
                 lower-affine,\
+                convert-scf-to-cf,\
+                canonicalize,\
+                cse,\
+                sccp,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
                 finalize-memref-to-llvm,\
@@ -119,7 +125,7 @@ impl Compiler {
         // Ensure libmlir_runner_utils.so is loaded globally so the ORC JIT
         // can resolve `memrefCopy` emitted by padded conv2d bufferization.
         ensure_runner_utils_loaded();
-        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
 
         Ok(CompiledGraph::new(
             engine,
@@ -3193,7 +3199,7 @@ mod tests {
         run_tosa_pipeline(&mut module, &context).expect("TOSA pipeline failed");
 
         // JIT execute: [1,2,3,4] + [10,20,30,40] = [11,22,33,44]
-        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
         let a = [1.0f32, 2.0, 3.0, 4.0];
         let b = [10.0f32, 20.0, 30.0, 40.0];
         let result = unsafe { jit_run_f32(&engine, &[&a, &b], 4) };
@@ -3398,7 +3404,7 @@ mod tests {
 
         // JIT execute: a=[2,4,6,8], b=[0,0,0,0] -> tosa.add=[2,4,6,8]
         //              c=[1,2,3,4] -> linalg div=[2,2,2,2]
-        let engine = melior::ExecutionEngine::new(&module, 2, &[], false);
+        let engine = melior::ExecutionEngine::new(&module, 3, &[], false);
         let a = [2.0f32, 4.0, 6.0, 8.0];
         let b = [0.0f32, 0.0, 0.0, 0.0];
         let c = [1.0f32, 2.0, 3.0, 4.0];
