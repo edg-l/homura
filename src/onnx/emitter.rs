@@ -476,12 +476,34 @@ fn emit_node<'c>(
             let b = get_tensor(value_map, builder, &node.inputs[1])?;
             let out = builder.emit_add(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Add on matching-size integer tensors.
+            if let (Some(va), Some(vb)) = (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+            ) {
+                if va.len() == vb.len() {
+                    let result: Vec<i64> = va.iter().zip(vb.iter()).map(|(&a, &b)| a + b).collect();
+                    const_i64.insert(node.outputs[0].clone(), result);
+                }
+            }
         }
         "Sub" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
             let b = get_tensor(value_map, builder, &node.inputs[1])?;
             let out = builder.emit_sub(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Sub on small integer tensors.
+            if let (Some(va), Some(vb)) = (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+            ) {
+                if va.len() == vb.len() {
+                    let result: Vec<i64> = va.iter().zip(vb.iter()).map(|(&a, &b)| a - b).collect();
+                    const_i64.insert(node.outputs[0].clone(), result);
+                }
+            }
         }
         "Mul" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
