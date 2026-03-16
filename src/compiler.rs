@@ -10,7 +10,7 @@ use melior::{
             ArrayAttribute, FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute,
         },
         block::BlockLike,
-        operation::{OperationBuilder, OperationLike},
+        operation::{OperationBuilder, OperationLike, OperationMutLike},
         r#type::{FunctionType, MemRefType, RankedTensorType},
     },
     pass,
@@ -96,7 +96,22 @@ impl Compiler {
         // the returned CompiledGraph is always fully-formed.
         let context = create_context();
         let location = Location::unknown(&context);
-        let module = Module::new(location);
+        let mut module = Module::new(location);
+
+        // Set data layout for x86-64 so MLIR passes (finalize-memref-to-llvm etc.)
+        // know the target's type sizes and alignments.
+        let dl_attr = Attribute::parse(&context,
+            "#dlti.dl_spec<\
+                index = 64 : i64, \
+                i32 = dense<32> : vector<2xi64>, \
+                i64 = dense<64> : vector<2xi64>, \
+                f32 = dense<32> : vector<2xi64>, \
+                f64 = dense<64> : vector<2xi64>, \
+                !llvm.ptr = dense<64> : vector<4xi64>\
+            >"
+        ).expect("failed to parse dlti.dl_spec");
+        module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
+
         let (num_inputs, output_descs) = build_module(&context, &module, trace, outputs)?;
 
         // ---- Cache hit path --------------------------------------------------
@@ -264,6 +279,14 @@ fn emit_object_file(
         let llvm_ctx = LLVMContextCreate();
         let llvm_module =
             mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_ctx);
+
+        // Set the host data layout on the LLVM module.
+        if !llvm_module.is_null() {
+            let dl = CString::new(
+                "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+            ).unwrap();
+            LLVMSetDataLayout(llvm_module, dl.as_ptr());
+        }
         if llvm_module.is_null() {
             LLVMContextDispose(llvm_ctx);
             return Err(CompileError::ObjectEmit(
@@ -8871,5 +8894,238 @@ mod tests {
         );
         let out = outputs[0].as_slice::<f32>();
         assert_eq!(out, &[1.0f32, 2.0, 3.0, 4.0], "reshape output mismatch: {out:?}");
+    }
+
+    #[test]
+    fn run_dynamic_reshape_then_transpose() {
+        use crate::shape::DIM_DYNAMIC;
+        use crate::trace::record;
+        // Reproduce the decode model crash pattern:
+        // reshape [1, 1, 768] → [1, 1, 12, 64] via shape tensor,
+        // then transpose [0, 2, 1, 3] → [1, 12, 1, 64].
+        begin_trace();
+        let input_id = record(Op::Input {
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 768]),
+            dtype: DType::F32,
+            arg_index: 0,
+        });
+        let shape_id = record(Op::Input {
+            shape: crate::Shape(vec![4]),
+            dtype: DType::I64,
+            arg_index: 1,
+        });
+        let reshape_id = record(Op::Reshape {
+            input: input_id,
+            target_shape: vec![DIM_DYNAMIC, DIM_DYNAMIC, 12, 64],
+            shape_tensor: Some(shape_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        let transpose_id = record(Op::Transpose {
+            input: reshape_id,
+            perm: vec![0, 2, 1, 3],
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[transpose_id], None)
+            .expect("compile failed");
+
+        // Input: [1, 1, 768] filled with index values
+        let mut input_data = vec![0.0f32; 768];
+        for i in 0..768 { input_data[i] = i as f32; }
+        let x_buf = Buffer::from_slice::<f32>(&input_data, &[1, 1, 768], DType::F32);
+        let shape_buf = Buffer::from_slice::<i64>(&[1, 1, 12, 64], &[4], DType::I64);
+
+        let outputs = compiled.run_dynamic(
+            &[&x_buf, &shape_buf],
+            &[crate::Shape(vec![1, 12, 1, 64])],
+        );
+        let out = outputs[0].as_slice::<f32>();
+        assert_eq!(out.len(), 768);
+        // After reshape [1,1,12,64] + transpose [0,2,1,3] → [1,12,1,64]:
+        // Element at output[0,h,0,d] = input[0,0,h*64+d]
+        // So out[0] = input[0,0,0] = 0.0, out[64] = input[0,0,64] = 64.0
+        assert!((out[0] - 0.0).abs() < 1e-5, "out[0]={}", out[0]);
+        assert!((out[64] - 64.0).abs() < 1e-5, "out[64]={}", out[64]);
+        assert!((out[128] - 128.0).abs() < 1e-5, "out[128]={}", out[128]);
+    }
+
+    #[test]
+    fn run_multiple_dynamic_reshapes_with_reuse() {
+        use crate::shape::DIM_DYNAMIC;
+        use crate::trace::record;
+        // Test buffer reuse: two tensor.reshape ops using DIFFERENT shape tensors.
+        // This triggers one-shot-bufferize to potentially reuse the shape alloca.
+        begin_trace();
+        // First input: [?, ?, 768]
+        let input1_id = record(Op::Input {
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 768]),
+            dtype: DType::F32,
+            arg_index: 0,
+        });
+        let shape1_id = record(Op::Input {
+            shape: crate::Shape(vec![2]),
+            dtype: DType::I64,
+            arg_index: 1,
+        });
+        // Reshape 1: [?, ?, 768] → [?, 768] (flatten batch*seq)
+        let reshape1_id = record(Op::Reshape {
+            input: input1_id,
+            target_shape: vec![DIM_DYNAMIC, 768],
+            shape_tensor: Some(shape1_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        // Matmul: [?, 768] x [768, 64] → [?, 64]
+        let weight_id = record(Op::Input {
+            shape: crate::Shape(vec![768, 64]),
+            dtype: DType::F32,
+            arg_index: 2,
+        });
+        let matmul_id = record(Op::Matmul {
+            lhs: reshape1_id,
+            rhs: weight_id,
+            shape: crate::Shape(vec![DIM_DYNAMIC, 64]),
+            dtype: DType::F32,
+        });
+        // Second shape tensor for reshape back
+        let shape2_id = record(Op::Input {
+            shape: crate::Shape(vec![3]),
+            dtype: DType::I64,
+            arg_index: 3,
+        });
+        // Reshape 2: [?, 64] → [?, ?, 64] (unflatten)
+        let reshape2_id = record(Op::Reshape {
+            input: matmul_id,
+            target_shape: vec![DIM_DYNAMIC, DIM_DYNAMIC, 64],
+            shape_tensor: Some(shape2_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[reshape2_id], None)
+            .expect("compile failed");
+
+        // Input: [1, 1, 768] = 768 floats
+        let input_data = vec![1.0f32; 768];
+        let x_buf = Buffer::from_slice::<f32>(&input_data, &[1, 1, 768], DType::F32);
+        let shape1_buf = Buffer::from_slice::<i64>(&[1, 768], &[2], DType::I64);
+        // Weight: 768x64 identity-like (first col = 1, rest = 0)
+        let mut w_data = vec![0.0f32; 768 * 64];
+        for i in 0..64 { w_data[i * 64 + i] = 1.0; }
+        let w_buf = Buffer::from_slice::<f32>(&w_data, &[768, 64], DType::F32);
+        let shape2_buf = Buffer::from_slice::<i64>(&[1, 1, 64], &[3], DType::I64);
+
+        let outputs = compiled.run_dynamic(
+            &[&x_buf, &shape1_buf, &w_buf, &shape2_buf],
+            &[crate::Shape(vec![1, 1, 64])],
+        );
+        let out = outputs[0].as_slice::<f32>();
+        assert_eq!(out.len(), 64, "expected 64 elements, got {}", out.len());
+        // With identity-like weight, first 64 outputs should be 1.0
+        assert!((out[0] - 1.0).abs() < 1e-3, "out[0]={}", out[0]);
+    }
+
+    #[test]
+    fn run_dynamic_qkv_split_pattern() {
+        use crate::shape::DIM_DYNAMIC;
+        use crate::trace::record;
+        // Reproduce the full QKV split: 3 reshapes (Q, K, V) from same input,
+        // each followed by transpose, then matmul Q*K^T.
+        begin_trace();
+        // Input: [batch, seq, 2304] where 2304 = 3 * 12 * 64
+        let input_id = record(Op::Input {
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 2304]),
+            dtype: DType::F32,
+            arg_index: 0,
+        });
+        // Slice Q: [batch, seq, 0:768]
+        let q_slice_id = record(Op::Slice {
+            input: input_id,
+            starts: vec![0, 0, 0],
+            ends: vec![i64::MAX, i64::MAX, 768],
+            axes: vec![0, 1, 2],
+            steps: vec![1, 1, 1],
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 768]),
+            dtype: DType::F32,
+        });
+        // Shape tensor for [batch, seq, 12, 64]
+        let shape4_id = record(Op::Input {
+            shape: crate::Shape(vec![4]),
+            dtype: DType::I64,
+            arg_index: 1,
+        });
+        // Reshape Q: [?, ?, 768] → [?, ?, 12, 64]
+        let q_reshape_id = record(Op::Reshape {
+            input: q_slice_id,
+            target_shape: vec![DIM_DYNAMIC, DIM_DYNAMIC, 12, 64],
+            shape_tensor: Some(shape4_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        // Transpose Q: [b,s,h,d] → [b,h,s,d]
+        let q_trans_id = record(Op::Transpose {
+            input: q_reshape_id,
+            perm: vec![0, 2, 1, 3],
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        // Slice K: [batch, seq, 768:1536]
+        let k_slice_id = record(Op::Slice {
+            input: input_id,
+            starts: vec![0, 0, 768],
+            ends: vec![i64::MAX, i64::MAX, 1536],
+            axes: vec![0, 1, 2],
+            steps: vec![1, 1, 1],
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, 768]),
+            dtype: DType::F32,
+        });
+        // Reshape K
+        let k_reshape_id = record(Op::Reshape {
+            input: k_slice_id,
+            target_shape: vec![DIM_DYNAMIC, DIM_DYNAMIC, 12, 64],
+            shape_tensor: Some(shape4_id),
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        // Transpose K: [b,s,h,d] → [b,h,d,s] for Q*K^T
+        let k_trans_id = record(Op::Transpose {
+            input: k_reshape_id,
+            perm: vec![0, 2, 3, 1],
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        // Matmul Q * K^T: [b,h,s,d] x [b,h,d,s] → [b,h,s,s]
+        let qk_id = record(Op::Matmul {
+            lhs: q_trans_id,
+            rhs: k_trans_id,
+            shape: crate::Shape(vec![DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC, DIM_DYNAMIC]),
+            dtype: DType::F32,
+        });
+        let trace = take_trace();
+
+        let compiled = Compiler::compile(&trace, &[qk_id], None)
+            .expect("compile failed");
+
+        // Concrete: batch=1, seq=1, so QKV = [1, 1, 2304]
+        let mut input_data = vec![0.0f32; 2304];
+        // Q part [0..768]: set head 0, dim 0 = 1.0
+        input_data[0] = 1.0;
+        // K part [768..1536]: set head 0, dim 0 = 1.0
+        input_data[768] = 1.0;
+        let x_buf = Buffer::from_slice::<f32>(&input_data, &[1, 1, 2304], DType::F32);
+        let shape_buf = Buffer::from_slice::<i64>(&[1, 1, 12, 64], &[4], DType::I64);
+
+        let outputs = compiled.run_dynamic(
+            &[&x_buf, &shape_buf],
+            &[crate::Shape(vec![1, 12, 1, 1])],
+        );
+        let out = outputs[0].as_slice::<f32>();
+        assert_eq!(out.len(), 12, "expected 12 elements (b=1,h=12,s=1,s=1)");
+        // Q[0,0,0,0]=1.0, K[0,0,0,0]=1.0, so QK[0,0,0,0] = dot(Q[0,0,0,:], K[0,0,:,0]) = 1.0
+        assert!((out[0] - 1.0).abs() < 1e-3, "qk[0]={}, expected 1.0", out[0]);
     }
 }
