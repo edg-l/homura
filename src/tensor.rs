@@ -542,24 +542,31 @@ impl Tensor {
     /// Reshape the tensor to `target_shape`.
     ///
     /// At most one dimension may be `-1`, in which case it is inferred from the
-    /// total element count. All other dimensions must be non-negative. The total
-    /// number of elements must not change.
+    /// total element count. `i64::MIN` encodes a dynamic dimension (DIM_DYNAMIC)
+    /// that is preserved as-is without element-count checking. All other dimensions
+    /// must be positive. The total number of elements must not change (ignoring
+    /// dynamic dims).
     pub fn reshape(&self, target_shape: &[i64]) -> Tensor {
-        let total_elems: u64 = self.shape.0.iter().product();
+        use crate::shape::DIM_DYNAMIC;
 
-        // Count and locate the -1 dimension, if any.
+        // Count and locate the -1 (infer) dimension, if any.
         let neg_count = target_shape.iter().filter(|&&d| d == -1).count();
         assert!(
             neg_count <= 1,
             "reshape: at most one dimension can be -1, got {neg_count}"
         );
 
+        let has_dynamic = target_shape.iter().any(|&d| d == i64::MIN);
+
         let mut resolved: Vec<u64> = Vec::with_capacity(target_shape.len());
         let mut known_product: u64 = 1;
         let mut infer_idx: Option<usize> = None;
 
         for (i, &d) in target_shape.iter().enumerate() {
-            if d == -1 {
+            if d == i64::MIN {
+                // DIM_DYNAMIC: keep as dynamic, skip element-count accounting.
+                resolved.push(DIM_DYNAMIC);
+            } else if d == -1 {
                 infer_idx = Some(i);
                 resolved.push(0); // placeholder
             } else {
@@ -571,12 +578,19 @@ impl Tensor {
         }
 
         if let Some(idx) = infer_idx {
-            assert!(
-                total_elems % known_product == 0,
-                "reshape: cannot infer -1 dimension: {total_elems} elements not divisible by {known_product}"
-            );
-            resolved[idx] = total_elems / known_product;
-        } else {
+            if has_dynamic {
+                // Cannot infer a dim when other dims are dynamic; leave as dynamic.
+                resolved[idx] = DIM_DYNAMIC;
+            } else {
+                let total_elems: u64 = self.shape.0.iter().product();
+                assert!(
+                    total_elems % known_product == 0,
+                    "reshape: cannot infer -1 dimension: {total_elems} elements not divisible by {known_product}"
+                );
+                resolved[idx] = total_elems / known_product;
+            }
+        } else if !has_dynamic {
+            let total_elems: u64 = self.shape.0.iter().product();
             assert_eq!(
                 known_product, total_elems,
                 "reshape: element count mismatch: input has {total_elems} elements but target shape has {known_product}"

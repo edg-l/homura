@@ -352,6 +352,26 @@ impl KvGenerator {
         let vocab_size = logits.shape().0[2] as usize;
         let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
 
+        // Debug: print top-5 prefill logits
+        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
+            let logit_data = logits.as_slice::<f32>();
+            let offset = (seq_len - 1) * vocab_size;
+            let pos_logits = &logit_data[offset..offset + vocab_size];
+            let mut indexed: Vec<(usize, f32)> = pos_logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top5: Vec<String> = indexed[..5.min(indexed.len())]
+                .iter()
+                .map(|(i, v)| format!("{}={:.4}", i, v))
+                .collect();
+            eprintln!(
+                "[debug] prefill logits top5: [{}] min={:.4} max={:.4} result_token={}",
+                top5.join(", "),
+                pos_logits.iter().cloned().fold(f32::INFINITY, f32::min),
+                pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                next_token,
+            );
+        }
+
         // KV outputs: outputs[1 .. 1 + num_kv_tensors], each [1, heads, bucket, head_dim]
         // Trim to [1, heads, seq_len, head_dim] (remove bucket padding) so that
         // the KV cache exactly matches real_pos and the attention mask is all-ones.
@@ -364,32 +384,9 @@ impl KvGenerator {
             )
             .into());
         }
-        let heads = self.config.num_heads as usize;
-        let head_dim = self.config.head_dim as usize;
-        let kv_buffers = if seq_len == bucket {
-            outputs[1..1 + kv_count].to_vec()
-        } else {
-            // Trim: extract first seq_len positions per head from [1, heads, bucket, head_dim]
-            outputs[1..1 + kv_count]
-                .iter()
-                .map(|kv| {
-                    let mut trimmed = Buffer::new(
-                        &[1, heads as u64, seq_len as u64, head_dim as u64],
-                        DType::F32,
-                    );
-                    let src = kv.as_slice::<f32>();
-                    let dst = trimmed.as_slice_mut::<f32>();
-                    for h in 0..heads {
-                        let src_off = h * bucket * head_dim;
-                        let dst_off = h * seq_len * head_dim;
-                        let copy_len = seq_len * head_dim;
-                        dst[dst_off..dst_off + copy_len]
-                            .copy_from_slice(&src[src_off..src_off + copy_len]);
-                    }
-                    trimmed
-                })
-                .collect()
-        };
+        // Keep full bucket KV (including padding positions).
+        // The decode step uses the attention mask to distinguish real from padding.
+        let kv_buffers = outputs[1..1 + kv_count].to_vec();
 
         Ok((next_token, kv_buffers, seq_len))
     }
@@ -429,9 +426,15 @@ impl KvGenerator {
         let input_ids =
             Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
 
-        // attention_mask: [1, real_pos + 1] — all ones (no padding)
-        let mask_len = real_pos + 1;
-        let mask_data = vec![1i64; mask_len];
+        // attention_mask: [1, kv_seq_len + 1]
+        // 1 at real positions, 0 at padding positions, 1 at new-token position
+        let kv_seq_len = kv_cache[0].shape().0[2] as usize;
+        let mask_len = kv_seq_len + 1;
+        let mut mask_data = vec![0i64; mask_len];
+        for i in 0..real_pos {
+            mask_data[i] = 1;
+        }
+        mask_data[kv_seq_len] = 1; // new token
         let attention_mask =
             Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
 
@@ -447,7 +450,7 @@ impl KvGenerator {
         // Output 0: logits [1, 1, vocab_size]
         // Outputs 1..kv_count: KV [1, heads, real_pos+1, head_dim]
         let kv_count = self.config.num_kv_tensors;
-        let out_seq_len = (real_pos + 1) as u64;
+        let out_seq_len = (kv_seq_len + 1) as u64;
         let mut output_shapes: Vec<crate::shape::Shape> = Vec::with_capacity(1 + kv_count);
         // Get vocab_size from the compiled model's output desc (last dim of logits).
         let vocab_size_dim = self
@@ -465,12 +468,44 @@ impl KvGenerator {
             ]));
         }
 
+        // Debug: print KV cache and mask shapes
+        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
+            eprintln!(
+                "[debug] decode inputs: token={} input_ids={:?} kv[0]={:?} mask={:?} real_pos={}",
+                next_token, input_ids.shape(), kv_cache[0].shape(), attention_mask.shape(), real_pos,
+            );
+            let kv0 = kv_cache[0].as_slice::<f32>();
+            eprintln!(
+                "[debug] kv[0] first 4 vals: {:?}, last 4: {:?}",
+                &kv0[..4.min(kv0.len())],
+                &kv0[kv0.len().saturating_sub(4)..],
+            );
+        }
+
         let mut outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
 
         // logits: [1, 1, vocab_size] — only one position, read at index 0
         let logits = &outputs[0];
         let vocab_size = logits.shape().0[2] as usize;
         let result_token = argmax_at_position(logits, 0, vocab_size);
+
+        // Debug: print top-5 logits to diagnose output quality
+        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
+            let logit_data = logits.as_slice::<f32>();
+            let mut indexed: Vec<(usize, f32)> = logit_data.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top5: Vec<String> = indexed[..5.min(indexed.len())]
+                .iter()
+                .map(|(i, v)| format!("{}={:.4}", i, v))
+                .collect();
+            eprintln!(
+                "[debug] decode logits top5: [{}] min={:.4} max={:.4} result_token={}",
+                top5.join(", "),
+                logit_data.iter().cloned().fold(f32::INFINITY, f32::min),
+                logit_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                result_token,
+            );
+        }
 
         if outputs.len() < 1 + kv_count {
             return Err(format!(

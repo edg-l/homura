@@ -488,7 +488,7 @@ fn map_node(
                 // Do NOT insert into constant_data — the values are only known at runtime.
             } else {
                 // Static path: constant-fold as before.
-                let dims: Vec<i64> = input.shape().0.iter().map(|&d| d as i64).collect();
+                let dims: Vec<i64> = input.shape().0.iter().map(|&d| crate::shape::dim_to_i64(d)).collect();
                 let buf = Buffer::from_slice::<i64>(&dims, &[dims.len() as u64], crate::DType::I64);
                 let t = register_constant(buf, constant_data, weights, &node.outputs[0]);
                 tensors.insert(node.outputs[0].clone(), t);
@@ -672,7 +672,7 @@ fn map_node(
                 None => in_shape
                     .iter()
                     .filter(|&&d| d != 1)
-                    .map(|&d| d as i64)
+                    .map(|&d| crate::shape::dim_to_i64(d))
                     .collect(),
                 Some(ax) => {
                     // Normalize negative axes.
@@ -684,7 +684,7 @@ fn map_node(
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !ax_set.contains(&(*i as i64)))
-                        .map(|(_, &d)| d as i64)
+                        .map(|(_, &d)| crate::shape::dim_to_i64(d))
                         .collect()
                 }
             };
@@ -740,7 +740,7 @@ fn map_node(
             normalized.sort_unstable();
 
             // Build the output shape by inserting 1s at the specified positions.
-            let mut new_shape: Vec<i64> = in_shape.iter().map(|&d| d as i64).collect();
+            let mut new_shape: Vec<i64> = in_shape.iter().map(|&d| crate::shape::dim_to_i64(d)).collect();
             for &ax in &normalized {
                 new_shape.insert(ax as usize, 1);
             }

@@ -7,6 +7,12 @@
 /// as `RankedTensorType::new` and `MemRefType::new`.
 pub const DIM_DYNAMIC: u64 = u64::MAX;
 
+/// Convert a u64 dim to i64, preserving DIM_DYNAMIC as i64::MIN (MLIR's kDynamic).
+/// This avoids collision with ONNX's -1 "infer this dim" convention.
+pub fn dim_to_i64(d: u64) -> i64 {
+    if d == DIM_DYNAMIC { i64::MIN } else { d as i64 }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Shape(pub Vec<u64>);
 
