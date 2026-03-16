@@ -1,2 +1,6 @@
 /target
 CLAUDE.md
+debug.md
+debug_memref*
+/[A-Z]*_*.md
+/PLAN.md
