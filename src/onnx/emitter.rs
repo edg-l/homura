@@ -210,7 +210,7 @@ fn lookup_const_i64(const_i64: &HashMap<String, Vec<i64>>, name: &str) -> Option
 /// Also returns the ordered weight buffers (initializers). These must be passed
 /// as runtime arguments after the dynamic inputs when running the compiled graph.
 /// Default MLIR op-count threshold before starting a new sub-function.
-const DEFAULT_SPLIT_THRESHOLD: usize = 2000;
+const DEFAULT_SPLIT_THRESHOLD: usize = 500;
 
 pub fn emit_graph<'c>(
     model: &OnnxModel,
@@ -270,16 +270,24 @@ pub fn emit_graph_with_split<'c>(
     // Weights already routed into the current sub-function (name -> sub-function tensor).
     let mut weight_remap: HashMap<String, Tensor<'c>> = HashMap::new();
 
+    // Start the first sub-function immediately so @compute only has glue code.
+    if splitting_enabled {
+        let live = collect_live_values(
+            &mut value_map, &weight_names, &last_use, 0, builder,
+        );
+        begin_chunk(builder, &mut value_map, &live, chunk_index);
+        chunk_index += 1;
+        weight_remap.clear();
+    }
+
     for (node_idx, node) in model.nodes.iter().enumerate() {
         // Check if we should split based on MLIR op count in the current block.
         let op_count = builder.block_op_count();
         if splitting_enabled && op_count >= split_threshold {
-            if builder.in_subfunction() {
-                let live = collect_live_values(
-                    &mut value_map, &weight_names, &last_use, node_idx, builder,
-                );
-                end_chunk(builder, &mut value_map, &live);
-            }
+            let live = collect_live_values(
+                &mut value_map, &weight_names, &last_use, node_idx, builder,
+            );
+            end_chunk(builder, &mut value_map, &live);
             let live = collect_live_values(
                 &mut value_map, &weight_names, &last_use, node_idx, builder,
             );
