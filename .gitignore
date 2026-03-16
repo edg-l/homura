@@ -4,3 +4,6 @@ debug.md
 debug_memref*
 /[A-Z]*_*.md
 /PLAN.md
+tests/fixtures/gpt2_decoder_model.onnx
+tests/fixtures/gpt2_decoder_model_merged.onnx
+tests/fixtures/gpt2_decoder_with_past_model.onnx
