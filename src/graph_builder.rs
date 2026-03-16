@@ -2694,6 +2694,235 @@ impl<'c> GraphBuilder<'c> {
         Tensor::from_value(result)
     }
 
+    /// Resolve ONNX special values in a runtime reshape shape.
+    ///
+    /// Given `dim_indices` (index values extracted from the ONNX shape tensor):
+    /// - `-1` → inferred dimension = total_input_elems / product_of_other_dims
+    /// - `0`  → copy from input dim i (when `allowzero` is false)
+    ///
+    /// Returns corrected index values ready for `emit_reshape_from_index_dims`.
+    pub fn emit_resolve_reshape_dims(
+        &mut self,
+        input: &Tensor<'c>,
+        dim_indices: &[melior::ir::Value<'c, 'c>],
+        allowzero: bool,
+    ) -> Vec<melior::ir::Value<'c, 'c>> {
+        let in_shape = input.shape();
+        let in_rank = in_shape.len();
+        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
+        let loc = self.location;
+        let ctx = self.context;
+
+        // Constants we'll need.
+        let c0 = self.emit_arith_constant_index(0);
+        let c1 = self.emit_arith_constant_index(1);
+        let c_neg1 = {
+            // -1 as index (for comparison). arith.constant doesn't support negative index,
+            // so cast from i64.
+            let i64_type = melior::ir::Type::parse(ctx, "i64").expect("i64");
+            let neg1_attr = Attribute::parse(ctx, "-1 : i64").expect("-1 i64 attr");
+            let neg1_i64: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.constant", loc)
+                        .add_results(&[i64_type])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), neg1_attr)])
+                        .build()
+                        .expect("arith.constant -1"),
+                )
+                .result(0).unwrap().into();
+            self.block
+                .append_operation(
+                    OperationBuilder::new("arith.index_cast", loc)
+                        .add_operands(&[neg1_i64])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.index_cast -1"),
+                )
+                .result(0).unwrap().into()
+        };
+
+        // Compute total input elements.
+        let mut total: melior::ir::Value<'c, 'c> = c1;
+        for i in 0..in_rank {
+            let dim_val = match in_shape[i] {
+                Some(n) => self.emit_arith_constant_index(n),
+                None => self.emit_tensor_dim(input.value(), i),
+            };
+            total = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.muli", loc)
+                        .add_operands(&[total, dim_val])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.muli total"),
+                )
+                .result(0).unwrap().into();
+        }
+
+        // First pass: resolve 0 entries (copy from input), leave -1 as-is.
+        let resolved_zeros: Vec<melior::ir::Value<'c, 'c>> = dim_indices.iter().enumerate().map(|(i, &dim_val)| {
+            if allowzero {
+                return dim_val;
+            }
+            // Check if dim == 0 using arith.cmpi eq.
+            let is_zero: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.cmpi", loc)
+                        .add_operands(&[dim_val, c0])
+                        .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
+                        .add_attributes(&[(
+                            Identifier::new(ctx, "predicate"),
+                            Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
+                        )])
+                        .build()
+                        .expect("arith.cmpi eq zero"),
+                )
+                .result(0).unwrap().into();
+
+            // If zero, use input dim i; else use dim_val.
+            let input_dim = if i < in_rank {
+                match in_shape[i] {
+                    Some(n) => self.emit_arith_constant_index(n),
+                    None => self.emit_tensor_dim(input.value(), i),
+                }
+            } else {
+                c0 // out of range, shouldn't happen in valid ONNX
+            };
+
+            self.block
+                .append_operation(
+                    OperationBuilder::new("arith.select", loc)
+                        .add_operands(&[is_zero, input_dim, dim_val])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.select zero"),
+                )
+                .result(0).unwrap().into()
+        }).collect();
+
+        // Compute product of known dims (non -1).
+        let mut known_product: melior::ir::Value<'c, 'c> = c1;
+        for &dim_val in &resolved_zeros {
+            // Check if dim == -1.
+            let is_neg1: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.cmpi", loc)
+                        .add_operands(&[dim_val, c_neg1])
+                        .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
+                        .add_attributes(&[(
+                            Identifier::new(ctx, "predicate"),
+                            Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
+                        )])
+                        .build()
+                        .expect("arith.cmpi eq neg1"),
+                )
+                .result(0).unwrap().into();
+
+            // If -1, contribute 1 to the product; else contribute dim_val.
+            let contrib: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.select", loc)
+                        .add_operands(&[is_neg1, c1, dim_val])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.select neg1 contrib"),
+                )
+                .result(0).unwrap().into();
+
+            known_product = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.muli", loc)
+                        .add_operands(&[known_product, contrib])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.muli known_product"),
+                )
+                .result(0).unwrap().into();
+        }
+
+        // Inferred dim value = total / known_product.
+        let inferred: melior::ir::Value<'c, 'c> = self.block
+            .append_operation(
+                OperationBuilder::new("arith.divui", loc)
+                    .add_operands(&[total, known_product])
+                    .add_results(&[index_type])
+                    .build()
+                    .expect("arith.divui inferred"),
+            )
+            .result(0).unwrap().into();
+
+        // Second pass: replace -1 with inferred.
+        resolved_zeros.iter().map(|&dim_val| {
+            let is_neg1: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("arith.cmpi", loc)
+                        .add_operands(&[dim_val, c_neg1])
+                        .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
+                        .add_attributes(&[(
+                            Identifier::new(ctx, "predicate"),
+                            Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
+                        )])
+                        .build()
+                        .expect("arith.cmpi eq neg1 final"),
+                )
+                .result(0).unwrap().into();
+
+            self.block
+                .append_operation(
+                    OperationBuilder::new("arith.select", loc)
+                        .add_operands(&[is_neg1, inferred, dim_val])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.select replace neg1"),
+                )
+                .result(0).unwrap().into()
+        }).collect()
+    }
+
+    /// Reshape `input` using corrected runtime index dim values.
+    ///
+    /// Builds a `tensor<Nxindex>` shape tensor from the provided index values,
+    /// then calls `tensor.reshape`.
+    pub fn emit_reshape_from_index_dims(
+        &mut self,
+        input: &Tensor<'c>,
+        dim_vals: &[melior::ir::Value<'c, 'c>],
+        out_shape: &[Option<u64>],
+    ) -> Tensor<'c> {
+        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
+        let n = dim_vals.len() as u64;
+        let shape_tensor_type: melior::ir::Type =
+            melior::ir::r#type::RankedTensorType::new(&[n], index_type, None).into();
+
+        let shape_tensor: melior::ir::Value<'c, 'c> = self.block
+            .append_operation(
+                OperationBuilder::new("tensor.from_elements", self.location)
+                    .add_operands(dim_vals)
+                    .add_results(&[shape_tensor_type])
+                    .build()
+                    .expect("tensor.from_elements reshape dims"),
+            )
+            .result(0).unwrap().into();
+
+        self.emit_reshape_with_tensor(input, shape_tensor, out_shape)
+    }
+
+    /// Emit `arith.constant <n> : index`.
+    fn emit_arith_constant_index(&mut self, n: u64) -> melior::ir::Value<'c, 'c> {
+        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
+        let attr = Attribute::parse(self.context, &format!("{n} : index"))
+            .expect("index const attr");
+        self.block
+            .append_operation(
+                OperationBuilder::new("arith.constant", self.location)
+                    .add_results(&[index_type])
+                    .add_attributes(&[(Identifier::new(self.context, "value"), attr)])
+                    .build()
+                    .expect("arith.constant index"),
+            )
+            .result(0).unwrap().into()
+    }
+
     /// Transpose `input` according to `perms` (ONNX-style signed permutation).
     ///
     /// E.g. `perms = [2, 0, 1]` maps output dim i to input dim perms[i].

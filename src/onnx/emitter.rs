@@ -210,7 +210,7 @@ fn lookup_const_i64(const_i64: &HashMap<String, Vec<i64>>, name: &str) -> Option
 /// Also returns the ordered weight buffers (initializers). These must be passed
 /// as runtime arguments after the dynamic inputs when running the compiled graph.
 /// Default MLIR op-count threshold before starting a new sub-function.
-const DEFAULT_SPLIT_THRESHOLD: usize = 500;
+const DEFAULT_SPLIT_THRESHOLD: usize = 0; // temporarily disabled for debugging
 
 pub fn emit_graph<'c>(
     model: &OnnxModel,
@@ -703,12 +703,17 @@ fn emit_node<'c>(
                 builder.emit_reshape(&x, &target_shape)
             } else {
                 // Dynamic path: shape comes from a runtime tensor (Concat output,
-                // ShapeDims, etc.). Use tensor.reshape with the runtime shape tensor.
+                // ShapeDims, etc.).
+                //
+                // The shape tensor may contain ONNX special values:
+                //   -1 = "infer this dimension" (total_input_elems / product_of_others)
+                //    0 = "copy from input dim i" (when allowzero=0, the default)
+                //
+                // tensor.reshape does NOT handle these — we must resolve them first.
                 let shape_val = value_map.get(shape_name)
                     .ok_or_else(|| OnnxError::MissingEdge(shape_name.clone()))?;
                 let shape_tensor = shape_val.as_tensor(builder);
 
-                // Determine output rank from the shape tensor's static size.
                 let shape_tensor_shape = shape_tensor.shape();
                 let out_rank = shape_tensor_shape.first()
                     .and_then(|d| *d)
@@ -716,11 +721,18 @@ fn emit_node<'c>(
                         panic!("Reshape: shape tensor '{}' must have static rank-1 size", shape_name)
                     }) as usize;
 
-                // All output dims are dynamic since the shape values are runtime.
-                let out_shape: Vec<Option<u64>> = vec![None; out_rank];
+                // Extract individual dim values as index values.
+                let dim_indices = extract_dims_from_i64_tensor(builder, &shape_tensor);
+                let allowzero = get_int_attr(&node.attributes, "allowzero", 0);
 
-                // tensor.reshape accepts tensor<Nxi64> for the shape operand.
-                builder.emit_reshape_with_tensor(&x, shape_tensor.value(), &out_shape)
+                // Resolve -1 and 0 entries, producing corrected index values.
+                let corrected = builder.emit_resolve_reshape_dims(
+                    &x, &dim_indices, allowzero != 0,
+                );
+
+                // Build the corrected shape tensor and reshape.
+                let out_shape: Vec<Option<u64>> = vec![None; out_rank];
+                builder.emit_reshape_from_index_dims(&x, &corrected, &out_shape)
             };
             insert_tensor(value_map, &node.outputs[0], out);
         }
