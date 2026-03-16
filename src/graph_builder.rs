@@ -2635,8 +2635,10 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
 
-        // Compute result shape: static where target_shape[i] > 0, dynamic for -1 or
-        // for `0` when the corresponding input dim is also dynamic.
+        // Compute result shape: static where possible.
+        // - d > 0: static
+        // - d == 0: copy from input dim i
+        // - d == -1: infer from total_input / product_of_known_target (static if computable)
         let out_shape: Vec<Option<u64>> = target_shape
             .iter()
             .enumerate()
@@ -2644,10 +2646,24 @@ impl<'c> GraphBuilder<'c> {
                 if d > 0 {
                     Some(d as u64)
                 } else if d == 0 {
-                    // `0` means copy from input dim i.
                     in_shape.get(i).and_then(|opt| *opt)
                 } else {
-                    None // -1: inferred, dynamic
+                    // d == -1: try to infer statically.
+                    let total_static: Option<u64> = in_shape.iter()
+                        .try_fold(1u64, |acc, dim| dim.map(|n| acc * n));
+                    let known_product: Option<u64> = target_shape.iter().enumerate()
+                        .try_fold(1u64, |acc, (j, &td)| {
+                            if j == i { Some(acc) } // skip the -1 dim
+                            else if td > 0 { Some(acc * td as u64) }
+                            else if td == 0 {
+                                in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
+                            }
+                            else { None }
+                        });
+                    match (total_static, known_product) {
+                        (Some(t), Some(k)) if k > 0 => Some(t / k),
+                        _ => None,
+                    }
                 }
             })
             .collect();
@@ -6924,14 +6940,14 @@ mod tests {
         let mut gb = ctx.builder();
         let a = gb.input(&[Some(2), Some(6)], DType::F32);
         let r = gb.emit_reshape(&a, &[-1, 3]);
-        // inferred dim becomes dynamic in type
-        assert_eq!(r.shape(), vec![None, Some(3)]);
+        // inferred dim is now resolved statically: 12 / 3 = 4
+        assert_eq!(r.shape(), vec![Some(4), Some(3)]);
         let graph = gb.compile(&[&r]).expect("compile reshape infer dim");
 
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
         let a_buf = Buffer::from_slice(&data, &[2, 6], DType::F32);
-        // output is [4, 3] — dynamic dim, so use run_dynamic
-        let out = graph.run_dynamic(&[&a_buf], &[crate::Shape(vec![4, 3])]);
+        // output is [4, 3] — now statically inferred
+        let out = graph.run(&[&a_buf]);
         assert_eq!(out[0].as_slice::<f32>(), data.as_slice());
     }
 
@@ -7488,11 +7504,11 @@ mod tests {
         let mut gb = ctx.builder();
         let a = gb.input(&[Some(2), Some(3)], DType::F32);
         let flat = gb.emit_reshape(&a, &[-1]);
-        assert_eq!(flat.shape(), vec![None]); // -1 → dynamic
+        assert_eq!(flat.shape(), vec![Some(6)]); // -1 → statically inferred: 2*3 = 6
 
         let graph = gb.compile(&[&flat]).expect("compile reshape flat");
         let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
-        let out = graph.run_dynamic(&[&a_buf], &[crate::Shape(vec![6])]);
+        let out = graph.run(&[&a_buf]);
         assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 

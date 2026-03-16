@@ -730,8 +730,46 @@ fn emit_node<'c>(
                     &x, &dim_indices, allowzero != 0,
                 );
 
-                // Build the corrected shape tensor and reshape.
-                let out_shape: Vec<Option<u64>> = vec![None; out_rank];
+                // Compute static output shape where possible.
+                // If const_i64 propagation (e.g. through Concat) made the shape
+                // tensor's values available, use them to resolve dims statically.
+                // This prevents the all-dynamic cascade that breaks expand_shape.
+                let shape_static = lookup_const_i64(const_i64, shape_name);
+                let in_shape = x.shape();
+                let allowzero_flag = allowzero != 0;
+
+                let out_shape: Vec<Option<u64>> = (0..out_rank).map(|i| {
+                    let raw_val: Option<i64> = shape_static.as_ref().and_then(|v| v.get(i).copied());
+
+                    match raw_val {
+                        Some(d) if d > 0 => Some(d as u64),
+                        Some(0) if !allowzero_flag => {
+                            // Copy from input dim i.
+                            in_shape.get(i).and_then(|opt| *opt)
+                        }
+                        Some(-1) => {
+                            // Infer: total_input / product_of_known_target.
+                            let total_static: Option<u64> = in_shape.iter()
+                                .try_fold(1u64, |acc, d| d.map(|n| acc * n));
+                            let known_product: Option<u64> = shape_static.as_ref().and_then(|sv| {
+                                sv.iter().enumerate().try_fold(1u64, |acc, (j, &d)| {
+                                    if j == i { Some(acc) } // skip the -1 dim
+                                    else if d > 0 { Some(acc * d as u64) }
+                                    else if d == 0 && !allowzero_flag {
+                                        in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
+                                    }
+                                    else { None }
+                                })
+                            });
+                            match (total_static, known_product) {
+                                (Some(t), Some(k)) if k > 0 => Some(t / k),
+                                _ => None,
+                            }
+                        }
+                        _ => None, // truly dynamic
+                    }
+                }).collect();
+
                 builder.emit_reshape_from_index_dims(&x, &corrected, &out_shape)
             };
             insert_tensor(value_map, &node.outputs[0], out);
@@ -767,6 +805,23 @@ fn emit_node<'c>(
             }
             let out = builder.emit_concat(&inputs, axis_usize);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through concatenation so downstream Reshape
+            // ops can take the static path. This is critical for avoiding the
+            // all-dynamic cascade that breaks expand_shape in matmul.
+            let mut all_const = true;
+            let mut concat_vals: Vec<i64> = Vec::new();
+            for name in &node.inputs {
+                if let Some(vals) = const_i64.get(name) {
+                    concat_vals.extend(vals);
+                } else {
+                    all_const = false;
+                    break;
+                }
+            }
+            if all_const && !concat_vals.is_empty() {
+                const_i64.insert(node.outputs[0].clone(), concat_vals);
+            }
         }
         "Slice" => {
             let data = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -849,6 +904,21 @@ fn emit_node<'c>(
             let axis_usize = normalize_axis(axis, data.rank());
             let out = builder.emit_gather(&data, &indices, axis_usize);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64: if data and indices are both static constants,
+            // compute the gathered values so downstream Reshape can use them.
+            if let (Some(data_vals), Some(idx_vals)) = (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+            ) {
+                if axis_usize == 0 && data.rank() == 1 {
+                    let gathered: Vec<i64> = idx_vals.iter().map(|&idx| {
+                        let i = if idx < 0 { (data_vals.len() as i64 + idx) as usize } else { idx as usize };
+                        data_vals[i]
+                    }).collect();
+                    const_i64.insert(node.outputs[0].clone(), gathered);
+                }
+            }
         }
         "Where" => {
             let cond = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -875,6 +945,11 @@ fn emit_node<'c>(
             let axes = get_axes_from_input_or_attr(node, const_i64, "Unsqueeze")?;
             let out = builder.emit_unsqueeze(&x, &axes);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Unsqueeze (values unchanged, just shape).
+            if let Some(vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
         }
         "Squeeze" => {
             let x = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -890,6 +965,11 @@ fn emit_node<'c>(
             };
             let out = builder.emit_squeeze(&x, &axes);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Squeeze (values unchanged).
+            if let Some(vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
         }
         "Split" => {
             let input = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -924,6 +1004,17 @@ fn emit_node<'c>(
         "Shape" => {
             let input = get_tensor(value_map, builder, &node.inputs[0])?;
             let dims = builder.emit_shape_of(&input);
+
+            // Seed const_i64 with static shape values so downstream Gather/Concat/
+            // Reshape chains can resolve dims at compile time.
+            let in_shape = input.shape();
+            let static_vals: Option<Vec<i64>> = in_shape.iter()
+                .map(|d| d.map(|n| n as i64))
+                .collect();
+            if let Some(vals) = static_vals {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
+
             // Store as ShapeDims — downstream ops (Reshape, ConstantOfShape) can
             // materialize as a tensor or use the index values directly.
             value_map.insert(node.outputs[0].clone(), EmitValue::ShapeDims(dims));

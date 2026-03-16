@@ -49,19 +49,58 @@ From `ArithBase.td`:
 Use `Attribute::parse(ctx, "0 : i64")` for eq, `"1 : i64"` for ne, etc.
 The `#arith.cmpipredicate<eq>` syntax does NOT work in LLVM 21.
 
-## Current issue: NaN/Inf logits
+## Current issue: NaN/Inf logits (heap corruption from expand_shape)
 
-After the reshape fix, the test runs to completion but:
-```
-thread 'gpt2_prefill_emitter_only' panicked at tests/gpt2_e2e.rs:151:5:
-logits contain NaN/Inf
+After the reshape fix, the test runs to completion but produces NaN/Inf logits.
+The "double free or corruption (!prev)" on exit is a **pre-existing libLLVM cleanup
+issue** (also happens with the working mapper path).
+
+### Root cause: expand_shape output_shape bug with dynamic dims
+
+In `graph_builder.rs:emit_expand_shape_impl()`, when a reassociation group splits
+one input dim into multiple output dims (e.g., `[[0,1],[2],[3]]` expanding
+`[batch*heads, seq, dim]` → `[batch, heads, seq, dim]`), the code uses
+`tensor.dim %input, <group_input_dim>` for ALL output dims in the group.
+
+This means both `batch` and `heads` output dims get the value `batch*heads`,
+producing an output shape `[batch*heads, batch*heads, seq, dim]` instead of
+`[batch, heads, seq, dim]`. This causes out-of-bounds memory access (heap
+corruption) which manifests as NaN/Inf in the results.
+
+**Evidence from the IR** (line 1418-1426 of pre-pass IR):
+```mlir
+%dim_649 = tensor.dim %547, %c0_648 : tensor<?x?x?xf32>  // = batch*heads
+%dim_651 = tensor.dim %547, %c0_650 : tensor<?x?x?xf32>  // = batch*heads (WRONG! should be different)
+%expanded_656 = tensor.expand_shape %547 [[0, 1], [2], [3]]
+    output_shape [%dim_649, %dim_651, %dim_653, %dim_655]
 ```
 
-This is a numerical correctness issue, not a crash. Possible causes:
-- Attention score computation (QK^T / sqrt(d)) may produce Inf before softmax
-- Missing or incorrect attention mask application
-- LayerNorm epsilon handling
-- Accumulation of errors from dynamic-dim overhead in the emitter path
+### Why this works in the mapper path
+
+The mapper path produces **static** shapes because symbolic dims are resolved
+before tracing. So the matmul collapse/expand cycle uses static dims like
+`[1, 12, 4, 64]` → `[12, 4, 64]` → `[1, 12, 4, 64]`, and expand_shape
+knows the exact sizes.
+
+### Fix approach
+
+The emitter's dynamic Reshape path makes ALL dims dynamic via `tensor.reshape`,
+which then propagates through matmul's internal collapse→batch_matmul→expand cycle.
+The fix needs one of:
+
+1. **Propagate known-static dims through reshape**: If the input has static dims
+   (like batch=1, seq=4) and the reshape target is `[-1, 4]`, the output should
+   be `tensor<1x4xi64>` not `tensor<?x?xi64>`. This avoids the all-dynamic cascade.
+
+2. **Fix expand_shape for multi-dim groups**: Track the actual target shape from
+   the Reshape op and pass it down to expand_shape, rather than using tensor.dim.
+
+3. **Use tosa.reshape instead of tensor.reshape**: The static `emit_reshape` path
+   uses tosa.reshape which preserves known dimensions. The dynamic path should
+   try to use it too when possible.
+
+Option 1 is the cleanest — resolve as many static dims as possible in the emitter's
+Reshape handler, only leaving truly-unknown dims as dynamic.
 
 ## How to reproduce
 
