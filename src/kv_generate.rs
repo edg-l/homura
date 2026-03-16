@@ -160,7 +160,12 @@ impl KvGenerator {
         })?;
 
         tracing::info!(path = %prompt_path.display(), "loading prefill model");
-        let prompt_model = Model::load(&prompt_path)?;
+        let prefill_keep_dynamic: std::collections::HashSet<String> = [
+            "sequence_length".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let prompt_model = Model::load_with_dynamic_dims(&prompt_path, prefill_keep_dynamic)?;
 
         tracing::info!(path = %decode_path.display(), "loading decode model");
         // Keep past_sequence_length (and derived dims like "past_sequence_length + 1")

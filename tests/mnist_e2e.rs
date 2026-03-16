@@ -41,8 +41,7 @@ fn mnist_predicts_7_from_image() {
     );
 }
 
-/// Task 8.6: MNIST through the new GraphBuilder emitter path produces the same
-/// digit-7 prediction as the existing mapper-based path.
+/// MNIST through the GraphBuilder emitter predicts digit 7.
 #[test]
 fn mnist_emitter_predicts_7_from_image() {
     let model =
