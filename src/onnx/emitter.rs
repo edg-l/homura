@@ -231,6 +231,7 @@ pub fn emit_graph_with_split<'c>(
     // ── 1. Dynamic inputs ───────────────────────────────────────────────────────
     for input in &model.dynamic_inputs {
         let shape: Vec<Option<u64>> = input.dims.iter().map(|d| match d {
+            Dim::Fixed(v) if *v == crate::shape::DIM_DYNAMIC => None,
             Dim::Fixed(v) => Some(*v),
             Dim::Symbolic(name) if keep_dynamic.contains(name) => None,
             Dim::Symbolic(_) => None, // unresolved — treat as dynamic
