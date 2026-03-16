@@ -2040,18 +2040,22 @@ impl<'c> GraphBuilder<'c> {
                 // lhs: [..., M, K] -> [B_flat, M, K]
                 // rhs: [..., K, N] -> [B_flat, K, N]
                 let m = lhs_shape[lhs_rank - 2];
-                let k = lhs_shape[lhs_rank - 1];
+                let lhs_k = lhs_shape[lhs_rank - 1];
+                let rhs_k = rhs_shape[rhs_rank - 2];
                 let n = rhs_shape[rhs_rank - 1];
 
-                // Compute flat batch size. If any batch dim is dynamic, flat_b = None.
+                // Compute flat batch size per tensor (use each tensor's own batch dims).
                 let lhs_batch_dims = &lhs_shape[..lhs_rank - 2];
                 let flat_b: Option<u64> = lhs_batch_dims.iter().try_fold(1u64, |acc, d| {
                     d.map(|v| acc * v)
                 });
+                let rhs_batch_dims = &rhs_shape[..rhs_rank - 2];
+                let rhs_flat_b: Option<u64> = rhs_batch_dims.iter().try_fold(1u64, |acc, d| {
+                    d.map(|v| acc * v)
+                });
 
-                let lhs_3d_shape = vec![flat_b, m, k];
-                let rhs_3d_shape = vec![flat_b, k, n];
-
+                let lhs_3d_shape = vec![flat_b, m, lhs_k];
+                let rhs_3d_shape = vec![rhs_flat_b, rhs_k, n];
                 let lhs_collapsed = self.emit_collapse_shape_nd_to_3d(
                     lhs.value(), &lhs_shape, &lhs_3d_shape,
                 );

@@ -773,6 +773,11 @@ fn emit_node<'c>(
                 builder.emit_reshape_from_index_dims(&x, &corrected, &out_shape)
             };
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Reshape (data values unchanged).
+            if let Some(vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
         }
         "Flatten" => {
             let x = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -939,6 +944,11 @@ fn emit_node<'c>(
                 .ok_or_else(|| OnnxError::UnsupportedOp(format!("Cast: unsupported ONNX dtype {to}")))?;
             let out = builder.emit_cast(&a, target);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            // Propagate const_i64 through Cast (integer values preserved for int→int casts).
+            if let Some(vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
         }
         "Unsqueeze" => {
             let x = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -1062,7 +1072,27 @@ fn emit_node<'c>(
             let start = extract_scalar_as_index(builder, &start_t);
             let limit = extract_scalar_as_index(builder, &limit_t);
             let delta = extract_scalar_as_index(builder, &delta_t);
-            let out = builder.emit_range(start, limit, delta, None, dtype);
+
+            // Try to compute output size statically: ceil((limit - start) / delta).
+            let output_size = match (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+                lookup_const_i64(const_i64, &node.inputs[2]),
+            ) {
+                (Some(s), Some(l), Some(d)) if !s.is_empty() && !l.is_empty() && !d.is_empty() => {
+                    let sv = s[0];
+                    let lv = l[0];
+                    let dv = d[0];
+                    if dv != 0 {
+                        Some(((lv - sv + dv - 1) / dv).max(0) as u64)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let out = builder.emit_range(start, limit, delta, output_size, dtype);
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "Constant" => {
