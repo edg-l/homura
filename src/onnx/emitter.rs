@@ -200,6 +200,20 @@ fn lookup_const_i64(const_i64: &HashMap<String, Vec<i64>>, name: &str) -> Option
     const_i64.get(name).cloned()
 }
 
+/// Element-wise op on two const_i64 vectors, with scalar broadcast support.
+/// Returns None if sizes are incompatible.
+fn const_i64_elementwise(a: &[i64], b: &[i64], op: fn(i64, i64) -> i64) -> Option<Vec<i64>> {
+    if a.len() == b.len() {
+        Some(a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect())
+    } else if a.len() == 1 {
+        Some(b.iter().map(|&y| op(a[0], y)).collect())
+    } else if b.len() == 1 {
+        Some(a.iter().map(|&x| op(x, b[0])).collect())
+    } else {
+        None
+    }
+}
+
 // ── emit_graph ─────────────────────────────────────────────────────────────────
 
 /// Emit an ONNX model into a `GraphBuilder`.
@@ -478,13 +492,12 @@ fn emit_node<'c>(
             let out = builder.emit_add(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
 
-            // Propagate const_i64 through Add on matching-size integer tensors.
+            // Propagate const_i64 through Add on integer tensors (with broadcast).
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
             ) {
-                if va.len() == vb.len() {
-                    let result: Vec<i64> = va.iter().zip(vb.iter()).map(|(&a, &b)| a + b).collect();
+                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a + b) {
                     const_i64.insert(node.outputs[0].clone(), result);
                 }
             }
@@ -495,13 +508,12 @@ fn emit_node<'c>(
             let out = builder.emit_sub(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
 
-            // Propagate const_i64 through Sub on small integer tensors.
+            // Propagate const_i64 through Sub on integer tensors (with broadcast).
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
             ) {
-                if va.len() == vb.len() {
-                    let result: Vec<i64> = va.iter().zip(vb.iter()).map(|(&a, &b)| a - b).collect();
+                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a - b) {
                     const_i64.insert(node.outputs[0].clone(), result);
                 }
             }
@@ -511,12 +523,32 @@ fn emit_node<'c>(
             let b = get_tensor(value_map, builder, &node.inputs[1])?;
             let out = builder.emit_mul(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            if let (Some(va), Some(vb)) = (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+            ) {
+                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a * b) {
+                    const_i64.insert(node.outputs[0].clone(), result);
+                }
+            }
         }
         "Div" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
             let b = get_tensor(value_map, builder, &node.inputs[1])?;
             let out = builder.emit_div(&a, &b);
             insert_tensor(value_map, &node.outputs[0], out);
+
+            if let (Some(va), Some(vb)) = (
+                lookup_const_i64(const_i64, &node.inputs[0]),
+                lookup_const_i64(const_i64, &node.inputs[1]),
+            ) {
+                if vb.iter().all(|&b| b != 0) {
+                    if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a / b) {
+                        const_i64.insert(node.outputs[0].clone(), result);
+                    }
+                }
+            }
         }
         "Neg" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;

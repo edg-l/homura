@@ -4433,25 +4433,30 @@ impl<'c> GraphBuilder<'c> {
         debug_assert!(src_rank >= 3);
         debug_assert_eq!(tgt_shape.len(), 3);
 
-        // When all target dims are static AND all source dims are static,
-        // tensor.collapse_shape correctly infers the result type. But when
-        // it's used alongside a collapse of a tensor with dynamic dims (e.g.,
-        // LHS of a matmul), MLIR may fail to verify. Use emit_reshape for
-        // all-static target shapes to sidestep the issue.
-        if tgt_shape.iter().all(|d| d.is_some()) {
-            let target_i64: Vec<i64> = tgt_shape.iter().map(|d| d.unwrap() as i64).collect();
-            let input_tensor = Tensor::from_value(input);
-            return self.emit_reshape(&input_tensor, &target_i64);
+        // Use tensor.collapse_shape when safe (the batch group has at most one
+        // dynamic dim, so MLIR can infer the collapsed type correctly).
+        // Fall back to emit_reshape only when the batch group would have
+        // multiple dynamic dims.
+        let batch_dims = &src_shape[..src_rank - 2];
+        let n_dynamic_in_batch = batch_dims.iter().filter(|d| d.is_none()).count();
+
+        if n_dynamic_in_batch <= 1 {
+            // Safe for collapse_shape.
+            let batch_indices: Vec<String> = (0..src_rank - 2).map(|i| i.to_string()).collect();
+            let batch_group = format!("[{}]", batch_indices.join(", "));
+            let m_group = format!("[{}]", src_rank - 2);
+            let k_group = format!("[{}]", src_rank - 1);
+            let reassoc_str = format!("[{batch_group}, {m_group}, {k_group}]");
+            return self.emit_collapse_shape_with_reassoc(input, tgt_shape, &reassoc_str);
         }
 
-        // Reassociation: first group collects all batch dims (0..src_rank-2),
-        // then one group for M (src_rank-2), one group for K (src_rank-1).
-        let batch_indices: Vec<String> = (0..src_rank - 2).map(|i| i.to_string()).collect();
-        let batch_group = format!("[{}]", batch_indices.join(", "));
-        let m_group = format!("[{}]", src_rank - 2);
-        let k_group = format!("[{}]", src_rank - 1);
-        let reassoc_str = format!("[{batch_group}, {m_group}, {k_group}]");
-        self.emit_collapse_shape_with_reassoc(input, tgt_shape, &reassoc_str)
+        // Multiple dynamic batch dims — fall back to emit_reshape.
+        let target_i64: Vec<i64> = tgt_shape.iter().map(|d| match d {
+            Some(n) => *n as i64,
+            None => -1,
+        }).collect();
+        let input_tensor = Tensor::from_value(input);
+        self.emit_reshape(&input_tensor, &target_i64)
     }
 
     /// Expand a 3D `[B_flat, M, N]` result back to ND `[..., M, N]`.
@@ -4466,11 +4471,23 @@ impl<'c> GraphBuilder<'c> {
         debug_assert_eq!(src_shape.len(), 3);
         debug_assert!(tgt_rank >= 3);
 
-        // Use emit_reshape to avoid the tensor.expand_shape multi-dim group
-        // problem: expand_shape uses tensor.dim on the input for ALL output
-        // dims in a reassociation group, which is wrong when splitting one
-        // dim into multiple (e.g., batch*heads → [batch, heads]).
-        // emit_reshape correctly uses the provided target shape values.
+        // Use tensor.expand_shape when safe: the batch group (dims 0..tgt_rank-2)
+        // must have at most one dynamic dim, otherwise expand_shape can't infer
+        // the correct output dims.
+        let batch_tgt = &tgt_shape[..tgt_rank - 2];
+        let n_dynamic_in_batch = batch_tgt.iter().filter(|d| d.is_none()).count();
+
+        if n_dynamic_in_batch <= 1 {
+            // Safe for expand_shape.
+            let batch_indices: Vec<String> = (0..tgt_rank - 2).map(|i| i.to_string()).collect();
+            let batch_group = format!("[{}]", batch_indices.join(", "));
+            let m_group = format!("[{}]", tgt_rank - 2);
+            let n_group = format!("[{}]", tgt_rank - 1);
+            let reassoc_str = format!("[{batch_group}, {m_group}, {n_group}]");
+            return self.emit_expand_shape_with_reassoc(input, tgt_shape, &reassoc_str);
+        }
+
+        // Multiple dynamic batch dims — fall back to emit_reshape.
         let target_i64: Vec<i64> = tgt_shape.iter().map(|d| match d {
             Some(n) => *n as i64,
             None => -1,
