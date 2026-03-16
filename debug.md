@@ -8,8 +8,21 @@
   `gpt2_prefill_emitter_matches_mapper_output` pass. All 457 unit tests pass.
 - **Decode model: WORKING.** `gpt2_decode_emitter_dynamic` passes.
   Compiles and runs correctly with dynamic `past_sequence_length`.
+- **Generation: WORKING.** Coherent output with KV cache: "The meaning of life is
+  not the same as the meaning of death." Warm decode at ~0.24s/token.
 - **"double free or corruption (!prev)" on exit** is a pre-existing libLLVM cleanup
   issue — also happens with the working mapper path. Ignore it.
+
+## Completed: Fix KV cache attention mask (bucket padding gap)
+
+After prefill with bucket padding (e.g. 5 tokens → bucket=8), the KV cache had
+a gap of padding positions. The decode model appended new KV entries AFTER the
+gap, but the attention mask assumed contiguous real positions `0..real_pos` — so
+from step 2 onward it attended to padding and masked real data, causing "to to
+to to" repetition.
+
+**Fix:** Trim KV cache to `seq_len` after prefill (remove bucket padding). All
+positions are now contiguous, decode mask is all-ones. Commit: `a1ecc62`.
 
 ## Completed: Eliminate `tensor.reshape` via collapse/expand_shape
 
@@ -109,6 +122,7 @@ simple case.
 ### Commit history
 
 ```
+a1ecc62 fix KV cache attention mask: trim bucket padding after prefill
 f3de340 eliminate tensor.reshape via collapse/expand decomposition, fix decode segfault
 16729c5 debug.md: add concrete reshape patterns, mapper comparison, commit history, constraint details
 f0de921 debug.md: full plan for eliminating tensor.reshape via collapse/expand decomposition
