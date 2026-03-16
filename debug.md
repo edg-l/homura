@@ -65,17 +65,25 @@ Given ONNX Reshape from `[a, b, c, d]` to `[x, y, z]`:
 The hard part: inferring the reassociation from two shapes when some dims are dynamic.
 When both shapes are fully known (from const_i64), this is trivial.
 
-**Simpler alternative decomposition:**
-1. Always flatten to 1D first: `tensor.collapse_shape %input [[0,1,...,n-1]]`
-2. Then expand to target: `tensor.expand_shape %flat [[0,1,...,m-1]]`
+**Simpler alternative decomposition (flatten-to-1D):**
+1. `tensor.collapse_shape %input [[0,1,...,n-1]]` → flatten to 1D
+2. `tensor.expand_shape %flat [[0,1,...,m-1]]` → expand to target
 
-This works when the target shape has at most one dynamic dim (the expand_shape
-constraint). For the decode model, most reshapes have at most one dynamic dim
-(`past_sequence_length`), so this should cover nearly all cases.
+**Constraints on this approach:**
+- Step 1 (collapse to 1D): the input can have at most ONE dynamic dim, because
+  `collapse_shape` requires each group to have ≤1 dynamic dim. If the input has
+  multiple dynamic dims, we must first collapse groups of contiguous dims that
+  each have ≤1 dynamic, then collapse those intermediate results further.
+- Step 2 (expand from 1D): same constraint — the target must have ≤1 dynamic dim
+  in the single reassociation group `[[0,1,...,m-1]]`. Since all target dims are in
+  one group, this means the target can have AT MOST ONE dynamic dim total.
 
-For the remaining cases with multiple dynamic dims in the target... use `tosa.reshape`
-if all target dims are statically known (they might be, via const_i64), otherwise
-leave `tensor.reshape` as a last resort.
+For the decode model, most reshapes have exactly one dynamic dim
+(`past_sequence_length`), so this covers nearly all cases.
+
+**Fallback for multiple dynamic dims:** Use `tosa.reshape` with `tosa.const_shape`
+when all target dims are statically known (via const_i64). Otherwise, use
+`tensor.reshape` as a last resort (only for truly unknowable shapes).
 
 ### What's already done (don't redo)
 
@@ -101,6 +109,52 @@ leave `tensor.reshape` as a last resort.
   has at most one dynamic dim
 - `memref.reshape` reinterprets memory (no copy) with contiguous row-major strides —
   source must have identity layout. Strides computed from new shape at runtime.
+
+### Concrete reshape patterns in the decode model
+
+From the decode model's pre-pass IR (172 `tensor.reshape` ops), the patterns are:
+
+1. **Identity**: `[1,1] → [1,1]` — no-op, can skip
+2. **Flatten for Gemm**: `[?,1,768] → [?,?]` (batch*seq × hidden) — collapse_shape [[0,1],[2]]
+3. **Unflatten after Gemm**: `[?,2304] → [?,?,?]` (batch × seq × qkv) — expand_shape [[0,1],[2]]
+4. **QKV split reshape**: `[?,?,768] → [?,?,12,64]` — expand_shape [[0],[1],[2,3]]
+5. **Attention head merge**: `[?,?,12,64] → [?,?,768]` — collapse_shape [[0],[1],[2,3]]
+6. **Matmul batch collapse**: `[1,12,?,64] → [12,?,64]` — collapse_shape [[0,1],[2],[3]]
+7. **Matmul batch expand**: `[12,?,64] → [1,12,?,64]` — expand_shape [[0,1],[2],[3]]
+
+Key: patterns 2-3 have the Gemm flatten where batch*seq merges. For decode,
+batch=1 and seq=1, so this is `[1,1,768] → [1,768]`. The `?` dims come from
+the emitter not const-propagating far enough — if const_i64 covers the Concat
+that produces the shape tensor, the static path handles it.
+
+Patterns 4-5 split/merge the head dimension (768 = 12 × 64). These are always
+static in the last dims.
+
+Patterns 6-7 are already handled by `emit_collapse_shape_nd_to_3d` /
+`emit_expand_shape_3d_to_nd` (use native collapse/expand when ≤1 dynamic in batch).
+
+### How the mapper avoids this
+
+The mapper path uses `Tensor::reshape(&target_shape)` which records an `Op::Reshape`
+in the trace. The `Compiler` then emits `tosa.reshape` with `tosa.const_shape` —
+the target shape is always fully static because symbolic dims were resolved before
+tracing. The TOSA reshape gets lowered by `tosa-to-linalg` into proper
+`linalg.generic` ops with correct indexing maps. No `tensor.reshape` or
+`memref.reshape` ever appears.
+
+### Commit history for this session
+
+```
+a4bfcbb fix emitter dynamic reshape: resolve ONNX -1 and 0 shape values
+4d66648 propagate static dims through emitter shape subgraph ops
+c4d1224 propagate const_i64 through Cast, Range, Reshape; fix matmul collapse shapes
+8a00c89 propagate const_i64 through Slice; use emit_reshape for static collapses
+e6cf297 fix emitter: propagate const_i64 through Sub/Add, complete GPT-2 prefill
+53e00b9 fix emitter: treat DIM_DYNAMIC as None in input shapes
+4a2f210 fix emit_where broadcasting + expand_shape for dynamic dims + output shape resolution
+31f50af smarter collapse/expand: use native ops when safe, emit_reshape as fallback
+f0de921 debug.md: full plan for eliminating tensor.reshape via collapse/expand decomposition
+```
 
 ## How to reproduce
 
