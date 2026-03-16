@@ -143,6 +143,459 @@ impl GraphContext {
     }
 }
 
+// ── Reshape decomposition: collapse_shape / expand_shape ──────────────────────
+
+/// Result of analyzing how to decompose a reshape into collapse/expand ops.
+#[derive(Debug, Clone, PartialEq)]
+enum ReassocResult {
+    /// Same rank, same dims — no-op.
+    Identity,
+    /// Rank decreases: groups of input dims collapse into output dims.
+    /// `inferred_shape` is the result shape computed from input + reassociation
+    /// (may be more precise than the caller's out_shape).
+    Collapse { reassoc: Vec<Vec<usize>>, inferred_shape: Vec<Option<u64>> },
+    /// Rank increases: each input dim expands into a group of output dims.
+    Expand { reassoc: Vec<Vec<usize>> },
+    /// General: collapse to intermediate shape, then expand to target.
+    CollapseExpand {
+        collapse_reassoc: Vec<Vec<usize>>,
+        intermediate_shape: Vec<Option<u64>>,
+        expand_reassoc: Vec<Vec<usize>>,
+    },
+}
+
+/// Format a reassociation as an MLIR attribute string, e.g. `[[0, 1], [2]]`.
+fn reassoc_to_string(reassoc: &[Vec<usize>]) -> String {
+    let groups: Vec<String> = reassoc
+        .iter()
+        .map(|g| format!("[{}]", g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")))
+        .collect();
+    format!("[{}]", groups.join(", "))
+}
+
+/// Compute the reassociation mapping for a reshape from `in_shape` to `out_shape`.
+///
+/// Returns `None` when the shapes cannot be decomposed into valid
+/// collapse_shape/expand_shape ops (e.g., multiple dynamic dims in a group).
+///
+/// The algorithm greedily matches contiguous dim products left-to-right.
+fn compute_reassociation(
+    in_shape: &[Option<u64>],
+    out_shape: &[Option<u64>],
+) -> Option<ReassocResult> {
+    let in_rank = in_shape.len();
+    let out_rank = out_shape.len();
+
+    // Identity check.
+    if in_rank == out_rank && in_shape == out_shape {
+        return Some(ReassocResult::Identity);
+    }
+
+    if out_rank < in_rank {
+        // Collapse: merge groups of input dims into each output dim.
+        try_collapse(in_shape, out_shape)
+    } else if out_rank > in_rank {
+        // Expand: split each input dim into a group of output dims.
+        try_expand(in_shape, out_shape)
+    } else {
+        // Same rank but different shapes — try collapse-then-expand through 1D,
+        // or identity with type cast.
+        try_collapse_expand(in_shape, out_shape)
+    }
+}
+
+/// Try to build a collapse reassociation: groups of contiguous input dims
+/// whose products match each output dim.
+///
+/// `tensor.collapse_shape` supports multiple dynamic dims per group —
+/// MLIR computes the collapsed dim as the product at runtime.
+///
+/// Strategy: match static dims from the END first (they anchor the grouping),
+/// then assign remaining input dims to the first dynamic output dim.
+fn try_collapse(
+    in_shape: &[Option<u64>],
+    out_shape: &[Option<u64>],
+) -> Option<ReassocResult> {
+    let in_rank = in_shape.len();
+    let out_rank = out_shape.len();
+
+    if out_rank == 0 || in_rank == 0 {
+        return None;
+    }
+
+    // Try the forward greedy approach first for fully static cases,
+    // then fall back to end-matching for mixed static/dynamic.
+
+    // End-matching: match static output dims from the right, accumulate
+    // the rest into the first dynamic group.
+    let mut reassoc: Vec<Vec<usize>> = vec![Vec::new(); out_rank];
+
+    // Match from the end: pair output dims with input dims right-to-left.
+    let mut in_end = in_rank;
+    let mut out_end = out_rank;
+    while out_end > 1 && in_end > 0 {
+        let out_i = out_end - 1;
+        let in_i = in_end - 1;
+
+        match (out_shape[out_i], in_shape[in_i]) {
+            (Some(out_val), Some(in_val)) if out_val == in_val => {
+                // Static dims match 1:1.
+                reassoc[out_i].push(in_i);
+                in_end -= 1;
+                out_end -= 1;
+            }
+            (Some(out_val), Some(in_val)) => {
+                // Static dims differ — need to match a product of input dims.
+                let mut product = in_val;
+                let mut group = vec![in_i];
+                let mut j = in_i;
+                while product < out_val && j > 0 {
+                    j -= 1;
+                    match in_shape[j] {
+                        Some(d) => {
+                            product *= d;
+                            group.push(j);
+                        }
+                        None => break,
+                    }
+                }
+                if product == out_val {
+                    group.reverse();
+                    reassoc[out_i] = group.clone();
+                    in_end = *group.first().unwrap();
+                    out_end -= 1;
+                } else {
+                    break;
+                }
+            }
+            (None, None) => {
+                // Both dynamic — match 1:1.
+                reassoc[out_i].push(in_i);
+                in_end -= 1;
+                out_end -= 1;
+            }
+            _ => {
+                // Mismatch (one static, one dynamic) — stop matching from end.
+                break;
+            }
+        }
+    }
+
+    // Distribute remaining input dims across remaining output groups.
+    // The FIRST output group gets all "extra" input dims (ONNX contiguous merge
+    // semantics: leading dims merge before trailing dims).
+    if in_end > 0 && out_end > 0 {
+        let excess = in_end as isize - out_end as isize;
+        if excess < 0 {
+            return None; // more output groups than input dims
+        }
+        let mut in_fwd = 0;
+        for out_i in 0..out_end {
+            if out_i == 0 {
+                // First group: take (1 + excess) input dims.
+                let n = 1 + excess as usize;
+                for _ in 0..n {
+                    if in_fwd < in_end {
+                        reassoc[out_i].push(in_fwd);
+                        in_fwd += 1;
+                    }
+                }
+            } else {
+                // Subsequent groups: take one input dim each.
+                if in_fwd < in_end {
+                    reassoc[out_i].push(in_fwd);
+                    in_fwd += 1;
+                }
+            }
+        }
+        if in_fwd != in_end { return None; }
+    } else if in_end > 0 && out_end == 0 {
+        // All output groups matched from the end, but extra input dims remain.
+        // Prepend them to the first matched group (smallest output index with a group).
+        let first_matched = reassoc.iter().position(|g| !g.is_empty());
+        if let Some(idx) = first_matched {
+            let extra: Vec<usize> = (0..in_end).collect();
+            let mut merged = extra;
+            merged.extend_from_slice(&reassoc[idx]);
+            reassoc[idx] = merged;
+        } else {
+            return None;
+        }
+    } else if in_end > 0 {
+        return None;
+    }
+
+    // Validate: all output groups must be non-empty and cover all input dims.
+    let mut covered = vec![false; in_rank];
+    for group in &reassoc {
+        if group.is_empty() {
+            return None;
+        }
+        for &i in group {
+            if i >= in_rank || covered[i] {
+                return None;
+            }
+            covered[i] = true;
+        }
+    }
+    if covered.iter().any(|&c| !c) {
+        return None;
+    }
+
+    // Validate contiguity: each group must be contiguous indices.
+    for group in &reassoc {
+        for w in group.windows(2) {
+            if w[1] != w[0] + 1 {
+                return None;
+            }
+        }
+    }
+
+    // Compute the correct inferred output shape from input + reassociation.
+    // For collapse_shape, each output dim is:
+    //   - product of static input dims if ALL dims in the group are static
+    //   - dynamic (None) if ANY dim in the group is dynamic
+    let inferred_shape: Vec<Option<u64>> = reassoc.iter().map(|group| {
+        let mut product = 1u64;
+        let mut all_static = true;
+        for &i in group {
+            match in_shape[i] {
+                Some(d) => product *= d,
+                None => { all_static = false; break; }
+            }
+        }
+        if all_static { Some(product) } else { None }
+    }).collect();
+
+    Some(ReassocResult::Collapse { reassoc, inferred_shape })
+}
+
+/// Try to build an expand reassociation: groups of contiguous output dims
+/// whose products match each input dim.
+///
+/// Strategy: match static dims from the END first (they anchor the grouping),
+/// then assign remaining output dims to the first group.
+fn try_expand(
+    in_shape: &[Option<u64>],
+    out_shape: &[Option<u64>],
+) -> Option<ReassocResult> {
+    let in_rank = in_shape.len();
+    let out_rank = out_shape.len();
+
+    if in_rank == 0 || out_rank == 0 {
+        return None;
+    }
+
+    let mut reassoc: Vec<Vec<usize>> = vec![Vec::new(); in_rank];
+
+    // Match from the end: pair input dims with output dims right-to-left.
+    let mut in_end = in_rank;
+    let mut out_end = out_rank;
+
+    while in_end > 1 && out_end > 0 {
+        let in_i = in_end - 1;
+        let out_i = out_end - 1;
+
+        match (in_shape[in_i], out_shape[out_i]) {
+            (Some(in_val), Some(out_val)) if in_val == out_val => {
+                // Static dims match 1:1.
+                reassoc[in_i].push(out_i);
+                in_end -= 1;
+                out_end -= 1;
+            }
+            (Some(in_val), Some(out_val)) => {
+                // Static dims differ — accumulate output dims whose product equals input.
+                let mut product = out_val;
+                let mut group = vec![out_i];
+                let mut j = out_i;
+                while product < in_val && j > 0 {
+                    j -= 1;
+                    match out_shape[j] {
+                        Some(d) => {
+                            product *= d;
+                            group.push(j);
+                        }
+                        None => {
+                            // Dynamic output dim — absorbs remainder.
+                            group.push(j);
+                            break;
+                        }
+                    }
+                }
+                if product == in_val || group.iter().any(|&i| out_shape[i].is_none()) {
+                    group.reverse();
+                    let first_out = *group.first().unwrap();
+                    reassoc[in_i] = group;
+                    out_end = first_out;
+                    in_end -= 1;
+                } else {
+                    break;
+                }
+            }
+            (None, None) => {
+                // Both dynamic — match 1:1.
+                reassoc[in_i].push(out_i);
+                in_end -= 1;
+                out_end -= 1;
+            }
+            (Some(_in_val), None) => {
+                // Static input, dynamic output — output absorbs input.
+                reassoc[in_i].push(out_i);
+                in_end -= 1;
+                out_end -= 1;
+            }
+            (None, Some(_)) => {
+                // Dynamic input, static output — stop matching from end.
+                break;
+            }
+        }
+    }
+
+    // Forward match remaining dims.
+    if out_end > 0 && in_end > 0 {
+        let mut out_fwd = 0;
+        for in_i in 0..in_end {
+            match in_shape[in_i] {
+                Some(source_val) => {
+                    // Static input: accumulate output dims whose product matches.
+                    let mut product = 1u64;
+                    let mut has_dynamic = false;
+                    while out_fwd < out_end {
+                        match out_shape[out_fwd] {
+                            Some(d) => {
+                                reassoc[in_i].push(out_fwd);
+                                out_fwd += 1;
+                                product *= d;
+                                if !has_dynamic && product == source_val {
+                                    // If last input group, consume remaining output dims.
+                                    if in_i == in_end - 1 {
+                                        while out_fwd < out_end {
+                                            reassoc[in_i].push(out_fwd);
+                                            out_fwd += 1;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if !has_dynamic && product > source_val { return None; }
+                            }
+                            None => {
+                                reassoc[in_i].push(out_fwd);
+                                out_fwd += 1;
+                                has_dynamic = true;
+                                // If last input group, consume all remaining.
+                                if in_i == in_end - 1 {
+                                    while out_fwd < out_end {
+                                        reassoc[in_i].push(out_fwd);
+                                        out_fwd += 1;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if in_i == in_end - 1 {
+                        // Last input: take all remaining output dims.
+                        while out_fwd < out_end {
+                            reassoc[in_i].push(out_fwd);
+                            out_fwd += 1;
+                        }
+                    } else {
+                        if out_fwd < out_end {
+                            reassoc[in_i].push(out_fwd);
+                            out_fwd += 1;
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        if out_fwd != out_end { return None; }
+    } else if out_end > 0 {
+        return None;
+    }
+
+    // Validate: all groups non-empty, all output dims covered.
+    let mut covered = vec![false; out_rank];
+    for group in &reassoc {
+        if group.is_empty() {
+            return None;
+        }
+        for &i in group {
+            if i >= out_rank || covered[i] {
+                return None;
+            }
+            covered[i] = true;
+        }
+    }
+    if covered.iter().any(|&c| !c) {
+        return None;
+    }
+
+    // Validate contiguity.
+    for group in &reassoc {
+        for w in group.windows(2) {
+            if w[1] != w[0] + 1 {
+                return None;
+            }
+        }
+    }
+
+    // Validate expand_shape constraint: if a group has any dynamic output dim,
+    // the corresponding input dim must also be dynamic (MLIR verifier requires this).
+    for (in_i, group) in reassoc.iter().enumerate() {
+        let has_dynamic_out = group.iter().any(|&i| out_shape[i].is_none());
+        if has_dynamic_out && in_shape[in_i].is_some() {
+            return None;
+        }
+    }
+
+    Some(ReassocResult::Expand { reassoc })
+}
+
+/// Try to decompose a same-rank reshape.
+///
+/// First tries identity reassociation (1:1 dim mapping) — this works when each
+/// dim pair is compatible for collapse_shape (static dims must match).
+/// Falls back to collapse-to-1D then expand for truly different shapes.
+fn try_collapse_expand(
+    in_shape: &[Option<u64>],
+    out_shape: &[Option<u64>],
+) -> Option<ReassocResult> {
+    let in_rank = in_shape.len();
+    let out_rank = out_shape.len();
+
+    // Try identity: if shapes already match (possibly with dynamic dims),
+    // it's a no-op or a safe type refinement (dynamic→same-dynamic).
+    // Note: we do NOT use tensor.cast to refine dynamic→static because
+    // the static values from const_i64 may be wrong at runtime (computed
+    // from a specific input shape, not the actual runtime shape).
+    if in_shape == out_shape {
+        return Some(ReassocResult::Identity);
+    }
+
+    // Collapse to 1D then expand.
+    let n_dyn_in = in_shape.iter().filter(|d| d.is_none()).count();
+    let n_dyn_out = out_shape.iter().filter(|d| d.is_none()).count();
+
+    if n_dyn_in > 1 || n_dyn_out > 1 {
+        return None;
+    }
+
+    let collapse_reassoc = vec![(0..in_rank).collect::<Vec<usize>>()];
+    let total: Option<u64> = in_shape.iter().try_fold(1u64, |acc, d| d.map(|n| acc * n));
+    let intermediate_shape = vec![total];
+    let expand_reassoc = vec![(0..out_rank).collect::<Vec<usize>>()];
+
+    Some(ReassocResult::CollapseExpand {
+        collapse_reassoc,
+        intermediate_shape,
+        expand_reassoc,
+    })
+}
+
 /// Builds an MLIR computation graph by emitting ops directly into an MLIR
 /// function body. Borrows the MLIR `Context` from a `GraphContext`.
 pub struct GraphBuilder<'c> {
@@ -2075,7 +2528,10 @@ impl<'c> GraphBuilder<'c> {
                 out_shape.push(m);
                 out_shape.push(n);
                 let result_3d_shape = vec![flat_b, m, n];
-                self.emit_expand_shape_3d_to_nd(result_3d.value(), &result_3d_shape, &out_shape)
+                self.emit_expand_shape_3d_to_nd(
+                    result_3d.value(), &result_3d_shape, &out_shape,
+                    Some((lhs.value(), &lhs_shape)),
+                )
             }
             (3, 2) => {
                 // [B,M,K] x [K,N] → unsqueeze rhs to [1,K,N], broadcast to [B,K,N], batch_matmul
@@ -2489,160 +2945,16 @@ impl<'c> GraphBuilder<'c> {
     ///
     /// `target_shape[i]` semantics:
     /// - positive `n`  → static dim n
-    /// - `0`           → keep input dim unchanged (not supported, caller must expand)
+    /// - `0`           → keep input dim unchanged (ONNX copy-from-input)
     /// - `-1`          → ONNX infer-this-dim: computed as `total_elements / product_of_known`
     ///
-    /// Emits `tensor.reshape %input(%shape_tensor) : (...) -> tensor<...>`.
-    /// The shape tensor is built from `arith.constant` / `tensor.dim` values via
-    /// `tensor.from_elements`.
+    /// Prefers `tensor.collapse_shape`/`tensor.expand_shape` over `tensor.reshape`
+    /// to avoid broken strides from `memref.reshape` after bufferization.
+    /// Falls back to `tensor.reshape` only when collapse/expand constraints aren't met.
     pub fn emit_reshape(&mut self, input: &Tensor<'c>, target_shape: &[i64]) -> Tensor<'c> {
         let in_shape = input.shape();
-        let dtype = input.dtype();
-        let rank = in_shape.len();
-        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
 
-        let infer_axis = target_shape.iter().position(|&d| d == -1);
-        let target_rank = target_shape.len();
-
-        // Helper: emit an `arith.constant <n> : index`.
-        let emit_index_const = |block: &Block<'c>, ctx: &'c Context, n: u64| -> melior::ir::Value<'c, 'c> {
-            let attr = Attribute::parse(ctx, &format!("{n} : index")).expect("index const attr");
-            block
-                .append_operation(
-                    OperationBuilder::new("arith.constant", Location::unknown(ctx))
-                        .add_results(&[melior::ir::Type::parse(ctx, "index").unwrap()])
-                        .add_attributes(&[(Identifier::new(ctx, "value"), attr)])
-                        .build()
-                        .expect("arith.constant index"),
-                )
-                .result(0)
-                .unwrap()
-                .into()
-        };
-
-        // Build a Value for each target dim.
-        let mut dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::with_capacity(target_rank);
-
-        // Compute total input elements (needed only when -1 is present).
-        let total_elems: Option<melior::ir::Value<'c, 'c>> = if infer_axis.is_some() {
-            let mut prod: Option<melior::ir::Value<'c, 'c>> = None;
-            for i in 0..rank {
-                let dim_val = match in_shape[i] {
-                    Some(n) => emit_index_const(&self.block, self.context, n),
-                    None => self.emit_tensor_dim(input.value(), i),
-                };
-                prod = Some(match prod {
-                    None => dim_val,
-                    Some(prev) => self.block
-                        .append_operation(
-                            OperationBuilder::new("arith.muli", self.location)
-                                .add_operands(&[prev, dim_val])
-                                .add_results(&[index_type])
-                                .build()
-                                .expect("arith.muli total"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into(),
-                });
-            }
-            prod
-        } else {
-            None
-        };
-
-        // Compute product of known (non -1) target dims.
-        let known_product: Option<melior::ir::Value<'c, 'c>> = if infer_axis.is_some() {
-            let mut prod: Option<melior::ir::Value<'c, 'c>> = None;
-            for (i, &d) in target_shape.iter().enumerate() {
-                if d == -1 { continue; }
-                let dim_val = if d > 0 {
-                    emit_index_const(&self.block, self.context, d as u64)
-                } else if d == 0 {
-                    // ONNX `0` means "copy from input dim i".
-                    match in_shape.get(i).and_then(|d| *d) {
-                        Some(n) => emit_index_const(&self.block, self.context, n),
-                        None => self.emit_tensor_dim(input.value(), i),
-                    }
-                } else {
-                    panic!("emit_reshape: invalid target_shape[{i}] = {d}");
-                };
-                prod = Some(match prod {
-                    None => dim_val,
-                    Some(prev) => self.block
-                        .append_operation(
-                            OperationBuilder::new("arith.muli", self.location)
-                                .add_operands(&[prev, dim_val])
-                                .add_results(&[index_type])
-                                .build()
-                                .expect("arith.muli known_product"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into(),
-                });
-            }
-            prod
-        } else {
-            None
-        };
-
-        // Build per-dim values.
-        for (i, &d) in target_shape.iter().enumerate() {
-            let val = if d == -1 {
-                // inferred dim = total / known_product
-                let total = total_elems.expect("total_elems must exist for -1 dim");
-                match known_product {
-                    Some(known) => {
-                        self.block
-                            .append_operation(
-                                OperationBuilder::new("arith.divui", self.location)
-                                    .add_operands(&[total, known])
-                                    .add_results(&[index_type])
-                                    .build()
-                                    .expect("arith.divui infer dim"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into()
-                    }
-                    None => total, // only dim is -1, so it equals total_elems
-                }
-            } else if d > 0 {
-                emit_index_const(&self.block, self.context, d as u64)
-            } else if d == 0 {
-                // ONNX `0` means "copy from input dim i".
-                match in_shape.get(i).and_then(|d| *d) {
-                    Some(n) => emit_index_const(&self.block, self.context, n),
-                    None => self.emit_tensor_dim(input.value(), i),
-                }
-            } else {
-                panic!("emit_reshape: invalid target_shape[{i}] = {d}");
-            };
-            dim_vals.push(val);
-        }
-
-        // Build shape tensor: tensor<target_rank x index> from elements.
-        let shape_tensor_type: melior::ir::Type = {
-            let dims_u64 = vec![target_rank as u64];
-            RankedTensorType::new(&dims_u64, index_type, None).into()
-        };
-        let shape_tensor: melior::ir::Value<'c, 'c> = self.block
-            .append_operation(
-                OperationBuilder::new("tensor.from_elements", self.location)
-                    .add_operands(&dim_vals)
-                    .add_results(&[shape_tensor_type])
-                    .build()
-                    .expect("tensor.from_elements shape"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-
-        // Compute result shape: static where possible.
-        // - d > 0: static
-        // - d == 0: copy from input dim i
-        // - d == -1: infer from total_input / product_of_known_target (static if computable)
+        // Resolve target_shape into Option<u64> (static where possible).
         let out_shape: Vec<Option<u64>> = target_shape
             .iter()
             .enumerate()
@@ -2671,8 +2983,169 @@ impl<'c> GraphBuilder<'c> {
                 }
             })
             .collect();
-        let out_type = self.make_tensor_type(&out_shape, dtype);
 
+        // Try collapse_shape/expand_shape decomposition first.
+        if let Some(reassoc) = compute_reassociation(&in_shape, &out_shape) {
+            match reassoc {
+                ReassocResult::Identity => {
+                    return Tensor::from_value(input.value());
+                }
+                ReassocResult::Collapse { reassoc, inferred_shape } => {
+                    let reassoc_str = reassoc_to_string(&reassoc);
+                    return self.emit_collapse_shape_with_reassoc(
+                        input.value(), &inferred_shape, &reassoc_str,
+                    );
+                }
+                ReassocResult::Expand { reassoc } => {
+                    let reassoc_str = reassoc_to_string(&reassoc);
+                    return self.emit_expand_shape_with_reassoc(
+                        input.value(), &out_shape, &reassoc_str,
+                    );
+                }
+                ReassocResult::CollapseExpand {
+                    collapse_reassoc,
+                    intermediate_shape,
+                    expand_reassoc,
+                } => {
+                    let c_str = reassoc_to_string(&collapse_reassoc);
+                    let collapsed = self.emit_collapse_shape_with_reassoc(
+                        input.value(), &intermediate_shape, &c_str,
+                    );
+                    let e_str = reassoc_to_string(&expand_reassoc);
+                    return self.emit_expand_shape_with_reassoc(
+                        collapsed.value(), &out_shape, &e_str,
+                    );
+                }
+            }
+        }
+
+        // Fallback: emit tensor.reshape (the old path).
+        eprintln!(
+            "WARN emit_reshape: falling back to tensor.reshape for {:?} -> {:?}",
+            in_shape, out_shape,
+        );
+        self.emit_reshape_tensor_op(input, &out_shape)
+    }
+
+    /// Emit `tensor.reshape` — the legacy path, used as fallback when
+    /// collapse_shape/expand_shape constraints aren't met.
+    fn emit_reshape_tensor_op(
+        &mut self,
+        input: &Tensor<'c>,
+        out_shape: &[Option<u64>],
+    ) -> Tensor<'c> {
+        let in_shape = input.shape();
+        let dtype = input.dtype();
+        let rank = in_shape.len();
+        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
+        let target_rank = out_shape.len();
+
+        let emit_index_const = |block: &Block<'c>, ctx: &'c Context, n: u64| -> melior::ir::Value<'c, 'c> {
+            let attr = Attribute::parse(ctx, &format!("{n} : index")).expect("index const attr");
+            block
+                .append_operation(
+                    OperationBuilder::new("arith.constant", Location::unknown(ctx))
+                        .add_results(&[melior::ir::Type::parse(ctx, "index").unwrap()])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), attr)])
+                        .build()
+                        .expect("arith.constant index"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        };
+
+        // Build dim values — for dynamic dims, compute from input.
+        let mut dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::with_capacity(target_rank);
+
+        // Compute total input elements for dynamic dims.
+        let needs_infer = out_shape.iter().any(|d| d.is_none());
+        let total_elems: Option<melior::ir::Value<'c, 'c>> = if needs_infer {
+            let mut prod: Option<melior::ir::Value<'c, 'c>> = None;
+            for i in 0..rank {
+                let dim_val = match in_shape[i] {
+                    Some(n) => emit_index_const(&self.block, self.context, n),
+                    None => self.emit_tensor_dim(input.value(), i),
+                };
+                prod = Some(match prod {
+                    None => dim_val,
+                    Some(prev) => self.block
+                        .append_operation(
+                            OperationBuilder::new("arith.muli", self.location)
+                                .add_operands(&[prev, dim_val])
+                                .add_results(&[index_type])
+                                .build()
+                                .expect("arith.muli total"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into(),
+                });
+            }
+            prod
+        } else {
+            None
+        };
+
+        for (i, dim) in out_shape.iter().enumerate() {
+            let val = match dim {
+                Some(n) => emit_index_const(&self.block, self.context, *n),
+                None => {
+                    // Dynamic dim — use total/known_product or tensor.dim fallback.
+                    if let Some(total) = total_elems {
+                        let mut known = emit_index_const(&self.block, self.context, 1);
+                        for (j, d) in out_shape.iter().enumerate() {
+                            if j == i { continue; }
+                            if let Some(n) = d {
+                                let c = emit_index_const(&self.block, self.context, *n);
+                                known = self.block
+                                    .append_operation(
+                                        OperationBuilder::new("arith.muli", self.location)
+                                            .add_operands(&[known, c])
+                                            .add_results(&[index_type])
+                                            .build()
+                                            .expect("arith.muli known"),
+                                    )
+                                    .result(0).unwrap().into();
+                            }
+                        }
+                        self.block
+                            .append_operation(
+                                OperationBuilder::new("arith.divui", self.location)
+                                    .add_operands(&[total, known])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .expect("arith.divui infer"),
+                            )
+                            .result(0).unwrap().into()
+                    } else if i < rank {
+                        self.emit_tensor_dim(input.value(), i)
+                    } else {
+                        emit_index_const(&self.block, self.context, 1)
+                    }
+                }
+            };
+            dim_vals.push(val);
+        }
+
+        // Build shape tensor.
+        let shape_tensor_type: melior::ir::Type = {
+            let dims_u64 = vec![target_rank as u64];
+            RankedTensorType::new(&dims_u64, index_type, None).into()
+        };
+        let shape_tensor: melior::ir::Value<'c, 'c> = self.block
+            .append_operation(
+                OperationBuilder::new("tensor.from_elements", self.location)
+                    .add_operands(&dim_vals)
+                    .add_results(&[shape_tensor_type])
+                    .build()
+                    .expect("tensor.from_elements shape"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        let out_type = self.make_tensor_type(out_shape, dtype);
         let result: melior::ir::Value<'c, 'c> = self.block
             .append_operation(
                 OperationBuilder::new("tensor.reshape", self.location)
@@ -2901,14 +3374,93 @@ impl<'c> GraphBuilder<'c> {
 
     /// Reshape `input` using corrected runtime index dim values.
     ///
-    /// Builds a `tensor<Nxindex>` shape tensor from the provided index values,
-    /// then calls `tensor.reshape`.
+    /// Tries collapse_shape/expand_shape first when the output shape has enough
+    /// static information. Falls back to `tensor.reshape` via shape tensor.
     pub fn emit_reshape_from_index_dims(
         &mut self,
         input: &Tensor<'c>,
         dim_vals: &[melior::ir::Value<'c, 'c>],
         out_shape: &[Option<u64>],
     ) -> Tensor<'c> {
+        let in_shape = input.shape();
+
+        // Try collapse/expand decomposition.
+        if let Some(reassoc) = compute_reassociation(&in_shape, out_shape) {
+            match reassoc {
+                ReassocResult::Identity => {
+                    return Tensor::from_value(input.value());
+                }
+                ReassocResult::Collapse { reassoc, inferred_shape } => {
+                    let reassoc_str = reassoc_to_string(&reassoc);
+                    return self.emit_collapse_shape_with_reassoc(
+                        input.value(), &inferred_shape, &reassoc_str,
+                    );
+                }
+                ReassocResult::Expand { reassoc } => {
+                    let reassoc_str = reassoc_to_string(&reassoc);
+                    // Use the pre-computed dim_vals for dynamic dims instead of
+                    // tensor.dim (which only works for direct inheritance).
+                    let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.is_none())
+                        .map(|(i, _)| dim_vals[i])
+                        .collect();
+                    return self.emit_expand_shape_impl_with_dyn_vals(
+                        input.value(), out_shape, input.dtype(), &reassoc_str, &dyn_vals,
+                    );
+                }
+                ReassocResult::CollapseExpand {
+                    collapse_reassoc,
+                    intermediate_shape,
+                    expand_reassoc,
+                } => {
+                    let c_str = reassoc_to_string(&collapse_reassoc);
+                    let collapsed = self.emit_collapse_shape_with_reassoc(
+                        input.value(), &intermediate_shape, &c_str,
+                    );
+                    let e_str = reassoc_to_string(&expand_reassoc);
+                    let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.is_none())
+                        .map(|(i, _)| dim_vals[i])
+                        .collect();
+                    return self.emit_expand_shape_impl_with_dyn_vals(
+                        collapsed.value(), out_shape, input.dtype(), &e_str, &dyn_vals,
+                    );
+                }
+            }
+        }
+
+        // Second attempt: if expand failed due to static→dynamic constraint,
+        // cast the input to make those dims dynamic, then try expand again.
+        if out_shape.len() > in_shape.len() {
+            // Make all input dims that correspond to dynamic output groups dynamic.
+            let cast_shape: Vec<Option<u64>> = in_shape.iter().map(|_| None).collect();
+            let cast_val = self.emit_tensor_cast(input.value(), &cast_shape);
+            let cast_in_shape = cast_val.shape();
+            if let Some(reassoc) = compute_reassociation(&cast_in_shape, out_shape) {
+                if let ReassocResult::Expand { reassoc } = reassoc {
+                    let reassoc_str = reassoc_to_string(&reassoc);
+                    let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| d.is_none())
+                        .map(|(i, _)| dim_vals[i])
+                        .collect();
+                    return self.emit_expand_shape_impl_with_dyn_vals(
+                        cast_val.value(), out_shape, input.dtype(), &reassoc_str, &dyn_vals,
+                    );
+                }
+            }
+        }
+
+        // Final fallback: tensor.reshape via shape tensor.
+        eprintln!(
+            "WARN emit_reshape_from_index_dims: falling back to tensor.reshape for {:?} -> {:?}",
+            in_shape, out_shape,
+        );
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let n = dim_vals.len() as u64;
         let shape_tensor_type: melior::ir::Type =
@@ -3816,11 +4368,22 @@ impl<'c> GraphBuilder<'c> {
         let iterator_types = self.make_iterator_types(out_rank);
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
-        // Pick a dynamic-dim source: prefer the operand that matches the output shape.
-        let init_source = if x_padded == out_shape {
+        // Pick a dynamic-dim source for the empty tensor.
+        // Need a tensor whose dynamic dims at the same positions as out_shape.
+        let find_dyn_source = |padded: &[Option<u64>], _val: melior::ir::Value<'c, 'c>| -> bool {
+            // The source must have the same rank and its dynamic positions must
+            // cover all dynamic positions of out_shape.
+            if padded.len() != out_shape.len() { return false; }
+            out_shape.iter().enumerate().all(|(i, d)| {
+                d.is_some() || padded[i].is_none()
+            })
+        };
+        let init_source = if find_dyn_source(&x_padded, x_val) {
             Some(x_val)
-        } else if y_padded == out_shape {
+        } else if find_dyn_source(&y_padded, y_val) {
             Some(y_val)
+        } else if find_dyn_source(&cond_padded, cond_val) {
+            Some(cond_val)
         } else {
             None
         };
@@ -4408,6 +4971,34 @@ impl<'c> GraphBuilder<'c> {
         self.emit_expand_shape_impl(input, tgt_shape, dtype, "[[0, 1]]")
     }
 
+    /// Emit `tensor.cast` for same-rank type refinement (e.g. dynamic→static dims).
+    fn emit_tensor_cast(
+        &mut self,
+        input: melior::ir::Value<'c, 'c>,
+        tgt_shape: &[Option<u64>],
+    ) -> Tensor<'c> {
+        let elem_type = {
+            let rtt = RankedTensorType::try_from(input.r#type())
+                .expect("tensor.cast input must be RankedTensorType");
+            rtt.element()
+        };
+        let dtype = mlir_element_type_to_dtype(elem_type);
+        let out_type = self.make_tensor_type(tgt_shape, dtype);
+
+        let result: melior::ir::Value = self.block
+            .append_operation(
+                OperationBuilder::new("tensor.cast", self.location)
+                    .add_operands(&[input])
+                    .add_results(&[out_type])
+                    .build()
+                    .expect("tensor.cast"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
     /// Collapse a 2D tensor to 1D via `tensor.collapse_shape`.
     /// Reassociation: `[[0, 1]]` — source dims 0,1 collapse into target dim 0.
     fn emit_collapse_shape_2d_to_1d(
@@ -4433,67 +5024,72 @@ impl<'c> GraphBuilder<'c> {
         debug_assert!(src_rank >= 3);
         debug_assert_eq!(tgt_shape.len(), 3);
 
-        // Use tensor.collapse_shape when safe (the batch group has at most one
-        // dynamic dim, so MLIR can infer the collapsed type correctly).
-        // Fall back to emit_reshape only when the batch group would have
-        // multiple dynamic dims.
-        let batch_dims = &src_shape[..src_rank - 2];
-        let n_dynamic_in_batch = batch_dims.iter().filter(|d| d.is_none()).count();
-
-        if n_dynamic_in_batch <= 1 {
-            // Safe for collapse_shape.
-            let batch_indices: Vec<String> = (0..src_rank - 2).map(|i| i.to_string()).collect();
-            let batch_group = format!("[{}]", batch_indices.join(", "));
-            let m_group = format!("[{}]", src_rank - 2);
-            let k_group = format!("[{}]", src_rank - 1);
-            let reassoc_str = format!("[{batch_group}, {m_group}, {k_group}]");
-            return self.emit_collapse_shape_with_reassoc(input, tgt_shape, &reassoc_str);
-        }
-
-        // Multiple dynamic batch dims — fall back to emit_reshape.
-        let target_i64: Vec<i64> = tgt_shape.iter().map(|d| match d {
-            Some(n) => *n as i64,
-            None => -1,
-        }).collect();
-        let input_tensor = Tensor::from_value(input);
-        self.emit_reshape(&input_tensor, &target_i64)
+        // tensor.collapse_shape supports multiple dynamic dims per group —
+        // MLIR computes the collapsed dim as the product at runtime.
+        let batch_indices: Vec<String> = (0..src_rank - 2).map(|i| i.to_string()).collect();
+        let batch_group = format!("[{}]", batch_indices.join(", "));
+        let m_group = format!("[{}]", src_rank - 2);
+        let k_group = format!("[{}]", src_rank - 1);
+        let reassoc_str = format!("[{batch_group}, {m_group}, {k_group}]");
+        self.emit_collapse_shape_with_reassoc(input, tgt_shape, &reassoc_str)
     }
 
     /// Expand a 3D `[B_flat, M, N]` result back to ND `[..., M, N]`.
     /// Reassociation: first group expands the batch dim, then identity for M and N.
+    /// Expand a 3D `[B_flat, M, N]` result back to ND `[..., M, N]`.
+    /// Reassociation: first group expands the batch dim, then identity for M and N.
+    ///
+    /// `batch_ref` is an optional (value, shape) of the original ND tensor whose
+    /// batch dims should be restored. Used to get dynamic batch dim values via
+    /// `tensor.dim` when the batch group has multiple dynamic dims.
     fn emit_expand_shape_3d_to_nd(
         &mut self,
         input: melior::ir::Value<'c, 'c>,
         src_shape: &[Option<u64>],   // [B_flat, M, N]
         tgt_shape: &[Option<u64>],   // [..., M, N]
+        batch_ref: Option<(melior::ir::Value<'c, 'c>, &[Option<u64>])>,
     ) -> Tensor<'c> {
         let tgt_rank = tgt_shape.len();
         debug_assert_eq!(src_shape.len(), 3);
         debug_assert!(tgt_rank >= 3);
 
-        // Use tensor.expand_shape when safe: the batch group (dims 0..tgt_rank-2)
-        // must have at most one dynamic dim, otherwise expand_shape can't infer
-        // the correct output dims.
-        let batch_tgt = &tgt_shape[..tgt_rank - 2];
-        let n_dynamic_in_batch = batch_tgt.iter().filter(|d| d.is_none()).count();
+        let batch_indices: Vec<String> = (0..tgt_rank - 2).map(|i| i.to_string()).collect();
+        let batch_group = format!("[{}]", batch_indices.join(", "));
+        let m_group = format!("[{}]", tgt_rank - 2);
+        let n_group = format!("[{}]", tgt_rank - 1);
+        let reassoc_str = format!("[{batch_group}, {m_group}, {n_group}]");
 
-        if n_dynamic_in_batch <= 1 {
-            // Safe for expand_shape.
-            let batch_indices: Vec<String> = (0..tgt_rank - 2).map(|i| i.to_string()).collect();
-            let batch_group = format!("[{}]", batch_indices.join(", "));
-            let m_group = format!("[{}]", tgt_rank - 2);
-            let n_group = format!("[{}]", tgt_rank - 1);
-            let reassoc_str = format!("[{batch_group}, {m_group}, {n_group}]");
-            return self.emit_expand_shape_with_reassoc(input, tgt_shape, &reassoc_str);
+        // Collect dynamic dim values for the output_shape operands.
+        let mut dyn_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+        for (i, dim) in tgt_shape.iter().enumerate() {
+            if dim.is_none() {
+                // Get the dynamic dim value from the batch reference tensor
+                // if available, otherwise from the input.
+                let val = if let Some((ref_val, _)) = batch_ref {
+                    if i < tgt_rank - 2 {
+                        // Batch dim — get from the original ND tensor.
+                        self.emit_tensor_dim(ref_val, i)
+                    } else {
+                        // M or N dim — get from the 3D input.
+                        self.emit_tensor_dim(input, i - (tgt_rank - 3))
+                    }
+                } else {
+                    let in_dim = self.find_input_dim_for_expand_output(&reassoc_str, i);
+                    self.emit_tensor_dim(input, in_dim)
+                };
+                dyn_vals.push(val);
+            }
         }
 
-        // Multiple dynamic batch dims — fall back to emit_reshape.
-        let target_i64: Vec<i64> = tgt_shape.iter().map(|d| match d {
-            Some(n) => *n as i64,
-            None => -1,
-        }).collect();
-        let input_tensor = Tensor::from_value(input);
-        self.emit_reshape(&input_tensor, &target_i64)
+        let elem_type = {
+            let rtt = RankedTensorType::try_from(input.r#type())
+                .expect("expand_shape input must be RankedTensorType");
+            rtt.element()
+        };
+        let dtype = mlir_element_type_to_dtype(elem_type);
+        self.emit_expand_shape_impl_with_dyn_vals(
+            input, tgt_shape, dtype, &reassoc_str, &dyn_vals,
+        )
     }
 
     fn emit_collapse_shape_with_reassoc(
@@ -4593,6 +5189,54 @@ impl<'c> GraphBuilder<'c> {
 
         let mut operands = vec![input];
         operands.extend(dyn_output_shape_vals);
+
+        let result: melior::ir::Value = self.block
+            .append_operation(
+                OperationBuilder::new("tensor.expand_shape", self.location)
+                    .add_operands(&operands)
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (Identifier::new(self.context, "reassociation"), reassoc_attr),
+                        (Identifier::new(self.context, "static_output_shape"), static_output_shape_attr),
+                    ])
+                    .build()
+                    .expect("tensor.expand_shape"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
+    /// Like `emit_expand_shape_impl` but uses pre-computed dynamic dim values
+    /// instead of `tensor.dim`. Used when dynamic dims come from shape tensor
+    /// extraction (e.g., ONNX Reshape's -1 inference) rather than direct
+    /// inheritance from the input tensor.
+    fn emit_expand_shape_impl_with_dyn_vals(
+        &mut self,
+        input: melior::ir::Value<'c, 'c>,
+        tgt_shape: &[Option<u64>],
+        dtype: DType,
+        reassoc_str: &str,
+        dyn_vals: &[melior::ir::Value<'c, 'c>],
+    ) -> Tensor<'c> {
+        let out_type = self.make_tensor_type(tgt_shape, dtype);
+
+        let reassoc_attr = Attribute::parse(self.context, reassoc_str)
+            .expect("expand_shape reassociation");
+
+        let static_shape_vals: Vec<i64> = tgt_shape.iter().map(|d| match d {
+            Some(n) => *n as i64,
+            None => i64::MIN,
+        }).collect();
+        let static_shape_str = static_shape_vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+        let static_output_shape_attr = Attribute::parse(
+            self.context,
+            &format!("array<i64: {static_shape_str}>"),
+        ).expect("static_output_shape attr");
+
+        let mut operands = vec![input];
+        operands.extend_from_slice(dyn_vals);
 
         let result: melior::ir::Value = self.block
             .append_operation(

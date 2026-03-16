@@ -13,6 +13,11 @@ use crate::{
 
 use super::parser::{Dim, OnnxAttribute, OnnxError, OnnxModel, OnnxNode};
 
+/// Sentinel for partially-known const_i64 values. Used when a Concat input
+/// doesn't have const values — downstream consumers (Reshape) treat this as
+/// "dynamic / unknown" while still using the known values from other inputs.
+const CONST_I64_UNKNOWN: i64 = i64::MIN;
+
 // ── Value classification ───────────────────────────────────────────────────────
 
 /// An entry in the emitter's value map.
@@ -202,13 +207,21 @@ fn lookup_const_i64(const_i64: &HashMap<String, Vec<i64>>, name: &str) -> Option
 
 /// Element-wise op on two const_i64 vectors, with scalar broadcast support.
 /// Returns None if sizes are incompatible.
+/// Propagates CONST_I64_UNKNOWN: if either operand is unknown, result is unknown.
 fn const_i64_elementwise(a: &[i64], b: &[i64], op: fn(i64, i64) -> i64) -> Option<Vec<i64>> {
+    let apply = |x: i64, y: i64| -> i64 {
+        if x == CONST_I64_UNKNOWN || y == CONST_I64_UNKNOWN {
+            CONST_I64_UNKNOWN
+        } else {
+            op(x, y)
+        }
+    };
     if a.len() == b.len() {
-        Some(a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect())
+        Some(a.iter().zip(b.iter()).map(|(&x, &y)| apply(x, y)).collect())
     } else if a.len() == 1 {
-        Some(b.iter().map(|&y| op(a[0], y)).collect())
+        Some(b.iter().map(|&y| apply(a[0], y)).collect())
     } else if b.len() == 1 {
-        Some(a.iter().map(|&x| op(x, b[0])).collect())
+        Some(a.iter().map(|&x| apply(x, b[0])).collect())
     } else {
         None
     }
@@ -738,8 +751,9 @@ fn emit_node<'c>(
             let x = get_tensor(value_map, builder, &node.inputs[0])?;
             let shape_name = &node.inputs[1];
 
-            // Static path: shape input is a known initializer.
-            let static_target = lookup_const_i64(const_i64, shape_name);
+            // Static path: shape input is fully known (no CONST_I64_UNKNOWN sentinels).
+            let static_target = lookup_const_i64(const_i64, shape_name)
+                .filter(|vals| vals.iter().all(|&v| v != CONST_I64_UNKNOWN));
 
             let out = if let Some(mut target_shape) = static_target {
                 // In ONNX, `0` means "copy this dimension from the input" (when allowzero=0,
@@ -794,7 +808,9 @@ fn emit_node<'c>(
                 let allowzero_flag = allowzero != 0;
 
                 let out_shape: Vec<Option<u64>> = (0..out_rank).map(|i| {
-                    let raw_val: Option<i64> = shape_static.as_ref().and_then(|v| v.get(i).copied());
+                    let raw_val: Option<i64> = shape_static.as_ref()
+                        .and_then(|v| v.get(i).copied())
+                        .filter(|&v| v != CONST_I64_UNKNOWN);
 
                     match raw_val {
                         Some(d) if d > 0 => Some(d as u64),
@@ -809,7 +825,7 @@ fn emit_node<'c>(
                             let known_product: Option<u64> = shape_static.as_ref().and_then(|sv| {
                                 sv.iter().enumerate().try_fold(1u64, |acc, (j, &d)| {
                                     if j == i { Some(acc) } // skip the -1 dim
-                                    else if d > 0 { Some(acc * d as u64) }
+                                    else if d > 0 && d != CONST_I64_UNKNOWN { Some(acc * d as u64) }
                                     else if d == 0 && !allowzero_flag {
                                         in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
                                     }
@@ -821,7 +837,7 @@ fn emit_node<'c>(
                                 _ => None,
                             }
                         }
-                        _ => None, // truly dynamic
+                        _ => None, // truly dynamic (or CONST_I64_UNKNOWN)
                     }
                 }).collect();
 
@@ -867,20 +883,34 @@ fn emit_node<'c>(
             insert_tensor(value_map, &node.outputs[0], out);
 
             // Propagate const_i64 through concatenation so downstream Reshape
-            // ops can take the static path. This is critical for avoiding the
-            // all-dynamic cascade that breaks expand_shape in matmul.
-            let mut all_const = true;
-            let mut concat_vals: Vec<i64> = Vec::new();
-            for name in &node.inputs {
-                if let Some(vals) = const_i64.get(name) {
-                    concat_vals.extend(vals);
-                } else {
-                    all_const = false;
-                    break;
+            // ops can take the static path. Support PARTIAL propagation:
+            // use CONST_I64_UNKNOWN sentinel for inputs without const values,
+            // so that known values (like 12, 64, 768) still reach Reshape.
+            {
+                let mut concat_vals: Vec<i64> = Vec::new();
+                let mut has_any = false;
+                for name in &node.inputs {
+                    if let Some(vals) = const_i64.get(name) {
+                        concat_vals.extend(vals);
+                        has_any = true;
+                    } else {
+                        // Unknown — use sentinel. Check the MLIR tensor shape
+                        // to determine how many values this input contributes.
+                        let n = match value_map.get(name) {
+                            Some(EmitValue::Tensor(t)) => {
+                                let s = t.shape();
+                                if s.len() == 1 { s[0].unwrap_or(1) as usize }
+                                else { 1 }
+                            }
+                            Some(EmitValue::ShapeDims(dims)) => dims.len(),
+                            None => 1,
+                        };
+                        concat_vals.extend(std::iter::repeat(CONST_I64_UNKNOWN).take(n));
+                    }
                 }
-            }
-            if all_const && !concat_vals.is_empty() {
-                const_i64.insert(node.outputs[0].clone(), concat_vals);
+                if has_any {
+                    const_i64.insert(node.outputs[0].clone(), concat_vals);
+                }
             }
         }
         "Slice" => {
