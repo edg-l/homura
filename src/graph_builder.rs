@@ -4419,6 +4419,17 @@ impl<'c> GraphBuilder<'c> {
         debug_assert!(src_rank >= 3);
         debug_assert_eq!(tgt_shape.len(), 3);
 
+        // When all target dims are static AND all source dims are static,
+        // tensor.collapse_shape correctly infers the result type. But when
+        // it's used alongside a collapse of a tensor with dynamic dims (e.g.,
+        // LHS of a matmul), MLIR may fail to verify. Use emit_reshape for
+        // all-static target shapes to sidestep the issue.
+        if tgt_shape.iter().all(|d| d.is_some()) {
+            let target_i64: Vec<i64> = tgt_shape.iter().map(|d| d.unwrap() as i64).collect();
+            let input_tensor = Tensor::from_value(input);
+            return self.emit_reshape(&input_tensor, &target_i64);
+        }
+
         // Reassociation: first group collects all batch dims (0..src_rank-2),
         // then one group for M (src_rank-2), one group for K (src_rank-1).
         let batch_indices: Vec<String> = (0..src_rank - 2).map(|i| i.to_string()).collect();

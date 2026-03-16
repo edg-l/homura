@@ -861,6 +861,18 @@ fn emit_node<'c>(
                 };
                 let out = builder.emit_slice(&data, &starts, &ends, &axes, &steps);
                 insert_tensor(value_map, &node.outputs[0], out);
+
+                // Propagate const_i64 through static Slice on 1-D data.
+                if let Some(data_vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
+                    if axes.len() == 1 && axes[0] == 0 && steps.iter().all(|&s| s == 1) {
+                        let n = data_vals.len() as i64;
+                        let s = if starts[0] < 0 { (n + starts[0]).max(0) } else { starts[0].min(n) } as usize;
+                        let e = if ends[0] < 0 { (n + ends[0]).max(0) } else { ends[0].min(n) } as usize;
+                        if s <= e && e <= data_vals.len() {
+                            const_i64.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
+                        }
+                    }
+                }
             } else {
                 // ── Dynamic path ─────────────────────────────────────────────
                 // starts/ends are runtime 1-D I64 tensors in value_map.
