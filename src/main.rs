@@ -70,10 +70,20 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(e) = run(cli) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+    let code = match run(cli) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    };
+    // Flush output before exiting. We use libc::_exit() to skip global C++
+    // destructors — LLVM has a static initialization order fiasco
+    // (llvm/llvm-project#154528) that causes segfaults during __cxa_finalize
+    // when MLIR dialects have been loaded.
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    unsafe { libc::_exit(code) }
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {

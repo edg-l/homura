@@ -10,8 +10,12 @@
   Compiles and runs correctly with dynamic `past_sequence_length`.
 - **Generation: WORKING.** Coherent output with KV cache: "The meaning of life is
   not the same as the meaning of death." Warm decode at ~0.24s/token.
-- **"double free or corruption (!prev)" on exit** is a pre-existing libLLVM cleanup
-  issue — also happens with the working mapper path. Ignore it.
+- **Exit segfault: FIXED** (workaround). Caused by LLVM static initialization
+  order fiasco ([llvm/llvm-project#154528](https://github.com/llvm/llvm-project/issues/154528)).
+  `TensorSpec` and `KnownAssumptionStrings` globals in libLLVM are destroyed in
+  wrong order during `__cxa_finalize`. Fix: `libc::_exit()` in main to skip C++
+  global destructors. Upstream fix merged: [PR #154541](https://github.com/llvm/llvm-project/pull/154541)
+  — will land in the next LLVM release after 21.1.
 
 ## Completed: Fix KV cache attention mask (bucket padding gap)
 

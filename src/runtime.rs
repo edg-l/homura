@@ -229,6 +229,14 @@ pub struct CompiledGraph {
 unsafe impl Send for CompiledGraph {}
 unsafe impl Sync for CompiledGraph {}
 
+impl Drop for CompiledGraph {
+    fn drop(&mut self) {
+        if !self._lib.is_null() {
+            unsafe { libc::dlclose(self._lib); }
+        }
+    }
+}
+
 impl CompiledGraph {
     /// Load a pre-compiled `.so` and wrap it as a `CompiledGraph`.
     ///
