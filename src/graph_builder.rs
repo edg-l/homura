@@ -482,7 +482,10 @@ impl<'c> GraphBuilder<'c> {
 
     /// Emit a `linalg.generic` binary elementwise op with broadcast support.
     ///
-    /// The body emits `<arith_op> %a, %b : elem_type` and yields the result.
+    /// Uses broadcast-aware indexing maps directly in the linalg.generic
+    /// instead of pre-broadcasting inputs. This avoids canonicalize fusion
+    /// bugs where a separate broadcast generic gets merged with the binary
+    /// generic and produces incorrect identity maps.
     fn emit_linalg_binary(
         &mut self,
         body_op: &str,
@@ -496,27 +499,45 @@ impl<'c> GraphBuilder<'c> {
         let out_rank = out_shape.len();
         let elem_type = dtype.to_mlir_type(self.context);
 
-        // Broadcast inputs to output shape if needed.
-        let lhs_val = self.broadcast_to(lhs, &out_shape).value();
-        let rhs_val = self.broadcast_to(rhs, &out_shape).value();
+        // Rank-promote inputs if needed (insert leading size-1 dims).
+        let (lhs_val, lhs_padded) = self.rank_promote_for_broadcast(lhs, out_rank);
+        let (rhs_val, rhs_padded) = self.rank_promote_for_broadcast(rhs, out_rank);
 
-        let dims_u64: Vec<u64> = out_shape
-            .iter()
-            .map(|d| match d {
-                Some(n) => *n as u64,
-                None => i64::MIN as u64,
-            })
-            .collect();
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&dims_u64, elem_type, None).into();
+        // Build broadcast-aware indexing maps.
+        let lhs_map = Self::make_broadcast_map(out_rank, &lhs_padded, &out_shape);
+        let rhs_map = Self::make_broadcast_map(out_rank, &rhs_padded, &out_shape);
+        let out_map = identity_map_str(out_rank);
 
-        let init = self.emit_tensor_empty_dyn(&out_shape, dtype, Some(lhs_val));
-        let identity = identity_map_str(out_rank);
         let indexing_maps = Attribute::parse(
             self.context,
-            &format!("[{0}, {0}, {0}]", identity),
-        ).expect("indexing_maps");
+            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
+        ).expect("broadcast indexing_maps");
         let iterator_types = self.make_iterator_types(out_rank);
+
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+
+        // For tensor.empty, find a source tensor that has the output's dynamic dims.
+        // Prefer the operand that is NOT all-broadcast (has matching dims).
+        let dyn_source = if lhs_padded == out_shape {
+            Some(lhs_val)
+        } else if rhs_padded == out_shape {
+            Some(rhs_val)
+        } else {
+            // Neither operand matches fully — need to build dynamic dims from
+            // whichever operand provides each dim.
+            Some(self.emit_tensor_empty_for_broadcast(&out_shape, &lhs_padded, lhs_val, &rhs_padded, rhs_val, dtype))
+        };
+        let init = if let Some(src) = dyn_source {
+            // If src is already a tensor.empty Value, use it directly.
+            // Otherwise, emit tensor.empty with dims from src.
+            if lhs_padded == out_shape || rhs_padded == out_shape {
+                self.emit_tensor_empty_dyn(&out_shape, dtype, Some(src))
+            } else {
+                src // emit_tensor_empty_for_broadcast already returned a tensor.empty
+            }
+        } else {
+            self.emit_tensor_empty_dyn(&out_shape, dtype, None)
+        };
 
         let body_block = Block::new(&[
             (elem_type, self.location),
@@ -549,7 +570,7 @@ impl<'c> GraphBuilder<'c> {
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, init])
-                    .add_results(&[tensor_type])
+                    .add_results(&[out_type])
                     .add_attributes(&[
                         (Identifier::new(self.context, "indexing_maps"), indexing_maps),
                         (Identifier::new(self.context, "iterator_types"), iterator_types),
@@ -564,6 +585,88 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
         Tensor::from_value(result)
+    }
+
+    /// Promote a tensor to the target rank by inserting leading size-1 dims.
+    /// Returns the promoted value and its padded shape.
+    fn rank_promote_for_broadcast(
+        &mut self,
+        tensor: &Tensor<'c>,
+        target_rank: usize,
+    ) -> (melior::ir::Value<'c, 'c>, Vec<Option<u64>>) {
+        let shape = tensor.shape();
+        if shape.len() == target_rank {
+            return (tensor.value(), shape);
+        }
+        let extra = target_rank - shape.len();
+        let axes: Vec<i64> = (0..extra as i64).collect();
+        let promoted = self.emit_unsqueeze(tensor, &axes);
+        let padded = promoted.shape();
+        (promoted.value(), padded)
+    }
+
+    /// Build an affine map string for broadcast: `(d0, d1, ...) -> (expr0, expr1, ...)`
+    /// where `expr_i = 0` if `operand_shape[i] == Some(1)` and `out_shape[i] != Some(1)`,
+    /// otherwise `expr_i = d_i`.
+    fn make_broadcast_map(
+        out_rank: usize,
+        operand_shape: &[Option<u64>],
+        out_shape: &[Option<u64>],
+    ) -> String {
+        assert_eq!(operand_shape.len(), out_rank);
+        let dim_vars: Vec<String> = (0..out_rank).map(|i| format!("d{i}")).collect();
+        let dim_list = dim_vars.join(", ");
+
+        let result_exprs: Vec<String> = (0..out_rank)
+            .map(|i| {
+                if operand_shape[i] == Some(1) && out_shape[i] != Some(1) {
+                    "0".to_string()
+                } else {
+                    dim_vars[i].clone()
+                }
+            })
+            .collect();
+        let result_str = result_exprs.join(", ");
+        format!("affine_map<({dim_list}) -> ({result_str})>")
+    }
+
+    /// Emit a `tensor.empty` for broadcast output when neither input fully matches
+    /// the output shape. Picks dynamic dim values from whichever operand provides them.
+    fn emit_tensor_empty_for_broadcast(
+        &mut self,
+        out_shape: &[Option<u64>],
+        lhs_shape: &[Option<u64>],
+        lhs_val: melior::ir::Value<'c, 'c>,
+        rhs_shape: &[Option<u64>],
+        rhs_val: melior::ir::Value<'c, 'c>,
+        dtype: DType,
+    ) -> melior::ir::Value<'c, 'c> {
+        let tensor_type = self.make_tensor_type(out_shape, dtype);
+        let mut dyn_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
+
+        for (i, dim) in out_shape.iter().enumerate() {
+            if dim.is_none() {
+                // Pick the operand that is NOT broadcast at this dim.
+                let src = if lhs_shape[i] != Some(1) {
+                    lhs_val
+                } else {
+                    rhs_val
+                };
+                dyn_vals.push(self.emit_tensor_dim(src, i));
+            }
+        }
+
+        self.block
+            .append_operation(
+                OperationBuilder::new("tensor.empty", self.location)
+                    .add_operands(&dyn_vals)
+                    .add_results(&[tensor_type])
+                    .build()
+                    .expect("tensor.empty broadcast"),
+            )
+            .result(0)
+            .unwrap()
+            .into()
     }
 
     /// Emit a `linalg.generic` unary elementwise op (single-operand body op).
