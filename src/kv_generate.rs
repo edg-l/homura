@@ -384,9 +384,13 @@ impl KvGenerator {
             )
             .into());
         }
-        // Keep full bucket KV (including padding positions).
-        // The decode step uses the attention mask to distinguish real from padding.
-        let kv_buffers = outputs[1..1 + kv_count].to_vec();
+        // Trim KV to [1, heads, seq_len, head_dim] — remove bucket padding.
+        // This keeps positions contiguous so the decode step's attention mask
+        // can be all-ones (no padding gap between real prefill and new decode KVs).
+        let kv_buffers: Vec<Buffer> = outputs[1..1 + kv_count]
+            .iter()
+            .map(|kv| trim_kv_seq_dim(kv, seq_len))
+            .collect();
 
         Ok((next_token, kv_buffers, seq_len))
     }
@@ -426,15 +430,11 @@ impl KvGenerator {
         let input_ids =
             Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
 
-        // attention_mask: [1, kv_seq_len + 1]
-        // 1 at real positions, 0 at padding positions, 1 at new-token position
+        // attention_mask: [1, kv_seq_len + 1] — all ones.
+        // KV cache is trimmed (no padding gap), so every position is real.
         let kv_seq_len = kv_cache[0].shape().0[2] as usize;
         let mask_len = kv_seq_len + 1;
-        let mut mask_data = vec![0i64; mask_len];
-        for i in 0..real_pos {
-            mask_data[i] = 1;
-        }
-        mask_data[kv_seq_len] = 1; // new token
+        let mask_data = vec![1i64; mask_len];
         let attention_mask =
             Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
 
@@ -529,6 +529,33 @@ impl KvGenerator {
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
+/// Trim a KV cache buffer from `[1, heads, full_seq, head_dim]` to
+/// `[1, heads, target_seq, head_dim]` by copying only the first `target_seq`
+/// positions along dimension 2.
+fn trim_kv_seq_dim(kv: &Buffer, target_seq: usize) -> Buffer {
+    let shape = &kv.shape().0;
+    assert_eq!(shape.len(), 4, "KV buffer must be 4-D");
+    let heads = shape[1] as usize;
+    let full_seq = shape[2] as usize;
+    let head_dim = shape[3] as usize;
+
+    if target_seq >= full_seq {
+        return kv.clone();
+    }
+
+    let src = kv.as_slice::<f32>();
+    let mut dst = Vec::with_capacity(heads * target_seq * head_dim);
+    for h in 0..heads {
+        let head_offset = h * full_seq * head_dim;
+        dst.extend_from_slice(&src[head_offset..head_offset + target_seq * head_dim]);
+    }
+    Buffer::from_slice::<f32>(
+        &dst,
+        &[1, heads as u64, target_seq as u64, head_dim as u64],
+        kv.dtype(),
+    )
+}
+
 /// Return the first existing path from `candidates` under `dir`.
 fn find_file(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
     for &name in candidates {
@@ -561,28 +588,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attention_mask_correct_pattern() {
-        // Verify the decode_step attention mask construction:
-        // all ones, length = real_pos + 1.
-        let real_pos = 3usize;
-
-        let mask_len = real_pos + 1;
+    fn attention_mask_all_ones() {
+        // After KV trimming, decode mask is all-ones: length = kv_seq_len + 1.
+        let kv_seq_len = 5usize; // 5 real past positions
+        let mask_len = kv_seq_len + 1;
         let mask_data = vec![1i64; mask_len];
-
-        let expected: Vec<i64> = vec![1, 1, 1, 1];
-        assert_eq!(mask_data, expected);
+        assert_eq!(mask_data, vec![1i64; 6]);
     }
 
     #[test]
-    fn attention_mask_zero_real_pos() {
-        // real_pos=0: mask is length 1 — just the current token.
-        let real_pos = 0usize;
-
-        let mask_len = real_pos + 1;
-        let mask_data = vec![1i64; mask_len];
-
-        let expected: Vec<i64> = vec![1];
-        assert_eq!(mask_data, expected);
+    fn trim_kv_seq_dim_basic() {
+        use super::trim_kv_seq_dim;
+        // KV: [1, 2, 4, 3] → trim to seq_len=2
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let kv = Buffer::from_slice::<f32>(&data, &[1, 2, 4, 3], DType::F32);
+        let trimmed = trim_kv_seq_dim(&kv, 2);
+        assert_eq!(trimmed.shape().0, vec![1, 2, 2, 3]);
+        let result = trimmed.as_slice::<f32>();
+        // Head 0: positions 0-1 → elements 0..6
+        // Head 1: positions 0-1 → elements 12..18
+        assert_eq!(result, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]);
     }
 
     #[test]
