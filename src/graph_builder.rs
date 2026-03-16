@@ -3798,19 +3798,33 @@ impl<'c> GraphBuilder<'c> {
         let out_rank = out_shape.len();
         let elem_type = dtype.to_mlir_type(self.context);
 
-        let x_bc = self.broadcast_to(x, &out_shape);
-        let y_bc = self.broadcast_to(y, &out_shape);
-        let cond_bc = self.broadcast_to(cond, &out_shape);
+        // Rank-promote inputs for broadcasting (insert leading 1-dims).
+        let (cond_val, cond_padded) = self.rank_promote_for_broadcast(cond, out_rank);
+        let (x_val, x_padded) = self.rank_promote_for_broadcast(x, out_rank);
+        let (y_val, y_padded) = self.rank_promote_for_broadcast(y, out_rank);
 
-        let out_type = self.make_tensor_type(&out_shape, dtype);
-        let init = self.emit_tensor_empty_dyn(&out_shape, dtype, Some(x_bc.value()));
+        // Build broadcast-aware indexing maps (size-1 dims map to constant 0).
+        let cond_map = Self::make_broadcast_map(out_rank, &cond_padded, &out_shape);
+        let x_map = Self::make_broadcast_map(out_rank, &x_padded, &out_shape);
+        let y_map = Self::make_broadcast_map(out_rank, &y_padded, &out_shape);
+        let out_map = identity_map_str(out_rank);
 
-        let identity = identity_map_str(out_rank);
         let indexing_maps = Attribute::parse(
             self.context,
-            &format!("[{0}, {0}, {0}, {0}]", identity),
+            &format!("[{cond_map}, {x_map}, {y_map}, {out_map}]"),
         ).expect("where indexing_maps");
         let iterator_types = self.make_iterator_types(out_rank);
+
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        // Pick a dynamic-dim source: prefer the operand that matches the output shape.
+        let init_source = if x_padded == out_shape {
+            Some(x_val)
+        } else if y_padded == out_shape {
+            Some(y_val)
+        } else {
+            None
+        };
+        let init = self.emit_tensor_empty_dyn(&out_shape, dtype, init_source);
 
         let cond_dtype = cond.dtype();
         let cond_elem_type = cond_dtype.to_mlir_type(self.context);
@@ -3918,7 +3932,7 @@ impl<'c> GraphBuilder<'c> {
         let result: melior::ir::Value<'c, 'c> = self.block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
-                    .add_operands(&[cond_bc.value(), x_bc.value(), y_bc.value(), init])
+                    .add_operands(&[cond_val, x_val, y_val, init])
                     .add_results(&[out_type])
                     .add_attributes(&[
                         (Identifier::new(self.context, "indexing_maps"), indexing_maps),
@@ -4452,14 +4466,17 @@ impl<'c> GraphBuilder<'c> {
         debug_assert_eq!(src_shape.len(), 3);
         debug_assert!(tgt_rank >= 3);
 
-        // Reassociation: first group expands batch dim (0) to (0..tgt_rank-2),
-        // then [tgt_rank-2] for M, [tgt_rank-1] for N.
-        let batch_indices: Vec<String> = (0..tgt_rank - 2).map(|i| i.to_string()).collect();
-        let batch_group = format!("[{}]", batch_indices.join(", "));
-        let m_group = format!("[{}]", tgt_rank - 2);
-        let n_group = format!("[{}]", tgt_rank - 1);
-        let reassoc_str = format!("[{batch_group}, {m_group}, {n_group}]");
-        self.emit_expand_shape_with_reassoc(input, tgt_shape, &reassoc_str)
+        // Use emit_reshape to avoid the tensor.expand_shape multi-dim group
+        // problem: expand_shape uses tensor.dim on the input for ALL output
+        // dims in a reassociation group, which is wrong when splitting one
+        // dim into multiple (e.g., batch*heads → [batch, heads]).
+        // emit_reshape correctly uses the provided target shape values.
+        let target_i64: Vec<i64> = tgt_shape.iter().map(|d| match d {
+            Some(n) => *n as i64,
+            None => -1,
+        }).collect();
+        let input_tensor = Tensor::from_value(input);
+        self.emit_reshape(&input_tensor, &target_i64)
     }
 
     fn emit_collapse_shape_with_reassoc(

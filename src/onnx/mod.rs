@@ -539,7 +539,11 @@ fn compute_concrete_output_shapes(
     for (spec, buf) in model.dynamic_inputs.iter().zip(inputs.iter()) {
         for (i, dim) in spec.dims.iter().enumerate() {
             if let Dim::Symbolic(name) = dim {
-                if !keep_dynamic.contains(name) && i < buf.shape().0.len() {
+                // Resolve ALL symbolic dims from actual input shapes, including
+                // those in keep_dynamic. Even though the MLIR type uses `?` for
+                // keep_dynamic dims, we need their concrete values to compute
+                // output shapes at runtime.
+                if i < buf.shape().0.len() {
                     sym_values.insert(name.clone(), buf.shape().0[i]);
                 }
             }
