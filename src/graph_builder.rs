@@ -3457,10 +3457,7 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Final fallback: tensor.reshape via shape tensor.
-        eprintln!(
-            "WARN emit_reshape_from_index_dims: falling back to tensor.reshape for {:?} -> {:?}",
-            in_shape, out_shape,
-        );
+        tracing::debug!(?in_shape, ?out_shape, "emit_reshape_from_index_dims: falling back to tensor.reshape");
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let n = dim_vals.len() as u64;
         let shape_tensor_type: melior::ir::Type =
