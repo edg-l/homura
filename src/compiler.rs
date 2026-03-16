@@ -3985,15 +3985,185 @@ fn emit_tensor_ops<'c>(
                 let input_val = *values.get(input).expect("input not yet emitted");
                 let input_shape = trace.get(*input).shape().0.clone();
 
-                // Dynamic reshape via shape tensor: emit `tensor.reshape %input(%shape_tensor)`.
+                // Dynamic reshape via shape tensor: copy data to a new tensor with
+                // target shape. We avoid tensor.reshape because:
+                // - memref.reshape (its lowering) is not used by any production compiler
+                // - one-shot-bufferize may reuse shape buffers causing stale strides
+                // - expand/collapse_shape crashes in expand-strided-metadata (LLVM bug)
+                // Instead, emit linalg.generic identity copy with linearized index
+                // remapping. Safe and correct for any reshape pattern.
                 if let Some(st_id) = shape_tensor {
                     let shape_val = *values.get(st_id).expect("shape_tensor not yet emitted");
+                    let elem_type = dtype.to_mlir_type(context);
+                    let index_type = melior::ir::Type::parse(context, "index")
+                        .ok_or_else(|| CompileError::AttributeParse("index type".into()))?;
+                    let i64_type = DType::I64.to_mlir_type(context);
+                    let out_rank = shape.0.len();
+                    let in_rank = input_shape.len();
+
+                    // Load output dim sizes from the shape tensor.
+                    let mut out_dim_vals: Vec<melior::ir::Value> = Vec::new();
+                    for i in 0..out_rank {
+                        let ci: melior::ir::Value = body_block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(index_type, i as i64).into(),
+                                location,
+                            ))
+                            .result(0).unwrap().into();
+                        let dim_i64: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("tensor.extract", location)
+                                    .add_operands(&[shape_val, ci])
+                                    .add_results(&[i64_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0).unwrap().into();
+                        let dim_idx: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.index_cast", location)
+                                    .add_operands(&[dim_i64])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0).unwrap().into();
+                        out_dim_vals.push(dim_idx);
+                    }
+
+                    // Get input dim sizes (for linearization).
+                    let mut in_dim_vals: Vec<melior::ir::Value> = Vec::new();
+                    for i in 0..in_rank {
+                        let dv = emit_tensor_dim(context, body_block, input_val, i, location)?;
+                        in_dim_vals.push(dv);
+                    }
+
+                    // Allocate output tensor.
                     let out_type = make_ranked_tensor_type(context, &shape.0, *dtype);
+                    let dyn_dims: Vec<melior::ir::Value> = shape.0.iter().enumerate()
+                        .filter(|(_, d)| **d == DIM_DYNAMIC)
+                        .map(|(i, _)| out_dim_vals[i])
+                        .collect();
+                    let empty_val: melior::ir::Value = body_block
+                        .append_operation(
+                            OperationBuilder::new("tensor.empty", location)
+                                .add_operands(&dyn_dims)
+                                .add_results(&[out_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0).unwrap().into();
+
+                    // Build linalg.generic: iterate over output indices, compute
+                    // linear index, delinearize into input indices, extract, yield.
+                    let dims_str = (0..out_rank).map(|i| format!("d{i}")).collect::<Vec<_>>().join(", ");
+                    let out_map_str = format!("affine_map<({dims_str}) -> ({dims_str})>");
+                    let out_map = Attribute::parse(context, &out_map_str)
+                        .ok_or_else(|| CompileError::AttributeParse(out_map_str.clone()))?;
+                    let indexing_maps = ArrayAttribute::new(context, &[out_map]);
+                    let iters: Vec<&str> = (0..out_rank).map(|_| "#linalg.iterator_type<parallel>").collect();
+                    let iter_str = format!("[{}]", iters.join(", "));
+                    let iterator_types = Attribute::parse(context, &iter_str)
+                        .ok_or_else(|| CompileError::AttributeParse(iter_str.clone()))?;
+
+                    // Body block: takes one block arg (output element, unused).
+                    let body = Region::new();
+                    let body_block_inner = Block::new(&[(elem_type, location)]);
+
+                    // Compute linear index from output indices:
+                    // linear = d0 * out_dim[1]*out_dim[2]*... + d1 * out_dim[2]*... + ... + d_{n-1}
+                    let mut linear: melior::ir::Value = body_block_inner
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, 0).into(),
+                            location,
+                        ))
+                        .result(0).unwrap().into();
+                    for i in 0..out_rank {
+                        let idx: melior::ir::Value = body_block_inner
+                            .append_operation(
+                                OperationBuilder::new("linalg.index", location)
+                                    .add_attributes(&[(
+                                        Identifier::new(context, "dim"),
+                                        IntegerAttribute::new(
+                                            melior::ir::Type::parse(context, "i64").unwrap(),
+                                            i as i64
+                                        ).into(),
+                                    )])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0).unwrap().into();
+                        // linear = linear * out_dim[i] + idx
+                        linear = body_block_inner
+                            .append_operation(arith::muli(linear, out_dim_vals[i], location))
+                            .result(0).unwrap().into();
+                        linear = body_block_inner
+                            .append_operation(arith::addi(linear, idx, location))
+                            .result(0).unwrap().into();
+                    }
+
+                    // Delinearize: compute input indices from linear index.
+                    // in_idx[rank-1] = linear % in_dim[rank-1]
+                    // in_idx[i] = (linear / product(in_dim[i+1..])) % in_dim[i]
+                    let mut in_indices: Vec<melior::ir::Value> = vec![linear; in_rank];
+                    let mut remaining = linear;
+                    for i in (0..in_rank).rev() {
+                        if i == in_rank - 1 {
+                            in_indices[i] = body_block_inner
+                                .append_operation(arith::remui(remaining, in_dim_vals[i], location))
+                                .result(0).unwrap().into();
+                            remaining = body_block_inner
+                                .append_operation(arith::divui(remaining, in_dim_vals[i], location))
+                                .result(0).unwrap().into();
+                        } else {
+                            in_indices[i] = body_block_inner
+                                .append_operation(arith::remui(remaining, in_dim_vals[i], location))
+                                .result(0).unwrap().into();
+                            if i > 0 {
+                                remaining = body_block_inner
+                                    .append_operation(arith::divui(remaining, in_dim_vals[i], location))
+                                    .result(0).unwrap().into();
+                            }
+                        }
+                    }
+
+                    // Extract element from input at computed indices.
+                    let extracted: melior::ir::Value = body_block_inner
+                        .append_operation(
+                            OperationBuilder::new("tensor.extract", location)
+                                .add_operands(&[&[input_val], in_indices.as_slice()].concat())
+                                .add_results(&[elem_type])
+                                .build()
+                                .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                        )
+                        .result(0).unwrap().into();
+
+                    // Yield the element.
+                    body_block_inner.append_operation(
+                        OperationBuilder::new("linalg.yield", location)
+                            .add_operands(&[extracted])
+                            .build()
+                            .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                    );
+
+                    body.append_block(body_block_inner);
+
+                    let seg_sizes = Attribute::parse(context, "array<i32: 0, 1>")
+                        .ok_or_else(|| CompileError::AttributeParse("operandSegmentSizes".into()))?;
                     let result_val: melior::ir::Value = body_block
                         .append_operation(
-                            OperationBuilder::new("tensor.reshape", location)
-                                .add_operands(&[input_val, shape_val])
+                            OperationBuilder::new("linalg.generic", location)
+                                .add_operands(&[empty_val])
                                 .add_results(&[out_type])
+                                .add_attributes(&[
+                                    (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
+                                    (Identifier::new(context, "iterator_types"), iterator_types),
+                                    (Identifier::new(context, "operandSegmentSizes"), seg_sizes),
+                                ])
+                                .add_regions([body])
                                 .build()
                                 .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
                         )
@@ -4001,7 +4171,7 @@ fn emit_tensor_ops<'c>(
                         .unwrap()
                         .into();
                     values.insert(node_id, result_val);
-                    continue; // skip the static path below
+                    continue;
                 }
 
                 let result_val = if shape.0.contains(&DIM_DYNAMIC)
