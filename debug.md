@@ -49,7 +49,27 @@ From `ArithBase.td`:
 Use `Attribute::parse(ctx, "0 : i64")` for eq, `"1 : i64"` for ne, etc.
 The `#arith.cmpipredicate<eq>` syntax does NOT work in LLVM 21.
 
-## Current issue: NaN/Inf logits (heap corruption from expand_shape)
+## Prefill: FIXED
+
+Both `gpt2_prefill_emitter_only` and `gpt2_prefill_emitter_matches_mapper_output`
+tests pass. Full text generation works for the first token via prefill.
+
+## Decode model: runtime SEGFAULT
+
+The decode model (with dynamic `past_sequence_length`) now compiles successfully
+through the full MLIR pass pipeline, but crashes at runtime inside `compute()`.
+
+gdb shows 7 successful `memrefCopy` calls before crash. The first 3 copies have
+garbage strides (e.g., `strides=[2304, 1, 140735984714131, 1]`) suggesting
+uninitialized memref descriptors from incorrect `tensor.reshape` output shapes.
+
+The decode model has genuinely dynamic `past_sequence_length` dim, so the const
+propagation approach can't resolve all shapes statically. The `emit_resolve_reshape_dims`
+runtime path needs to work correctly with truly dynamic dims — this likely needs
+debugging of the MLIR ops it generates (arith.cmpi/select/divui) to ensure -1
+replacement works at runtime.
+
+## Previous issue (resolved): NaN/Inf logits (heap corruption from expand_shape)
 
 After the reshape fix, the test runs to completion but produces NaN/Inf logits.
 The "double free or corruption (!prev)" on exit is a **pre-existing libLLVM cleanup
