@@ -159,10 +159,10 @@ impl KvGenerator {
             )
         })?;
 
-        eprintln!("[homura] loading prefill model: {}", prompt_path.display());
+        tracing::info!(path = %prompt_path.display(), "loading prefill model");
         let prompt_model = Model::load(&prompt_path)?;
 
-        eprintln!("[homura] loading decode model: {}", decode_path.display());
+        tracing::info!(path = %decode_path.display(), "loading decode model");
         // Keep past_sequence_length (and derived dims like "past_sequence_length + 1")
         // dynamic so the decode model compiles ONCE and accepts any past_len at runtime.
         let keep_dynamic: std::collections::HashSet<String> = [
@@ -173,19 +173,19 @@ impl KvGenerator {
         .collect();
         let decode_model = Model::load_with_dynamic_dims(&decode_path, keep_dynamic)?;
 
-        eprintln!(
-            "[homura] detecting model config from {}",
-            decode_path.display()
-        );
+        tracing::info!(path = %decode_path.display(), "detecting model config");
         let config = ModelConfig::from_onnx_model(&decode_path, max_seq_len, eos_token_id)?;
-        eprintln!(
-            "[homura] config: {} KV tensors, {} heads, {} head_dim, max_seq_len={}",
-            config.num_kv_tensors, config.num_heads, config.head_dim, config.max_seq_len
+        tracing::info!(
+            num_kv_tensors = config.num_kv_tensors,
+            num_heads = config.num_heads,
+            head_dim = config.head_dim,
+            max_seq_len = config.max_seq_len,
+            "model config"
         );
 
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
-        eprintln!("[homura] loading tokenizer");
+        tracing::info!("loading tokenizer");
         let tokenizer = Tokenizer::from_files(
             vocab_path
                 .to_str()
@@ -223,18 +223,18 @@ impl KvGenerator {
         // Leave room for at least 1 generated token.
         let max_prompt = self.config.max_seq_len - 1;
         if token_ids.len() > max_prompt {
-            eprintln!(
-                "[homura] truncating prompt from {} to {} tokens",
-                token_ids.len(),
-                max_prompt
+            tracing::warn!(
+                from = token_ids.len(),
+                to = max_prompt,
+                "truncating prompt"
             );
             token_ids.truncate(max_prompt);
         }
 
-        eprintln!(
-            "[homura] prompt: {} tokens, generating up to {} new tokens",
-            token_ids.len(),
-            max_new_tokens
+        tracing::info!(
+            prompt_tokens = token_ids.len(),
+            max_new_tokens,
+            "starting generation"
         );
 
         let gen_start = std::time::Instant::now();
@@ -244,35 +244,26 @@ impl KvGenerator {
         let (mut next_token, mut kv_cache, mut real_pos) = match self.prefill(&token_ids) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[homura] prefill failed: {e}");
+                tracing::error!("prefill failed: {e}");
                 return String::new();
             }
         };
-        eprintln!(
-            "[homura] prefill: {:.2}s",
-            step_start.elapsed().as_secs_f64()
-        );
+        tracing::info!(elapsed_s = step_start.elapsed().as_secs_f64(), "prefill complete");
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
         if next_token == self.config.eos_token_id {
-            eprintln!("[homura] EOS after prefill");
+            tracing::info!("EOS after prefill");
             return String::new();
         }
         generated_ids.push(next_token);
         let token_text = self.tokenizer.decode(&[next_token]);
-        eprintln!(
-            "[homura] token 1/{}: {:?} (prefill)",
-            max_new_tokens, token_text
-        );
+        tracing::info!(step = 1, max = max_new_tokens, token = ?token_text, "(prefill)");
 
         // Decode loop
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
-                eprintln!(
-                    "[homura] context limit reached ({} tokens)",
-                    self.config.max_seq_len
-                );
+                tracing::warn!(max_seq_len = self.config.max_seq_len, "context limit reached");
                 break;
             }
 
@@ -280,38 +271,37 @@ impl KvGenerator {
             next_token = match self.decode_step(next_token, &mut kv_cache, real_pos) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("[homura] decode step failed: {e}");
+                    tracing::error!("decode step failed: {e}");
                     break;
                 }
             };
             real_pos += 1;
 
             let token_text = self.tokenizer.decode(&[next_token]);
-            eprintln!(
-                "[homura] token {}/{}: {:?} ({:.2}s)",
-                step + 1,
-                max_new_tokens,
-                token_text,
-                step_start.elapsed().as_secs_f64()
+            tracing::info!(
+                step = step + 1,
+                max = max_new_tokens,
+                token = ?token_text,
+                elapsed_s = step_start.elapsed().as_secs_f64(),
             );
 
             if next_token == self.config.eos_token_id {
-                eprintln!("[homura] EOS token reached");
+                tracing::info!("EOS token reached");
                 break;
             }
             generated_ids.push(next_token);
         }
 
         let total = gen_start.elapsed();
-        eprintln!(
-            "[homura] generated {} tokens in {:.2}s ({:.2}s/token)",
-            generated_ids.len(),
-            total.as_secs_f64(),
-            if generated_ids.is_empty() {
+        tracing::info!(
+            tokens = generated_ids.len(),
+            total_s = total.as_secs_f64(),
+            per_token_s = if generated_ids.is_empty() {
                 0.0
             } else {
                 total.as_secs_f64() / generated_ids.len() as f64
-            }
+            },
+            "generation complete"
         );
 
         self.tokenizer.decode(&generated_ids)
@@ -353,7 +343,7 @@ impl KvGenerator {
         let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
 
         // Debug: print top-5 prefill logits
-        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
+        {
             let logit_data = logits.as_slice::<f32>();
             let offset = (seq_len - 1) * vocab_size;
             let pos_logits = &logit_data[offset..offset + vocab_size];
@@ -363,12 +353,12 @@ impl KvGenerator {
                 .iter()
                 .map(|(i, v)| format!("{}={:.4}", i, v))
                 .collect();
-            eprintln!(
-                "[debug] prefill logits top5: [{}] min={:.4} max={:.4} result_token={}",
-                top5.join(", "),
-                pos_logits.iter().cloned().fold(f32::INFINITY, f32::min),
-                pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                next_token,
+            tracing::debug!(
+                top5 = top5.join(", "),
+                min = pos_logits.iter().cloned().fold(f32::INFINITY, f32::min),
+                max = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                result_token = next_token,
+                "prefill logits top5"
             );
         }
 
@@ -469,16 +459,17 @@ impl KvGenerator {
         }
 
         // Debug: print KV cache and mask shapes
-        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
-            eprintln!(
-                "[debug] decode inputs: token={} input_ids={:?} kv[0]={:?} mask={:?} real_pos={}",
-                next_token, input_ids.shape(), kv_cache[0].shape(), attention_mask.shape(), real_pos,
-            );
+        {
             let kv0 = kv_cache[0].as_slice::<f32>();
-            eprintln!(
-                "[debug] kv[0] first 4 vals: {:?}, last 4: {:?}",
-                &kv0[..4.min(kv0.len())],
-                &kv0[kv0.len().saturating_sub(4)..],
+            tracing::debug!(
+                token = next_token,
+                input_ids_shape = ?input_ids.shape(),
+                kv0_shape = ?kv_cache[0].shape(),
+                mask_shape = ?attention_mask.shape(),
+                real_pos,
+                kv0_first4 = ?&kv0[..4.min(kv0.len())],
+                kv0_last4 = ?&kv0[kv0.len().saturating_sub(4)..],
+                "decode inputs"
             );
         }
 
@@ -490,7 +481,7 @@ impl KvGenerator {
         let result_token = argmax_at_position(logits, 0, vocab_size);
 
         // Debug: print top-5 logits to diagnose output quality
-        if std::env::var("HOMURA_DEBUG_LOGITS").is_ok() {
+        {
             let logit_data = logits.as_slice::<f32>();
             let mut indexed: Vec<(usize, f32)> = logit_data.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -498,12 +489,12 @@ impl KvGenerator {
                 .iter()
                 .map(|(i, v)| format!("{}={:.4}", i, v))
                 .collect();
-            eprintln!(
-                "[debug] decode logits top5: [{}] min={:.4} max={:.4} result_token={}",
-                top5.join(", "),
-                logit_data.iter().cloned().fold(f32::INFINITY, f32::min),
-                logit_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+            tracing::debug!(
+                top5 = top5.join(", "),
+                min = logit_data.iter().cloned().fold(f32::INFINITY, f32::min),
+                max = logit_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
                 result_token,
+                "decode logits top5"
             );
         }
 

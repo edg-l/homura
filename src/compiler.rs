@@ -124,10 +124,7 @@ impl Compiler {
                         Err(e) => {
                             // Cache entry is unloadable (corrupt/stale). Fall
                             // through to recompile and overwrite.
-                            eprintln!(
-                                "homura cache: failed to load {}: {e}, recompiling",
-                                so_path.display()
-                            );
+                            tracing::warn!(path = %so_path.display(), "cache entry unloadable, recompiling: {e}");
                         }
                     }
                 }
@@ -182,7 +179,7 @@ impl Compiler {
         // Dump pre-lowering IR to /tmp for debugging dynamic shapes
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_post_passes.mlir", module.as_operation().to_string());
-            eprintln!("[homura] post-pass IR dumped to /tmp/homura_post_passes.mlir");
+            tracing::debug!("post-pass IR dumped to /tmp/homura_post_passes.mlir");
         }
 
         // ---- AOT: emit object file, link to .so, dlopen ----------------------
@@ -215,7 +212,7 @@ impl Compiler {
                     .collect(),
             };
             if let Err(e) = cache.store(key, &tmp_so, &meta) {
-                eprintln!("homura cache: failed to write cache entry: {e}");
+                tracing::warn!("cache: failed to write cache entry: {e}");
             }
         }
 
@@ -556,7 +553,7 @@ fn tempfile_dir() -> Option<std::path::PathBuf> {
 fn create_context() -> Context {
     let context = Context::new();
     context.attach_diagnostic_handler(|diagnostic| {
-        eprintln!("{diagnostic}");
+        tracing::debug!("{diagnostic}");
         true
     });
     let registry = DialectRegistry::new();
@@ -666,13 +663,13 @@ fn build_module<'c>(
     // Dump pre-pass MLIR for debugging when HOMURA_DUMP_IR is set
     if std::env::var("HOMURA_DUMP_IR").is_ok() {
         let _ = std::fs::write("/tmp/homura_pre_passes.mlir", module.as_operation().to_string());
-        eprintln!("[homura] pre-pass IR dumped to /tmp/homura_pre_passes.mlir");
+        tracing::debug!("pre-pass IR dumped to /tmp/homura_pre_passes.mlir");
     }
 
     if !module.as_operation().verify() {
         let ir = module.as_operation().to_string();
         let _ = std::fs::write("/tmp/homura_failed.mlir", &ir);
-        eprintln!("[homura] MLIR verification failed — IR dumped to /tmp/homura_failed.mlir");
+        tracing::warn!("MLIR verification failed — IR dumped to /tmp/homura_failed.mlir");
         return Err(CompileError::Verification);
     }
 

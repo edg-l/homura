@@ -582,10 +582,13 @@ impl Tensor {
             if has_dynamic || input_has_dynamic {
                 // Cannot infer a dim when any dims are dynamic; leave as dynamic.
                 resolved[idx] = DIM_DYNAMIC;
-                if std::env::var("HOMURA_DEBUG_RESHAPE").is_ok() {
-                    eprintln!("[debug reshape] input={:?} target={:?} -> {:?} (infer@{})",
-                        self.shape.0, target_shape, resolved, idx);
-                }
+                tracing::debug!(
+                    input_shape = ?self.shape.0,
+                    target_shape = ?target_shape,
+                    resolved = ?resolved,
+                    infer_idx = idx,
+                    "reshape: dynamic dim inference deferred"
+                );
             } else {
                 let total_elems: u64 = self.shape.0.iter().product();
                 assert!(

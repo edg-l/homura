@@ -356,8 +356,10 @@ pub fn emit_graph_with_split<'c>(
     }
 
     if chunk_index > 0 {
-        eprintln!(
-            "[homura] emitter: split graph into {chunk_index} sub-functions (threshold={split_threshold})"
+        tracing::debug!(
+            chunk_index,
+            split_threshold,
+            "emitter: split graph into sub-functions"
         );
     }
 

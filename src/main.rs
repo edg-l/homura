@@ -220,29 +220,29 @@ fn cmd_generate(
         .to_str()
         .ok_or("model path is not valid UTF-8")?;
 
-    eprintln!("Loading generator from {}...", model_dir.display());
+    tracing::info!(dir = %model_dir.display(), "loading generator");
     let t_load = Instant::now();
 
     // Prefer the two-model KV cache approach when a with-past model is present.
     let generated = if has_with_past_model(&model_dir) {
-        eprintln!("(using KV cache generator — two-model approach)");
+        tracing::info!("using KV cache generator — two-model approach");
         let generator = KvGenerator::load(model_dir_str, 1024, 50256)?;
-        eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
 
-        eprintln!("Generating up to {max_tokens} tokens...");
+        tracing::info!(max_tokens, "generating");
         let t_gen = Instant::now();
         let text = generator.generate(prompt, max_tokens);
-        eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
         text
     } else {
-        eprintln!("(using full-recompute generator — no with-past model found)");
+        tracing::info!("using full-recompute generator — no with-past model found");
         let generator = Generator::load(model_dir_str)?;
-        eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
+        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
 
-        eprintln!("Generating up to {max_tokens} tokens...");
+        tracing::info!(max_tokens, "generating");
         let t_gen = Instant::now();
         let text = generator.generate(prompt, max_tokens);
-        eprintln!("Generated in {:.1}s", t_gen.elapsed().as_secs_f64());
+        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
         text
     };
 
@@ -316,9 +316,9 @@ fn cmd_run(
         }
         let first = &onnx.dynamic_inputs[0];
         if onnx.dynamic_inputs.len() > 1 {
-            eprintln!(
-                "note: model has {} dynamic inputs; using all-zeros for each",
-                onnx.dynamic_inputs.len()
+            tracing::info!(
+                count = onnx.dynamic_inputs.len(),
+                "model has multiple dynamic inputs; using all-zeros for each"
             );
         }
         let shape = first
@@ -361,10 +361,10 @@ fn cmd_run(
             .flat_map(|v| v.to_le_bytes())
             .collect();
         std::fs::write(out_path, &bytes)?;
-        eprintln!(
-            "wrote {} f32 values to {}",
-            output.as_slice::<f32>().len(),
-            out_path.display()
+        tracing::info!(
+            count = output.as_slice::<f32>().len(),
+            path = %out_path.display(),
+            "wrote f32 values"
         );
     } else {
         let stdout = io::stdout();

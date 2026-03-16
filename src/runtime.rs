@@ -407,15 +407,10 @@ impl CompiledGraph {
             args.push(p as *mut *mut u8 as *mut ());
         }
 
-        if std::env::var_os("HOMURA_DUMP_MEMREFS").is_some() {
-            eprintln!("[HOMURA_DUMP_MEMREFS] --- inputs ({}) ---", inputs.len());
+        {
+            tracing::debug!(count = inputs.len(), "memref inputs");
             for (i, buf) in inputs.iter().enumerate() {
                 let data_ptr = buf.data.as_ptr();
-                eprintln!(
-                    "  input[{i}]: shape={:?} dtype={:?} ptr={data_ptr:?}",
-                    buf.shape().0,
-                    buf.dtype(),
-                );
                 match buf.dtype() {
                     DType::F32 => {
                         let n = buf.data.len() / 4;
@@ -426,7 +421,10 @@ impl CompiledGraph {
                                 f32::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
-                        eprintln!("    first {show} f32 elements: {elems:?}");
+                        tracing::debug!(
+                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
+                            ptr = ?data_ptr, first_elems = ?elems, "input memref"
+                        );
                     }
                     DType::I64 => {
                         let n = buf.data.len() / 8;
@@ -437,19 +435,25 @@ impl CompiledGraph {
                                 i64::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
-                        eprintln!("    first {show} i64 elements: {elems:?}");
+                        tracing::debug!(
+                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
+                            ptr = ?data_ptr, first_elems = ?elems, "input memref"
+                        );
                     }
-                    _ => {}
+                    _ => {
+                        tracing::debug!(
+                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
+                            ptr = ?data_ptr, "input memref"
+                        );
+                    }
                 }
             }
-            eprintln!("[HOMURA_DUMP_MEMREFS] --- outputs ({}) ---", output_bufs.len());
+            tracing::debug!(count = output_bufs.len(), "memref outputs");
             for (i, buf) in output_bufs.iter().enumerate() {
                 let data_ptr = buf.data.as_ptr();
-                eprintln!(
-                    "  output[{i}]: shape={:?} dtype={:?} ptr={data_ptr:?} size_bytes={}",
-                    buf.shape().0,
-                    buf.dtype(),
-                    buf.data.len(),
+                tracing::debug!(
+                    i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
+                    ptr = ?data_ptr, size_bytes = buf.data.len(), "output memref"
                 );
             }
         }

@@ -38,9 +38,9 @@ impl Generator {
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
 
-        eprintln!("[homura] loading model: {}", model_path.display());
+        tracing::info!(path = %model_path.display(), "loading model");
         let model = Model::load(&model_path)?;
-        eprintln!("[homura] loading tokenizer");
+        tracing::info!("loading tokenizer");
         let tokenizer = Tokenizer::from_files(
             vocab_path.to_str().unwrap(),
             merges_path.to_str().unwrap(),
@@ -67,10 +67,10 @@ impl Generator {
             return String::new();
         }
 
-        eprintln!(
-            "[homura] prompt: {} tokens, generating up to {} new tokens",
-            prompt_ids.len(),
-            max_new_tokens
+        tracing::info!(
+            prompt_tokens = prompt_ids.len(),
+            max_new_tokens,
+            "starting generation"
         );
 
         let prompt_len = prompt_ids.len();
@@ -97,7 +97,7 @@ impl Generator {
             let outputs = match self.model.run(&[&input_ids, &attention_mask]) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("[homura] model run failed at seq_len={seq_len}: {e}");
+                    tracing::error!(seq_len, "model run failed: {e}");
                     break;
                 }
             };
@@ -108,17 +108,16 @@ impl Generator {
 
             let token_text = self.tokenizer.decode(&[next_token]);
             let elapsed = step_start.elapsed();
-            eprintln!(
-                "[homura] token {}/{}: {:?} (seq_len={}, {:.2}s)",
-                step + 1,
-                max_new_tokens,
-                token_text,
+            tracing::info!(
+                step = step + 1,
+                max = max_new_tokens,
+                token = ?token_text,
                 seq_len,
-                elapsed.as_secs_f64()
+                elapsed_s = elapsed.as_secs_f64(),
             );
 
             if next_token == EOS_TOKEN_ID {
-                eprintln!("[homura] EOS token reached");
+                tracing::info!("EOS token reached");
                 break;
             }
 
@@ -127,15 +126,15 @@ impl Generator {
         }
 
         let total = gen_start.elapsed();
-        eprintln!(
-            "[homura] generated {} tokens in {:.2}s ({:.2}s/token)",
-            generated_ids.len(),
-            total.as_secs_f64(),
-            if generated_ids.is_empty() {
+        tracing::info!(
+            tokens = generated_ids.len(),
+            total_s = total.as_secs_f64(),
+            per_token_s = if generated_ids.is_empty() {
                 0.0
             } else {
                 total.as_secs_f64() / generated_ids.len() as f64
-            }
+            },
+            "generation complete"
         );
 
         // Drop the prompt tokens, decode only the generated portion.

@@ -3020,9 +3020,10 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Fallback: emit tensor.reshape (the old path).
-        eprintln!(
-            "WARN emit_reshape: falling back to tensor.reshape for {:?} -> {:?}",
-            in_shape, out_shape,
+        tracing::debug!(
+            in_shape = ?in_shape,
+            out_shape = ?out_shape,
+            "emit_reshape: falling back to tensor.reshape"
         );
         self.emit_reshape_tensor_op(input, &out_shape)
     }
@@ -6350,14 +6351,14 @@ impl<'c> GraphBuilder<'c> {
         // Dump pre-pass IR if requested.
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_gb_pre_passes.mlir", module.as_operation().to_string());
-            eprintln!("[homura] GraphBuilder pre-pass IR dumped to /tmp/homura_gb_pre_passes.mlir");
+            tracing::debug!("GraphBuilder pre-pass IR dumped to /tmp/homura_gb_pre_passes.mlir");
         }
 
         // Verify.
         if !module.as_operation().verify() {
             let ir = module.as_operation().to_string();
             let _ = std::fs::write("/tmp/homura_gb_failed.mlir", &ir);
-            eprintln!("[homura] GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir");
+            tracing::warn!("GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir");
             return Err(CompileError::Verification);
         }
 
@@ -6369,10 +6370,7 @@ impl<'c> GraphBuilder<'c> {
                     match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                         Ok(graph) => return Ok(graph),
                         Err(e) => {
-                            eprintln!(
-                                "homura cache: failed to load {}: {e}, recompiling",
-                                so_path.display()
-                            );
+                            tracing::warn!(path = %so_path.display(), "cache entry unloadable, recompiling: {e}");
                         }
                     }
                 }
@@ -6414,7 +6412,7 @@ impl<'c> GraphBuilder<'c> {
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_gb_post_passes.mlir", module.as_operation().to_string());
-            eprintln!("[homura] GraphBuilder post-pass IR dumped to /tmp/homura_gb_post_passes.mlir");
+            tracing::debug!("GraphBuilder post-pass IR dumped to /tmp/homura_gb_post_passes.mlir");
         }
 
         // AOT compile.
@@ -6444,7 +6442,7 @@ impl<'c> GraphBuilder<'c> {
                     .collect(),
             };
             if let Err(e) = cache.store(key, &tmp_so, &meta) {
-                eprintln!("homura cache: failed to write cache entry: {e}");
+                tracing::warn!("cache: failed to write cache entry: {e}");
             }
         }
 
@@ -6905,7 +6903,7 @@ impl<'c> GraphBuilder<'c> {
 fn create_context() -> Context {
     let context = Context::new();
     context.attach_diagnostic_handler(|diagnostic| {
-        eprintln!("{diagnostic}");
+        tracing::debug!("{diagnostic}");
         true
     });
     let registry = DialectRegistry::new();
