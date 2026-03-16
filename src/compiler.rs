@@ -113,6 +113,8 @@ impl Compiler {
         module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
 
         let (num_inputs, output_descs) = build_module(&context, &module, trace, outputs)?;
+        tracing::info!(num_inputs, num_outputs = output_descs.len(), "compilation starting");
+        let compile_start = std::time::Instant::now();
 
         // ---- Cache hit path --------------------------------------------------
         if let Some(key) = cache_key {
@@ -120,7 +122,10 @@ impl Compiler {
             if let Some((so_path, meta_path)) = cache.get(key) {
                 if let Some(meta) = CompilationCache::load_meta(&meta_path) {
                     match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
-                        Ok(graph) => return Ok(graph),
+                        Ok(graph) => {
+                            tracing::info!("compilation cache hit");
+                            return Ok(graph);
+                        }
                         Err(e) => {
                             // Cache entry is unloadable (corrupt/stale). Fall
                             // through to recompile and overwrite.
@@ -219,6 +224,7 @@ impl Compiler {
         let graph = CompiledGraph::load(&tmp_so, num_inputs, output_descs)
             .map_err(CompileError::ObjectEmit)?;
         std::fs::remove_file(&tmp_so).ok(); // safe: inode kept alive by dlopen
+        tracing::info!(elapsed_s = compile_start.elapsed().as_secs_f64(), "compilation complete");
 
         Ok(graph)
     }
