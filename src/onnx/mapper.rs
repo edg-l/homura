@@ -395,17 +395,25 @@ fn map_node(
             );
             // ONNX Flatten always produces a 2D output.
             // axis==0 → [1, total], axis==rank → [total, 1].
+            // If any dim in a range is DIM_DYNAMIC, the merged dim is DIM_DYNAMIC.
             let dim0: u64 = if axis == 0 {
                 1
+            } else if shape[..axis].iter().any(|&d| d == crate::shape::DIM_DYNAMIC) {
+                crate::shape::DIM_DYNAMIC
             } else {
                 shape[..axis].iter().product()
             };
             let dim1: u64 = if axis == shape.len() {
                 1
+            } else if shape[axis..].iter().any(|&d| d == crate::shape::DIM_DYNAMIC) {
+                crate::shape::DIM_DYNAMIC
             } else {
                 shape[axis..].iter().product()
             };
-            let result = x.reshape(&[dim0 as i64, dim1 as i64]);
+            let result = x.reshape(&[
+                crate::shape::dim_to_i64(dim0),
+                crate::shape::dim_to_i64(dim1),
+            ]);
             tensors.insert(node.outputs[0].clone(), result);
         }
         "BatchNormalization" => {
@@ -485,7 +493,13 @@ fn map_node(
                 // at runtime for each dynamic dimension.
                 let result = input.shape_of();
                 tensors.insert(node.outputs[0].clone(), result);
-                // Do NOT insert into constant_data — the values are only known at runtime.
+                // Insert partial constant_data: static dims are concrete, dynamic dims
+                // use DIM_DYNAMIC sentinel (i64::MIN). This allows downstream ops
+                // (Gather, Slice, Concat) to constant-fold the static dims while keeping
+                // dynamic dims as runtime values.
+                let dims: Vec<i64> = input.shape().0.iter().map(|&d| crate::shape::dim_to_i64(d)).collect();
+                let buf = Buffer::from_slice::<i64>(&dims, &[dims.len() as u64], crate::DType::I64);
+                constant_data.insert(node.outputs[0].clone(), buf);
             } else {
                 // Static path: constant-fold as before.
                 let dims: Vec<i64> = input.shape().0.iter().map(|&d| crate::shape::dim_to_i64(d)).collect();
@@ -1035,8 +1049,17 @@ fn map_node(
             let input = get_tensor(tensors, &node.inputs[0])?;
             let rank = input.shape().rank() as i64;
             let ax = if axis < 0 { axis + rank } else { axis } as usize;
-            let ax_size = input.shape().0[ax] as i64;
+            let ax_dim = input.shape().0[ax];
             let num_outputs = node.outputs.len();
+
+            // Guard against dynamic split axis — cannot statically resolve split sizes.
+            if ax_dim == crate::shape::DIM_DYNAMIC {
+                return Err(OnnxError::UnsupportedOp(format!(
+                    "Split: split axis {} dimension is dynamic; input shape {:?}, outputs {:?}, input_name {:?}",
+                    ax, input.shape().0, node.outputs, node.inputs[0]
+                )));
+            }
+            let ax_size = ax_dim as i64;
 
             // Determine split sizes: either from the `split` input tensor or equal splits.
             let split_sizes: Vec<i64> =
@@ -1383,13 +1406,6 @@ fn eval_gather_constant(data: &Buffer, indices: &Buffer, axis: i64) -> Option<Bu
     if axis != 0 {
         return None;
     }
-    // Guard: if data contains DIM_DYNAMIC sentinel (i64::MIN), the result would
-    // be a literal i64::MIN which would corrupt downstream ops (ConstantOfShape,
-    // Range, etc.). Return None so the caller takes the dynamic-trace path.
-    if contains_dynamic_sentinel(data) {
-        return None;
-    }
-
     let data_vals = data.as_slice::<i64>();
     let data_shape = &data.shape().0;
     let idx_vals = indices.as_slice::<i64>();
@@ -1405,6 +1421,8 @@ fn eval_gather_constant(data: &Buffer, indices: &Buffer, axis: i64) -> Option<Bu
 
         if data_shape.len() == 1 {
             // 1-D data, scalar index → scalar result.
+            // DIM_DYNAMIC sentinel (i64::MIN) is preserved — downstream ops
+            // (Reshape, ConstantOfShape) know how to handle it.
             let val = data_vals[idx];
             return Some(Buffer::from_slice::<i64>(&[val], &[1], crate::DType::I64));
         }

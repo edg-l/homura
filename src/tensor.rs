@@ -557,6 +557,7 @@ impl Tensor {
         );
 
         let has_dynamic = target_shape.iter().any(|&d| d == i64::MIN);
+        let input_has_dynamic = self.shape.has_dynamic_dims();
 
         let mut resolved: Vec<u64> = Vec::with_capacity(target_shape.len());
         let mut known_product: u64 = 1;
@@ -578,9 +579,13 @@ impl Tensor {
         }
 
         if let Some(idx) = infer_idx {
-            if has_dynamic {
-                // Cannot infer a dim when other dims are dynamic; leave as dynamic.
+            if has_dynamic || input_has_dynamic {
+                // Cannot infer a dim when any dims are dynamic; leave as dynamic.
                 resolved[idx] = DIM_DYNAMIC;
+                if std::env::var("HOMURA_DEBUG_RESHAPE").is_ok() {
+                    eprintln!("[debug reshape] input={:?} target={:?} -> {:?} (infer@{})",
+                        self.shape.0, target_shape, resolved, idx);
+                }
             } else {
                 let total_elems: u64 = self.shape.0.iter().product();
                 assert!(
@@ -589,7 +594,7 @@ impl Tensor {
                 );
                 resolved[idx] = total_elems / known_product;
             }
-        } else if !has_dynamic {
+        } else if !has_dynamic && !input_has_dynamic {
             let total_elems: u64 = self.shape.0.iter().product();
             assert_eq!(
                 known_product, total_elems,
@@ -994,8 +999,18 @@ impl Tensor {
         let mut out_dims: Vec<u64> = self.shape.0.clone();
         for i in 0..norm_axes.len() {
             let ax = norm_axes[i] as usize;
-            // If this axis is dynamic, output stays dynamic.
+            // If this axis is dynamic, try to compute a concrete output size
+            // from the start/end values. Common pattern: start=-N, end=MAX → size=N.
             if out_dims[ax] == crate::shape::DIM_DYNAMIC {
+                let step = steps[i];
+                let raw_start = starts[i];
+                let raw_end = ends[i];
+                if raw_start < 0 && raw_end >= i64::MAX / 2 && step > 0 {
+                    // Slice from -N to end: always produces N elements.
+                    let n = (-raw_start) as u64;
+                    out_dims[ax] = ((n as i64 + step - 1) / step) as u64;
+                }
+                // Otherwise stays DIM_DYNAMIC.
                 continue;
             }
             let step = steps[i];
