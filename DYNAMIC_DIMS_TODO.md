@@ -171,12 +171,20 @@ QKV: `[?, ?, 768] → [?, ?, 3, 12, 64]` or similar). The buffer reuse hypothesi
 may be correct after all: the shape buffer `alloc_28` was overwritten with values
 from a DIFFERENT reshape by the time THIS reshape's copy loop executes.
 
-### Next step: minimal reproducer
+### tensor.reshape bug FIXED (commit 9932181)
 
-Extract lines 1-600 of the pre-passes MLIR, add `func.return` after the transpose,
-and run through `mlir-cpu-runner` with concrete inputs. If mlir-cpu-runner also
-crashes, it's an MLIR `memref.reshape` lowering bug (or buffer reuse). If not,
-it's our descriptor construction.
+Replaced all `tensor.reshape` with `linalg.generic` copy-reshape.
+Zero `tensor.reshape` ops in the decode model IR. The previous crash
+at `compute+13072` (vmovups from address 192) is gone.
+
+### NEW crash: NULL pointer dereference (rdx=0)
+
+After the copy-reshape fix, a NEW crash appears:
+- `compute+13347`: `vmovss (%rdx,%rsi,4),%xmm0` with `rdx=0`
+- This is a scalar float load from a NULL pointer
+- Different from the previous reshape crash — new bug to investigate
+- Likely another codegen issue with dynamic dims (wrong pointer in
+  a linalg.generic body or tensor.extract)
 
 ### Ruled out causes
 
