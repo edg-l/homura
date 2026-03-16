@@ -177,43 +177,25 @@ Replaced all `tensor.reshape` with `linalg.generic` copy-reshape.
 Zero `tensor.reshape` ops in the decode model IR. The previous crash
 at `compute+13072` (vmovups from address 192) is gone.
 
-### NEW crash: NULL pointer dereference (rdx=0)
+### NULL pointer crash FIXED: ONNX -1 dim inference
 
-After the copy-reshape fix, a NEW crash appears:
-- `compute+13347`: `vmovss (%rdx,%rsi,4),%xmm0` with `rdx=0`
-- This is a scalar float load from a NULL pointer
-- Different from the previous reshape crash — new bug to investigate
-- Likely another codegen issue with dynamic dims (wrong pointer in
-  a linalg.generic body or tensor.extract)
+Root cause: ONNX shape tensors contain `-1` (meaning "infer this dimension").
+These raw -1 values were passed to the compiled code and used directly in
+`tensor.empty` to allocate output tensors. `-1` as an index = `0xFFFFFFFFFFFFFFFF`,
+causing malloc of astronomical size → returns NULL → segfault when accessed.
 
-### Ruled out causes
+Fix: In the copy-reshape `linalg.generic` codegen, after extracting dims from
+the shape tensor, check for `-1` and replace with
+`total_input_elements / product_of_other_dims`. Uses `arith.cmpi` + `arith.select`
+to handle at runtime.
 
-- **memref<0xi64> dangling pointers**: Fixed (use sentinel), crash unchanged.
-  0-element memrefs have valid descriptors now but crash is at the same location.
-- **Input/output descriptor construction**: Confirmed correct via HOMURA_DUMP_MEMREFS.
-  All 1408 inputs have valid pointers, correct shapes. 25 outputs correct.
-- **matmul codegen**: Tested `run_dynamic_matmul_2d` — works correctly at runtime.
-- **Buffer reuse in one-shot-bufferize**: Initially suspected but NOT confirmed.
-  `finalize-memref-to-llvm` lowers `memref.reshape` by reading shape buffer values
-  at the reshape site (immediate, not lazy). Reuse should be safe.
+Also added `input_val` as `ins` operand to the linalg.generic (with zero-map)
+so one-shot-bufferize properly tracks the input buffer dependency.
 
-### Next: map crash to MLIR source op
+## Decode model runs end-to-end!
 
-The crash at `compute+13072` is in a vectorized memcpy loop. The struct at `%rbx`
-has wrong field values (0 stride, 192 as "base pointer"). Need to:
-
-1. Dump LLVM IR (`HOMURA_DUMP_IR=1`)
-2. Find which LLVM IR block/function corresponds to compute+13072
-3. Trace back through the LLVM IR to find which memref op produced the bad descriptor
-4. The `0xC0 = 192` value is suspicious: 192 = 48*4 = 12*16 or 3*64 — possibly
-   a stride from a [1, 12, ?, 64] tensor (stride for dim 3 = 64, stride for dim 2 = 64,
-   stride for dim 1 = ?*64)
-
-### IR dump
-
-Set `HOMURA_DUMP_IR=1` to dump:
-- `/tmp/homura_pre_passes.mlir` — MLIR before lowering passes
-- `/tmp/homura_post_passes.mlir` — LLVM dialect IR after all passes
+GPT-2 with KV cache decode path works. Output quality is poor (generates
+commas), likely an attention mask or KV cache issue — not a codegen bug.
 
 ### Items from original TODO not yet hit (may be fine)
 
@@ -223,15 +205,25 @@ Set `HOMURA_DUMP_IR=1` to dump:
 - [ ] **Softmax Div**: Broadcast map with dynamic reduced dim.
 - [ ] **BatchNorm reshapes**: Likely fine (dynamic is seq dim, not channel).
 
-## Performance targets
+## Performance (measured)
 
 | Phase | Time | Notes |
 |-------|------|-------|
 | Load models | ~2.3s | Parse ONNX (2 models) + tokenizer |
-| Prefill (cold) | ~28-30s | First-ever compile for this bucket |
+| Prefill (cold) | ~23s | First-ever compile for this bucket |
 | Prefill (warm) | ~7.5s | Cache hit: dlopen + inference |
-| Decode (cold) | ~? | First-ever compile for decode model (compiles now!) |
-| Decode (warm) | ~0.85s/token | Target: cache hit, dlopen + inference |
+| Decode (cold) | ~91s | First-ever compile for decode model |
+| Decode (warm) | ~0.30s/token | Cache hit: dlopen + inference |
 
 The decode model compiles ONCE (dynamic past_sequence_length). After that,
-every token is just inference — no recompilation.
+every token is just inference — no recompilation. Warm decode at 0.30s/token
+beats the 0.85s target.
+
+## Next: output quality
+
+The model generates correctly but output is low quality (mostly commas).
+Possible causes:
+- Attention mask not properly passed/computed for decode steps
+- KV cache concatenation producing wrong values
+- Position IDs not incrementing correctly
+- Causal mask handling in the with-past model

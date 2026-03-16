@@ -4001,8 +4001,40 @@ fn emit_tensor_ops<'c>(
                     let out_rank = shape.0.len();
                     let in_rank = input_shape.len();
 
+                    // Get input dim sizes (for linearization) — needed first for -1 inference.
+                    let mut in_dim_vals: Vec<melior::ir::Value> = Vec::new();
+                    for i in 0..in_rank {
+                        let dv = emit_tensor_dim(context, body_block, input_val, i, location)?;
+                        in_dim_vals.push(dv);
+                    }
+
+                    // Compute total input elements: product of all input dims.
+                    let mut total_input_elems: melior::ir::Value = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, 1).into(),
+                            location,
+                        ))
+                        .result(0).unwrap().into();
+                    for dv in &in_dim_vals {
+                        total_input_elems = body_block
+                            .append_operation(arith::muli(total_input_elems, *dv, location))
+                            .result(0).unwrap().into();
+                    }
+
                     // Load output dim sizes from the shape tensor.
-                    let mut out_dim_vals: Vec<melior::ir::Value> = Vec::new();
+                    // ONNX uses -1 to mean "infer this dimension". We handle it by:
+                    // 1. Extract raw i64 values
+                    // 2. Check for -1 and replace with total_input_elems / product_of_other_dims
+                    let neg_one_i64: melior::ir::Value = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(i64_type, -1).into(),
+                            location,
+                        ))
+                        .result(0).unwrap().into();
+
+                    let mut raw_dim_i64s: Vec<melior::ir::Value> = Vec::new();
                     for i in 0..out_rank {
                         let ci: melior::ir::Value = body_block
                             .append_operation(arith::constant(
@@ -4020,23 +4052,81 @@ fn emit_tensor_ops<'c>(
                                     .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
                             )
                             .result(0).unwrap().into();
+                        raw_dim_i64s.push(dim_i64);
+                    }
+
+                    // Compute product of known (non -1) dims as index values.
+                    let mut known_product: melior::ir::Value = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, 1).into(),
+                            location,
+                        ))
+                        .result(0).unwrap().into();
+                    let mut out_dim_idx_vals: Vec<melior::ir::Value> = Vec::new();
+                    let mut is_neg_one: Vec<melior::ir::Value> = Vec::new();
+                    let one_idx: melior::ir::Value = body_block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(index_type, 1).into(),
+                            location,
+                        ))
+                        .result(0).unwrap().into();
+
+                    for i in 0..out_rank {
+                        // Check if this dim is -1
+                        let cmp: melior::ir::Value = body_block
+                            .append_operation(arith::cmpi(
+                                context, arith::CmpiPredicate::Eq,
+                                raw_dim_i64s[i], neg_one_i64, location,
+                            ))
+                            .result(0).unwrap().into();
+                        is_neg_one.push(cmp);
+
                         let dim_idx: melior::ir::Value = body_block
                             .append_operation(
                                 OperationBuilder::new("arith.index_cast", location)
-                                    .add_operands(&[dim_i64])
+                                    .add_operands(&[raw_dim_i64s[i]])
                                     .add_results(&[index_type])
                                     .build()
                                     .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
                             )
                             .result(0).unwrap().into();
-                        out_dim_vals.push(dim_idx);
+                        out_dim_idx_vals.push(dim_idx);
+
+                        // For known_product, multiply by dim if not -1, else multiply by 1
+                        let dim_or_one: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.select", location)
+                                    .add_operands(&[cmp, one_idx, dim_idx])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0).unwrap().into();
+                        known_product = body_block
+                            .append_operation(arith::muli(known_product, dim_or_one, location))
+                            .result(0).unwrap().into();
                     }
 
-                    // Get input dim sizes (for linearization).
-                    let mut in_dim_vals: Vec<melior::ir::Value> = Vec::new();
-                    for i in 0..in_rank {
-                        let dv = emit_tensor_dim(context, body_block, input_val, i, location)?;
-                        in_dim_vals.push(dv);
+                    // inferred_dim = total_input_elems / known_product
+                    let inferred_dim: melior::ir::Value = body_block
+                        .append_operation(arith::divui(total_input_elems, known_product, location))
+                        .result(0).unwrap().into();
+
+                    // Replace -1 dims with the inferred value.
+                    let mut out_dim_vals: Vec<melior::ir::Value> = Vec::new();
+                    for i in 0..out_rank {
+                        let resolved: melior::ir::Value = body_block
+                            .append_operation(
+                                OperationBuilder::new("arith.select", location)
+                                    .add_operands(&[is_neg_one[i], inferred_dim, out_dim_idx_vals[i]])
+                                    .add_results(&[index_type])
+                                    .build()
+                                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                            )
+                            .result(0).unwrap().into();
+                        out_dim_vals.push(resolved);
                     }
 
                     // Allocate output tensor.
@@ -4057,19 +4147,26 @@ fn emit_tensor_ops<'c>(
 
                     // Build linalg.generic: iterate over output indices, compute
                     // linear index, delinearize into input indices, extract, yield.
+                    // input_val is passed as `ins` so that one-shot-bufferize
+                    // knows the input buffer is live during this op.
                     let dims_str = (0..out_rank).map(|i| format!("d{i}")).collect::<Vec<_>>().join(", ");
+                    let zeros_str = (0..in_rank).map(|_| "0".to_string()).collect::<Vec<_>>().join(", ");
+                    let in_map_str = format!("affine_map<({dims_str}) -> ({zeros_str})>");
+                    let in_map = Attribute::parse(context, &in_map_str)
+                        .ok_or_else(|| CompileError::AttributeParse(in_map_str.clone()))?;
                     let out_map_str = format!("affine_map<({dims_str}) -> ({dims_str})>");
                     let out_map = Attribute::parse(context, &out_map_str)
                         .ok_or_else(|| CompileError::AttributeParse(out_map_str.clone()))?;
-                    let indexing_maps = ArrayAttribute::new(context, &[out_map]);
+                    let indexing_maps = ArrayAttribute::new(context, &[in_map, out_map]);
                     let iters: Vec<&str> = (0..out_rank).map(|_| "#linalg.iterator_type<parallel>").collect();
                     let iter_str = format!("[{}]", iters.join(", "));
                     let iterator_types = Attribute::parse(context, &iter_str)
                         .ok_or_else(|| CompileError::AttributeParse(iter_str.clone()))?;
 
-                    // Body block: takes one block arg (output element, unused).
+                    // Body block: takes two block args (input element [from zero-map, unused],
+                    // output element [unused]). We use tensor.extract for the actual read.
                     let body = Region::new();
-                    let body_block_inner = Block::new(&[(elem_type, location)]);
+                    let body_block_inner = Block::new(&[(elem_type, location), (elem_type, location)]);
 
                     // Compute linear index from output indices:
                     // linear = d0 * out_dim[1]*out_dim[2]*... + d1 * out_dim[2]*... + ... + d_{n-1}
@@ -4151,12 +4248,12 @@ fn emit_tensor_ops<'c>(
 
                     body.append_block(body_block_inner);
 
-                    let seg_sizes = Attribute::parse(context, "array<i32: 0, 1>")
+                    let seg_sizes = Attribute::parse(context, "array<i32: 1, 1>")
                         .ok_or_else(|| CompileError::AttributeParse("operandSegmentSizes".into()))?;
                     let result_val: melior::ir::Value = body_block
                         .append_operation(
                             OperationBuilder::new("linalg.generic", location)
-                                .add_operands(&[empty_val])
+                                .add_operands(&[input_val, empty_val])
                                 .add_results(&[out_type])
                                 .add_attributes(&[
                                     (Identifier::new(context, "indexing_maps"), indexing_maps.into()),
