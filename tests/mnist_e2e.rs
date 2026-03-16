@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use homura::{Buffer, DType, Model};
 
 fn load_image(path: &str) -> Vec<f32> {
@@ -19,6 +21,33 @@ fn load_image(path: &str) -> Vec<f32> {
 #[test]
 fn mnist_predicts_7_from_image() {
     let model = Model::load("tests/fixtures/mnist-12.onnx").expect("load failed");
+    let pixels = load_image("tests/fixtures/digit7.png");
+    let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
+    let outputs = model.run(&[&input]).expect("inference failed");
+    let logits = outputs[0].as_slice::<f32>();
+
+    assert_eq!(logits.len(), 10);
+    assert!(logits.iter().all(|v| v.is_finite()));
+
+    let predicted = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0;
+    assert_eq!(
+        predicted, 7,
+        "expected digit 7, got {predicted} (logits: {logits:?})"
+    );
+}
+
+/// Task 8.6: MNIST through the new GraphBuilder emitter path produces the same
+/// digit-7 prediction as the existing mapper-based path.
+#[test]
+fn mnist_emitter_predicts_7_from_image() {
+    let model =
+        Model::load_with_dynamic_dims("tests/fixtures/mnist-12.onnx", HashSet::new())
+            .expect("load failed");
     let pixels = load_image("tests/fixtures/digit7.png");
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
     let outputs = model.run(&[&input]).expect("inference failed");

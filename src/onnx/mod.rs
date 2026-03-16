@@ -1,3 +1,4 @@
+pub mod emitter;
 pub mod mapper;
 pub mod parser;
 pub mod proto;
@@ -42,6 +43,9 @@ pub struct Model {
     /// `None` when the model was created via `load_bytes` with no bytes stored,
     /// but in practice always `Some` for models loaded from file or bytes.
     model_bytes: Option<Vec<u8>>,
+    /// When true, use the new GraphBuilder emitter path instead of the old
+    /// mapper + trace path for compilation.
+    use_emitter: bool,
     /// Symbolic dim names that should remain as `DIM_DYNAMIC` in the compiled
     /// code rather than being resolved to concrete values at trace time. This
     /// allows a single compiled artifact to accept varying values for these
@@ -67,7 +71,7 @@ impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Model, OnnxError> {
         let bytes = std::fs::read(path).map_err(OnnxError::Io)?;
         let onnx_model = parser::parse_bytes(&bytes)?;
-        Model::from_onnx(onnx_model, Some(bytes), HashSet::new())
+        Model::from_onnx(onnx_model, Some(bytes), HashSet::new(), false)
     }
 
     /// Load an ONNX model from raw protobuf bytes.
@@ -75,7 +79,7 @@ impl Model {
     /// Useful in tests where models are built in memory.
     pub fn load_bytes(bytes: &[u8]) -> Result<Model, OnnxError> {
         let onnx_model = parser::parse_bytes(bytes)?;
-        Model::from_onnx(onnx_model, Some(bytes.to_vec()), HashSet::new())
+        Model::from_onnx(onnx_model, Some(bytes.to_vec()), HashSet::new(), false)
     }
 
     /// Load an ONNX model, keeping the specified symbolic dim names as dynamic
@@ -92,13 +96,15 @@ impl Model {
     ) -> Result<Model, OnnxError> {
         let bytes = std::fs::read(path).map_err(OnnxError::Io)?;
         let onnx_model = parser::parse_bytes(&bytes)?;
-        Model::from_onnx(onnx_model, Some(bytes), keep_dynamic)
+        // Use the new GraphBuilder emitter for compilation (both eager and lazy paths).
+        Model::from_onnx(onnx_model, Some(bytes), keep_dynamic, true)
     }
 
     fn from_onnx(
         onnx_model: OnnxModel,
         model_bytes: Option<Vec<u8>>,
         keep_dynamic: HashSet<String>,
+        use_emitter: bool,
     ) -> Result<Model, OnnxError> {
         let num_dynamic = onnx_model.dynamic_inputs.len();
 
@@ -113,33 +119,45 @@ impl Model {
                 parsed: Some(onnx_model),
                 state: Mutex::new(None),
                 model_bytes,
+                use_emitter,
                 keep_dynamic,
             })
         } else {
-            // All shapes concrete: compile eagerly (backward compat).
-            // Build dummy input shapes from the concrete dims for the CompiledState.
+            // All shapes concrete: compile eagerly.
+            // Build concrete input shapes from the model spec.
             let input_shapes: Vec<Shape> = onnx_model
                 .dynamic_inputs
                 .iter()
                 .map(|di| di.concrete_shape().expect("all dims are concrete"))
                 .collect();
-            let (trace, output_ids, weights) = mapper::map_graph(&onnx_model)?;
-            let cache_key = model_bytes.as_deref().map(|b| {
-                let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
-                CompilationCache::cache_key(b, &shape_refs)
-            });
-            let compiled = Compiler::compile(&trace, &output_ids, cache_key.as_deref())
-                .map_err(|e| OnnxError::CompileError(e.to_string()))?;
-            let state = CompiledState {
-                compiled,
-                weights,
-                input_shapes,
+            let state = if use_emitter {
+                // Build dummy zero buffers (only their shapes are used by the emitter).
+                let dummy_inputs: Vec<Buffer> = onnx_model
+                    .dynamic_inputs
+                    .iter()
+                    .map(|di| {
+                        let shape = di.concrete_shape().expect("all dims are concrete");
+                        Buffer::new(&shape.0, di.dtype)
+                    })
+                    .collect();
+                let dummy_refs: Vec<&Buffer> = dummy_inputs.iter().collect();
+                compile_model_emitter(&onnx_model, &dummy_refs, model_bytes.as_deref(), &keep_dynamic)?
+            } else {
+                let cache_key = model_bytes.as_deref().map(|b| {
+                    let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
+                    CompilationCache::cache_key(b, &shape_refs)
+                });
+                let (trace, output_ids, weights) = mapper::map_graph(&onnx_model)?;
+                let compiled = Compiler::compile(&trace, &output_ids, cache_key.as_deref())
+                    .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+                CompiledState { compiled, weights, input_shapes }
             };
             Ok(Model {
                 num_dynamic_inputs: num_dynamic,
                 parsed: None,
                 state: Mutex::new(Some(state)),
                 model_bytes,
+                use_emitter,
                 keep_dynamic,
             })
         }
@@ -168,7 +186,7 @@ impl Model {
                 .expect("parsed model must be present when state is None");
 
             let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+            *guard = Some(self.do_compile(&resolved, inputs)?);
         }
 
         // For models with symbolic dims, recompile only if non-dynamic dims changed.
@@ -194,7 +212,7 @@ impl Model {
                     .as_ref()
                     .expect("parsed model must be present when symbolic dims exist");
                 let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+                *guard = Some(self.do_compile(&resolved, inputs)?);
             }
         }
 
@@ -220,6 +238,19 @@ impl Model {
             Ok(state.compiled.run_dynamic(&all_args, &concrete_output_shapes))
         } else {
             Ok(state.compiled.run(&all_args))
+        }
+    }
+
+    /// Compile the model using the selected backend (emitter or mapper).
+    fn do_compile(
+        &self,
+        model: &OnnxModel,
+        inputs: &[&Buffer],
+    ) -> Result<CompiledState, OnnxError> {
+        if self.use_emitter {
+            compile_model_emitter(model, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)
+        } else {
+            compile_model(model, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)
         }
     }
 
@@ -253,7 +284,7 @@ impl Model {
                 .as_ref()
                 .expect("parsed model must be present when state is None");
             let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-            *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+            *guard = Some(self.do_compile(&resolved, inputs)?);
         }
 
         // Recompile if non-dynamic dims changed.
@@ -277,7 +308,7 @@ impl Model {
                     .as_ref()
                     .expect("parsed model must be present when symbolic dims exist");
                 let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-                *guard = Some(compile_model(&resolved, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)?);
+                *guard = Some(self.do_compile(&resolved, inputs)?);
             }
         }
 
@@ -340,6 +371,63 @@ fn compile_model(
     });
     let compiled = Compiler::compile(&trace, &output_ids, cache_key.as_deref())
         .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+    Ok(CompiledState {
+        compiled,
+        weights,
+        input_shapes,
+    })
+}
+
+/// Compile an `OnnxModel` using the new GraphBuilder emitter.
+///
+/// This is the emitter-path equivalent of `compile_model`. It uses
+/// `emitter::emit_graph` instead of `mapper::map_graph`, emitting MLIR ops
+/// directly without the intermediate Trace/Op system.
+fn compile_model_emitter(
+    model: &OnnxModel,
+    inputs: &[&Buffer],
+    model_bytes: Option<&[u8]>,
+    keep_dynamic: &HashSet<String>,
+) -> Result<CompiledState, OnnxError> {
+    use crate::graph_builder::GraphContext;
+
+    // Build input_shapes for recompilation detection.
+    let input_shapes: Vec<Shape> = model
+        .dynamic_inputs
+        .iter()
+        .zip(inputs.iter())
+        .map(|(spec, buf)| {
+            let dims: Vec<u64> = spec
+                .dims
+                .iter()
+                .enumerate()
+                .map(|(i, d)| match d {
+                    Dim::Fixed(v) if *v == DIM_DYNAMIC => DIM_DYNAMIC,
+                    Dim::Fixed(v) => *v,
+                    Dim::Symbolic(name) if keep_dynamic.contains(name) => DIM_DYNAMIC,
+                    Dim::Symbolic(_) => buf.shape().0[i],
+                })
+                .collect();
+            Shape(dims)
+        })
+        .collect();
+
+    // Build MLIR via the emitter.
+    let ctx = GraphContext::new();
+    let mut builder = ctx.builder();
+    let (output_tensors, weights) = emitter::emit_graph(model, &mut builder, keep_dynamic)?;
+
+    let output_refs: Vec<&crate::graph_builder::Tensor<'_>> = output_tensors.iter().collect();
+
+    let cache_key = model_bytes.map(|b| {
+        let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
+        format!("gb_{}", CompilationCache::cache_key(b, &shape_refs))
+    });
+
+    let compiled = builder
+        .compile_with_cache(&output_refs, cache_key.as_deref())
+        .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+
     Ok(CompiledState {
         compiled,
         weights,

@@ -6470,6 +6470,24 @@ fn emit_tensor_ops<'c>(
     Ok(())
 }
 
+// ── Public wrappers for graph_builder ─────────────────────────────────────────
+
+/// Public wrapper so `graph_builder` can call the AOT object emitter.
+pub(crate) fn emit_object_file_pub(
+    module: &melior::ir::Module,
+    output_path: &std::path::Path,
+) -> Result<(), CompileError> {
+    emit_object_file(module, output_path)
+}
+
+/// Public wrapper so `graph_builder` can call the shared lib linker.
+pub(crate) fn link_shared_lib_pub(
+    obj_path: &std::path::Path,
+    so_path: &std::path::Path,
+) -> Result<(), CompileError> {
+    link_shared_lib(obj_path, so_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

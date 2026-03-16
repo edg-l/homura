@@ -1,12 +1,13 @@
 pub mod cache;
-mod compiler;
+pub(crate) mod compiler;
+pub mod graph_builder;
 mod llvm_ffi;
 pub mod dtype;
 pub mod generate;
 pub mod kv_generate;
 pub mod onnx;
 pub mod op;
-mod runtime;
+pub(crate) mod runtime;
 pub mod shape;
 pub mod tensor;
 pub mod tokenizer;
@@ -14,6 +15,7 @@ pub mod trace;
 
 pub use compiler::Compiler;
 pub use dtype::DType;
+pub use graph_builder::{GraphBuilder, GraphContext};
 pub use onnx::Model;
 pub use op::NodeId;
 pub use runtime::{Buffer, CompiledGraph};
