@@ -7020,4 +7020,94 @@ mod tests {
         assert_eq!(c.shape(), vec![]);
         assert_eq!(c.dtype(), DType::F32);
     }
+
+    // ── Regression tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn regression_broadcast_scalar_to_3d() {
+        // Bug: canonicalize fused a broadcast linalg.generic with the binary
+        // linalg.generic, producing identity maps on mismatched shapes
+        // (tensor<1x1x1> vs tensor<2x3x4>). Fix: inline broadcast maps.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let a = gb.input(&[Some(2), Some(3), Some(4)], DType::F32);
+        let scalar = gb.input(&[Some(1), Some(1), Some(1)], DType::F32);
+        let result = gb.emit_add(&a, &scalar);
+        assert_eq!(result.shape(), vec![Some(2), Some(3), Some(4)]);
+
+        let graph = gb.compile(&[&result]).expect("compile broadcast scalar");
+        let a_buf = Buffer::from_slice(&[1.0f32; 24], &[2, 3, 4], DType::F32);
+        let s_buf = Buffer::from_slice(&[10.0f32], &[1, 1, 1], DType::F32);
+        let out = graph.run(&[&a_buf, &s_buf]);
+        assert!(out[0].as_slice::<f32>().iter().all(|&v| (v - 11.0).abs() < 1e-5));
+    }
+
+    #[test]
+    fn regression_broadcast_1d_to_3d_dynamic() {
+        // Same bug but with dynamic dims: tensor<1x1x1> + tensor<?x?x768>
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let a = gb.input(&[None, None, Some(768)], DType::F32);
+        let scalar = gb.input(&[Some(1), Some(1), Some(1)], DType::F32);
+        let result = gb.emit_sub(&a, &scalar);
+        assert_eq!(result.shape(), vec![None, None, Some(768)]);
+        // Shape check only — can't compile dynamic without concrete dims at runtime.
+    }
+
+    #[test]
+    fn regression_reshape_infer_flat() {
+        // Bug: emit_reshape panicked on target_shape=[-1] because known_product
+        // was None (no known dims to divide by).
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let a = gb.input(&[Some(2), Some(3)], DType::F32);
+        let flat = gb.emit_reshape(&a, &[-1]);
+        assert_eq!(flat.shape(), vec![None]); // -1 → dynamic
+
+        let graph = gb.compile(&[&flat]).expect("compile reshape flat");
+        let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let out = graph.run_dynamic(&[&a_buf], &[crate::Shape(vec![6])]);
+        assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn regression_matmul_3d_x_2d() {
+        // Bug: emit_matmul (3,2) case used emit_expand_shape_1d_to_2d on a 2D
+        // tensor, causing an assertion failure. Fix: use emit_unsqueeze instead.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let a = gb.input(&[Some(2), Some(3), Some(4)], DType::F32); // [B=2, M=3, K=4]
+        let b = gb.input(&[Some(4), Some(5)], DType::F32);          // [K=4, N=5]
+        let c = gb.emit_matmul(&a, &b);
+        assert_eq!(c.shape(), vec![Some(2), Some(3), Some(5)]);
+
+        let graph = gb.compile(&[&c]).expect("compile matmul 3dx2d");
+        let a_data: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let b_data: Vec<f32> = (0..20).map(|x| x as f32 * 0.1).collect();
+        let a_buf = Buffer::from_slice(&a_data, &[2, 3, 4], DType::F32);
+        let b_buf = Buffer::from_slice(&b_data, &[4, 5], DType::F32);
+        let out = graph.run(&[&a_buf, &b_buf]);
+        assert_eq!(out[0].shape().0, vec![2, 3, 5]);
+        assert!(out[0].as_slice::<f32>().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn regression_matmul_2d_x_3d() {
+        // Same fix needed for the (2,3) case.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let a = gb.input(&[Some(3), Some(4)], DType::F32);          // [M=3, K=4]
+        let b = gb.input(&[Some(2), Some(4), Some(5)], DType::F32); // [B=2, K=4, N=5]
+        let c = gb.emit_matmul(&a, &b);
+        assert_eq!(c.shape(), vec![Some(2), Some(3), Some(5)]);
+
+        let graph = gb.compile(&[&c]).expect("compile matmul 2dx3d");
+        let a_data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let b_data: Vec<f32> = (0..40).map(|x| x as f32 * 0.1).collect();
+        let a_buf = Buffer::from_slice(&a_data, &[3, 4], DType::F32);
+        let b_buf = Buffer::from_slice(&b_data, &[2, 4, 5], DType::F32);
+        let out = graph.run(&[&a_buf, &b_buf]);
+        assert_eq!(out[0].shape().0, vec![2, 3, 5]);
+        assert!(out[0].as_slice::<f32>().iter().all(|v| v.is_finite()));
+    }
 }
