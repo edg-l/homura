@@ -1,182 +1,163 @@
-# GPT-2 Emitter Runtime Debug Notes
+# GPT-2 Emitter Debug Notes
 
 **IMPORTANT:** Always `source env-llvm21-dev.sh` before any cargo command.
-This sets `LLVM_SYS_211_PREFIX`, `MLIR_SYS_210_PREFIX`, `MLIR_SYS_LINK_SHARED`,
-and `RUSTFLAGS` with rpath to the patched LLVM 21 build. Without it, you'll link
-against the system LLVM which has the expand-strided-metadata crash.
 
-## Status
+## Current status
 
-**SEGFAULT FIXED.** The null-pointer crash in `memrefCopy` has been resolved.
-The emitter now runs GPT-2 prefill to completion, but produces **NaN/Inf logits**.
+- **Prefill model: WORKING.** Both `gpt2_prefill_emitter_only` and
+  `gpt2_prefill_emitter_matches_mapper_output` pass. All 457 unit tests pass.
+- **Decode model: SEGFAULT at runtime.** Compiles through the full MLIR pipeline
+  but crashes during JIT execution (`vmovss` load at wrong offset inside `compute()`).
+- **"double free or corruption (!prev)" on exit** is a pre-existing libLLVM cleanup
+  issue — also happens with the working mapper path. Ignore it.
 
-## Root cause of the SEGFAULT (fixed)
+## Next task: Eliminate `tensor.reshape` — use collapse/expand_shape everywhere
 
-The emitter's dynamic Reshape path passed raw ONNX shape tensors (containing `-1`
-for "infer this dimension") directly to `tensor.reshape`, which does NOT handle
-`-1`. The `-1` was interpreted as a literal dimension size (0xFFFFFFFFFFFFFFFF),
-causing massive `memref.alloc` calls that returned null pointers.
+### The problem
 
-### gdb evidence
+The emitter uses `tensor.reshape` (with a runtime shape tensor) for ONNX Reshape
+ops that go through the dynamic path. After bufferization, this becomes
+`memref.reshape` which reinterprets memory with new strides computed from the shape
+tensor at runtime. When the resolved `-1` dimension is wrong (off by one, wrong
+divui input), the strides become garbage → SEGFAULT.
 
-Using `debug_memref4.py`, the first `memrefCopy` call had:
-```
-src: alloc=0x0 aligned=0x0 *** NULL *** offset=0 sizes=[-1, 4, 768, 9216] strides=[2304, 1, 0, 0]
-dst: alloc=0x0 aligned=0x0 *** NULL *** offset=0 sizes=[-1, 4, 768, 3072] strides=[768, 1, 0, 0]
-```
-- `sizes[0] = -1` = unresolved dimension (should be batch_size=1)
-- 9216 = 768 × 12 (attention QKV projection)
-- 3072 = 768 × 4 (FFN intermediate)
-- Both alloc/aligned pointers are NULL because allocating `-1` elements fails
+Evidence from gdb: the first 3 `memrefCopy` calls in the decode model have garbage
+strides like `[2304, 1, 140735984714131, 1]` for a `[1, 1, 768, 2304]` tensor.
 
-### The fix
+The mapper path avoids this entirely — it uses `tosa.reshape` for known shapes and
+`collapse_shape`/`expand_shape` for rank changes. It NEVER uses `tensor.reshape`.
 
-Added `emit_resolve_reshape_dims()` in `graph_builder.rs` which emits MLIR ops to:
-1. Detect `-1` entries via `arith.cmpi eq` + `arith.select`
-2. Detect `0` entries (ONNX "copy from input dim") via same mechanism
-3. Compute `total_input_elems / product_of_known_dims` for the inferred dim
-4. Replace `-1` with the computed value at runtime
+### The fix: decompose every tensor.reshape into collapse→expand
 
-The emitter's `Reshape` handler now extracts individual dims from the runtime
-shape tensor, resolves special values, then builds a corrected shape tensor.
+Replace all `tensor.reshape` usage with a two-step pattern:
+1. `tensor.collapse_shape` to flatten to 1D (or the appropriate lower rank)
+2. `tensor.expand_shape` to expand to the target shape
 
-### MLIR `arith.cmpi` predicate encoding (LLVM 21)
+This avoids `memref.reshape` entirely. The collapse→expand pattern is what MLIR
+natively supports with correct stride computation.
 
-From `ArithBase.td`:
-- `eq = 0`, `ne = 1`, `slt = 2`, `sle = 3`, `sgt = 4`, `sge = 5`
-- `ult = 6`, `ule = 7`, `ugt = 8`, `uge = 9`
+### Implementation plan
 
-Use `Attribute::parse(ctx, "0 : i64")` for eq, `"1 : i64"` for ne, etc.
-The `#arith.cmpipredicate<eq>` syntax does NOT work in LLVM 21.
+**Where the changes go:**
+- `src/graph_builder.rs`: `emit_reshape()` (line ~2494) and
+  `emit_reshape_from_index_dims()` / `emit_reshape_with_tensor()` (line ~2674+)
+- The `emit_resolve_reshape_dims()` runtime -1 resolution code can be REMOVED
+  once all reshapes go through collapse/expand (which don't need runtime shape
+  tensors for known reassociation patterns)
 
-## Prefill: FIXED
+**Key constraint for collapse/expand_shape:**
+- Each reassociation group can have AT MOST ONE dynamic dim
+- `emit_expand_shape_impl` uses `tensor.dim` on the input for dynamic output dims
+  in a group — this works correctly when there's only one dynamic dim per group
+  (MLIR can infer its value from the input dim and the static dims in the group)
+- When multiple dynamic dims share a group, fall back to... what? Options:
+  - Use `tosa.reshape` with `tosa.const_shape` (requires static target shape)
+  - Use a `linalg.generic` copy with appropriate indexing maps
+  - Accept the limitation and use `tensor.reshape` only for that rare case
 
-Both `gpt2_prefill_emitter_only` and `gpt2_prefill_emitter_matches_mapper_output`
-tests pass. Full text generation works for the first token via prefill.
+**The decomposition algorithm:**
+Given ONNX Reshape from `[a, b, c, d]` to `[x, y, z]`:
+1. Compute which source dims map to which target dims (contiguous grouping)
+2. For dims that merge: use `tensor.collapse_shape` with appropriate reassociation
+3. For dims that split: use `tensor.expand_shape` with appropriate reassociation
+4. For dims that just pass through: identity in the reassociation
 
-## Decode model: runtime SEGFAULT
+The hard part: inferring the reassociation from two shapes when some dims are dynamic.
+When both shapes are fully known (from const_i64), this is trivial.
 
-The decode model (with dynamic `past_sequence_length`) now compiles successfully
-through the full MLIR pass pipeline, but crashes at runtime inside `compute()`.
+**Simpler alternative decomposition:**
+1. Always flatten to 1D first: `tensor.collapse_shape %input [[0,1,...,n-1]]`
+2. Then expand to target: `tensor.expand_shape %flat [[0,1,...,m-1]]`
 
-gdb shows 7 successful `memrefCopy` calls before crash. The first 3 copies have
-garbage strides (e.g., `strides=[2304, 1, 140735984714131, 1]`) suggesting
-uninitialized memref descriptors from incorrect `tensor.reshape` output shapes.
+This works when the target shape has at most one dynamic dim (the expand_shape
+constraint). For the decode model, most reshapes have at most one dynamic dim
+(`past_sequence_length`), so this should cover nearly all cases.
 
-The decode model has genuinely dynamic `past_sequence_length` dim, so the const
-propagation approach can't resolve all shapes statically. The `emit_resolve_reshape_dims`
-runtime path needs to work correctly with truly dynamic dims — this likely needs
-debugging of the MLIR ops it generates (arith.cmpi/select/divui) to ensure -1
-replacement works at runtime.
+For the remaining cases with multiple dynamic dims in the target... use `tosa.reshape`
+if all target dims are statically known (they might be, via const_i64), otherwise
+leave `tensor.reshape` as a last resort.
 
-## Previous issue (resolved): NaN/Inf logits (heap corruption from expand_shape)
+### What's already done (don't redo)
 
-After the reshape fix, the test runs to completion but produces NaN/Inf logits.
-The "double free or corruption (!prev)" on exit is a **pre-existing libLLVM cleanup
-issue** (also happens with the working mapper path).
+- **const_i64 propagation** through Shape, Gather, Unsqueeze, Squeeze, Concat,
+  Cast, Reshape, Slice, Sub, Add, Mul, Div — this makes most shape subgraph
+  values available at compile time
+- **Static -1 inference** in `emit_reshape` — when all input dims are known,
+  the `-1` dim is resolved statically in the output type
+- **DIM_DYNAMIC handling** — `Dim::Fixed(DIM_DYNAMIC)` treated as `None` in emitter
+- **emit_where** uses broadcast-aware indexing maps (not pre-broadcast + identity)
+- **emit_collapse_shape_nd_to_3d** and **emit_expand_shape_3d_to_nd** use native
+  collapse/expand when safe (≤1 dynamic dim in batch group), emit_reshape as fallback
+- **compute_concrete_output_shapes** resolves keep_dynamic symbols from inputs
 
-### Root cause: expand_shape output_shape bug with dynamic dims
+### MLIR notes
 
-In `graph_builder.rs:emit_expand_shape_impl()`, when a reassociation group splits
-one input dim into multiple output dims (e.g., `[[0,1],[2],[3]]` expanding
-`[batch*heads, seq, dim]` → `[batch, heads, seq, dim]`), the code uses
-`tensor.dim %input, <group_input_dim>` for ALL output dims in the group.
-
-This means both `batch` and `heads` output dims get the value `batch*heads`,
-producing an output shape `[batch*heads, batch*heads, seq, dim]` instead of
-`[batch, heads, seq, dim]`. This causes out-of-bounds memory access (heap
-corruption) which manifests as NaN/Inf in the results.
-
-**Evidence from the IR** (line 1418-1426 of pre-pass IR):
-```mlir
-%dim_649 = tensor.dim %547, %c0_648 : tensor<?x?x?xf32>  // = batch*heads
-%dim_651 = tensor.dim %547, %c0_650 : tensor<?x?x?xf32>  // = batch*heads (WRONG! should be different)
-%expanded_656 = tensor.expand_shape %547 [[0, 1], [2], [3]]
-    output_shape [%dim_649, %dim_651, %dim_653, %dim_655]
-```
-
-### Why this works in the mapper path
-
-The mapper path produces **static** shapes because symbolic dims are resolved
-before tracing. So the matmul collapse/expand cycle uses static dims like
-`[1, 12, 4, 64]` → `[12, 4, 64]` → `[1, 12, 4, 64]`, and expand_shape
-knows the exact sizes.
-
-### Fix approach
-
-The emitter's dynamic Reshape path makes ALL dims dynamic via `tensor.reshape`,
-which then propagates through matmul's internal collapse→batch_matmul→expand cycle.
-The fix needs one of:
-
-1. **Propagate known-static dims through reshape**: If the input has static dims
-   (like batch=1, seq=4) and the reshape target is `[-1, 4]`, the output should
-   be `tensor<1x4xi64>` not `tensor<?x?xi64>`. This avoids the all-dynamic cascade.
-
-2. **Fix expand_shape for multi-dim groups**: Track the actual target shape from
-   the Reshape op and pass it down to expand_shape, rather than using tensor.dim.
-
-3. **Use tosa.reshape instead of tensor.reshape**: The static `emit_reshape` path
-   uses tosa.reshape which preserves known dimensions. The dynamic path should
-   try to use it too when possible.
-
-Option 1 is the cleanest — resolve as many static dims as possible in the emitter's
-Reshape handler, only leaving truly-unknown dims as dynamic.
+- `arith.cmpi` predicate: eq=0, ne=1, slt=2, sle=3, sgt=4, sge=5, ult=6, ule=7, ugt=8, uge=9
+  Use `Attribute::parse(ctx, "0 : i64")` — the `#arith.cmpipredicate<eq>` syntax doesn't work
+- `tensor.collapse_shape` infers its result type from input + reassociation — you
+  cannot override it with a different result type via OperationBuilder
+- `tensor.expand_shape` with dynamic output dims: uses `tensor.dim` on the input
+  for ALL output dims in the same reassociation group — only correct when the group
+  has at most one dynamic dim
+- `memref.reshape` reinterprets memory (no copy) with contiguous row-major strides —
+  source must have identity layout. Strides computed from new shape at runtime.
 
 ## How to reproduce
 
 ```bash
 source env-llvm21-dev.sh
 rm -rf ~/.cache/homura/
-cargo test --test gpt2_e2e gpt2_prefill_emitter_only -- --ignored --nocapture
-```
 
-Requires patched LLVM 21 (fix for expand-strided-metadata, PR #186834).
+# Prefill (works):
+cargo test --test gpt2_e2e gpt2_prefill_emitter_only -- --ignored --nocapture
+
+# Decode (crashes):
+cargo test --test gpt2_e2e gpt2_decode_emitter_dynamic -- --ignored --nocapture
+
+# Full generation (prefill works, decode crashes):
+cargo run -- run tests/fixtures --prompt "The meaning of life is" --max-tokens 20
+
+# All unit tests:
+cargo test
+```
 
 ## Useful commands
 
-### Dump IR at each stage
 ```bash
-HOMURA_DUMP_IR=1 cargo test --test gpt2_e2e gpt2_prefill_emitter_only -- --ignored --nocapture
-# Pre-pass: /tmp/homura_gb_pre_passes.mlir
-# Post-pass: /tmp/homura_gb_post_passes.mlir
-```
+# Dump IR
+HOMURA_DUMP_IR=1 cargo test --test gpt2_e2e gpt2_decode_emitter_dynamic -- --ignored --nocapture
 
-### Run under gdb with memref descriptor inspection
-```bash
-source env-llvm21-dev.sh
-gdb -batch \
-  -ex "source debug_memref4.py" \
-  -ex "run gpt2_prefill_emitter_only --ignored --nocapture" \
-  -ex "bt 5" \
-  --args target/debug/deps/gpt2_e2e-*
-```
+# Verify IR manually
+/home/edgar/data/llvm-21/bin/mlir-opt /tmp/homura_gb_pre_passes.mlir -o /dev/null
 
-### Dump memref descriptors
-```bash
-HOMURA_DUMP_MEMREFS=1 cargo test --test gpt2_e2e gpt2_prefill_emitter_only -- --ignored --nocapture
-```
-
-### Run passes step by step with mlir-opt
-```bash
+# Run passes step by step
 /home/edgar/data/llvm-21/bin/mlir-opt /tmp/homura_gb_pre_passes.mlir \
   --pass-pipeline="builtin.module(func.func(canonicalize,cse))" -o /tmp/step1.mlir
 
-/home/edgar/data/llvm-21/bin/mlir-opt /tmp/step1.mlir \
-  --pass-pipeline="builtin.module(one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map})" \
-  -o /tmp/step_bufferized.mlir
-```
+# gdb with memref inspection
+gdb -batch -ex "source debug_memref4.py" \
+  -ex "run gpt2_decode_emitter_dynamic --ignored --nocapture" \
+  -ex "bt 5" --args target/debug/deps/gpt2_e2e-*
 
-### Compare emitter vs mapper output
-```bash
-# Run the comparison test:
-cargo test --test gpt2_e2e gpt2_prefill_emitter_matches_mapper_output -- --ignored --nocapture
+# Count reshape types in IR
+grep -c 'tensor.reshape' /tmp/homura_gb_pre_passes.mlir
+grep -c 'tensor.collapse_shape' /tmp/homura_gb_pre_passes.mlir
+grep -c 'tensor.expand_shape' /tmp/homura_gb_pre_passes.mlir
 ```
 
 ## Key files
 
-- `src/onnx/emitter.rs` — ONNX→MLIR emitter (Reshape handler at ~line 682)
-- `src/graph_builder.rs` — MLIR op emission (`emit_resolve_reshape_dims` at ~line 2700)
+- `src/onnx/emitter.rs` — ONNX→MLIR emitter (Reshape handler ~line 682)
+- `src/graph_builder.rs` — MLIR op emission:
+  - `emit_reshape` (~line 2494) — static path, uses tensor.reshape with index shape tensor
+  - `emit_reshape_with_tensor` (~line 2674) — dynamic path
+  - `emit_reshape_from_index_dims` (~line 2886) — builds shape tensor from index values
+  - `emit_resolve_reshape_dims` (~line 2700) — runtime -1/0 resolution
+  - `emit_collapse_shape_nd_to_3d` (~line 4412) — matmul batch collapse
+  - `emit_expand_shape_3d_to_nd` (~line 4457) — matmul batch expand
+  - `emit_expand_shape_impl` (~line 4533) — core expand_shape with output_shape
+  - `emit_where` (~line 3788) — uses broadcast maps
+- `src/onnx/mod.rs` — Model load/run, compile_model_emitter, compute_concrete_output_shapes
 - `tests/gpt2_e2e.rs` — GPT-2 integration tests
-- `debug_memref4.py` — gdb Python script for inspecting memref descriptors at `memrefCopy`
-- `/tmp/homura_gb_pre_passes.mlir` — emitter pre-pass IR (regenerate with HOMURA_DUMP_IR=1)
-- `env-llvm21-dev.sh` — env vars for building against patched LLVM 21
+- `debug_memref4.py` — gdb Python script for inspecting memref descriptors
+- `env-llvm21-dev.sh` — env vars for patched LLVM 21
