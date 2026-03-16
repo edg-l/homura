@@ -34,6 +34,8 @@ pub struct OnnxModel {
     pub dynamic_inputs: Vec<DynamicInput>,
     /// Output edge names.
     pub outputs: Vec<String>,
+    /// Output shape specs (from ONNX ValueInfoProto). Each dim is Fixed or Symbolic.
+    pub output_shapes: Vec<Vec<Dim>>,
 }
 
 impl OnnxModel {
@@ -249,15 +251,46 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
         });
     }
 
-    // Output edge names.
+    // Output edge names and shapes.
     let outputs = graph.output.iter().map(|vi| vi.name.clone()).collect();
+    let output_shapes = graph.output.iter().map(|vi| {
+        parse_output_dims(vi)
+    }).collect();
 
     Ok(OnnxModel {
         nodes,
         initializers,
         dynamic_inputs,
         outputs,
+        output_shapes,
     })
+}
+
+/// Parse dims from an output ValueInfoProto. Returns empty vec if shape info is missing.
+fn parse_output_dims(vi: &crate::onnx::proto::ValueInfoProto) -> Vec<Dim> {
+    use crate::onnx::proto::type_proto::Value as TypeValue;
+    use crate::onnx::proto::tensor_shape_proto::dimension::Value as DimValue;
+
+    let type_proto = match &vi.r#type {
+        Some(tp) => tp,
+        None => return Vec::new(),
+    };
+    let tensor_type = match &type_proto.value {
+        Some(TypeValue::TensorType(tt)) => tt,
+        _ => return Vec::new(),
+    };
+    let shape_proto = match &tensor_type.shape {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    shape_proto.dim.iter().enumerate().map(|(idx, dim)| {
+        match &dim.value {
+            Some(DimValue::DimValue(v)) => Dim::Fixed(*v as u64),
+            Some(DimValue::DimParam(p)) => Dim::Symbolic(p.clone()),
+            None => Dim::Symbolic(format!("output_{}_{}", vi.name, idx)),
+        }
+    }).collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

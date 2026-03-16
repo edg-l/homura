@@ -2084,6 +2084,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -2111,6 +2112,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2132,6 +2134,7 @@ mod tests {
                 make_dynamic("B", &[3, 4], DType::F32),
             ],
             outputs: vec!["C".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2163,6 +2166,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("A", &[4], DType::F32)],
             outputs: vec!["D".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2197,6 +2201,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -2248,6 +2253,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2277,6 +2283,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2310,6 +2317,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[5, 1, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let result = map_graph(&model);
@@ -2327,6 +2335,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 1, 4, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let result = map_graph(&model);
@@ -2354,6 +2363,7 @@ mod tests {
                 make_dynamic("B", &[3, 4], DType::F32),
             ],
             outputs: vec!["C".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2397,6 +2407,7 @@ mod tests {
                 make_dynamic("B", &[4, 3], DType::F32), // [N, K], transB → [K, N] = [3, 4]
             ],
             outputs: vec!["C".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2429,6 +2440,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -2450,6 +2462,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Z".to_string()], // "Z" is never produced
+            output_shapes: vec![],
         };
 
         let result = map_graph(&model);
@@ -2473,6 +2486,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let result = map_graph(&model);
@@ -2493,6 +2507,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let result = map_graph(&bad_model);
         assert!(result.is_err(), "expected error from bad model");
@@ -2503,6 +2518,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let result = map_graph(&good_model);
         assert!(
@@ -2523,6 +2539,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2542,6 +2559,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2561,6 +2579,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2577,6 +2596,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2593,6 +2613,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2609,6 +2630,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2633,6 +2655,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         // Input(X), Input(Y), Add, Relu → 4 ops
@@ -2654,6 +2677,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
         assert_eq!(weights.len(), 2);
@@ -2681,6 +2705,7 @@ mod tests {
             initializers: vec![make_weight("W", &[1.0; 9], &[1, 1, 3, 3])],
             dynamic_inputs: vec![make_dynamic("X", &[1, 1, 5, 5], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
         assert_eq!(weights.len(), 1);
@@ -2709,6 +2734,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 1, 4, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2732,6 +2758,7 @@ mod tests {
             initializers: vec![make_i64_weight("shape", &[3, 4], &[2])],
             dynamic_inputs: vec![make_dynamic("X", &[2, 6], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert!(
@@ -2755,6 +2782,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out = trace.get(output_ids[0]);
@@ -2774,6 +2802,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out = trace.get(output_ids[0]);
@@ -2798,6 +2827,7 @@ mod tests {
             initializers: vec![make_weight("W", &[1.0; 18], &[2, 1, 3, 3])],
             dynamic_inputs: vec![make_dynamic("X", &[1, 2, 5, 5], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let result = map_graph(&model);
         assert!(result.is_err(), "grouped conv should return error");
@@ -2820,6 +2850,7 @@ mod tests {
             initializers: vec![make_i32_weight("shape", &[3, 4], &[2])],
             dynamic_inputs: vec![make_dynamic("X", &[2, 6], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("i32 shape should work");
         let out = trace.get(output_ids[0]);
@@ -2838,6 +2869,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out = trace.get(output_ids[0]);
@@ -2867,6 +2899,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("X", &[1, c, 4, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
         assert_eq!(weights.len(), 4);
@@ -2900,6 +2933,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("X", &[1, c, 2, 2], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out = trace.get(output_ids[0]);
@@ -2915,6 +2949,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 3, 7, 7], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out = trace.get(output_ids[0]);
@@ -2944,6 +2979,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![],
             outputs: vec!["c".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -2969,6 +3005,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![],
             outputs: vec!["c".to_string()],
+            output_shapes: vec![],
         };
         let result = map_graph(&model);
         assert!(matches!(result, Err(OnnxError::UnsupportedOp(_))));
@@ -2984,6 +3021,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
             outputs: vec!["shape_out".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3024,6 +3062,7 @@ mod tests {
             initializers: vec![("shape_const".to_string(), shape_buf)],
             dynamic_inputs: vec![],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (_trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3051,6 +3090,7 @@ mod tests {
             initializers: vec![("shape_const".to_string(), shape_buf)],
             dynamic_inputs: vec![],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (_trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3083,6 +3123,7 @@ mod tests {
             ],
             dynamic_inputs: vec![],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (_trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3114,6 +3155,7 @@ mod tests {
             ],
             dynamic_inputs: vec![],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (_trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3143,6 +3185,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 3, 1, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3158,6 +3201,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[1, 2, 1, 3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3174,6 +3218,7 @@ mod tests {
             initializers: vec![("axes".to_string(), axes_buf)],
             dynamic_inputs: vec![make_dynamic("X", &[1, 3, 1, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3196,6 +3241,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3217,6 +3263,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3233,6 +3280,7 @@ mod tests {
             initializers: vec![("axes".to_string(), axes_buf)],
             dynamic_inputs: vec![make_dynamic("X", &[5], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3254,6 +3302,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 4], DType::F32)],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
 
         let (_trace, _output_ids, weights) = map_graph(&model).expect("map_graph failed");
@@ -3282,6 +3331,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["Z".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3299,6 +3349,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3322,6 +3373,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3], DType::I64)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3352,6 +3404,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3378,6 +3431,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3410,6 +3464,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
 
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
@@ -3440,6 +3495,7 @@ mod tests {
                 make_dynamic("indices", &[3], DType::I64),
             ],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         let out_op = trace.get(output_ids[0]);
@@ -3464,6 +3520,7 @@ mod tests {
                 make_dynamic("idx", &[2], DType::I64),
             ],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3496,6 +3553,7 @@ mod tests {
             ],
             dynamic_inputs: vec![make_dynamic("data", &[6], DType::F32)],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3525,6 +3583,7 @@ mod tests {
                 make_dynamic("B", &[5, 4], DType::F32),
             ],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3552,6 +3611,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[6], DType::F32)],
             outputs: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         assert_eq!(output_ids.len(), 3);
@@ -3579,6 +3639,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[3, 5], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3598,6 +3659,7 @@ mod tests {
             initializers: vec![],
             dynamic_inputs: vec![make_dynamic("X", &[2, 3, 4], DType::F32)],
             outputs: vec!["Y".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3623,6 +3685,7 @@ mod tests {
                 make_dynamic("Y", &[4], DType::F32),
             ],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         match trace.get(output_ids[0]) {
@@ -3646,6 +3709,7 @@ mod tests {
                 make_dynamic("Y", &[3], DType::F32),
             ],
             outputs: vec!["out".to_string()],
+            output_shapes: vec![],
         };
         let (trace, output_ids, _) = map_graph(&model).expect("map_graph failed");
         // Output should be Op::Where with F32 dtype.

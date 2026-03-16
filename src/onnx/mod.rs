@@ -229,11 +229,10 @@ impl Model {
         let has_dynamic_outputs = output_descs.iter().any(|d| d.shape.has_dynamic_dims());
 
         if has_dynamic_outputs {
-            // Compute concrete output shapes from the actual input shapes.
+            let parsed = self.parsed.as_ref()
+                .expect("parsed model must be present when outputs have dynamic dims");
             let concrete_output_shapes = compute_concrete_output_shapes(
-                state.compiled.output_descs(),
-                inputs,
-                &state.input_shapes,
+                parsed, inputs, &self.keep_dynamic,
             );
             Ok(state.compiled.run_dynamic(&all_args, &concrete_output_shapes))
         } else {
@@ -521,101 +520,98 @@ fn resolve_symbolic_dims(
         initializers: model.initializers.clone(),
         dynamic_inputs: resolved_inputs,
         outputs: model.outputs.clone(),
+        output_shapes: model.output_shapes.clone(),
     })
 }
 
-/// Compute concrete output shapes for a compiled graph that has dynamic dims.
+/// Compute concrete output shapes by resolving ONNX output shape specs.
 ///
-/// For each output, substitute `DIM_DYNAMIC` positions with their actual
-/// runtime value. The strategy used here is:
-/// - For output positions that are NOT `DIM_DYNAMIC` in the compiled shape,
-///   keep the compiled value as-is.
-/// - For output positions that ARE `DIM_DYNAMIC`, scan the compiled input
-///   shapes to find what the dynamic dim corresponds to in the inputs, then
-///   read the concrete runtime value from the actual input buffer.
-///
-/// For the KV-cache concat case (the main use case), the output dynamic dim
-/// equals input_dynamic_dim + 1 (past_len + new_token). Rather than trying to
-/// infer this algebraically here, we fall back to a simple heuristic: query
-/// `tensor.dim` at runtime through the compiled code... but that's only
-/// available inside the JIT. Instead we use a simpler approach: since we can't
-/// know the exact output shape without running the code, we pass a placeholder
-/// shape that MLIR can derive, but that won't work for buffer allocation.
-///
-/// In practice, for this project's use case, the caller (`KvGenerator`) knows
-/// the output shape (past_len + 1). The `run_dynamic` path requires the caller
-/// to provide these shapes. This function provides a reasonable default by
-/// scanning for matching non-dynamic dims from inputs, returning DIM_DYNAMIC
-/// for any dim it can't resolve (which would then cause `run_dynamic` to fail
-/// with a clear error).
-///
-/// For now, implement the concrete "past_len+1" logic by finding input dims
-/// that appear as dynamic in outputs and adding 1 to them.
+/// Uses the model's symbolic output dim specs and resolves them against the
+/// actual runtime input shapes. Fixed dims stay as-is, symbolic dims are
+/// resolved by matching the symbolic name to input dim specs.
 fn compute_concrete_output_shapes(
-    output_descs: &[OutputDesc],
+    model: &OnnxModel,
     inputs: &[&Buffer],
-    compiled_input_shapes: &[Shape],
+    keep_dynamic: &HashSet<String>,
 ) -> Vec<Shape> {
-    output_descs
-        .iter()
-        .map(|desc| {
-            if !desc.shape.has_dynamic_dims() {
-                return desc.shape.clone();
+    // Build a map from symbolic name → concrete runtime value.
+    let mut sym_values: HashMap<String, u64> = HashMap::new();
+    for (spec, buf) in model.dynamic_inputs.iter().zip(inputs.iter()) {
+        for (i, dim) in spec.dims.iter().enumerate() {
+            if let Dim::Symbolic(name) = dim {
+                if !keep_dynamic.contains(name) && i < buf.shape().0.len() {
+                    sym_values.insert(name.clone(), buf.shape().0[i]);
+                }
             }
-            // For each dynamic dim, try to find a matching dynamic dim in the
-            // compiled input shapes and use the corresponding runtime input value.
-            // For the concat case (KV cache), the output past_len = max input past_len + 1.
-            let dims: Vec<u64> = desc
-                .shape
-                .0
-                .iter()
-                .enumerate()
-                .map(|(out_dim_idx, &compiled_dim)| {
-                    if compiled_dim != DIM_DYNAMIC {
-                        return compiled_dim;
-                    }
-                    // Find the largest runtime value for this dim position across all inputs.
-                    // For concat along past_len: output = sum of inputs along that axis.
-                    // But since we don't know the operation, we use the heuristic:
-                    // sum all dynamic dim values from inputs that have a dynamic dim at the same position.
-                    // Strategy 1: look for dynamic input dims at the same position
-                    // and sum their runtime values (handles concat case).
-                    let mut total: u64 = 0;
-                    let mut found_dynamic = false;
-                    for (inp_idx, inp_shape) in compiled_input_shapes.iter().enumerate() {
-                        if out_dim_idx < inp_shape.0.len()
-                            && inp_shape.0[out_dim_idx] == DIM_DYNAMIC
-                        {
-                            if let Some(buf) = inputs.get(inp_idx) {
-                                if out_dim_idx < buf.shape().0.len() {
-                                    total += buf.shape().0[out_dim_idx];
-                                    found_dynamic = true;
-                                }
-                            }
-                        }
-                    }
-                    if found_dynamic {
-                        return total;
-                    }
-
-                    // Strategy 2: look for any input whose runtime shape at
-                    // this position can serve as the value. This handles cases
-                    // like logits [?, ?, vocab] where the ? dims come from
-                    // static input_ids [1, 1] — the output should also be [1, 1, vocab].
-                    for (inp_idx, _) in compiled_input_shapes.iter().enumerate() {
-                        if let Some(buf) = inputs.get(inp_idx) {
-                            if out_dim_idx < buf.shape().0.len() {
-                                return buf.shape().0[out_dim_idx];
-                            }
-                        }
-                    }
-
-                    DIM_DYNAMIC
-                })
-                .collect();
-            Shape(dims)
+        }
+    }
+    // Also scan output shapes for symbols used in expressions (e.g., "X + 1")
+    // and try to derive missing symbols from known ones.
+    // For GPT-2: "past_sequence_length + 1" = sequence_length, so
+    // past_sequence_length = sequence_length - 1.
+    let output_syms: Vec<String> = model.output_shapes.iter().flat_map(|dims| {
+        dims.iter().filter_map(|d| match d {
+            Dim::Symbolic(name) => Some(name.clone()),
+            _ => None,
         })
-        .collect()
+    }).collect();
+    for sym in &output_syms {
+        if sym_values.contains_key(sym) { continue; }
+        // "base + N" → base = (known alias) - N
+        if let Some(pos) = sym.rfind(" + ") {
+            let base = &sym[..pos];
+            let offset: u64 = sym[pos+3..].parse().unwrap_or(0);
+            if !sym_values.contains_key(base) {
+                // Check if "base + offset" equals a known symbol's value.
+                // e.g., past_sequence_length + 1 == sequence_length
+                for (known_name, &known_val) in &sym_values.clone() {
+                    // If the expression result matches a known symbol, derive the base.
+                    // Heuristic: "past_X + 1" likely equals "X" for prefill models.
+                    if known_val >= offset {
+                        let candidate_base_val = known_val - offset;
+                        // Check if the known symbol name contains the expression's base concept.
+                        // e.g., "sequence_length" contains "sequence_length" which relates to "past_sequence_length".
+                        if known_name.contains(&base.replace("past_", "")) {
+                            sym_values.insert(base.to_string(), candidate_base_val);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    model.output_shapes.iter().map(|dims| {
+        let resolved: Vec<u64> = dims.iter().map(|d| match d {
+            Dim::Fixed(v) => *v,
+            Dim::Symbolic(name) => {
+                // Try exact match first.
+                if let Some(&v) = sym_values.get(name) {
+                    return v;
+                }
+                // Handle expressions like "past_sequence_length + 1".
+                if let Some(pos) = name.rfind(" + ") {
+                    let base = &name[..pos];
+                    let offset: u64 = name[pos+3..].parse().unwrap_or(0);
+                    // If the base symbol is resolved, use it.
+                    if let Some(&v) = sym_values.get(base) {
+                        return v + offset;
+                    }
+                    // If the base symbol isn't in any input and isn't kept dynamic,
+                    // assume it's 0 (e.g., past_sequence_length in prefill models).
+                    if !keep_dynamic.contains(base) {
+                        return offset;
+                    }
+                }
+                // Unresolved symbols not in keep_dynamic default to 0.
+                if !keep_dynamic.contains(name) {
+                    return 0;
+                }
+                DIM_DYNAMIC
+            }
+        }).collect();
+        Shape(resolved)
+    }).collect()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -127,6 +127,30 @@ fn gpt2_prefill_emitter_matches_mapper_output() {
     );
 }
 
+/// GPT-2 prefill through emitter only (no mapper reference).
+/// Verifies compilation succeeds and produces finite logits.
+#[test]
+#[ignore = "slow: compiles GPT-2 prefill model"]
+fn gpt2_prefill_emitter_only() {
+    let model =
+        Model::load_with_dynamic_dims("tests/fixtures/gpt2_decoder_model.onnx", HashSet::new())
+            .expect("failed to load GPT-2 decoder model (emitter)");
+
+    let input_ids = Buffer::from_slice::<i64>(&[15496, 995, 318, 257], &[1, 4], DType::I64);
+    let attention_mask = Buffer::from_slice::<i64>(&[1, 1, 1, 1], &[1, 4], DType::I64);
+
+    let outputs = model
+        .run(&[&input_ids, &attention_mask])
+        .expect("emitter inference failed");
+
+    // 25 outputs: logits + 24 KV tensors.
+    assert_eq!(outputs.len(), 25, "expected 25 outputs");
+    assert_eq!(outputs[0].shape().0, vec![1, 4, 50257], "logits shape");
+
+    let logits = outputs[0].as_slice::<f32>();
+    assert!(logits.iter().all(|v| v.is_finite()), "logits contain NaN/Inf");
+}
+
 /// Task 8.8: GPT-2 decode model with dynamic `past_sequence_length` compiles
 /// once and produces sensible outputs for a single decode step.
 ///
