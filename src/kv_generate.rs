@@ -163,10 +163,14 @@ impl KvGenerator {
         let prompt_model = Model::load(&prompt_path)?;
 
         eprintln!("[homura] loading decode model: {}", decode_path.display());
-        // Keep past_sequence_length dynamic so the decode model compiles ONCE
-        // and accepts any past_len at runtime.
-        let keep_dynamic: std::collections::HashSet<String> =
-            ["past_sequence_length".to_string()].into_iter().collect();
+        // Keep past_sequence_length (and derived dims like "past_sequence_length + 1")
+        // dynamic so the decode model compiles ONCE and accepts any past_len at runtime.
+        let keep_dynamic: std::collections::HashSet<String> = [
+            "past_sequence_length".to_string(),
+            "past_sequence_length + 1".to_string(),
+        ]
+        .into_iter()
+        .collect();
         let decode_model = Model::load_with_dynamic_dims(&decode_path, keep_dynamic)?;
 
         eprintln!(
@@ -320,7 +324,7 @@ impl KvGenerator {
     /// Returns `(next_token, kv_cache, real_pos)` where:
     /// - `next_token` is the greedy-argmax token predicted after the prompt
     /// - `kv_cache` is a Vec of `num_kv_tensors` buffers shaped
-    ///   `[1, heads, max_seq_len, head_dim]` (zero-padded beyond the prompt)
+    ///   `[1, heads, bucket, head_dim]` (actual bucket size, not padded to max_seq_len)
     /// - `real_pos` is `token_ids.len()` (number of filled KV slots)
     fn prefill(
         &self,
@@ -349,6 +353,8 @@ impl KvGenerator {
         let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
 
         // KV outputs: outputs[1 .. 1 + num_kv_tensors], each [1, heads, bucket, head_dim]
+        // Trim to [1, heads, seq_len, head_dim] (remove bucket padding) so that
+        // the KV cache exactly matches real_pos and the attention mask is all-ones.
         let kv_count = self.config.num_kv_tensors;
         if outputs.len() < 1 + kv_count {
             return Err(format!(
@@ -358,13 +364,32 @@ impl KvGenerator {
             )
             .into());
         }
-        let kv_buffers = pad_kv_tensors(
-            &outputs[1..1 + kv_count],
-            bucket,
-            self.config.num_heads as usize,
-            self.config.head_dim as usize,
-            self.config.max_seq_len,
-        );
+        let heads = self.config.num_heads as usize;
+        let head_dim = self.config.head_dim as usize;
+        let kv_buffers = if seq_len == bucket {
+            outputs[1..1 + kv_count].to_vec()
+        } else {
+            // Trim: extract first seq_len positions per head from [1, heads, bucket, head_dim]
+            outputs[1..1 + kv_count]
+                .iter()
+                .map(|kv| {
+                    let mut trimmed = Buffer::new(
+                        &[1, heads as u64, seq_len as u64, head_dim as u64],
+                        DType::F32,
+                    );
+                    let src = kv.as_slice::<f32>();
+                    let dst = trimmed.as_slice_mut::<f32>();
+                    for h in 0..heads {
+                        let src_off = h * bucket * head_dim;
+                        let dst_off = h * seq_len * head_dim;
+                        let copy_len = seq_len * head_dim;
+                        dst[dst_off..dst_off + copy_len]
+                            .copy_from_slice(&src[src_off..src_off + copy_len]);
+                    }
+                    trimmed
+                })
+                .collect()
+        };
 
         Ok((next_token, kv_buffers, seq_len))
     }
@@ -372,20 +397,22 @@ impl KvGenerator {
     /// Run one decode step.
     ///
     /// Inputs: `next_token` (the token just generated), the current KV cache
-    /// buffers (each `[1, heads, max_seq_len, head_dim]`), and `real_pos`
-    /// (number of non-padding positions already written to the KV cache).
+    /// buffers (each `[1, heads, real_pos, head_dim]`), and `real_pos`
+    /// (number of past positions in the KV cache).
     ///
     /// The decode model takes `2 + num_kv_tensors` inputs:
     ///   `[input_ids, kv[0], ..., kv[num_kv-1], attention_mask]`
     ///
-    /// After running, the new KV entry (at output position `max_seq_len`) is
-    /// written into each cache buffer at slot `real_pos`.
+    /// The attention mask is `[1, real_pos + 1]` — all ones (past + current token).
+    ///
+    /// The output KV tensors already have shape `[1, heads, real_pos+1, head_dim]`
+    /// (past concatenated with new). They replace the cache directly.
     ///
     /// Returns the greedy argmax token for the next step.
     fn decode_step(
         &self,
         next_token: u32,
-        kv_cache: &mut [Buffer],
+        kv_cache: &mut Vec<Buffer>,
         real_pos: usize,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         assert!(
@@ -397,21 +424,14 @@ impl KvGenerator {
 
         let heads = self.config.num_heads as usize;
         let head_dim = self.config.head_dim as usize;
-        let max_len = self.config.max_seq_len;
 
         // input_ids: [1, 1]
         let input_ids =
             Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
 
-        // attention_mask: [1, max_seq_len + 1]
-        // 1 at positions 0..real_pos (real past), 0 at real_pos..max_seq_len (padding),
-        // 1 at position max_seq_len (the current new token).
-        let mask_len = max_len + 1;
-        let mut mask_data = vec![0i64; mask_len];
-        for i in 0..real_pos {
-            mask_data[i] = 1;
-        }
-        mask_data[max_len] = 1; // current token
+        // attention_mask: [1, real_pos + 1] — all ones (no padding)
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
         let attention_mask =
             Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
 
@@ -425,9 +445,9 @@ impl KvGenerator {
 
         // Build concrete output shapes for the dynamic model.
         // Output 0: logits [1, 1, vocab_size]
-        // Outputs 1..kv_count: KV [1, heads, past_len+1, head_dim]
+        // Outputs 1..kv_count: KV [1, heads, real_pos+1, head_dim]
         let kv_count = self.config.num_kv_tensors;
-        let out_seq_len = (max_len + 1) as u64;
+        let out_seq_len = (real_pos + 1) as u64;
         let mut output_shapes: Vec<crate::shape::Shape> = Vec::with_capacity(1 + kv_count);
         // Get vocab_size from the compiled model's output desc (last dim of logits).
         let vocab_size_dim = self
@@ -437,20 +457,21 @@ impl KvGenerator {
             .unwrap_or(50257);
         output_shapes.push(crate::shape::Shape(vec![1, 1, vocab_size_dim]));
         for _ in 0..kv_count {
-            output_shapes.push(crate::shape::Shape(vec![1, heads as u64, out_seq_len, head_dim as u64]));
+            output_shapes.push(crate::shape::Shape(vec![
+                1,
+                heads as u64,
+                out_seq_len,
+                head_dim as u64,
+            ]));
         }
 
-        let outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
+        let mut outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
 
         // logits: [1, 1, vocab_size] — only one position, read at index 0
         let logits = &outputs[0];
         let vocab_size = logits.shape().0[2] as usize;
         let result_token = argmax_at_position(logits, 0, vocab_size);
 
-        // Update KV cache: each output KV tensor has shape [1, heads, max_len+1, head_dim].
-        // The new entry is at seq position max_len (the last one in the output).
-        // Write it into kv_cache[i] at seq position real_pos.
-        let kv_count = self.config.num_kv_tensors;
         if outputs.len() < 1 + kv_count {
             return Err(format!(
                 "decode model returned {} outputs, expected at least {}",
@@ -460,20 +481,11 @@ impl KvGenerator {
             .into());
         }
 
-        let out_seq_len = max_len + 1;
+        // Replace each KV cache buffer with the full output KV tensor.
+        // The output already has shape [1, heads, real_pos+1, head_dim] —
+        // past concatenated with the new token's KV entry.
         for i in 0..kv_count {
-            let output_kv = &outputs[1 + i];
-            let out_data = output_kv.as_slice::<f32>();
-            let cache_data = kv_cache[i].as_slice_mut::<f32>();
-
-            for h in 0..heads {
-                // Source: new KV entry at seq position max_len in the output tensor
-                let out_offset = h * out_seq_len * head_dim + max_len * head_dim;
-                // Destination: slot real_pos in the fixed-size cache
-                let cache_offset = h * max_len * head_dim + real_pos * head_dim;
-                cache_data[cache_offset..cache_offset + head_dim]
-                    .copy_from_slice(&out_data[out_offset..out_offset + head_dim]);
-            }
+            kv_cache[i] = outputs.remove(1);
         }
 
         Ok(result_token)
@@ -481,43 +493,6 @@ impl KvGenerator {
 }
 
 // ── Free functions ────────────────────────────────────────────────────────────
-
-/// Pad KV tensors from `[1, heads, actual_len, head_dim]` to
-/// `[1, heads, max_seq_len, head_dim]` by zero-padding the seq dimension.
-///
-/// The KV layout is row-major `[batch=1, heads, seq, head_dim]`, so the seq
-/// axis is NOT the outermost. We iterate over heads and copy per-head slices.
-pub(crate) fn pad_kv_tensors(
-    kv_outputs: &[Buffer],
-    actual_len: usize,
-    heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
-) -> Vec<Buffer> {
-    kv_outputs
-        .iter()
-        .map(|kv| {
-            let mut padded = Buffer::new(
-                &[1, heads as u64, max_seq_len as u64, head_dim as u64],
-                DType::F32,
-            );
-            let src = kv.as_slice::<f32>();
-            let dst = padded.as_slice_mut::<f32>();
-
-            // For each attention head, copy the actual-length slice into the
-            // corresponding slice in the zero-padded destination.
-            for h in 0..heads {
-                let src_offset = h * actual_len * head_dim;
-                let dst_offset = h * max_seq_len * head_dim;
-                let copy_len = actual_len * head_dim;
-                dst[dst_offset..dst_offset + copy_len]
-                    .copy_from_slice(&src[src_offset..src_offset + copy_len]);
-            }
-
-            padded
-        })
-        .collect()
-}
 
 /// Return the first existing path from `candidates` under `dir`.
 fn find_file(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
@@ -551,71 +526,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pad_kv_tensors_zero_pads_beyond_actual_len() {
-        // Simulate a KV tensor [1, 2, 4, 2] (2 heads, seq=4, head_dim=2)
-        // being padded to max_seq_len=8.
-        // Row-major data: head0 = [1,2, 3,4, 5,6, 7,8], head1 = [9,10, 11,12, 13,14, 15,16]
-        let data: Vec<f32> = (1..=16).map(|x| x as f32).collect();
-        let kv = Buffer::from_slice::<f32>(&data, &[1, 2, 4, 2], DType::F32);
-
-        let padded = pad_kv_tensors(&[kv], 4, 2, 2, 8);
-
-        assert_eq!(padded.len(), 1);
-        let out = padded[0].as_slice::<f32>();
-        assert_eq!(out.len(), 1 * 2 * 8 * 2); // [1, 2, 8, 2]
-
-        // Head 0: first actual_len*head_dim=8 elements match, next 8 are zero
-        assert_eq!(&out[0..8], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(&out[8..16], &[0.0; 8]);
-
-        // Head 1: offset by max_seq_len*head_dim = 16; first 8 match, next 8 are zero
-        assert_eq!(
-            &out[16..24],
-            &[9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
-        );
-        assert_eq!(&out[24..32], &[0.0; 8]);
-    }
-
-    #[test]
-    fn pad_kv_tensors_full_seq_no_padding() {
-        // When actual_len == max_seq_len, the result equals the source.
-        let data: Vec<f32> = (0..8).map(|x| x as f32).collect();
-        let kv = Buffer::from_slice::<f32>(&data, &[1, 2, 2, 2], DType::F32);
-
-        let padded = pad_kv_tensors(&[kv], 2, 2, 2, 2);
-        assert_eq!(padded[0].as_slice::<f32>(), data.as_slice());
-    }
-
-    #[test]
     fn attention_mask_correct_pattern() {
         // Verify the decode_step attention mask construction:
-        // 1s at 0..real_pos, 0s at real_pos..max_len, 1 at max_len.
-        let max_len = 8usize;
+        // all ones, length = real_pos + 1.
         let real_pos = 3usize;
 
-        let mut mask_data = vec![0i64; max_len + 1];
-        for i in 0..real_pos {
-            mask_data[i] = 1;
-        }
-        mask_data[max_len] = 1;
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
 
-        let expected: Vec<i64> = vec![1, 1, 1, 0, 0, 0, 0, 0, 1];
+        let expected: Vec<i64> = vec![1, 1, 1, 1];
         assert_eq!(mask_data, expected);
     }
 
     #[test]
     fn attention_mask_zero_real_pos() {
-        // real_pos=0: only the current token slot (max_len) is set.
-        let max_len = 4usize;
+        // real_pos=0: mask is length 1 — just the current token.
         let real_pos = 0usize;
 
-        let mut mask_data = vec![0i64; max_len + 1];
-        for i in 0..real_pos {
-            mask_data[i] = 1;
-        }
-        mask_data[max_len] = 1;
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
 
-        let expected: Vec<i64> = vec![0, 0, 0, 0, 1];
+        let expected: Vec<i64> = vec![1];
         assert_eq!(mask_data, expected);
     }
 
