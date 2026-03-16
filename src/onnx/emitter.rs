@@ -209,10 +209,22 @@ fn lookup_const_i64(const_i64: &HashMap<String, Vec<i64>>, name: &str) -> Option
 ///
 /// Also returns the ordered weight buffers (initializers). These must be passed
 /// as runtime arguments after the dynamic inputs when running the compiled graph.
+/// Default MLIR op-count threshold before starting a new sub-function.
+const DEFAULT_SPLIT_THRESHOLD: usize = 2000;
+
 pub fn emit_graph<'c>(
     model: &OnnxModel,
     builder: &mut GraphBuilder<'c>,
     keep_dynamic: &HashSet<String>,
+) -> Result<(Vec<Tensor<'c>>, Vec<Buffer>), OnnxError> {
+    emit_graph_with_split(model, builder, keep_dynamic, DEFAULT_SPLIT_THRESHOLD)
+}
+
+pub fn emit_graph_with_split<'c>(
+    model: &OnnxModel,
+    builder: &mut GraphBuilder<'c>,
+    keep_dynamic: &HashSet<String>,
+    split_threshold: usize,
 ) -> Result<(Vec<Tensor<'c>>, Vec<Buffer>), OnnxError> {
     let mut value_map: HashMap<String, EmitValue<'c>> = HashMap::new();
 
@@ -228,13 +240,18 @@ pub fn emit_graph<'c>(
     }
 
     // ── 2. Weights (initializers) ───────────────────────────────────────────────
-    // Also seed const_i64 with small integer initializers for compile-time axis/shape lookups.
     let mut const_i64: HashMap<String, Vec<i64>> = HashMap::new();
     let mut weights: Vec<Buffer> = Vec::with_capacity(model.initializers.len());
+    let mut weight_names: HashSet<String> = HashSet::new();
+    // Store @compute-scope weight tensors for sub-function routing.
+    let mut weight_compute_tensors: HashMap<String, Tensor<'c>> = HashMap::new();
+
     for (name, buffer) in &model.initializers {
         let shape: Vec<Option<u64>> = buffer.shape().0.iter().map(|&d| Some(d)).collect();
         let t = builder.add_weight(&shape, buffer.dtype());
         value_map.insert(name.clone(), EmitValue::Tensor(t));
+        weight_names.insert(name.clone());
+        weight_compute_tensors.insert(name.clone(), t);
         weights.push(buffer.clone());
         // Seed const_i64 with small integer initializers.
         if buffer.shape().num_elements() <= 64 {
@@ -244,9 +261,54 @@ pub fn emit_graph<'c>(
         }
     }
 
-    // ── 3. Walk nodes ────────────────────────────────────────────────────────────
-    for node in &model.nodes {
+    // ── 2b. Build last_use map (forward scan) ────────────────────────────────────
+    let last_use = build_last_use_map(&model.nodes, &model.outputs);
+    let splitting_enabled = split_threshold > 0 && model.nodes.len() > 1;
+
+    // ── 3. Walk nodes with automatic splitting ──────────────────────────────────
+    let mut chunk_index: usize = 0;
+    // Weights already routed into the current sub-function (name -> sub-function tensor).
+    let mut weight_remap: HashMap<String, Tensor<'c>> = HashMap::new();
+
+    for (node_idx, node) in model.nodes.iter().enumerate() {
+        // Check if we should split based on MLIR op count in the current block.
+        let op_count = builder.block_op_count();
+        if splitting_enabled && op_count >= split_threshold {
+            if builder.in_subfunction() {
+                let live = collect_live_values(
+                    &mut value_map, &weight_names, &last_use, node_idx, builder,
+                );
+                end_chunk(builder, &mut value_map, &live);
+            }
+            let live = collect_live_values(
+                &mut value_map, &weight_names, &last_use, node_idx, builder,
+            );
+            begin_chunk(builder, &mut value_map, &live, chunk_index);
+            chunk_index += 1;
+            weight_remap.clear();
+        }
+
+        // Route weights into the current sub-function on demand.
+        if builder.in_subfunction() {
+            remap_node_weights(
+                node, &weight_names, &weight_compute_tensors,
+                &mut weight_remap, &mut value_map, builder,
+            );
+        }
+
         emit_node(node, &mut value_map, &mut const_i64, builder)?;
+    }
+
+    // Close the last sub-function if one is open.
+    if builder.in_subfunction() {
+        // Collect model output values as the final sub-function's returns.
+        let mut final_live: Vec<(String, Tensor<'c>)> = Vec::new();
+        for name in &model.outputs {
+            let ev = value_map.get(name)
+                .ok_or_else(|| OnnxError::MissingEdge(name.clone()))?;
+            final_live.push((name.clone(), ev.as_tensor(builder)));
+        }
+        end_chunk(builder, &mut value_map, &final_live);
     }
 
     // ── 4. Collect outputs ───────────────────────────────────────────────────────
@@ -257,7 +319,138 @@ pub fn emit_graph<'c>(
         outputs.push(ev.as_tensor(builder));
     }
 
+    if chunk_index > 0 {
+        eprintln!(
+            "[homura] emitter: split graph into {chunk_index} sub-functions (threshold={split_threshold})"
+        );
+    }
+
     Ok((outputs, weights))
+}
+
+/// Build a map from ONNX value name to the last node index that uses it as input.
+/// Model outputs are always considered live (last_use = usize::MAX).
+fn build_last_use_map(nodes: &[OnnxNode], model_outputs: &[String]) -> HashMap<String, usize> {
+    let mut last_use: HashMap<String, usize> = HashMap::new();
+    for (idx, node) in nodes.iter().enumerate() {
+        for input_name in &node.inputs {
+            if !input_name.is_empty() {
+                last_use.insert(input_name.clone(), idx);
+            }
+        }
+    }
+    // Model outputs must survive all splits.
+    for name in model_outputs {
+        last_use.insert(name.clone(), usize::MAX);
+    }
+    last_use
+}
+
+/// Collect live non-weight values from value_map whose last_use >= current node index.
+/// Returns (name, tensor) pairs. ShapeDims are materialized into i64 tensors.
+fn collect_live_values<'c>(
+    value_map: &mut HashMap<String, EmitValue<'c>>,
+    weight_names: &HashSet<String>,
+    last_use: &HashMap<String, usize>,
+    current_node_idx: usize,
+    builder: &mut GraphBuilder<'c>,
+) -> Vec<(String, Tensor<'c>)> {
+    // First pass: identify names and materialize ShapeDims.
+    let names_to_materialize: Vec<String> = value_map
+        .iter()
+        .filter(|(name, ev)| {
+            if weight_names.contains(*name) { return false; }
+            if let Some(&lu) = last_use.get(*name) {
+                if lu >= current_node_idx {
+                    matches!(ev, EmitValue::ShapeDims(_))
+                } else { false }
+            } else { false }
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    // Materialize ShapeDims → Tensor so they can cross function boundaries.
+    for name in &names_to_materialize {
+        let tensor = value_map[name].as_tensor(builder);
+        value_map.insert(name.clone(), EmitValue::Tensor(tensor));
+    }
+
+    // Second pass: collect all live tensors.
+    let mut live = Vec::new();
+    for (name, ev) in value_map.iter() {
+        if weight_names.contains(name) { continue; }
+        if let Some(&lu) = last_use.get(name) {
+            if lu >= current_node_idx {
+                match ev {
+                    EmitValue::Tensor(t) => live.push((name.clone(), *t)),
+                    EmitValue::ShapeDims(_) => {
+                        unreachable!("ShapeDims should have been materialized above");
+                    }
+                }
+            }
+        }
+    }
+    live.sort_by(|a, b| a.0.cmp(&b.0));
+    live
+}
+
+/// Begin a new sub-function chunk, passing live values as arguments.
+fn begin_chunk<'c>(
+    builder: &mut GraphBuilder<'c>,
+    value_map: &mut HashMap<String, EmitValue<'c>>,
+    live: &[(String, Tensor<'c>)],
+    chunk_index: usize,
+) {
+    let tensors: Vec<&Tensor<'c>> = live.iter().map(|(_, t)| t).collect();
+    let name = format!("chunk_{chunk_index}");
+    let (_handle, sub_args) = builder.begin_subfunction(&name, &tensors);
+
+    // Update value_map to point to sub-function argument tensors.
+    for (i, (name, _)) in live.iter().enumerate() {
+        value_map.insert(name.clone(), EmitValue::Tensor(sub_args[i]));
+    }
+}
+
+/// End the current sub-function, returning live values.
+fn end_chunk<'c>(
+    builder: &mut GraphBuilder<'c>,
+    value_map: &mut HashMap<String, EmitValue<'c>>,
+    live: &[(String, Tensor<'c>)],
+) {
+    let returns: Vec<&Tensor<'c>> = live.iter().map(|(_, t)| t).collect();
+    let handle = crate::graph_builder::SubFunctionHandle { _index: 0 };
+    let results = builder.end_subfunction(handle, &returns);
+
+    // Update value_map to point to @compute-scope call results.
+    for (i, (name, _)) in live.iter().enumerate() {
+        value_map.insert(name.clone(), EmitValue::Tensor(results[i]));
+    }
+}
+
+/// Route weight values into the current sub-function on demand.
+/// Checks which inputs of `node` are weights and adds them as sub-function args
+/// if not already mapped.
+fn remap_node_weights<'c>(
+    node: &OnnxNode,
+    weight_names: &HashSet<String>,
+    weight_compute_tensors: &HashMap<String, Tensor<'c>>,
+    weight_remap: &mut HashMap<String, Tensor<'c>>,
+    value_map: &mut HashMap<String, EmitValue<'c>>,
+    builder: &mut GraphBuilder<'c>,
+) {
+    for input_name in &node.inputs {
+        if input_name.is_empty() || !weight_names.contains(input_name) {
+            continue;
+        }
+        if weight_remap.contains_key(input_name) {
+            continue; // Already routed into this sub-function.
+        }
+        // Add weight as a dynamic sub-function argument.
+        let compute_tensor = weight_compute_tensors[input_name];
+        let sub_tensor = builder.add_subfunction_arg(&compute_tensor);
+        weight_remap.insert(input_name.clone(), sub_tensor);
+        value_map.insert(input_name.clone(), EmitValue::Tensor(sub_tensor));
+    }
 }
 
 // ── Node dispatch ──────────────────────────────────────────────────────────────

@@ -98,6 +98,28 @@ struct ArgInfo {
     is_input: bool,
 }
 
+/// A completed sub-function ready to be emitted into the MLIR module.
+struct CompletedSubFunction<'c> {
+    name: String,
+    block: Block<'c>,
+    arg_types: Vec<melior::ir::Type<'c>>,
+    return_types: Vec<melior::ir::Type<'c>>,
+}
+
+/// Stashed caller state while a sub-function is being built.
+struct SubFunctionBuildState<'c> {
+    name: String,
+    caller_block: Block<'c>,
+    caller_args: Vec<ArgInfo>,
+    /// Caller-side tensor values to pass to func.call when finalized.
+    caller_arg_values: Vec<melior::ir::Value<'c, 'c>>,
+}
+
+/// Handle to a sub-function being built. Returned by `begin_subfunction`.
+pub struct SubFunctionHandle {
+    pub _index: usize,
+}
+
 /// Owns the MLIR Context. Create one, then call `.builder()` to get a
 /// `GraphBuilder` that borrows from it.
 ///
@@ -128,6 +150,10 @@ pub struct GraphBuilder<'c> {
     block: Block<'c>,
     location: Location<'c>,
     args: Vec<ArgInfo>,
+    /// Completed sub-functions to emit into the MLIR module.
+    completed_subfunctions: Vec<CompletedSubFunction<'c>>,
+    /// Stashed caller state when building a sub-function (no nesting).
+    subfunction_build_state: Option<SubFunctionBuildState<'c>>,
 }
 
 impl<'c> GraphBuilder<'c> {
@@ -135,7 +161,12 @@ impl<'c> GraphBuilder<'c> {
     pub fn new(context: &'c Context) -> Self {
         let location = Location::unknown(context);
         let block = Block::new(&[]);
-        Self { context, block, location, args: Vec::new() }
+        Self {
+            context, block, location,
+            args: Vec::new(),
+            completed_subfunctions: Vec::new(),
+            subfunction_build_state: None,
+        }
     }
 
     /// Access the MLIR context.
@@ -163,6 +194,151 @@ impl<'c> GraphBuilder<'c> {
     /// Declare a weight tensor (large constant passed as function argument).
     pub fn add_weight(&mut self, shape: &[Option<u64>], dtype: DType) -> Tensor<'c> {
         self.add_arg(shape, dtype, false)
+    }
+
+    // ── Sub-function API ─────────────────────────────────────────────────────
+
+    /// Start building a new sub-function. `args` are caller-side tensors whose
+    /// types define the sub-function's parameters.
+    ///
+    /// Returns a handle and the sub-function's argument tensors (same types as
+    /// `args` but in the sub-function's scope). All subsequent `emit_*` calls
+    /// go into the sub-function until `end_subfunction` is called.
+    pub fn begin_subfunction(
+        &mut self,
+        name: &str,
+        args: &[&Tensor<'c>],
+    ) -> (SubFunctionHandle, Vec<Tensor<'c>>) {
+        assert!(
+            self.subfunction_build_state.is_none(),
+            "nested sub-functions not supported"
+        );
+
+        let handle = SubFunctionHandle {
+            _index: self.completed_subfunctions.len(),
+        };
+
+        // New block with tensor-typed arguments matching caller tensors.
+        let new_block = Block::new(&[]);
+        let mut sub_arg_tensors = Vec::with_capacity(args.len());
+
+        for &arg in args {
+            let tensor_type = arg.value().r#type();
+            new_block.add_argument(tensor_type, self.location);
+            let idx = new_block.argument_count() - 1;
+            sub_arg_tensors.push(Tensor::from_value(
+                new_block.argument(idx).unwrap().into(),
+            ));
+        }
+
+        // Stash caller state.
+        let caller_arg_values: Vec<_> = args.iter().map(|t| t.value()).collect();
+        let caller_block = std::mem::replace(&mut self.block, new_block);
+        let caller_args = std::mem::take(&mut self.args);
+
+        self.subfunction_build_state = Some(SubFunctionBuildState {
+            name: name.to_string(),
+            caller_block,
+            caller_args,
+            caller_arg_values,
+        });
+
+        (handle, sub_arg_tensors)
+    }
+
+    /// Dynamically add an argument to the sub-function being built.
+    /// `caller_value` is the tensor in the caller's scope. Returns the
+    /// corresponding tensor in the sub-function's scope.
+    ///
+    /// Use this to route weights directly to sub-functions without threading
+    /// them through intermediate sub-functions.
+    pub fn add_subfunction_arg(&mut self, caller_value: &Tensor<'c>) -> Tensor<'c> {
+        let state = self.subfunction_build_state.as_mut().expect(
+            "add_subfunction_arg called outside of a sub-function"
+        );
+        let tensor_type = caller_value.value().r#type();
+        self.block.add_argument(tensor_type, self.location);
+        let idx = self.block.argument_count() - 1;
+        state.caller_arg_values.push(caller_value.value());
+        Tensor::from_value(self.block.argument(idx).unwrap().into())
+    }
+
+    /// Returns true if currently building a sub-function.
+    pub fn in_subfunction(&self) -> bool {
+        self.subfunction_build_state.is_some()
+    }
+
+    /// Number of MLIR operations in the current block (approximate op count).
+    pub fn block_op_count(&self) -> usize {
+        // melior Block doesn't expose op count directly, but we can iterate.
+        let mut count = 0;
+        let mut maybe_op = self.block.first_operation();
+        while let Some(op) = maybe_op {
+            count += 1;
+            maybe_op = op.next_in_block();
+        }
+        count
+    }
+
+    /// Finalize the sub-function: add `func.return`, store the completed
+    /// sub-function, restore the caller block, emit `func.call`, and return
+    /// the call results as tensors in the caller's scope.
+    pub fn end_subfunction(
+        &mut self,
+        _handle: SubFunctionHandle,
+        returns: &[&Tensor<'c>],
+    ) -> Vec<Tensor<'c>> {
+        let state = self.subfunction_build_state.take().expect(
+            "end_subfunction called without matching begin_subfunction",
+        );
+
+        // func.return in the sub-function.
+        let return_values: Vec<melior::ir::Value> =
+            returns.iter().map(|t| t.value()).collect();
+        self.block
+            .append_operation(func::r#return(&return_values, self.location));
+
+        // Collect types for the FunctionType.
+        let arg_types: Vec<melior::ir::Type<'c>> = (0..self.block.argument_count())
+            .map(|i| self.block.argument(i).unwrap().r#type())
+            .collect();
+        let return_types: Vec<melior::ir::Type<'c>> =
+            returns.iter().map(|t| t.value().r#type()).collect();
+
+        // Store completed sub-function and restore caller block.
+        let sub_block = std::mem::replace(&mut self.block, state.caller_block);
+        self.args = state.caller_args;
+
+        let func_name = state.name.clone();
+        self.completed_subfunctions.push(CompletedSubFunction {
+            name: state.name,
+            block: sub_block,
+            arg_types,
+            return_types: return_types.clone(),
+        });
+
+        // Emit func.call in the caller block.
+        let callee_attr = Attribute::parse(
+            self.context,
+            &format!("@{func_name}"),
+        )
+        .expect("callee attr");
+
+        let call_op = OperationBuilder::new("func.call", self.location)
+            .add_operands(&state.caller_arg_values)
+            .add_results(&return_types)
+            .add_attributes(&[(
+                Identifier::new(self.context, "callee"),
+                callee_attr,
+            )])
+            .build()
+            .expect("func.call");
+
+        let call_ref = self.block.append_operation(call_op);
+
+        (0..returns.len())
+            .map(|i| Tensor::from_value(call_ref.result(i).unwrap().into()))
+            .collect()
     }
 
     // ── Elementwise binary ops ────────────────────────────────────────────────
@@ -5197,7 +5373,28 @@ impl<'c> GraphBuilder<'c> {
         ).expect("failed to parse dlti.dl_spec");
         module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
 
-        // Build func.func.
+        // Emit sub-functions before @compute.
+        for sub in self.completed_subfunctions {
+            let sub_func_type =
+                FunctionType::new(context, &sub.arg_types, &sub.return_types);
+            let sub_region = Region::new();
+            sub_region.append_block(sub.block);
+
+            let sub_func = func::func(
+                context,
+                StringAttribute::new(context, &sub.name),
+                TypeAttribute::new(sub_func_type.into()),
+                sub_region,
+                &[(
+                    Identifier::new(context, "llvm.emit_c_interface"),
+                    Attribute::unit(context),
+                )],
+                location,
+            );
+            module.body().append_operation(sub_func);
+        }
+
+        // Build func.func @compute.
         let func_region = Region::new();
         func_region.append_block(self.block);
 
@@ -5254,7 +5451,7 @@ impl<'c> GraphBuilder<'c> {
             pass_manager.as_operation_pass_manager(),
             "builtin.module(\
                 func.func(canonicalize,cse),\
-                one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+                one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 fold-memref-alias-ops,\
                 func.func(linalg-generalize-named-ops),\
@@ -7109,5 +7306,71 @@ mod tests {
         let out = graph.run(&[&a_buf, &b_buf]);
         assert_eq!(out[0].shape().0, vec![2, 3, 5]);
         assert!(out[0].as_slice::<f32>().iter().all(|v| v.is_finite()));
+    }
+
+    // ── Sub-function tests (tasks 1.5, 1.6) ─────────────────────────────────
+
+    #[test]
+    fn subfunction_simple_matmul() {
+        // Task 1.5: input → sub-function(matmul) → return.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+
+        let a = gb.input(&[Some(2), Some(3)], DType::F32);
+        let b = gb.input(&[Some(3), Some(4)], DType::F32);
+
+        // Start sub-function that receives a and b.
+        let (handle, sub_args) = gb.begin_subfunction("chunk_0", &[&a, &b]);
+        let product = gb.emit_matmul(&sub_args[0], &sub_args[1]);
+        let results = gb.end_subfunction(handle, &[&product]);
+
+        // results[0] is the matmul result in @compute's scope.
+        let graph = gb.compile(&[&results[0]]).expect("compile with subfunction");
+
+        // a: [[1,2,3],[4,5,6]], b: [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
+        let a_buf = Buffer::from_slice(
+            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[2, 3],
+            DType::F32,
+        );
+        let b_buf = Buffer::from_slice(
+            &[1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[3, 4],
+            DType::F32,
+        );
+        let out = graph.run(&[&a_buf, &b_buf]);
+        assert_eq!(out[0].shape().0, vec![2, 4]);
+        let data = out[0].as_slice::<f32>();
+        // With identity-like b, result = [1,2,3,0; 4,5,6,0]
+        assert_eq!(data, &[1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0]);
+    }
+
+    #[test]
+    fn subfunction_two_chained() {
+        // Task 1.6: chunk_0 produces value, chunk_1 consumes it.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+
+        let x = gb.input(&[Some(4)], DType::F32);
+        let y = gb.input(&[Some(4)], DType::F32);
+
+        // chunk_0: add x + y
+        let (h0, args0) = gb.begin_subfunction("chunk_0", &[&x, &y]);
+        let sum = gb.emit_add(&args0[0], &args0[1]);
+        let r0 = gb.end_subfunction(h0, &[&sum]);
+
+        // chunk_1: mul result * y
+        let (h1, args1) = gb.begin_subfunction("chunk_1", &[&r0[0], &y]);
+        let product = gb.emit_mul(&args1[0], &args1[1]);
+        let r1 = gb.end_subfunction(h1, &[&product]);
+
+        let graph = gb.compile(&[&r1[0]]).expect("compile chained subfunctions");
+
+        let x_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let y_buf = Buffer::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[4], DType::F32);
+        let out = graph.run(&[&x_buf, &y_buf]);
+        let data = out[0].as_slice::<f32>();
+        // (x+y)*y = (1+10)*10, (2+20)*20, (3+30)*30, (4+40)*40 = 110, 440, 990, 1760
+        assert_eq!(data, &[110.0, 440.0, 990.0, 1760.0]);
     }
 }
