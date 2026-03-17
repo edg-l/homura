@@ -6,44 +6,22 @@
 - Reference: llama.cpp does ~100+ tok/s on similar hardware (~25x faster)
 - 232ms/token breakdown: **99% JIT execution**, <1% setup, <1% argmax/KV update
 
-## Critical issue: two compilation paths
+## Pipeline unification (done)
 
-There are two separate compilation pipelines:
+Both compilation paths now share the same transform schedule and pass
+pipeline. Graph_builder emits `linalg.generic` for matmuls (not named
+ops), calls `build_transform_schedule`, and runs the full pipeline:
+tiling → vectorization → OpenMP → LLVM.
 
-1. **`Compiler::compile`** (tensor trace API) — has the transform schedule
-   with tiling (32×32×32 cache + 8×8×1 register), padding, vectorization,
-   and OpenMP support. Used by unit tests.
+**Current blocker**: LLVM backend compilation (O3 + instruction selection)
+takes ~10 minutes on the tiled+vectorized GPT-2 IR. The MLIR passes
+complete successfully. The `.so` would be cached after first compile.
 
-2. **`GraphBuilder::compile_with_cache`** (graph_builder) — used by ONNX
-   model inference (GPT-2). Has **none of the above**: no transform
-   schedule, no tiling, no vectorization, no OpenMP. Goes straight from
-   `linalg → loops → LLVM` with naive scalar code.
-
-**GPT-2 runs through path 2.** The 4.3 tok/s measurement is on completely
-unoptimized scalar loops — not "tiled but naive" as previously assumed.
-This means the actual performance gap is much larger than expected, and
-adding the transform schedule to graph_builder should give a massive
-improvement even before threading.
-
-### Phase 0: Unify compilation pipelines (prerequisite for everything)
-
-Add the transform schedule and optimized pass pipeline to graph_builder's
-`compile_with_cache`. This is a prerequisite for all other phases.
-
-**Changes needed in `graph_builder.rs`**:
-1. Call `build_transform_schedule` before the pass pipeline (requires
-   adding `transform.with_named_sequence` module attribute).
-2. Add `transform-interpreter` + `canonicalize,cse` + `symbol-dce` to the
-   pipeline, before bufferization.
-3. Add `func.func(lower-vector-multi-reduction, lower-vector-mask)` for
-   vector lowering (the transform schedule vectorizes contractions).
-4. Add `scf-forall-to-parallel`, `convert-scf-to-openmp`,
-   `convert-openmp-to-llvm` in the correct positions (see Compiler::compile
-   pipeline for the working order).
-5. Add `convert-vector-to-scf` and `convert-vector-to-llvm` passes.
-
-**Expected impact**: Going from scalar loops to tiled+vectorized code
-should give a **10-50x improvement on its own**, before any threading.
+Options to fix compilation time:
+- Parallel codegen: split MLIR module into per-function .o files, compile
+  on separate threads, link together
+- Size threshold: skip tiling for small contractions that don't benefit
+- Accept one-time cost: cached .so makes subsequent runs instant
 
 ## Bottlenecks
 
@@ -91,13 +69,20 @@ Each decode step reads/writes the full KV cache ([1, 12, seq_len, 64]
 
 All MLIR-native — no external BLAS. Each phase builds on the previous.
 
-### Phase 0: Unify pipelines (10-50x → ~40-200 tok/s)
+### Phase 0: Unify pipelines — DONE
 
-Add the transform schedule (tiling + vectorization) to graph_builder.
-This is the single biggest win because GPT-2 is currently running
-completely unoptimized scalar loops.
+Pipelines unified. Graph_builder now emits `linalg.generic` for matmuls
+and shares `build_transform_schedule` with the compiler path. Both paths
+have tiling, vectorization, and OpenMP.
 
-See "Critical issue" section above for implementation details.
+**Blocker**: LLVM backend O3 compilation takes ~10 minutes on the
+tiled+vectorized GPT-2 IR (stuck in X86 instruction selection on the
+large vectorized module). The `.so` is cached after first compile.
+
+**Options to fix**:
+- Split module into per-function compilation units, compile in parallel
+- Add size threshold to matcher — skip tiling tiny contractions
+- Accept one-time cost (cached)
 
 ### Phase 1: Multi-threading (6-10x → ~25-40 tok/s)
 
@@ -128,8 +113,8 @@ biggest win because we have 12 cores doing nothing.
 - Only parallelize the OUTER (cache) tile level. The inner register
   tile runs sequentially per thread — this is the standard approach.
 
-**Status**: Implemented in `Compiler::compile` path (commit 558756e).
-Needs to be carried over to graph_builder as part of Phase 0.
+**Status**: Implemented in both paths. `tile_using_forall` + OpenMP passes
+are in the shared `build_transform_schedule` and unified pipeline.
 
 **Verification**: measure with `perf stat` to confirm all cores active.
 Target: 6-10x speedup → **25-40 tok/s**.
@@ -248,20 +233,17 @@ Requires `arith.truncf`/`arith.extf` at the KV cache boundary.
 
 ## Summary
 
-| Phase | Change | Target tok/s | Cumulative |
+| Phase | Change | Status | Target tok/s |
 |---|---|---|---|
-| Current | Unoptimized scalar loops (!) | 4.3 | 4.3 |
-| 0 | Tiling + vectorization in graph_builder | ×10-50 | 40-200 |
-| 1 | Multi-threading (OpenMP) | ×6-10 | 250-2000 |
-| 2 | Packed GEMM layout | ×2-4 | 500-8000 |
-| 3 | AVX-512 + unroll + loop order | ×1.5-2 | 750-16000 |
-| 4 | Fusion + weight prepack + KV quant | ×1.3-2 | 1000-32000 |
+| 0 | Tiling + vectorization + OpenMP in graph_builder | **Done** (blocked by slow LLVM compile) | unmeasured |
+| 1 | Multi-threading (OpenMP) | Done (part of Phase 0) | ×6-10 |
+| 2 | Packed GEMM layout | Not started | ×2-4 |
+| 3 | AVX-512 + unroll + loop order | Not started | ×1.5-2 |
+| 4 | Fusion + weight prepack + KV quant | Not started | ×1.3-2 |
 
-Note: Phase 0 targets are speculative — the actual improvement from
-adding tiling+vectorization to the graph_builder path hasn't been
-measured yet. Upper estimates are likely unrealistic due to memory
-bandwidth limits. Real-world target after all phases: ~100-300 tok/s
-(matching llama.cpp).
+Immediate next step: fix LLVM backend compilation time so we can
+measure actual tok/s with the new pipeline. Until then, performance
+impact of Phase 0+1 is unknown.
 
 All phases use MLIR transform dialect + standard passes. No external
 BLAS, no hand-written assembly. The compiler generates everything.
