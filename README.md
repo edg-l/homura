@@ -116,10 +116,14 @@ cargo test                                        # ~365 tests
 
 **Milestone 3** (complete) — 17 new ONNX ops, symbolic dimensions, multiple outputs, batched matmul, BPE tokenizer, generation loop, AOT compilation with native .so caching. GPT-2 runs end-to-end.
 
-**Milestone 4** — GPU backend (CUDA/Vulkan via MLIR gpu passes)
+**Milestone 4** (complete) — Dynamic shapes + KV cache. Two-model prefill/decode architecture. Decode model compiles once, ~0.30s/token on CPU.
 
-**Milestone 5** — Dynamic shapes + KV cache. Interactive chat speed.
+**Milestone 5** (in progress) — Linalg tiling and loop optimization. Affine loop tiling for cache locality, then `linalg-block-pack-matmul` for GEMM, then transform dialect for full tiling/vectorization/fusion control.
 
-**Milestone 6** — Quantization, graph optimizations, multi-model, multi-GPU
+**Milestone 6** — Parallel compilation. Split monolithic function into per-layer functions for parallel LLVM compilation.
+
+**Milestone 7** — Production-grade CPU: graph optimizations, more models (LLaMA, Mistral, Phi), quantization (int8/int4), streaming output.
+
+**Milestone 8** — GPU backend (CUDA/Vulkan via MLIR gpu passes). Multi-GPU.
 
 See [docs/design.md](docs/design.md) for details.
