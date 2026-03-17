@@ -2608,7 +2608,7 @@ impl<'c> GraphBuilder<'c> {
 
     // ── Matmul internals ──────────────────────────────────────────────────────
 
-    /// Emit `linalg.matmul` for 2D inputs `[M,K] x [K,N] -> [M,N]`.
+    /// Emit `linalg.generic` matmul for 2D inputs `[M,K] x [K,N] -> [M,N]`.
     /// Handles static and dynamic M, K, N.
     fn emit_matmul_2d(
         &mut self,
@@ -2632,18 +2632,32 @@ impl<'c> GraphBuilder<'c> {
             .expect("matmul segment sizes");
         let matmul_region = self.make_matmul_region(dtype);
 
+        // 3 iteration dims: d0=M, d1=N, d2=K
+        let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
+        let rhs_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
+        let out_map = "affine_map<(d0, d1, d2) -> (d0, d1)>";
+        let indexing_maps = Attribute::parse(
+            self.context,
+            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
+        ).expect("matmul 2d indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+        ).expect("matmul 2d iterator types");
+
         let result = self.block
             .append_operation(
-                OperationBuilder::new("linalg.matmul", self.location)
+                OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, filled])
                     .add_results(&[out_type])
-                    .add_attributes(&[(
-                        Identifier::new(self.context, "operandSegmentSizes"),
-                        segment,
-                    )])
+                    .add_attributes(&[
+                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
+                        (Identifier::new(self.context, "iterator_types"), iterator_types),
+                        (Identifier::new(self.context, "operandSegmentSizes"), segment),
+                    ])
                     .add_regions([matmul_region])
                     .build()
-                    .expect("linalg.matmul"),
+                    .expect("linalg.generic matmul 2d"),
             )
             .result(0)
             .unwrap()
@@ -2651,7 +2665,7 @@ impl<'c> GraphBuilder<'c> {
         Tensor::from_value(result)
     }
 
-    /// Emit `linalg.batch_matmul` for 3D inputs `[B,M,K] x [B,K,N] -> [B,M,N]`.
+    /// Emit `linalg.generic` batch matmul for 3D inputs `[B,M,K] x [B,K,N] -> [B,M,N]`.
     fn emit_batch_matmul_3d(
         &mut self,
         lhs_val: melior::ir::Value<'c, 'c>,
@@ -2676,18 +2690,32 @@ impl<'c> GraphBuilder<'c> {
             .expect("batch_matmul segment sizes");
         let matmul_region = self.make_matmul_region(dtype);
 
+        // 4 iteration dims: d0=B, d1=M, d2=N, d3=K
+        let lhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>";
+        let rhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>";
+        let out_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>";
+        let indexing_maps = Attribute::parse(
+            self.context,
+            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
+        ).expect("batch matmul 3d indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+        ).expect("batch matmul 3d iterator types");
+
         let result = self.block
             .append_operation(
-                OperationBuilder::new("linalg.batch_matmul", self.location)
+                OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, filled])
                     .add_results(&[out_type])
-                    .add_attributes(&[(
-                        Identifier::new(self.context, "operandSegmentSizes"),
-                        segment,
-                    )])
+                    .add_attributes(&[
+                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
+                        (Identifier::new(self.context, "iterator_types"), iterator_types),
+                        (Identifier::new(self.context, "operandSegmentSizes"), segment),
+                    ])
                     .add_regions([matmul_region])
                     .build()
-                    .expect("linalg.batch_matmul"),
+                    .expect("linalg.generic batch matmul 3d"),
             )
             .result(0)
             .unwrap()
@@ -6348,6 +6376,14 @@ impl<'c> GraphBuilder<'c> {
 
         module.body().append_operation(function);
 
+        // Attach the transform schedule so transform-interpreter can tile
+        // and vectorize linalg.generic contraction ops.
+        module.as_operation_mut().set_attribute(
+            "transform.with_named_sequence",
+            Attribute::unit(context),
+        );
+        crate::compiler::build_transform_schedule(context, &module, location);
+
         // Dump pre-pass IR if requested.
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_gb_pre_passes.mlir", module.as_operation().to_string());
@@ -6377,24 +6413,33 @@ impl<'c> GraphBuilder<'c> {
             }
         }
 
-        // Run lowering passes (linalg-direct pipeline, no TOSA).
+        // Run lowering passes: transform schedule + vectorization + bufferization.
         register_all_passes();
         let pass_manager = pass::PassManager::new(context);
         parse_pass_pipeline(
             pass_manager.as_operation_pass_manager(),
             "builtin.module(\
                 func.func(canonicalize,cse),\
+                transform-interpreter,\
+                func.func(canonicalize,cse),\
+                symbol-dce,\
+                func.func(lower-vector-multi-reduction,lower-vector-mask),\
                 one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+                scf-forall-to-parallel,\
                 fold-memref-alias-ops,\
-                func.func(linalg-generalize-named-ops),\
+                convert-vector-to-scf,\
                 convert-linalg-to-loops,\
                 fold-memref-alias-ops,\
                 lower-affine,\
+                convert-scf-to-openmp,\
+                convert-openmp-to-llvm,\
                 convert-scf-to-cf,\
                 canonicalize,\
                 cse,\
                 sccp,\
+                convert-vector-to-llvm,\
+                convert-ub-to-llvm,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
                 lower-affine,\
@@ -6403,6 +6448,7 @@ impl<'c> GraphBuilder<'c> {
                 convert-index-to-llvm,\
                 convert-cf-to-llvm,\
                 convert-func-to-llvm,\
+                convert-openmp-to-llvm,\
                 reconcile-unrealized-casts\
             )",
         )

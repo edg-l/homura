@@ -626,258 +626,324 @@ fn create_context() -> Context {
 
 // ── Transform dialect schedule ────────────────────────────────────────────────
 //
-// Emits three transform named_sequences that use foreach_match to find and tile
-// all contraction-like linalg.generic ops (arith.mulf + arith.addf body) with
-// 32×32×32 tiles for cache locality. This covers both batch_matmul and the 4D
-// attention contractions emitted for GPT-2.
+// Emits transform named_sequences that use foreach_match to find and tile
+// contraction-like linalg.generic ops (arith.mulf + arith.addf body).
 //
 // Structure:
-//   @match_contraction  — structured match: body has contraction [mulf, addf]
-//   @tile_contraction   — structured.tile_using_for with [32, 32, 32] sizes
-//   @__transform_main   — foreach_match dispatching the two above
+//   @match_contraction_3d  — matches 3-iter-dim contractions (plain matmul)
+//   @tile_contraction_3d   — tiles [32, 32, 0] (M, N parallel; K sequential)
+//   @match_contraction_4d  — matches 4-iter-dim contractions (batched matmul)
+//   @tile_contraction_4d   — tiles [0, 32, 32, 0] (B untiled; M, N parallel; K sequential)
+//   @__transform_main      — foreach_match dispatching the two pairs
 
-fn build_transform_schedule<'c>(
+pub(crate) fn build_transform_schedule<'c>(
     context: &'c Context,
     module: &Module<'c>,
     location: Location<'c>,
 ) {
     let any_op_type =
         melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
+    let param_i64_type =
+        melior::ir::Type::parse(context, "!transform.param<i64>").expect("parse !transform.param<i64>");
 
-    // ── @match_contraction ────────────────────────────────────────────────────
+    // Helper: build a @match_contraction_Nd named_sequence that matches
+    // linalg.generic contraction ops with exactly `rank` iteration dims.
     //
-    // transform.named_sequence @match_contraction(%op: !transform.any_op {transform.readonly})
-    //     -> !transform.any_op {
-    //   transform.match.structured %op : !transform.any_op {
-    //   ^bb0(%arg0: !transform.any_op):
-    //     transform.match.structured.body %arg0 {contraction = ["arith.mulf", "arith.addf"]}
-    //     transform.match.structured.yield %arg0
-    //   }
-    //   transform.yield %op
-    // }
+    // The sequence filters by:
+    //   1. transform.match.operation_name — must be "linalg.generic"
+    //   2. transform.match.structured body — must have contraction [mulf, addf] body
+    //   3. transform.match.structured.rank — iteration dims must equal `rank`
+    //   4. transform.match.param.cmpi eq  — enforce exact rank
+    let build_match_seq = |name: &str, rank: i64| {
+        // ── inner block of match.structured ──────────────────────────────────
+        // ^bb0(%arg0: !transform.any_op):
+        //   transform.match.structured.body %arg0 {contraction = ["arith.mulf", "arith.addf"]}
+        //   %rank = transform.match.structured.rank %arg0 : ... -> !transform.param<i64>
+        //   transform.match.structured.yield %arg0, %rank
+        let inner_block = Block::new(&[(any_op_type, location)]);
+        let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
 
-    // Inner block of match.structured body: takes one !transform.any_op arg
-    let inner_block = Block::new(&[(any_op_type, location)]);
-    let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
+        let contraction_attr = ArrayAttribute::new(
+            context,
+            &[
+                StringAttribute::new(context, "arith.mulf").into(),
+                StringAttribute::new(context, "arith.addf").into(),
+            ],
+        );
+        let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
+            .add_operands(&[inner_arg])
+            .add_attributes(&[(
+                Identifier::new(context, "contraction"),
+                contraction_attr.into(),
+            )])
+            .build()
+            .expect("build transform.match.structured.body");
+        inner_block.append_operation(body_check_op);
 
-    // transform.match.structured.body %arg0 {contraction = ["arith.mulf", "arith.addf"]}
-    let contraction_attr = ArrayAttribute::new(
-        context,
-        &[
-            StringAttribute::new(context, "arith.mulf").into(),
-            StringAttribute::new(context, "arith.addf").into(),
-        ],
-    );
-    let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
-        .add_operands(&[inner_arg])
-        .add_attributes(&[(
-            Identifier::new(context, "contraction"),
-            contraction_attr.into(),
-        )])
-        .build()
-        .expect("build transform.match.structured.body");
-    inner_block.append_operation(body_check_op);
+        // Capture the iteration rank of this structured op.
+        let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
+            .add_operands(&[inner_arg])
+            .add_results(&[param_i64_type])
+            .build()
+            .expect("build transform.match.structured.rank");
+        let rank_ref = inner_block.append_operation(rank_op);
+        let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
 
-    // transform.match.structured.yield %arg0
-    let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
-        .add_operands(&[inner_arg])
-        .build()
-        .expect("build transform.match.structured.yield");
-    inner_block.append_operation(inner_yield_op);
+        // Yield both the op handle and rank param out of the inner block.
+        let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
+            .add_operands(&[inner_arg, rank_param])
+            .build()
+            .expect("build transform.match.structured.yield");
+        inner_block.append_operation(inner_yield_op);
 
-    let inner_region = Region::new();
-    inner_region.append_block(inner_block);
+        let inner_region = Region::new();
+        inner_region.append_block(inner_block);
 
-    // Outer block of @match_contraction: takes one !transform.any_op arg (the candidate op)
-    let match_outer_block = Block::new(&[(any_op_type, location)]);
-    let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
+        // ── outer block of @match_contraction_Nd ─────────────────────────────
+        let match_outer_block = Block::new(&[(any_op_type, location)]);
+        let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
 
-    // Filter to linalg.generic only — named ops (batch_matmul etc.) fail to vectorize
-    // after tiling because they produce dynamic-shaped named ops.
-    // transform.match.operation_name %candidate ["linalg.generic"] : !transform.any_op
-    let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
-        .add_operands(&[candidate])
-        .add_attributes(&[(
-            Identifier::new(context, "op_names"),
-            ArrayAttribute::new(
-                context,
-                &[StringAttribute::new(context, "linalg.generic").into()],
-            )
-            .into(),
-        )])
-        .build()
-        .expect("build transform.match.operation_name");
-    match_outer_block.append_operation(op_name_filter);
+        // Filter to linalg.generic only.
+        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
+            .add_operands(&[candidate])
+            .add_attributes(&[(
+                Identifier::new(context, "op_names"),
+                ArrayAttribute::new(
+                    context,
+                    &[StringAttribute::new(context, "linalg.generic").into()],
+                )
+                .into(),
+            )])
+            .build()
+            .expect("build transform.match.operation_name");
+        match_outer_block.append_operation(op_name_filter);
 
-    // transform.match.structured %candidate : !transform.any_op { ... } -> !transform.any_op
-    let match_structured_op = OperationBuilder::new("transform.match.structured", location)
-        .add_operands(&[candidate])
-        .add_results(&[any_op_type])
-        .add_regions([inner_region])
-        .build()
-        .expect("build transform.match.structured");
-    let match_structured_ref = match_outer_block.append_operation(match_structured_op);
-    let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
+        // match.structured returns (!transform.any_op, !transform.param<i64>)
+        let match_structured_op = OperationBuilder::new("transform.match.structured", location)
+            .add_operands(&[candidate])
+            .add_results(&[any_op_type, param_i64_type])
+            .add_regions([inner_region])
+            .build()
+            .expect("build transform.match.structured");
+        let match_structured_ref = match_outer_block.append_operation(match_structured_op);
+        let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
+        let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
 
-    // transform.yield %matched_op
-    let match_outer_yield = OperationBuilder::new("transform.yield", location)
-        .add_operands(&[matched_op])
-        .build()
-        .expect("build transform.yield (match_contraction)");
-    match_outer_block.append_operation(match_outer_yield);
+        // transform.param.constant <rank> : i64 -> !transform.param<i64>
+        let rank_const_attr = Attribute::parse(context, &format!("{rank} : i64"))
+            .expect("parse rank constant attr");
+        let rank_const_op = OperationBuilder::new("transform.param.constant", location)
+            .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
+            .add_results(&[param_i64_type])
+            .build()
+            .expect("build transform.param.constant");
+        let rank_const_ref = match_outer_block.append_operation(rank_const_op);
+        let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
 
-    let match_outer_region = Region::new();
-    match_outer_region.append_block(match_outer_block);
+        // transform.match.param.cmpi eq %matched_rank, %expected_rank : !transform.param<i64>
+        // predicate attr: I32EnumAttr with value eq=0
+        let predicate_attr = Attribute::parse(context, "0 : i32")
+            .expect("parse eq predicate");
+        let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
+            .add_operands(&[matched_rank, expected_rank])
+            .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
+            .build()
+            .expect("build transform.match.param.cmpi");
+        match_outer_block.append_operation(cmpi_op);
 
-    // function_type: (!transform.any_op) -> !transform.any_op
-    let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
-    let match_arg_attrs =
-        Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
+        // transform.yield %matched_op
+        let match_outer_yield = OperationBuilder::new("transform.yield", location)
+            .add_operands(&[matched_op])
+            .build()
+            .expect("build transform.yield (match_contraction)");
+        match_outer_block.append_operation(match_outer_yield);
 
-    let match_named_seq = OperationBuilder::new("transform.named_sequence", location)
-        .add_attributes(&[
-            (
-                Identifier::new(context, "sym_name"),
-                StringAttribute::new(context, "match_contraction").into(),
-            ),
-            (
-                Identifier::new(context, "function_type"),
-                TypeAttribute::new(match_func_type.into()).into(),
-            ),
-            (Identifier::new(context, "arg_attrs"), match_arg_attrs),
-            (
-                Identifier::new(context, "sym_visibility"),
-                StringAttribute::new(context, "private").into(),
-            ),
-        ])
-        .add_regions([match_outer_region])
-        .build()
-        .expect("build transform.named_sequence @match_contraction");
-    module.body().append_operation(match_named_seq);
+        let match_outer_region = Region::new();
+        match_outer_region.append_block(match_outer_block);
 
-    // ── @tile_contraction ─────────────────────────────────────────────────────
+        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
+        let match_arg_attrs =
+            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
+
+        OperationBuilder::new("transform.named_sequence", location)
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "sym_name"),
+                    StringAttribute::new(context, name).into(),
+                ),
+                (
+                    Identifier::new(context, "function_type"),
+                    TypeAttribute::new(match_func_type.into()).into(),
+                ),
+                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
+                (
+                    Identifier::new(context, "sym_visibility"),
+                    StringAttribute::new(context, "private").into(),
+                ),
+            ])
+            .add_regions([match_outer_region])
+            .build()
+            .expect("build transform.named_sequence @match_contraction_Nd")
+    };
+
+    // Helper: build a @tile_contraction_Nd named_sequence.
     //
-    // transform.named_sequence @tile_contraction(%op: !transform.any_op {transform.consumed}) {
-    //   %tiled, %forall = transform.structured.tile_using_forall %op
-    //       tile_sizes [32, 32, 0]   -- M, N parallel; K sequential
-    //   %tiled_reg, ... = transform.structured.tile_using_for %tiled
-    //       tile_sizes [8, 8, 1]     -- register tile for vectorization
-    //   transform.structured.pad %tiled_reg ...
-    //   transform.yield
-    // }
+    // `forall_sizes`:   static_tile_sizes for tile_using_forall (cache tile, 0 = skip dim)
+    // `reg_sizes`:      static_sizes for tile_using_for (register tile)
+    // `pad_dims`:       MLIR array attribute text for padding_dimensions
+    // `pad_multiples`:  MLIR array<i64:...> text for static_pad_to_multiple_of
+    // `n_reg_loops`:    number of non-zero dims in reg_sizes (= number of loop results)
+    let build_tile_seq = |name: &str,
+                          forall_sizes: &str,
+                          scalable_forall: &str,
+                          reg_sizes: &str,
+                          scalable_reg: &str,
+                          pad_dims: &str,
+                          pad_multiples: &str,
+                          n_reg_loops: usize| {
+        let tile_outer_block = Block::new(&[(any_op_type, location)]);
+        let op_to_tile: melior::ir::Value = tile_outer_block.argument(0).unwrap().into();
 
-    let tile_outer_block = Block::new(&[(any_op_type, location)]);
-    let op_to_tile: melior::ir::Value = tile_outer_block.argument(0).unwrap().into();
-
-    // L1 cache tile: tile_using_forall with tile_sizes [32, 32, 0].
-    // M and N are parallel (mapped to scf.forall threads), K (reduction) is
-    // not tiled here (0 = full size) — it stays sequential and is handled by
-    // the register tile below.
-    let static_tile_sizes_attr = Attribute::parse(context, "array<i64: 32, 32, 0>")
-        .expect("parse static_tile_sizes");
-    let static_num_threads_attr = Attribute::parse(context, "array<i64>")
-        .expect("parse static_num_threads");
-    let scalable_sizes_attr =
-        Attribute::parse(context, "array<i1: false, false, false>")
+        let static_tile_sizes_attr = Attribute::parse(context, forall_sizes)
+            .expect("parse static_tile_sizes");
+        let static_num_threads_attr = Attribute::parse(context, "array<i64>")
+            .expect("parse static_num_threads");
+        let scalable_sizes_attr = Attribute::parse(context, scalable_forall)
             .expect("parse scalable_sizes");
+        let operand_segment_sizes = Attribute::parse(context, "array<i32: 1, 0, 0, 0, 0>")
+            .expect("parse operandSegmentSizes");
 
-    // operandSegmentSizes: target=1, num_threads=0, tile_sizes=0,
-    // packed_num_threads=0, packed_tile_sizes=0
-    let operand_segment_sizes = Attribute::parse(context, "array<i32: 1, 0, 0, 0, 0>")
-        .expect("parse operandSegmentSizes");
+        let tile_op = OperationBuilder::new("transform.structured.tile_using_forall", location)
+            .add_operands(&[op_to_tile])
+            .add_attributes(&[
+                (Identifier::new(context, "static_num_threads"), static_num_threads_attr),
+                (Identifier::new(context, "static_tile_sizes"), static_tile_sizes_attr),
+                (Identifier::new(context, "scalable_sizes"), scalable_sizes_attr),
+                (Identifier::new(context, "operandSegmentSizes"), operand_segment_sizes),
+            ])
+            .add_results(&[any_op_type, any_op_type])
+            .build()
+            .expect("build structured.tile_using_forall (cache tile)");
+        let tile_l1_ref = tile_outer_block.append_operation(tile_op);
+        let tiled_l1: melior::ir::Value = tile_l1_ref.result(0).unwrap().into();
 
-    let tile_op = OperationBuilder::new("transform.structured.tile_using_forall", location)
-        .add_operands(&[op_to_tile])
-        .add_attributes(&[
-            (Identifier::new(context, "static_num_threads"), static_num_threads_attr),
-            (Identifier::new(context, "static_tile_sizes"), static_tile_sizes_attr),
-            (Identifier::new(context, "scalable_sizes"), scalable_sizes_attr),
-            (Identifier::new(context, "operandSegmentSizes"), operand_segment_sizes),
-        ])
-        .add_results(&[any_op_type, any_op_type]) // (tiled_op, forall_op)
-        .build()
-        .expect("build structured.tile_using_forall (cache tile)");
-    let tile_l1_ref = tile_outer_block.append_operation(tile_op);
-    let tiled_l1: melior::ir::Value = tile_l1_ref.result(0).unwrap().into();
+        let reg_static_sizes = Attribute::parse(context, reg_sizes)
+            .expect("parse reg static_sizes");
+        let reg_scalable_sizes = Attribute::parse(context, scalable_reg)
+            .expect("parse reg scalable_sizes");
 
-    // Level 2: register tile — tile_sizes [8, 8, 1] for vectorization
-    let reg_static_sizes =
-        Attribute::parse(context, "array<i64: 8, 8, 1>").expect("parse reg static_sizes");
-    let reg_scalable_sizes =
-        Attribute::parse(context, "array<i1: false, false, false>").expect("parse reg scalable_sizes");
+        // tile_using_for returns: tiled_op + one loop handle per non-zero tile dim
+        let mut reg_results: Vec<melior::ir::Type> = vec![any_op_type];
+        for _ in 0..n_reg_loops {
+            reg_results.push(any_op_type);
+        }
+        let reg_tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+            .add_operands(&[tiled_l1])
+            .add_attributes(&[
+                (Identifier::new(context, "static_sizes"), reg_static_sizes),
+                (Identifier::new(context, "scalable_sizes"), reg_scalable_sizes),
+            ])
+            .add_results(&reg_results)
+            .build()
+            .expect("build structured.tile_using_for (register tile)");
+        let reg_tile_ref = tile_outer_block.append_operation(reg_tile_op);
+        let tiled_l2: melior::ir::Value = reg_tile_ref.result(0).unwrap().into();
 
-    let reg_tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
-        .add_operands(&[tiled_l1])
-        .add_attributes(&[
-            (Identifier::new(context, "static_sizes"), reg_static_sizes),
-            (Identifier::new(context, "scalable_sizes"), reg_scalable_sizes),
-        ])
-        .add_results(&[any_op_type, any_op_type, any_op_type, any_op_type]) // tiled + 3 loops (all non-zero)
-        .build()
-        .expect("build structured.tile_using_for (register tile)");
-    let reg_tile_ref = tile_outer_block.append_operation(reg_tile_op);
-    let tiled_l2: melior::ir::Value = reg_tile_ref.result(0).unwrap().into();
+        let pad_dims_attr = Attribute::parse(context, pad_dims)
+            .expect("parse padding_dimensions");
+        let pad_multiples_attr = Attribute::parse(context, pad_multiples)
+            .expect("parse pad_to_multiple_of");
+        let copy_back = StringAttribute::new(context, "none");
+        let pad_op = OperationBuilder::new("transform.structured.pad", location)
+            .add_operands(&[tiled_l2])
+            .add_attributes(&[
+                (Identifier::new(context, "padding_dimensions"), pad_dims_attr),
+                (Identifier::new(context, "static_pad_to_multiple_of"), pad_multiples_attr),
+                (Identifier::new(context, "copy_back_op"), copy_back.into()),
+            ])
+            .add_results(&[any_op_type, any_op_type, any_op_type])
+            .build()
+            .expect("build structured.pad");
+        tile_outer_block.append_operation(pad_op);
 
-    // Pad the register-tiled op so boundary tiles get static shapes matching
-    // the tile sizes.  This converts dynamic dims from affine.min into static
-    // [8, 8, 1], enabling vectorization without masked ops.
-    // padding_values is omitted (empty) → auto-inferred as 0 for the mulf/addf ring.
-    let pad_dims = Attribute::parse(context, "[0, 1, 2]").expect("parse padding_dimensions");
-    let pad_multiples =
-        Attribute::parse(context, "array<i64: 8, 8, 1>").expect("parse pad_to_multiple_of");
-    let copy_back =
-        StringAttribute::new(context, "none");
-    let pad_op = OperationBuilder::new("transform.structured.pad", location)
-        .add_operands(&[tiled_l2])
-        .add_attributes(&[
-            (Identifier::new(context, "padding_dimensions"), pad_dims),
-            (Identifier::new(context, "static_pad_to_multiple_of"), pad_multiples),
-            (Identifier::new(context, "copy_back_op"), copy_back.into()),
-        ])
-        .add_results(&[any_op_type, any_op_type, any_op_type]) // padded, pad, copy
-        .build()
-        .expect("build structured.pad");
-    tile_outer_block.append_operation(pad_op);
+        let tile_yield_op = OperationBuilder::new("transform.yield", location)
+            .build()
+            .expect("build transform.yield (tile_contraction)");
+        tile_outer_block.append_operation(tile_yield_op);
 
-    let tile_yield_op = OperationBuilder::new("transform.yield", location)
-        .build()
-        .expect("build transform.yield (tile_contraction)");
-    tile_outer_block.append_operation(tile_yield_op);
+        let tile_outer_region = Region::new();
+        tile_outer_region.append_block(tile_outer_block);
 
-    let tile_outer_region = Region::new();
-    tile_outer_region.append_block(tile_outer_block);
+        let tile_func_type = FunctionType::new(context, &[any_op_type], &[]);
+        let tile_arg_attrs =
+            Attribute::parse(context, "[{transform.consumed}]").expect("parse tile arg_attrs");
 
-    // function_type: (!transform.any_op) -> ()
-    let tile_func_type = FunctionType::new(context, &[any_op_type], &[]);
-    let tile_arg_attrs =
-        Attribute::parse(context, "[{transform.consumed}]").expect("parse tile arg_attrs");
+        OperationBuilder::new("transform.named_sequence", location)
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "sym_name"),
+                    StringAttribute::new(context, name).into(),
+                ),
+                (
+                    Identifier::new(context, "function_type"),
+                    TypeAttribute::new(tile_func_type.into()).into(),
+                ),
+                (Identifier::new(context, "arg_attrs"), tile_arg_attrs),
+                (
+                    Identifier::new(context, "sym_visibility"),
+                    StringAttribute::new(context, "private").into(),
+                ),
+            ])
+            .add_regions([tile_outer_region])
+            .build()
+            .expect("build transform.named_sequence @tile_contraction_Nd")
+    };
 
-    let tile_named_seq = OperationBuilder::new("transform.named_sequence", location)
-        .add_attributes(&[
-            (
-                Identifier::new(context, "sym_name"),
-                StringAttribute::new(context, "tile_contraction").into(),
-            ),
-            (
-                Identifier::new(context, "function_type"),
-                TypeAttribute::new(tile_func_type.into()).into(),
-            ),
-            (Identifier::new(context, "arg_attrs"), tile_arg_attrs),
-            (
-                Identifier::new(context, "sym_visibility"),
-                StringAttribute::new(context, "private").into(),
-            ),
-        ])
-        .add_regions([tile_outer_region])
-        .build()
-        .expect("build transform.named_sequence @tile_contraction");
-    module.body().append_operation(tile_named_seq);
+    // ── @match_contraction_3d ──────────────────────────────────────────────────
+    // Matches plain (2D) matmul generics: 3 iteration dims (M, N, K).
+    module.body().append_operation(build_match_seq("match_contraction_3d", 3));
+
+    // ── @tile_contraction_3d ───────────────────────────────────────────────────
+    // Tile sizes [32, 32, 0]: tile M and N at L1 cache level; K is reduction (untiled).
+    // Register tile [8, 8, 1]: tile M=8, N=8, K=1 for vectorization.
+    // Pad dims [0, 1, 2] to multiples of [8, 8, 1].
+    module.body().append_operation(build_tile_seq(
+        "tile_contraction_3d",
+        "array<i64: 32, 32, 0>",
+        "array<i1: false, false, false>",
+        "array<i64: 8, 8, 1>",
+        "array<i1: false, false, false>",
+        "[0, 1, 2]",
+        "array<i64: 8, 8, 1>",
+        3, // M, N, K all non-zero in register tile
+    ));
+
+    // ── @match_contraction_4d ──────────────────────────────────────────────────
+    // Matches batched matmul generics: 4 iteration dims (B, M, N, K).
+    module.body().append_operation(build_match_seq("match_contraction_4d", 4));
+
+    // ── @tile_contraction_4d ───────────────────────────────────────────────────
+    // Tile sizes [0, 32, 32, 0]: skip B, tile M and N at L1; K is reduction (untiled).
+    // Register tile [0, 8, 8, 1]: skip B, tile M=8, N=8, K=1 for vectorization.
+    // Pad dims [1, 2, 3] (M, N, K within 4-dim space) to multiples of [8, 8, 1].
+    // Note: pad_to_multiple_of must have exactly as many entries as padding_dimensions.
+    module.body().append_operation(build_tile_seq(
+        "tile_contraction_4d",
+        "array<i64: 0, 32, 32, 0>",
+        "array<i1: false, false, false, false>",
+        "array<i64: 0, 8, 8, 1>",
+        "array<i1: false, false, false, false>",
+        "[1, 2, 3]",
+        "array<i64: 8, 8, 1>",  // 3 entries matching padding_dimensions [1, 2, 3]
+        3, // M, N, K non-zero in register tile (B is 0, so no loop for B)
+    ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
     //
     // transform.named_sequence @__transform_main(%module: !transform.any_op {transform.consumed}) {
     //   %updated = transform.foreach_match in %module
-    //       @match_contraction -> @tile_contraction
+    //       @match_contraction_3d -> @tile_contraction_3d,
+    //       @match_contraction_4d -> @tile_contraction_4d
     //   %func = transform.structured.match ops{["func.func"]} in %updated
     //   transform.structured.vectorize_children_and_apply_patterns %func
     //   transform.yield
@@ -887,11 +953,12 @@ fn build_transform_schedule<'c>(
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
 
     let matchers_attr =
-        Attribute::parse(context, "[@match_contraction]").expect("parse matchers attr");
+        Attribute::parse(context, "[@match_contraction_3d, @match_contraction_4d]")
+            .expect("parse matchers attr");
     let actions_attr =
-        Attribute::parse(context, "[@tile_contraction]").expect("parse actions attr");
+        Attribute::parse(context, "[@tile_contraction_3d, @tile_contraction_4d]")
+            .expect("parse actions attr");
 
-    // foreach_match returns !transform.any_op (the updated module handle)
     let foreach_op = OperationBuilder::new("transform.foreach_match", location)
         .add_operands(&[module_handle])
         .add_attributes(&[
@@ -904,7 +971,6 @@ fn build_transform_schedule<'c>(
     let foreach_ref = main_block.append_operation(foreach_op);
     let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
 
-    // Match func.func inside the updated module
     let ops_attr = ArrayAttribute::new(
         context,
         &[StringAttribute::new(context, "func.func").into()],
