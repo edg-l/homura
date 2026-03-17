@@ -771,7 +771,29 @@ fn build_transform_schedule<'c>(
         .add_results(&[any_op_type, any_op_type, any_op_type, any_op_type]) // tiled + 3 loops (all non-zero)
         .build()
         .expect("build structured.tile_using_for (register tile)");
-    tile_outer_block.append_operation(reg_tile_op);
+    let reg_tile_ref = tile_outer_block.append_operation(reg_tile_op);
+    let tiled_l2: melior::ir::Value = reg_tile_ref.result(0).unwrap().into();
+
+    // Pad the register-tiled op so boundary tiles get static shapes matching
+    // the tile sizes.  This converts dynamic dims from affine.min into static
+    // [8, 8, 1], enabling vectorization without masked ops.
+    // padding_values is omitted (empty) → auto-inferred as 0 for the mulf/addf ring.
+    let pad_dims = Attribute::parse(context, "[0, 1, 2]").expect("parse padding_dimensions");
+    let pad_multiples =
+        Attribute::parse(context, "array<i64: 8, 8, 1>").expect("parse pad_to_multiple_of");
+    let copy_back =
+        StringAttribute::new(context, "none");
+    let pad_op = OperationBuilder::new("transform.structured.pad", location)
+        .add_operands(&[tiled_l2])
+        .add_attributes(&[
+            (Identifier::new(context, "padding_dimensions"), pad_dims),
+            (Identifier::new(context, "static_pad_to_multiple_of"), pad_multiples),
+            (Identifier::new(context, "copy_back_op"), copy_back.into()),
+        ])
+        .add_results(&[any_op_type, any_op_type, any_op_type]) // padded, pad, copy
+        .build()
+        .expect("build structured.pad");
+    tile_outer_block.append_operation(pad_op);
 
     let tile_yield_op = OperationBuilder::new("transform.yield", location)
         .build()
