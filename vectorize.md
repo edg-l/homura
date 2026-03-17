@@ -116,3 +116,115 @@ This pattern-based approach:
 - Gracefully skips ops with dynamic shapes (no failure)
 - Vectorizes ops with static shapes (e.g., `linalg.fill`)
 - Works for all test sizes including small tensors with uneven tiling
+
+### Limitation
+
+`vectorize_children_and_apply_patterns` skips the tiled contraction ops
+because they have dynamic shapes after tiling. Only simple ops like
+`linalg.fill` get vectorized. The contractions still lower through
+`convert-linalg-to-loops` → LLVM `-O3`, so LLVM's auto-vectorizer
+handles SIMD. This means GPT-2 decode stays at ~0.22s/token — no
+measurable improvement from this change.
+
+## Next: true micro-kernel vectorization
+
+The goal is to vectorize the 8×8×1 register-tiled contraction ops
+directly, producing explicit `vector.transfer_read/write` +
+`vector.contract` or FMA ops. This requires solving the masked
+vectorization issue.
+
+### Root cause
+
+`tile_using_for` always emits `affine.min(tile_size, remaining)` for
+boundary handling, producing dynamic shapes even when the data divides
+evenly. `structured.vectorize vector_sizes [8, 8, 1]` then creates
+masked ops (`vector.mask`) to handle the dynamic-sized boundary tiles.
+The bug: the vectorizer wraps both `vector.transfer_write` AND a
+`tensor.cast` inside `vector.mask`, violating the "exactly one maskable
+op" constraint.
+
+```
+// Illegal IR produced by masked vectorization after tiling:
+%r = "vector.mask"(%mask) ({
+  %w = vector.transfer_write ...  // maskable op
+  %c = tensor.cast %w             // non-maskable — violates constraint
+  vector.yield %c
+}) : (vector<8x8xi1>) -> tensor<?x?xf32>
+```
+
+### Approach A: loop peeling (most promising)
+
+Use `transform.loop.peel` (available in LLVM 21 as `loop.peel` in SCF
+transform ops) to split each tiling loop into:
+- **Main loop**: trip count divisible by step → static shapes inside
+- **Remainder loop**: last partial iteration → dynamic shapes (scalar)
+
+After peeling, the main loop body has a linalg.generic with **static**
+shapes (exactly tile_size), so `structured.vectorize` works without
+masking.
+
+```mlir
+// Pseudocode schedule:
+%tiled, %l0, %l1, %l2 = tile_using_for %op [8, 8, 1]
+%main0, %rem0 = loop.peel %l0   // peel M loop
+%main1, %rem1 = loop.peel %l1   // peel N loop
+vectorize %tiled vector_sizes [8, 8, 1]  // static shapes in main body
+```
+
+**Complication**: handle invalidation in the transform dialect. Peeling
+`%l0` invalidates `%l1` (nested inside). Workarounds:
+- Peel innermost-first (l2 → l1 → l0), re-matching inner loops after
+  each peel via `structured.match` inside the peeled loop body.
+- Use `transform.foreach` to iterate over peeled main loops and apply
+  inner peeling + vectorization.
+- Alternatively, peel at the cache-tile level (outer loops) and only
+  vectorize the full-tile path.
+
+**Key MLIR ops**:
+- `transform.loop.peel` — takes `!transform.op<"scf.for">`, returns
+  peeled main + remainder loop handles
+- `fail_if_already_divisible = false` — silently no-ops if already even
+
+### Approach B: pad before tiling
+
+Use `transform.structured.pad` (available in LLVM 21) to pad operands
+to multiples of tile sizes before tiling. This ensures all tiles are
+full-sized (no boundary handling), so shapes are always static.
+
+```mlir
+%padded = transform.structured.pad %op {
+  padding_values = [0.0 : f32, 0.0 : f32, 0.0 : f32],
+  padding_dimensions = [0, 1, 2],
+  pack_paddings = [1, 1, 1]
+}
+%tiled, ... = tile_using_for %padded [8, 8, 1]
+vectorize %tiled vector_sizes [8, 8, 1]  // always static
+```
+
+**Pros**: no masking, no peeling, clean static shapes everywhere.
+**Cons**: memory overhead from padding, extra computation on pad values,
+need to slice the result back to original size.
+
+### Approach C: per-rank vectorization with peeled cache tiles
+
+Combine rank-aware matching (via `match.structured.rank` +
+`match.param.cmpi`) with loop peeling at the cache tile level only:
+
+1. Match contraction ops by rank (3d, 4d, 5d)
+2. Cache-tile with batch dims tiled to 1: `[32,32,32]` / `[1,32,32,32]`
+3. Peel the cache-tile loops (outer level — fewer loops, simpler)
+4. Register-tile the peeled main body: `[8,8,1]` / `[1,8,8,1]`
+5. Vectorize with rank-appropriate sizes: `[8,8,1]` / `[1,8,8,1]`
+
+This avoids peeling the register-tile loops (which cause the handle
+invalidation cascade) and instead ensures the register tile always
+operates on full 32×32×32 blocks with no boundary.
+
+### MLIR references
+
+- `transform.loop.peel`: `/usr/lib/llvm/21/include/mlir/Dialect/SCF/TransformOps/SCFTransformOps.td`
+- `transform.structured.pad`: `/usr/lib/llvm/21/include/mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.td`
+- `match.structured.rank` + `match.param.cmpi`: for per-rank dispatch
+- `vector.mask` constraint: `/usr/lib/llvm/21/include/mlir/Dialect/Vector/IR/VectorOps.td`
+- LLVM issue #78787: pattern rewriting for maskable ops
+- MLIR discourse: "Linalg and Masking" thread, "RFC: Vector Masking" thread
