@@ -6414,6 +6414,8 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
+        let pipeline_start = std::time::Instant::now();
+        eprintln!("[pipeline] starting MLIR passes...");
         register_all_passes();
         let pass_manager = pass::PassManager::new(context);
         parse_pass_pipeline(
@@ -6455,6 +6457,7 @@ impl<'c> GraphBuilder<'c> {
         .map_err(CompileError::Pass)?;
 
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
+        eprintln!("[pipeline] MLIR passes done: {}ms", pipeline_start.elapsed().as_millis());
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_gb_post_passes.mlir", module.as_operation().to_string());
@@ -6470,12 +6473,13 @@ impl<'c> GraphBuilder<'c> {
             .unwrap_or_default()
             .subsec_nanos();
         let suffix = format!("{}_{:08x}", std::process::id(), nanos);
-        let tmp_obj = tmp_dir.join(format!("homura_gb_{suffix}.o"));
         let tmp_so = tmp_dir.join(format!("homura_gb_{suffix}.so"));
 
-        crate::compiler::emit_object_file_pub(&module, &tmp_obj)?;
-        crate::compiler::link_shared_lib_pub(&tmp_obj, &tmp_so)?;
-        std::fs::remove_file(&tmp_obj).ok();
+        let obj_paths = crate::compiler::emit_object_files_pub(&module, &tmp_dir, &format!("homura_gb_{suffix}"))?;
+        crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
+        for p in &obj_paths {
+            std::fs::remove_file(p).ok();
+        }
 
         // Store in cache.
         if let Some(key) = cache_key {

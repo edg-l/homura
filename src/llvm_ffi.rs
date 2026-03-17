@@ -11,6 +11,19 @@ unsafe extern "C" {
         module: mlir_sys::MlirOperation,
         context: LLVMContextRef,
     ) -> LLVMModuleRef;
+
+    /// Split an LLVM module into N linkable partitions.
+    ///
+    /// The callback is invoked N times, each time with a new `LLVMModuleRef`
+    /// representing one partition. The original module M is not modified.
+    /// Each partition can be compiled independently; cross-partition references
+    /// become external declarations resolved at link time.
+    pub fn LLVMSplitModule(
+        M: LLVMModuleRef,
+        N: std::ffi::c_uint,
+        Callback: unsafe extern "C" fn(MPart: LLVMModuleRef, UserData: *mut std::ffi::c_void),
+        UserData: *mut std::ffi::c_void,
+    );
 }
 
 #[cfg(test)]

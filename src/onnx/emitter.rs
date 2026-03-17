@@ -237,7 +237,7 @@ fn const_i64_elementwise(a: &[i64], b: &[i64], op: fn(i64, i64) -> i64) -> Optio
 /// Also returns the ordered weight buffers (initializers). These must be passed
 /// as runtime arguments after the dynamic inputs when running the compiled graph.
 /// Default MLIR op-count threshold before starting a new sub-function.
-const DEFAULT_SPLIT_THRESHOLD: usize = 500;
+const DEFAULT_SPLIT_THRESHOLD: usize = 100;
 
 pub fn emit_graph<'c>(
     model: &OnnxModel,
