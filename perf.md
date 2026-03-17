@@ -6,6 +6,45 @@
 - Reference: llama.cpp does ~100+ tok/s on similar hardware (~25x faster)
 - 232ms/token breakdown: **99% JIT execution**, <1% setup, <1% argmax/KV update
 
+## Critical issue: two compilation paths
+
+There are two separate compilation pipelines:
+
+1. **`Compiler::compile`** (tensor trace API) — has the transform schedule
+   with tiling (32×32×32 cache + 8×8×1 register), padding, vectorization,
+   and OpenMP support. Used by unit tests.
+
+2. **`GraphBuilder::compile_with_cache`** (graph_builder) — used by ONNX
+   model inference (GPT-2). Has **none of the above**: no transform
+   schedule, no tiling, no vectorization, no OpenMP. Goes straight from
+   `linalg → loops → LLVM` with naive scalar code.
+
+**GPT-2 runs through path 2.** The 4.3 tok/s measurement is on completely
+unoptimized scalar loops — not "tiled but naive" as previously assumed.
+This means the actual performance gap is much larger than expected, and
+adding the transform schedule to graph_builder should give a massive
+improvement even before threading.
+
+### Phase 0: Unify compilation pipelines (prerequisite for everything)
+
+Add the transform schedule and optimized pass pipeline to graph_builder's
+`compile_with_cache`. This is a prerequisite for all other phases.
+
+**Changes needed in `graph_builder.rs`**:
+1. Call `build_transform_schedule` before the pass pipeline (requires
+   adding `transform.with_named_sequence` module attribute).
+2. Add `transform-interpreter` + `canonicalize,cse` + `symbol-dce` to the
+   pipeline, before bufferization.
+3. Add `func.func(lower-vector-multi-reduction, lower-vector-mask)` for
+   vector lowering (the transform schedule vectorizes contractions).
+4. Add `scf-forall-to-parallel`, `convert-scf-to-openmp`,
+   `convert-openmp-to-llvm` in the correct positions (see Compiler::compile
+   pipeline for the working order).
+5. Add `convert-vector-to-scf` and `convert-vector-to-llvm` passes.
+
+**Expected impact**: Going from scalar loops to tiled+vectorized code
+should give a **10-50x improvement on its own**, before any threading.
+
 ## Bottlenecks
 
 ### 1. Single-threaded execution
@@ -20,9 +59,9 @@ dialect). Expected ~6-10x speedup.
 
 ### 2. Naive GEMM kernels
 
-Generated code is tiled (32x32x32 cache + 8x8x1 register) and
-vectorized (`vector.contract` → AVX2), but still far from hand-tuned
-BLAS. Missing:
+After Phase 0, generated code will be tiled (32x32x32 cache + 8x8x1
+register) and vectorized (`vector.contract` → AVX2), but still far from
+hand-tuned BLAS. Missing:
 - Register blocking with explicit accumulator registers
 - Software pipelining (prefetch next tile while computing current)
 - Optimal loop ordering for the micro-kernel
@@ -52,6 +91,14 @@ Each decode step reads/writes the full KV cache ([1, 12, seq_len, 64]
 
 All MLIR-native — no external BLAS. Each phase builds on the previous.
 
+### Phase 0: Unify pipelines (10-50x → ~40-200 tok/s)
+
+Add the transform schedule (tiling + vectorization) to graph_builder.
+This is the single biggest win because GPT-2 is currently running
+completely unoptimized scalar loops.
+
+See "Critical issue" section above for implementation details.
+
 ### Phase 1: Multi-threading (6-10x → ~25-40 tok/s)
 
 Parallelize outer tile loops across CPU cores. This is the single
@@ -64,25 +111,25 @@ biggest win because we have 12 cores doing nothing.
 3. Inner register tile + pad + vectorize stay the same (run per-thread).
 
 **Pass pipeline changes**:
-1. After tiling: `loop.forall_to_parallel` (transform op) converts
+1. After bufferization: `scf-forall-to-parallel` converts
    `scf.forall` → `scf.parallel`.
-   Alternatively, keep `scf.forall` and lower directly.
-2. Add `convert-scf-to-openmp` pass (available in LLVM 21) to convert
+2. After `lower-affine`: `convert-scf-to-openmp` converts
    `scf.parallel` → OpenMP worksharing constructs.
-3. Add `convert-openmp-to-llvm` pass to lower to LLVM IR with OpenMP
-   runtime calls.
-4. Link against `libomp.so` at JIT time (similar to how we already
-   dlopen `libmlir_c_runner_utils.so`).
+3. `convert-openmp-to-llvm` **before** `convert-scf-to-cf` (critical
+   ordering: omp ops must be lowered before scf-to-cf creates
+   multi-block regions inside `memref.alloca_scope`).
+4. Link against `libomp.so` at link time (derived from
+   `MLIR_SYS_210_PREFIX`).
 
 **Key details**:
-- `tile_using_forall` takes a `mapping` attribute for thread mapping.
-  For CPU, use default (no GPU mapping).
-- `num_threads` vs `tile_sizes`: use `tile_sizes` to keep consistent
-  with our current tiling strategy. The number of threads = dim / tile.
-- Thread count: use all available cores. The OpenMP runtime handles
-  scheduling.
+- `tile_using_forall` requires `operandSegmentSizes` attribute
+  (`array<i32: 1, 0, 0, 0, 0>`) and `static_num_threads` (empty array).
+- `tile_using_forall` uses `static_tile_sizes` (not `static_sizes`).
 - Only parallelize the OUTER (cache) tile level. The inner register
   tile runs sequentially per thread — this is the standard approach.
+
+**Status**: Implemented in `Compiler::compile` path (commit 558756e).
+Needs to be carried over to graph_builder as part of Phase 0.
 
 **Verification**: measure with `perf stat` to confirm all cores active.
 Target: 6-10x speedup → **25-40 tok/s**.
@@ -203,11 +250,18 @@ Requires `arith.truncf`/`arith.extf` at the KV cache boundary.
 
 | Phase | Change | Target tok/s | Cumulative |
 |---|---|---|---|
-| Current | Tiled + vectorized, single-thread | 4.3 | 4.3 |
-| 1 | Multi-threading (OpenMP) | ×6-10 | 25-40 |
-| 2 | Packed GEMM layout | ×2-4 | 50-120 |
-| 3 | AVX-512 + unroll + loop order | ×1.5-2 | 80-200 |
-| 4 | Fusion + weight prepack + KV quant | ×1.3-2 | 100-300 |
+| Current | Unoptimized scalar loops (!) | 4.3 | 4.3 |
+| 0 | Tiling + vectorization in graph_builder | ×10-50 | 40-200 |
+| 1 | Multi-threading (OpenMP) | ×6-10 | 250-2000 |
+| 2 | Packed GEMM layout | ×2-4 | 500-8000 |
+| 3 | AVX-512 + unroll + loop order | ×1.5-2 | 750-16000 |
+| 4 | Fusion + weight prepack + KV quant | ×1.3-2 | 1000-32000 |
+
+Note: Phase 0 targets are speculative — the actual improvement from
+adding tiling+vectorization to the graph_builder path hasn't been
+measured yet. Upper estimates are likely unrealistic due to memory
+bandwidth limits. Real-world target after all phases: ~100-300 tok/s
+(matching llama.cpp).
 
 All phases use MLIR transform dialect + standard passes. No external
 BLAS, no hand-written assembly. The compiler generates everything.
