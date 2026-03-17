@@ -48,13 +48,166 @@ Each decode step reads/writes the full KV cache ([1, 12, seq_len, 64]
 
 **Fix**: Quantize KV cache to FP16/INT8, or use paged attention.
 
-## Improvement roadmap (estimated impact)
+## Improvement roadmap
 
-| Change | Expected speedup | Complexity |
-|---|---|---|
-| Multi-threading (forall + OpenMP) | 6-10x | Medium |
-| Packed GEMM layout (structured.pack) | 2-4x | Medium |
-| Both above | 15-30x → ~60-130 tok/s | Medium |
-| AVX-512 micro-kernel (wider vectors) | 1.5-2x | Medium |
-| KV cache quantization | 1.3-2x (long sequences) | Medium |
-| Software prefetching | 1.2-1.5x | Medium |
+All MLIR-native — no external BLAS. Each phase builds on the previous.
+
+### Phase 1: Multi-threading (6-10x → ~25-40 tok/s)
+
+Parallelize outer tile loops across CPU cores. This is the single
+biggest win because we have 12 cores doing nothing.
+
+**Transform schedule changes**:
+1. Replace `tile_using_for` (cache-level) with `tile_using_forall` for
+   the M and N parallel dims. K (reduction) stays sequential.
+2. The tiled contraction loops become `scf.forall` instead of `scf.for`.
+3. Inner register tile + pad + vectorize stay the same (run per-thread).
+
+**Pass pipeline changes**:
+1. After tiling: `loop.forall_to_parallel` (transform op) converts
+   `scf.forall` → `scf.parallel`.
+   Alternatively, keep `scf.forall` and lower directly.
+2. Add `convert-scf-to-openmp` pass (available in LLVM 21) to convert
+   `scf.parallel` → OpenMP worksharing constructs.
+3. Add `convert-openmp-to-llvm` pass to lower to LLVM IR with OpenMP
+   runtime calls.
+4. Link against `libomp.so` at JIT time (similar to how we already
+   dlopen `libmlir_c_runner_utils.so`).
+
+**Key details**:
+- `tile_using_forall` takes a `mapping` attribute for thread mapping.
+  For CPU, use default (no GPU mapping).
+- `num_threads` vs `tile_sizes`: use `tile_sizes` to keep consistent
+  with our current tiling strategy. The number of threads = dim / tile.
+- Thread count: use all available cores. The OpenMP runtime handles
+  scheduling.
+- Only parallelize the OUTER (cache) tile level. The inner register
+  tile runs sequentially per thread — this is the standard approach.
+
+**Verification**: measure with `perf stat` to confirm all cores active.
+Target: 6-10x speedup → **25-40 tok/s**.
+
+### Phase 2: Packed GEMM layout (2-4x → ~50-120 tok/s)
+
+Rearrange matrix data into a packed, cache-friendly layout before the
+tiled computation. This is the key technique from GotoBLAS/BLIS that
+eliminates TLB misses on large matrices.
+
+**Why it matters**: For a 768×3072 matmul tiled at 32×32, each tile
+access strides across the full row (768 or 3072 elements apart). This
+causes TLB misses because non-adjacent cache lines are touched. Packing
+copies each tile's data into a contiguous buffer so the micro-kernel
+streams sequentially through memory.
+
+**Transform schedule changes**:
+1. After matching the contraction, use `transform.structured.pack` to
+   pack the LHS and RHS operands into tiled layout:
+   ```
+   // Pack A[M, K] into A_packed[M/mc, K/kc, mc, kc]
+   // Pack B[K, N] into B_packed[K/kc, N/nc, kc, nc]
+   transform.structured.pack %op
+       packed_sizes [32, 32, 32]  // mc, nc, kc matching cache tile
+   ```
+2. Use `transform.structured.pack_transpose` to reorder the inner tile
+   dims for optimal micro-kernel access (column-major for B panel).
+3. Tile the packed op (the outer dims are the tile-loop iterators).
+4. The inner `[mc, nc, kc]` block is the micro-kernel — tile to
+   register level [8, 8, 1], pad, vectorize as we do now.
+
+**Pass pipeline**: No new passes needed. `tensor.pack`/`tensor.unpack`
+lower through `one-shot-bufferize` → memref copies, which the existing
+pipeline handles.
+
+**Key details**:
+- Packing adds an O(N²) copy cost, but it's a streaming write (fast)
+  and the packed data is reused across all tiles in the inner loop.
+- For small matrices (e.g., [1, 768] × [768, 3072] in GPT-2 decode),
+  the B matrix packing can be hoisted out of the decode loop since
+  weights don't change between tokens.
+- `pack_greedily` can auto-detect optimal packing for all contractions.
+
+**Verification**: measure L1/TLB misses with `perf stat -e dTLB-load-misses`.
+Target: 2-4x on top of threading → **50-120 tok/s**.
+
+### Phase 3: Micro-kernel tuning (1.5-2x → ~80-200 tok/s)
+
+Squeeze more out of each core's compute throughput.
+
+**3a. AVX-512 vectors**
+
+The Ryzen 7900X3D supports AVX-512. Current register tile is 8×8×1
+targeting AVX2 (`vector<8xf32>`). With AVX-512:
+- Widen to `vector<16xf32>` (512-bit)
+- Register tile becomes 16×16×1 or 8×16×1
+- Change `vector_sizes` and `pad_to_multiple_of` accordingly
+- 2x throughput per vector op vs AVX2
+
+**Note**: Zen 4 executes AVX-512 as two 256-bit uops. Real speedup is
+~1.3-1.5x, not 2x. But the reduced loop overhead still helps.
+
+**3b. Unroll-and-jam**
+
+Unroll the K (reduction) loop by 4 and interleave FMAs from different
+K iterations. This hides FMA latency (5 cycles on Zen 4) by keeping
+multiple independent accumulations in flight.
+
+```mlir
+// Instead of K=1 per inner iteration:
+// Change register tile to [8, 8, 4] and unroll K
+transform.structured.tile_using_for %op tile_sizes [8, 8, 4]
+// The vectorizer produces 4 independent FMAs per iteration
+```
+
+**3c. Loop permutation**
+
+Reorder the register-tile loops for optimal register reuse:
+- Current: M → N → K (K innermost)
+- Better: K → M → N (broadcast B row, accumulate across M)
+
+Use `tile_using_for` `interchange` attribute:
+```
+tile_sizes [8, 8, 1] interchange = [2, 0, 1]  // K, M, N order
+```
+
+**3d. Prefetch intrinsics**
+
+Insert `llvm.prefetch` before each cache tile to overlap data fetch
+with compute. MLIR doesn't have a prefetch op, but we can emit it
+via `llvm.intr.prefetch` in a custom lowering or post-LLVM-lowering
+pass.
+
+### Phase 4: Inference-specific optimizations
+
+**4a. Weight prepacking at load time**
+
+Pack weight matrices once when the model loads, store the packed layout
+in the compilation cache. Each decode step uses the pre-packed weights
+directly — zero packing overhead at inference time.
+
+**4b. Operator fusion**
+
+Fuse elementwise ops (bias add, ReLU, layer norm) into the matmul
+epilogue. Instead of writing the matmul result to memory and reading
+it back for the next op, compute the chain in-register.
+
+MLIR approach: use `transform.structured.fuse_into_containing_op` to
+pull consumer ops into the tiled matmul loop body.
+
+**4c. KV cache quantization**
+
+As sequence length grows, KV cache becomes memory-bandwidth bound.
+Quantize to FP16 or INT8 to halve/quarter the memory traffic.
+Requires `arith.truncf`/`arith.extf` at the KV cache boundary.
+
+## Summary
+
+| Phase | Change | Target tok/s | Cumulative |
+|---|---|---|---|
+| Current | Tiled + vectorized, single-thread | 4.3 | 4.3 |
+| 1 | Multi-threading (OpenMP) | ×6-10 | 25-40 |
+| 2 | Packed GEMM layout | ×2-4 | 50-120 |
+| 3 | AVX-512 + unroll + loop order | ×1.5-2 | 80-200 |
+| 4 | Fusion + weight prepack + KV quant | ×1.3-2 | 100-300 |
+
+All phases use MLIR transform dialect + standard passes. No external
+BLAS, no hand-written assembly. The compiler generates everything.
