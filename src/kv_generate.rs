@@ -253,7 +253,8 @@ impl KvGenerator {
                 return String::new();
             }
         };
-        tracing::info!(elapsed_s = step_start.elapsed().as_secs_f64(), "prefill complete");
+        let prefill_s = step_start.elapsed().as_secs_f64();
+        tracing::info!("prefill complete in {prefill_s:.2}s");
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
@@ -263,7 +264,9 @@ impl KvGenerator {
         }
         generated_ids.push(next_token);
         let token_text = self.tokenizer.decode(&[next_token]);
-        tracing::info!(step = 1, max = max_new_tokens, token = ?token_text, "(prefill)");
+        eprintln!(
+            "  \x1b[36m[1/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m \x1b[2m(prefill)\x1b[0m"
+        );
 
         // Decode loop
         for step in 1..max_new_tokens {
@@ -284,12 +287,12 @@ impl KvGenerator {
 
             let token_text = self.tokenizer.decode(&[next_token]);
             let step_elapsed = step_start.elapsed().as_secs_f64();
-            tracing::info!(
-                step = step + 1,
-                max = max_new_tokens,
-                token = ?token_text,
-                elapsed_s = step_elapsed,
-                tok_per_s = format!("{:.1}", 1.0 / step_elapsed),
+            let tok_s = 1.0 / step_elapsed;
+            eprintln!(
+                "  \x1b[36m[{}/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m  \
+                 \x1b[33m{:.0}ms\x1b[0m  \x1b[32m{tok_s:.1} tok/s\x1b[0m",
+                step + 1,
+                step_elapsed * 1000.0,
             );
 
             if next_token == self.config.eos_token_id {
@@ -301,18 +304,14 @@ impl KvGenerator {
 
         let total = gen_start.elapsed();
         let decode_tokens = generated_ids.len();
-        let per_tok = if decode_tokens == 0 {
-            0.0
-        } else {
-            total.as_secs_f64() / decode_tokens as f64
-        };
+        let total_s = total.as_secs_f64();
+        let per_tok = if decode_tokens == 0 { 0.0 } else { total_s / decode_tokens as f64 };
         let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
-        tracing::info!(
-            tokens = decode_tokens,
-            total_s = total.as_secs_f64(),
-            per_token_s = per_tok,
-            tok_per_s = format!("{:.1}", tok_s),
-            "generation complete"
+        eprintln!(
+            "  \x1b[1;35m── done ──\x1b[0m {decode_tokens} tokens in \
+             \x1b[33m{total_s:.2}s\x1b[0m · \x1b[32m{tok_s:.1} tok/s\x1b[0m · \
+             {:.0}ms/tok",
+            per_tok * 1000.0,
         );
 
         self.tokenizer.decode(&generated_ids)
@@ -532,12 +531,14 @@ impl KvGenerator {
         }
         let t_post = post_start.elapsed();
 
-        tracing::info!(
-            setup_ms = format!("{:.2}", t_setup.as_secs_f64() * 1000.0),
-            jit_ms = format!("{:.2}", t_jit.as_secs_f64() * 1000.0),
-            post_ms = format!("{:.2}", t_post.as_secs_f64() * 1000.0),
-            "decode breakdown"
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            eprintln!(
+                "    \x1b[2msetup {:.1}ms │ jit {:.1}ms │ post {:.1}ms\x1b[0m",
+                t_setup.as_secs_f64() * 1000.0,
+                t_jit.as_secs_f64() * 1000.0,
+                t_post.as_secs_f64() * 1000.0,
+            );
+        }
 
         Ok(result_token)
     }
