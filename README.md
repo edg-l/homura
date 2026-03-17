@@ -118,7 +118,7 @@ cargo test                                        # ~365 tests
 
 **Milestone 4** (complete) — Dynamic shapes + KV cache. Two-model prefill/decode architecture. Decode model compiles once, ~0.30s/token on CPU.
 
-**Milestone 5** (in progress) — Linalg tiling and loop optimization. Affine loop tiling for cache locality, then `linalg-block-pack-matmul` for GEMM, then transform dialect for full tiling/vectorization/fusion control.
+**Milestone 5** (in progress) — Linalg tiling via MLIR transform dialect. Structured tiling, vectorization, and fusion of linalg ops before bufferization.
 
 **Milestone 6** — Parallel compilation. Split monolithic function into per-layer functions for parallel LLVM compilation.
 

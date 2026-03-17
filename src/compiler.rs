@@ -111,6 +111,10 @@ impl Compiler {
             >"
         ).expect("failed to parse dlti.dl_spec");
         module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
+        module.as_operation_mut().set_attribute(
+            "transform.with_named_sequence",
+            Attribute::unit(&context),
+        );
 
         let (num_inputs, output_descs) = build_module(&context, &module, trace, outputs)?;
         tracing::info!(num_inputs, num_outputs = output_descs.len(), "compilation starting");
@@ -155,6 +159,9 @@ impl Compiler {
                     tosa-to-tensor\
                 ),\
                 func.func(canonicalize,cse),\
+                transform-interpreter,\
+                func.func(canonicalize,cse),\
+                symbol-dce,\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 fold-memref-alias-ops,\
@@ -244,7 +251,12 @@ impl Compiler {
 
         let context = create_context();
         let location = Location::unknown(&context);
-        let module = Module::new(location);
+        let mut module = Module::new(location);
+        // build_module adds a transform schedule; the parent module needs this attribute.
+        module.as_operation_mut().set_attribute(
+            "transform.with_named_sequence",
+            Attribute::unit(&context),
+        );
         build_module(&context, &module, trace, outputs)?;
         Ok(module.as_operation().to_string())
     }
@@ -570,6 +582,114 @@ fn create_context() -> Context {
     context
 }
 
+// ── Transform dialect schedule ────────────────────────────────────────────────
+//
+// Emits a transform dialect schedule that tiles `linalg.batch_matmul` ops
+// (the hot path for GPT-2 attention/FFN) with 32×32×32 tiles for cache locality.
+// The schedule is a no-op when no batch_matmul ops are present.
+
+// Appends a transform dialect schedule that tiles linalg.batch_matmul ops.
+// No-op when no batch_matmul ops are present (the match finds zero ops).
+fn build_transform_schedule<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    location: Location<'c>,
+) {
+    let any_op_type =
+        melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
+
+    // Body: match → tile → yield
+    let body_block = Block::new(&[(any_op_type, location)]);
+    let module_handle = body_block.argument(0).unwrap().into();
+
+    // transform.structured.match ops{["linalg.batch_matmul"]} in %module
+    let match_op = OperationBuilder::new("transform.structured.match", location)
+        .add_operands(&[module_handle])
+        .add_attributes(&[(
+            Identifier::new(context, "ops"),
+            ArrayAttribute::new(
+                context,
+                &[StringAttribute::new(context, "linalg.batch_matmul").into()],
+            )
+            .into(),
+        )])
+        .add_results(&[any_op_type])
+        .build()
+        .expect("build structured.match");
+    let match_ref = body_block.append_operation(match_op);
+    let matched = match_ref.result(0).unwrap().into();
+
+    // transform.structured.tile_using_for %matmuls tile_sizes [0, 32, 32, 32]
+    let tile_sizes: &[i64] = &[0, 32, 32, 32];
+    let num_loops = tile_sizes.iter().filter(|&&s| s != 0).count();
+    let mut result_types = vec![any_op_type]; // tiled_linalg_op
+    result_types.extend(std::iter::repeat(any_op_type).take(num_loops));
+
+    let static_sizes_attr = Attribute::parse(
+        context,
+        &format!(
+            "array<i64: {}>",
+            tile_sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    )
+    .expect("parse static_sizes");
+
+    let scalable_sizes_attr = Attribute::parse(
+        context,
+        &format!(
+            "array<i1: {}>",
+            tile_sizes.iter().map(|_| "false").collect::<Vec<_>>().join(", ")
+        ),
+    )
+    .expect("parse scalable_sizes");
+
+    let tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+        .add_operands(&[matched])
+        .add_attributes(&[
+            (Identifier::new(context, "static_sizes"), static_sizes_attr),
+            (Identifier::new(context, "scalable_sizes"), scalable_sizes_attr),
+        ])
+        .add_results(&result_types)
+        .build()
+        .expect("build structured.tile_using_for");
+    body_block.append_operation(tile_op);
+
+    // transform.yield
+    let yield_op = OperationBuilder::new("transform.yield", location)
+        .build()
+        .expect("build transform.yield");
+    body_block.append_operation(yield_op);
+
+    // transform.named_sequence @__transform_main(%module: !transform.any_op)
+    let body_region = Region::new();
+    body_region.append_block(body_block);
+
+    let func_type = FunctionType::new(context, &[any_op_type], &[]);
+    let arg_attrs =
+        Attribute::parse(context, "[{transform.readonly}]").expect("parse arg_attrs");
+
+    let named_seq = OperationBuilder::new("transform.named_sequence", location)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "sym_name"),
+                StringAttribute::new(context, "__transform_main").into(),
+            ),
+            (
+                Identifier::new(context, "function_type"),
+                TypeAttribute::new(func_type.into()).into(),
+            ),
+            (Identifier::new(context, "arg_attrs"), arg_attrs),
+            (
+                Identifier::new(context, "sym_visibility"),
+                StringAttribute::new(context, "private").into(),
+            ),
+        ])
+        .add_regions([body_region])
+        .build()
+        .expect("build transform.named_sequence");
+    module.body().append_operation(named_seq);
+}
+
 // ── Shared module builder ─────────────────────────────────────────────────────
 //
 // Populates `module` with the `@compute` func body for the given trace and
@@ -665,6 +785,8 @@ fn build_module<'c>(
 
         module.body().append_operation(function);
     }
+
+    build_transform_schedule(context, module, location);
 
     // Dump pre-pass MLIR for debugging when HOMURA_DUMP_IR is set
     if std::env::var("HOMURA_DUMP_IR").is_ok() {
