@@ -277,6 +277,7 @@ unsafe fn optimise_and_emit(
     llvm_module: llvm_sys::prelude::LLVMModuleRef,
     llvm_ctx: llvm_sys::prelude::LLVMContextRef,
     output_path: &std::path::Path,
+    opt_level: &str,
 ) -> Result<(), CompileError> {
     use llvm_sys::core::*;
     use llvm_sys::error::LLVMGetErrorMessage;
@@ -303,18 +304,24 @@ unsafe fn optimise_and_emit(
             )));
         }
 
+        let codegen_level = match opt_level {
+            "O0" => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
+            "O1" => LLVMCodeGenOptLevel::LLVMCodeGenLevelLess,
+            "O2" => LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+            _ => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+        };
         let machine = LLVMCreateTargetMachine(
             target,
             triple,
             cpu,
             features,
-            LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+            codegen_level,
             LLVMRelocMode::LLVMRelocPIC,
             LLVMCodeModel::LLVMCodeModelDefault,
         );
 
         let opts = LLVMCreatePassBuilderOptions();
-        let passes = CString::new("default<O3>").unwrap();
+        let passes = CString::new(format!("default<{opt_level}>")).unwrap();
         let pass_error = LLVMRunPasses(llvm_module, passes.as_ptr(), machine, opts);
         if !pass_error.is_null() {
             let msg_ptr = LLVMGetErrorMessage(pass_error);
@@ -446,7 +453,7 @@ fn emit_object_files(
         if n_threads <= 1 || n_funcs <= 1 {
             eprintln!("[codegen] monolithic path: {n_funcs} function(s), {n_threads} thread(s)");
             let obj_path = output_dir.join(format!("{base_name}.o"));
-            optimise_and_emit(llvm_module, llvm_ctx, &obj_path)?;
+            optimise_and_emit(llvm_module, llvm_ctx, &obj_path, "O2")?;
             return Ok(vec![obj_path]);
         }
 
@@ -496,8 +503,8 @@ fn emit_object_files(
         LLVMContextDispose(llvm_ctx);
 
         let split_ms = split_start.elapsed().as_millis() as u64;
-        eprintln!("[codegen] split + serialise: {split_ms}ms, partition sizes: {:?}",
-            bitcode_bufs.iter().map(|b| b.len()).collect::<Vec<_>>());
+        eprintln!("[codegen] split + serialise: {split_ms}ms, partition sizes (KB): {:?}",
+            bitcode_bufs.iter().map(|b| b.len() / 1024).collect::<Vec<_>>());
 
         // Compile each partition in parallel: fresh LLVMContext per thread.
         let obj_paths: Vec<std::path::PathBuf> = (0..bitcode_bufs.len())
@@ -526,9 +533,12 @@ fn emit_object_files(
                                 "partition {i}: failed to parse bitcode"
                             )));
                         }
-                        match optimise_and_emit(part_module, ctx, obj_path) {
+                        // O3 for small partitions, O2 for large ones
+                        // (O3 is superlinear in IR size)
+                        let opt = if bc.len() < 1_000_000 { "O3" } else { "O1" };
+                        match optimise_and_emit(part_module, ctx, obj_path, opt) {
                             Ok(()) => {
-                                eprintln!("[codegen] partition {i} done: {}ms", t0.elapsed().as_millis());
+                                eprintln!("[codegen] partition {i} ({opt}) done: {}ms", t0.elapsed().as_millis());
                                 None
                             }
                             Err(e) => Some(e),

@@ -308,10 +308,16 @@ pub fn emit_graph_with_split<'c>(
         weight_remap.clear();
     }
 
+    // ONNX op types that expand dramatically during tiling/vectorization.
+    // Force a chunk boundary before each so they become separate functions.
+    const HEAVY_OPS: &[&str] = &["Conv", "MatMul", "Gemm", "ConvTranspose"];
+
     for (node_idx, node) in model.nodes.iter().enumerate() {
-        // Check if we should split based on MLIR op count in the current block.
+        // Split before heavy ops (Conv/MatMul/Gemm) that explode after tiling,
+        // or when the current chunk exceeds the op-count threshold.
         let op_count = builder.block_op_count();
-        if splitting_enabled && op_count >= split_threshold {
+        let is_heavy = HEAVY_OPS.contains(&node.op_type.as_str());
+        if splitting_enabled && (op_count >= split_threshold || (is_heavy && op_count > 0)) {
             let live = collect_live_values(
                 &mut value_map, &weight_names, &last_use, node_idx, builder,
             );
