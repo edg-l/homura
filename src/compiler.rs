@@ -117,6 +117,8 @@ impl Compiler {
         );
 
         let (num_inputs, output_descs) = build_module(&context, &module, trace, outputs)?;
+        let location = Location::unknown(&context);
+        build_transform_schedule(&context, &module, location);
         tracing::info!(num_inputs, num_outputs = output_descs.len(), "compilation starting");
         let compile_start = std::time::Instant::now();
 
@@ -251,12 +253,7 @@ impl Compiler {
 
         let context = create_context();
         let location = Location::unknown(&context);
-        let mut module = Module::new(location);
-        // build_module adds a transform schedule; the parent module needs this attribute.
-        module.as_operation_mut().set_attribute(
-            "transform.with_named_sequence",
-            Attribute::unit(&context),
-        );
+        let module = Module::new(location);
         build_module(&context, &module, trace, outputs)?;
         Ok(module.as_operation().to_string())
     }
@@ -650,6 +647,23 @@ fn build_transform_schedule<'c>(
     let match_outer_block = Block::new(&[(any_op_type, location)]);
     let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
 
+    // Filter to linalg.generic only — named ops (batch_matmul etc.) fail to vectorize
+    // after tiling because they produce dynamic-shaped named ops.
+    // transform.match.operation_name %candidate ["linalg.generic"] : !transform.any_op
+    let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
+        .add_operands(&[candidate])
+        .add_attributes(&[(
+            Identifier::new(context, "op_names"),
+            ArrayAttribute::new(
+                context,
+                &[StringAttribute::new(context, "linalg.generic").into()],
+            )
+            .into(),
+        )])
+        .build()
+        .expect("build transform.match.operation_name");
+    match_outer_block.append_operation(op_name_filter);
+
     // transform.match.structured %candidate : !transform.any_op { ... } -> !transform.any_op
     let match_structured_op = OperationBuilder::new("transform.match.structured", location)
         .add_operands(&[candidate])
@@ -734,8 +748,31 @@ fn build_transform_schedule<'c>(
         ])
         .add_results(&tile_result_types)
         .build()
-        .expect("build structured.tile_using_for");
-    tile_outer_block.append_operation(tile_op);
+        .expect("build structured.tile_using_for (cache tile)");
+    let tile_l1_ref = tile_outer_block.append_operation(tile_op);
+    let tiled_l1: melior::ir::Value = tile_l1_ref.result(0).unwrap().into();
+
+    // Level 2: register tile — tile_sizes [8, 8, 1] for vectorization
+    let reg_static_sizes =
+        Attribute::parse(context, "array<i64: 8, 8, 1>").expect("parse reg static_sizes");
+    let reg_scalable_sizes =
+        Attribute::parse(context, "array<i1: false, false, false>").expect("parse reg scalable_sizes");
+
+    let reg_tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+        .add_operands(&[tiled_l1])
+        .add_attributes(&[
+            (Identifier::new(context, "static_sizes"), reg_static_sizes),
+            (Identifier::new(context, "scalable_sizes"), reg_scalable_sizes),
+        ])
+        .add_results(&[any_op_type, any_op_type, any_op_type, any_op_type]) // tiled + 3 loops (all non-zero)
+        .build()
+        .expect("build structured.tile_using_for (register tile)");
+    tile_outer_block.append_operation(reg_tile_op);
+
+    // NOTE: structured.vectorize is not added here yet because vector_sizes
+    // must exactly match the op's iterator count, which varies by rank (3-dim
+    // for 2D matmul, 4-dim for batched, 5-dim for attention). Vectorize
+    // requires rank-aware size computation or multiple action sequences.
 
     let tile_yield_op = OperationBuilder::new("transform.yield", location)
         .build()
@@ -928,8 +965,6 @@ fn build_module<'c>(
 
         module.body().append_operation(function);
     }
-
-    build_transform_schedule(context, module, location);
 
     // Dump pre-pass MLIR for debugging when HOMURA_DUMP_IR is set
     if std::env::var("HOMURA_DUMP_IR").is_ok() {
