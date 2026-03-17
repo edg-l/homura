@@ -273,7 +273,7 @@ impl KvGenerator {
             }
 
             let step_start = std::time::Instant::now();
-            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos) {
+            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos, step_start) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("decode step failed: {e}");
@@ -283,11 +283,13 @@ impl KvGenerator {
             real_pos += 1;
 
             let token_text = self.tokenizer.decode(&[next_token]);
+            let step_elapsed = step_start.elapsed().as_secs_f64();
             tracing::info!(
                 step = step + 1,
                 max = max_new_tokens,
                 token = ?token_text,
-                elapsed_s = step_start.elapsed().as_secs_f64(),
+                elapsed_s = step_elapsed,
+                tok_per_s = format!("{:.1}", 1.0 / step_elapsed),
             );
 
             if next_token == self.config.eos_token_id {
@@ -298,14 +300,18 @@ impl KvGenerator {
         }
 
         let total = gen_start.elapsed();
+        let decode_tokens = generated_ids.len();
+        let per_tok = if decode_tokens == 0 {
+            0.0
+        } else {
+            total.as_secs_f64() / decode_tokens as f64
+        };
+        let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
         tracing::info!(
-            tokens = generated_ids.len(),
+            tokens = decode_tokens,
             total_s = total.as_secs_f64(),
-            per_token_s = if generated_ids.is_empty() {
-                0.0
-            } else {
-                total.as_secs_f64() / generated_ids.len() as f64
-            },
+            per_token_s = per_tok,
+            tok_per_s = format!("{:.1}", tok_s),
             "generation complete"
         );
 
@@ -410,6 +416,7 @@ impl KvGenerator {
         next_token: u32,
         kv_cache: &mut Vec<Buffer>,
         real_pos: usize,
+        step_start: std::time::Instant,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         assert!(
             real_pos < self.config.max_seq_len,
@@ -478,8 +485,13 @@ impl KvGenerator {
             );
         }
 
-        let mut outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
+        let t_setup = step_start.elapsed();
 
+        let jit_start = std::time::Instant::now();
+        let mut outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
+        let t_jit = jit_start.elapsed();
+
+        let post_start = std::time::Instant::now();
         // logits: [1, 1, vocab_size] — only one position, read at index 0
         let logits = &outputs[0];
         let vocab_size = logits.shape().0[2] as usize;
@@ -518,6 +530,14 @@ impl KvGenerator {
         for i in 0..kv_count {
             kv_cache[i] = outputs.remove(1);
         }
+        let t_post = post_start.elapsed();
+
+        tracing::info!(
+            setup_ms = format!("{:.2}", t_setup.as_secs_f64() * 1000.0),
+            jit_ms = format!("{:.2}", t_jit.as_secs_f64() * 1000.0),
+            post_ms = format!("{:.2}", t_post.as_secs_f64() * 1000.0),
+            "decode breakdown"
+        );
 
         Ok(result_token)
     }
