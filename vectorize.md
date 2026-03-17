@@ -92,23 +92,27 @@ Final LLVM dialect output for 128×768 × 768×3072 matmul:
 - 711× `vector<1xf32>` — scalar ops from K=1 reduction dimension
 - Total: ~1k vector ops — vs ~200k with single-level vectorize. 200× less IR.
 
-## Blocking issue: rank-aware vector sizes
+## Resolved: vectorization approach
 
-`structured.vectorize` requires `vector_sizes` to exactly match the op's iterator count. Unlike `tile_sizes` (which pads with leading zeros), `vector_sizes` does NOT pad — providing 3 sizes for a 4-dim op is an error.
+### Problems encountered
 
-GPT-2 contractions have different ranks:
-- 3-dim: M, N, K (2D matmul)
-- 4-dim: B, M, N, K (batched matmul)
-- 5-dim: B1, B2, M, N, K (4D attention)
+1. **Rank-aware vector sizes**: `structured.vectorize` with explicit `vector_sizes` requires them to exactly match the op's iterator count. GPT-2 contractions have 3, 4, or 5 dims.
 
-A single `vector_sizes [8, 8, 1]` only works for 3-dim ops. 4-dim needs `[1, 8, 8, 1]`, 5-dim needs `[1, 1, 8, 8, 1]`.
+2. **Masked vectorization**: After tiling, shapes become dynamic (via `affine.min` boundary handling). Using explicit `vector_sizes` triggers masked vectorization, which creates `vector.mask` ops containing `tensor.cast` — illegal IR (`vector.mask expects only one operation`).
 
-### Possible solutions
+3. **Regular vectorization**: Without `vector_sizes`, `structured.vectorize` requires static shapes — but dynamic shapes from tiling prevent this.
 
-1. **Multiple action sequences** per rank (match by dim count). Pragmatic but not general.
-2. **Dynamic vector sizes via `classify_contraction_dims`**. General but complex.
-3. **Skip vectorize, rely on LLVM -O3**. Current approach — two-level tiling gives cache locality, LLVM handles SIMD.
+### Solution: `vectorize_children_and_apply_patterns`
 
-### Current status
+Applied at function level in `@__transform_main` after all tiling via `foreach_match`:
 
-Two-level tiling (32×32×32 cache + 8×8×1 register) is implemented without vectorize. Vectorization deferred until rank-awareness is solved.
+```mlir
+%func = transform.structured.match ops{["func.func"]} in %updated
+transform.structured.vectorize_children_and_apply_patterns %func
+```
+
+This pattern-based approach:
+- Handles any rank (no per-rank matchers needed)
+- Gracefully skips ops with dynamic shapes (no failure)
+- Vectorizes ops with static shapes (e.g., `linalg.fill`)
+- Works for all test sizes including small tensors with uneven tiling

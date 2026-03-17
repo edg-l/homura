@@ -164,9 +164,11 @@ impl Compiler {
                 transform-interpreter,\
                 func.func(canonicalize,cse),\
                 symbol-dce,\
+                func.func(lower-vector-multi-reduction,lower-vector-mask),\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
                 fold-memref-alias-ops,\
+                convert-vector-to-scf,\
                 convert-linalg-to-loops,\
                 fold-memref-alias-ops,\
                 lower-affine,\
@@ -174,6 +176,8 @@ impl Compiler {
                 canonicalize,\
                 cse,\
                 sccp,\
+                convert-vector-to-llvm,\
+                convert-ub-to-llvm,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
                 lower-affine,\
@@ -769,11 +773,6 @@ fn build_transform_schedule<'c>(
         .expect("build structured.tile_using_for (register tile)");
     tile_outer_block.append_operation(reg_tile_op);
 
-    // NOTE: structured.vectorize is not added here yet because vector_sizes
-    // must exactly match the op's iterator count, which varies by rank (3-dim
-    // for 2D matmul, 4-dim for batched, 5-dim for attention). Vectorize
-    // requires rank-aware size computation or multiple action sequences.
-
     let tile_yield_op = OperationBuilder::new("transform.yield", location)
         .build()
         .expect("build transform.yield (tile_contraction)");
@@ -811,8 +810,10 @@ fn build_transform_schedule<'c>(
     // ── @__transform_main ─────────────────────────────────────────────────────
     //
     // transform.named_sequence @__transform_main(%module: !transform.any_op {transform.consumed}) {
-    //   transform.foreach_match in %module
-    //     @match_contraction -> @tile_contraction
+    //   %updated = transform.foreach_match in %module
+    //       @match_contraction -> @tile_contraction
+    //   %func = transform.structured.match ops{["func.func"]} in %updated
+    //   transform.structured.vectorize_children_and_apply_patterns %func
     //   transform.yield
     // }
 
@@ -834,7 +835,35 @@ fn build_transform_schedule<'c>(
         .add_results(&[any_op_type])
         .build()
         .expect("build transform.foreach_match");
-    main_block.append_operation(foreach_op);
+    let foreach_ref = main_block.append_operation(foreach_op);
+    let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
+
+    // Match func.func inside the updated module
+    let ops_attr = ArrayAttribute::new(
+        context,
+        &[StringAttribute::new(context, "func.func").into()],
+    );
+    let match_func_op = OperationBuilder::new("transform.structured.match", location)
+        .add_operands(&[updated_module])
+        .add_attributes(&[(Identifier::new(context, "ops"), ops_attr.into())])
+        .add_results(&[any_op_type])
+        .build()
+        .expect("build transform.structured.match func.func");
+    let match_func_ref = main_block.append_operation(match_func_op);
+    let func_handle: melior::ir::Value = match_func_ref.result(0).unwrap().into();
+
+    // Vectorize all structured ops inside the function using pattern-based
+    // vectorization.  This handles any rank and dynamic shapes gracefully
+    // (skipping ops it cannot vectorize rather than failing).
+    let vectorize_op = OperationBuilder::new(
+        "transform.structured.vectorize_children_and_apply_patterns",
+        location,
+    )
+    .add_operands(&[func_handle])
+    .add_results(&[any_op_type])
+    .build()
+    .expect("build vectorize_children_and_apply_patterns");
+    main_block.append_operation(vectorize_op);
 
     let main_yield_op = OperationBuilder::new("transform.yield", location)
         .build()
