@@ -18,7 +18,7 @@ pub use dtype::DType;
 pub use graph_builder::{GraphBuilder, GraphContext};
 pub use onnx::Model;
 pub use op::NodeId;
-pub use runtime::{Buffer, CompiledGraph};
+pub use runtime::{Buffer, CompiledGraph, ExecutionPlan, KernelStep, SlotDesc};
 pub use shape::Shape;
 pub use tensor::Tensor;
 pub use trace::{begin_trace, take_trace};

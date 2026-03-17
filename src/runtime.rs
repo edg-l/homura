@@ -464,6 +464,167 @@ impl CompiledGraph {
     }
 }
 
+// ── ExecutionPlan ─────────────────────────────────────────────────────────────
+
+/// Describes one buffer slot in the execution plan's buffer pool.
+#[derive(Clone, Debug)]
+pub struct SlotDesc {
+    pub shape: Shape,
+    pub dtype: DType,
+}
+
+/// One step in the execution plan: invoke a kernel with specific buffer routing.
+#[derive(Clone, Debug)]
+pub struct KernelStep {
+    /// Index into `ExecutionPlan::kernels`.
+    pub kernel_idx: usize,
+    /// Buffer pool slot indices to pass as inputs to this kernel.
+    /// Order matches the kernel's compiled input arguments.
+    pub input_slots: Vec<usize>,
+    /// Buffer pool slot indices where this kernel writes its outputs.
+    /// Order matches the kernel's compiled output arguments.
+    pub output_slots: Vec<usize>,
+}
+
+/// A compiled model consisting of multiple independently-compiled kernels
+/// executed in sequence with Rust-side buffer routing.
+///
+/// Each kernel is a `CompiledGraph` (its own `.so`). The execution plan
+/// specifies the order of kernel invocations and how buffer slots map to
+/// each kernel's inputs and outputs.
+pub struct ExecutionPlan {
+    /// Compiled kernels, indexed by `KernelStep::kernel_idx`.
+    pub(crate) kernels: Vec<CompiledGraph>,
+    /// Execution steps in order.
+    pub(crate) steps: Vec<KernelStep>,
+    /// Total number of buffer slots in the pool.
+    pub(crate) num_slots: usize,
+    /// Buffer pool slot indices for model inputs (in order).
+    pub(crate) input_slots: Vec<usize>,
+    /// Buffer pool slot indices for weight buffers (in order).
+    pub(crate) weight_slots: Vec<usize>,
+    /// Buffer pool slot indices that are model outputs (extracted at the end).
+    pub(crate) output_slots: Vec<usize>,
+    /// Shape + dtype for every slot (used to allocate intermediate buffers).
+    pub(crate) slot_descs: Vec<SlotDesc>,
+}
+
+/// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
+enum PoolEntry<'a> {
+    Borrowed(&'a Buffer),
+    Owned(Buffer),
+}
+
+impl<'a> PoolEntry<'a> {
+    fn as_ref(&self) -> &Buffer {
+        match self {
+            PoolEntry::Borrowed(b) => b,
+            PoolEntry::Owned(b) => b,
+        }
+    }
+
+    fn into_owned(self) -> Buffer {
+        match self {
+            PoolEntry::Borrowed(b) => b.clone(),
+            PoolEntry::Owned(b) => b,
+        }
+    }
+}
+
+impl ExecutionPlan {
+    /// Execute the plan with the given model inputs and weight buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the number of inputs or weights doesn't match the plan.
+    pub fn run(&self, inputs: &[&Buffer], weights: &[Buffer]) -> Vec<Buffer> {
+        assert_eq!(
+            inputs.len(),
+            self.input_slots.len(),
+            "ExecutionPlan::run: expected {} inputs, got {}",
+            self.input_slots.len(),
+            inputs.len()
+        );
+        assert_eq!(
+            weights.len(),
+            self.weight_slots.len(),
+            "ExecutionPlan::run: expected {} weights, got {}",
+            self.weight_slots.len(),
+            weights.len()
+        );
+
+        let mut pool: Vec<Option<PoolEntry>> = (0..self.num_slots).map(|_| None).collect();
+
+        // Place inputs (borrowed).
+        for (i, &slot) in self.input_slots.iter().enumerate() {
+            pool[slot] = Some(PoolEntry::Borrowed(inputs[i]));
+        }
+
+        // Place weights (borrowed).
+        for (i, &slot) in self.weight_slots.iter().enumerate() {
+            pool[slot] = Some(PoolEntry::Borrowed(&weights[i]));
+        }
+
+        // Execute steps.
+        for step in &self.steps {
+            let kernel = &self.kernels[step.kernel_idx];
+
+            // Gather input refs for this kernel.
+            let step_inputs: Vec<&Buffer> = step
+                .input_slots
+                .iter()
+                .map(|&s| {
+                    pool[s]
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("buffer slot {s} not populated at kernel step"))
+                        .as_ref()
+                })
+                .collect();
+
+            // Check if any output has dynamic dims — if so, resolve from slot_descs.
+            let has_dynamic = kernel
+                .output_descs()
+                .iter()
+                .any(|d| d.shape.has_dynamic_dims());
+
+            let outputs: Vec<Buffer> = if has_dynamic {
+                let concrete_shapes: Vec<Shape> = step
+                    .output_slots
+                    .iter()
+                    .map(|&s| self.slot_descs[s].shape.clone())
+                    .collect();
+                kernel.run_dynamic(&step_inputs, &concrete_shapes)
+            } else {
+                kernel.run(&step_inputs)
+            };
+
+            // Place outputs into pool.
+            assert_eq!(
+                outputs.len(),
+                step.output_slots.len(),
+                "kernel {} produced {} outputs but step expects {}",
+                step.kernel_idx,
+                outputs.len(),
+                step.output_slots.len()
+            );
+            for (buf, &slot) in outputs.into_iter().zip(step.output_slots.iter()) {
+                pool[slot] = Some(PoolEntry::Owned(buf));
+            }
+        }
+
+        // Extract model outputs.
+        self.output_slots
+            .iter()
+            .map(|&s| {
+                pool[s]
+                    .take()
+                    .unwrap_or_else(|| panic!("output slot {s} not populated"))
+                    .into_owned()
+            })
+            .collect()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1535,5 +1696,114 @@ mod tests {
 
         let result = compiled.run(&[&a_buf, &b_buf]);
         assert_eq!(result[0].as_slice::<f32>(), &[11.0f32, 22.0, 33.0, 44.0]);
+    }
+
+    // ── ExecutionPlan tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn execution_plan_two_kernels() {
+        // Build a plan: kernel0 = add(a, b) → c, kernel1 = mul(c, b) → d
+        // Equivalent to: d = (a + b) * b
+        use crate::graph_builder::GraphContext;
+        use super::{ExecutionPlan, KernelStep, SlotDesc};
+        use crate::Shape;
+
+        // Kernel 0: add(x, y) → z
+        let ctx0 = GraphContext::new();
+        let mut gb0 = ctx0.builder();
+        let x0 = gb0.input(&[Some(4)], DType::F32);
+        let y0 = gb0.input(&[Some(4)], DType::F32);
+        let z0 = gb0.emit_add(&x0, &y0);
+        let k0 = gb0.compile(&[&z0]).expect("compile kernel0");
+
+        // Kernel 1: mul(x, y) → z
+        let ctx1 = GraphContext::new();
+        let mut gb1 = ctx1.builder();
+        let x1 = gb1.input(&[Some(4)], DType::F32);
+        let y1 = gb1.input(&[Some(4)], DType::F32);
+        let z1 = gb1.emit_mul(&x1, &y1);
+        let k1 = gb1.compile(&[&z1]).expect("compile kernel1");
+
+        // Buffer slots:
+        //   0 = input a
+        //   1 = input b
+        //   2 = intermediate c (output of kernel0)
+        //   3 = output d (output of kernel1)
+        let plan = ExecutionPlan {
+            kernels: vec![k0, k1],
+            steps: vec![
+                KernelStep {
+                    kernel_idx: 0,
+                    input_slots: vec![0, 1],  // a, b
+                    output_slots: vec![2],     // c
+                },
+                KernelStep {
+                    kernel_idx: 1,
+                    input_slots: vec![2, 1],  // c, b
+                    output_slots: vec![3],     // d
+                },
+            ],
+            num_slots: 4,
+            input_slots: vec![0, 1],
+            weight_slots: vec![],
+            output_slots: vec![3],
+            slot_descs: vec![
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
+            ],
+        };
+
+        let a = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
+        let b = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
+
+        let result = plan.run(&[&a, &b], &[]);
+        // d = (a + b) * b = (11, 22, 33, 44) * (10, 20, 30, 40) = (110, 440, 990, 1760)
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].as_slice::<f32>(),
+            &[110.0, 440.0, 990.0, 1760.0]
+        );
+    }
+
+    #[test]
+    fn execution_plan_with_weights() {
+        // kernel0 = add(input, weight) → output
+        use crate::graph_builder::GraphContext;
+        use super::{ExecutionPlan, KernelStep, SlotDesc};
+        use crate::Shape;
+
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(3)], DType::F32);
+        let w = gb.input(&[Some(3)], DType::F32);
+        let y = gb.emit_add(&x, &w);
+        let k = gb.compile(&[&y]).expect("compile");
+
+        // Slots: 0=input, 1=weight, 2=output
+        let plan = ExecutionPlan {
+            kernels: vec![k],
+            steps: vec![KernelStep {
+                kernel_idx: 0,
+                input_slots: vec![0, 1],
+                output_slots: vec![2],
+            }],
+            num_slots: 3,
+            input_slots: vec![0],
+            weight_slots: vec![1],
+            output_slots: vec![2],
+            slot_descs: vec![
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
+            ],
+        };
+
+        let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
+        let weight = Buffer::from_slice::<f32>(&[0.5, 0.5, 0.5], &[3], DType::F32);
+
+        let result = plan.run(&[&input], &[weight]);
+        assert_eq!(result[0].as_slice::<f32>(), &[1.5, 2.5, 3.5]);
     }
 }
