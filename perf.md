@@ -28,10 +28,12 @@ BLAS. Missing:
 - Optimal loop ordering for the micro-kernel
 - AVX-512 utilization (CPU supports it)
 
-**Fix options**:
-- Link against OpenBLAS/MKL for matmuls (bypass generated code)
-- Improve the generated micro-kernel (better tile sizes, unroll, prefetch)
-- Use MLIR's `transform.structured.pack` for packed GEMM layout
+**Fix** (MLIR-native, no external BLAS):
+- `transform.structured.pack` for packed GEMM data layout (eliminates
+  TLB misses, enables streaming — this is how BLIS/GotoBLAS get speed)
+- Tune tile sizes and loop ordering for the micro-kernel
+- Explicit unroll-and-jam via transform schedule
+- AVX-512 targeting via wider vector_sizes
 
 ### 3. No memory prefetching
 
@@ -51,8 +53,8 @@ Each decode step reads/writes the full KV cache ([1, 12, seq_len, 64]
 | Change | Expected speedup | Complexity |
 |---|---|---|
 | Multi-threading (forall + OpenMP) | 6-10x | Medium |
-| Link OpenBLAS for matmul | 5-10x | Low |
-| Both above | 20-50x → ~80-200 tok/s | Medium |
-| AVX-512 micro-kernel | 1.5-2x | High |
+| Packed GEMM layout (structured.pack) | 2-4x | Medium |
+| Both above | 15-30x → ~60-130 tok/s | Medium |
+| AVX-512 micro-kernel (wider vectors) | 1.5-2x | Medium |
 | KV cache quantization | 1.3-2x (long sequences) | Medium |
 | Software prefetching | 1.2-1.5x | Medium |
