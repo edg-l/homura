@@ -941,13 +941,14 @@ pub(crate) fn build_transform_schedule<'c>(
     // ── @__transform_main ─────────────────────────────────────────────────────
     //
     // transform.named_sequence @__transform_main(%module: !transform.any_op {transform.consumed}) {
-    //   %updated = transform.foreach_match in %module
+    //   transform.foreach_match in %module
     //       @match_contraction_3d -> @tile_contraction_3d,
     //       @match_contraction_4d -> @tile_contraction_4d
-    //   %func = transform.structured.match ops{["func.func"]} in %updated
-    //   transform.structured.vectorize_children_and_apply_patterns %func
     //   transform.yield
     // }
+    // vectorize_children_and_apply_patterns runs on all func.func ops after
+    // tiling. It both vectorizes structured ops and applies cleanup patterns
+    // that make the tiled tensor IR bufferizable.
 
     let main_block = Block::new(&[(any_op_type, location)]);
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
@@ -971,6 +972,10 @@ pub(crate) fn build_transform_schedule<'c>(
     let foreach_ref = main_block.append_operation(foreach_op);
     let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
 
+    // Vectorize tiled contractions inside all functions. This also applies
+    // cleanup patterns that make the tiled IR bufferizable.
+    // Note: vectorize_nd_extract is NOT set, so tensor.extract ops (gather
+    // patterns) are left untouched — only structured linalg ops get vectorized.
     let ops_attr = ArrayAttribute::new(
         context,
         &[StringAttribute::new(context, "func.func").into()],
@@ -984,9 +989,6 @@ pub(crate) fn build_transform_schedule<'c>(
     let match_func_ref = main_block.append_operation(match_func_op);
     let func_handle: melior::ir::Value = match_func_ref.result(0).unwrap().into();
 
-    // Vectorize all structured ops inside the function using pattern-based
-    // vectorization.  This handles any rank and dynamic shapes gracefully
-    // (skipping ops it cannot vectorize rather than failing).
     let vectorize_op = OperationBuilder::new(
         "transform.structured.vectorize_children_and_apply_patterns",
         location,
