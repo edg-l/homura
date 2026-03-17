@@ -532,6 +532,11 @@ impl<'a> PoolEntry<'a> {
 }
 
 impl ExecutionPlan {
+    /// Return the `SlotDesc` for each model output slot.
+    pub fn output_slot_descs(&self) -> Vec<&SlotDesc> {
+        self.output_slots.iter().map(|&s| &self.slot_descs[s]).collect()
+    }
+
     /// Execute the plan with the given model inputs and weight buffers.
     ///
     /// # Panics

@@ -1435,3 +1435,376 @@ fn insert_tensor<'c>(
 ) {
     value_map.insert(name.to_string(), EmitValue::Tensor(t));
 }
+
+// ── Per-kernel compilation ───────────────────────────────────────────────────
+
+/// ONNX op types that expand dramatically during tiling/vectorization.
+const HEAVY_OPS: &[&str] = &["Conv", "MatMul", "Gemm", "ConvTranspose"];
+
+/// A group of ONNX nodes that will become one compiled kernel.
+struct KernelGroup {
+    node_indices: Vec<usize>,
+}
+
+/// Partition ONNX nodes into kernel groups: each heavy op becomes its own
+/// kernel, lightweight ops between heavy ops are grouped together.
+fn partition_nodes(nodes: &[OnnxNode]) -> Vec<KernelGroup> {
+    let mut groups: Vec<KernelGroup> = Vec::new();
+    let mut current_lightweight: Vec<usize> = Vec::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+        if HEAVY_OPS.contains(&node.op_type.as_str()) {
+            // Close current lightweight group if non-empty.
+            if !current_lightweight.is_empty() {
+                groups.push(KernelGroup {
+                    node_indices: std::mem::take(&mut current_lightweight),
+                });
+            }
+            // Heavy op is its own kernel.
+            groups.push(KernelGroup {
+                node_indices: vec![i],
+            });
+        } else {
+            current_lightweight.push(i);
+        }
+    }
+
+    // Close any remaining lightweight group.
+    if !current_lightweight.is_empty() {
+        groups.push(KernelGroup {
+            node_indices: current_lightweight,
+        });
+    }
+
+    groups
+}
+
+/// I/O mapping for a single kernel: which ONNX value names are inputs/outputs
+/// and which buffer pool slot they map to.
+struct KernelIO {
+    /// (ONNX value name, buffer slot index) — inputs to this kernel, in order.
+    input_slots: Vec<(String, usize)>,
+    /// (ONNX value name, buffer slot index) — outputs from this kernel, in order.
+    output_slots: Vec<(String, usize)>,
+}
+
+/// Assign buffer pool slots and compute per-kernel I/O mappings.
+///
+/// Returns `(kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_value_names)`
+/// where `slot_value_names[i]` is the ONNX value name for slot `i`.
+fn assign_buffer_slots(
+    model: &OnnxModel,
+    groups: &[KernelGroup],
+) -> (Vec<KernelIO>, usize, Vec<usize>, Vec<usize>, Vec<usize>, Vec<String>) {
+    let mut name_to_slot: HashMap<String, usize> = HashMap::new();
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut next_slot = 0usize;
+
+    let mut alloc_slot = |name: &str, name_to_slot: &mut HashMap<String, usize>,
+                          slot_names: &mut Vec<String>, next: &mut usize| -> usize {
+        if let Some(&s) = name_to_slot.get(name) {
+            s
+        } else {
+            let s = *next;
+            *next += 1;
+            name_to_slot.insert(name.to_string(), s);
+            slot_names.push(name.to_string());
+            s
+        }
+    };
+
+    // Assign slots for model inputs (in order).
+    let mut input_slots: Vec<usize> = Vec::new();
+    for input in &model.dynamic_inputs {
+        let s = alloc_slot(&input.name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+        input_slots.push(s);
+    }
+
+    // Assign slots for weights (in order).
+    let mut weight_slots: Vec<usize> = Vec::new();
+    let weight_names: HashSet<String> = model.initializers.iter().map(|(n, _)| n.clone()).collect();
+    for (name, _) in &model.initializers {
+        let s = alloc_slot(name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+        weight_slots.push(s);
+    }
+
+    // For each group, determine which values are produced inside vs consumed from outside.
+    let mut produced_by: HashMap<String, usize> = HashMap::new(); // value name → group index
+    for (gi, group) in groups.iter().enumerate() {
+        for &ni in &group.node_indices {
+            for out_name in &model.nodes[ni].outputs {
+                if !out_name.is_empty() {
+                    produced_by.insert(out_name.clone(), gi);
+                }
+            }
+        }
+    }
+
+    // Build per-kernel I/O.
+    let mut kernel_ios: Vec<KernelIO> = Vec::new();
+    for (gi, group) in groups.iter().enumerate() {
+        let mut produced_in_group: HashSet<String> = HashSet::new();
+        for &ni in &group.node_indices {
+            for out_name in &model.nodes[ni].outputs {
+                if !out_name.is_empty() {
+                    produced_in_group.insert(out_name.clone());
+                }
+            }
+        }
+
+        // Inputs: consumed by this group but produced outside (or model inputs/weights).
+        let mut seen_inputs: HashSet<String> = HashSet::new();
+        let mut io_input_slots: Vec<(String, usize)> = Vec::new();
+        for &ni in &group.node_indices {
+            for in_name in &model.nodes[ni].inputs {
+                if in_name.is_empty() || produced_in_group.contains(in_name) {
+                    continue;
+                }
+                if seen_inputs.insert(in_name.clone()) {
+                    let s = alloc_slot(in_name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+                    io_input_slots.push((in_name.clone(), s));
+                }
+            }
+        }
+
+        // Outputs: produced by this group AND (consumed by a later group OR model output).
+        let model_output_set: HashSet<&str> = model.outputs.iter().map(|s| s.as_str()).collect();
+        let mut seen_outputs: HashSet<String> = HashSet::new();
+        let mut io_output_slots: Vec<(String, usize)> = Vec::new();
+        for &ni in &group.node_indices {
+            for out_name in &model.nodes[ni].outputs {
+                if out_name.is_empty() || !seen_outputs.insert(out_name.clone()) {
+                    continue;
+                }
+                // Is this value used outside this group or is a model output?
+                let used_outside = model.nodes.iter().enumerate().any(|(other_ni, other_node)| {
+                    if group.node_indices.contains(&other_ni) {
+                        return false;
+                    }
+                    other_node.inputs.contains(out_name)
+                }) || model_output_set.contains(out_name.as_str());
+
+                if used_outside {
+                    let s = alloc_slot(out_name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+                    io_output_slots.push((out_name.clone(), s));
+                }
+            }
+        }
+
+        kernel_ios.push(KernelIO {
+            input_slots: io_input_slots,
+            output_slots: io_output_slots,
+        });
+    }
+
+    // Model output slots (in order).
+    let output_slots: Vec<usize> = model
+        .outputs
+        .iter()
+        .map(|name| *name_to_slot.get(name).expect("model output not in slot map"))
+        .collect();
+
+    (kernel_ios, next_slot, input_slots, weight_slots, output_slots, slot_names)
+}
+
+/// Shape + dtype info for a value, recorded after emission for use by downstream kernels.
+struct ValueShapeInfo {
+    shape: Vec<Option<u64>>,
+    dtype: DType,
+}
+
+/// Emit and compile all kernels, producing an ExecutionPlan.
+///
+/// This is the per-kernel replacement for `emit_graph` + `compile_with_cache`.
+/// Each kernel group gets its own `GraphContext` + `GraphBuilder`, so MLIR
+/// passes and codegen run on small independent modules.
+pub fn emit_and_compile_plan(
+    model: &OnnxModel,
+    inputs: &[&Buffer],
+    model_bytes: Option<&[u8]>,
+    keep_dynamic: &HashSet<String>,
+) -> Result<(crate::runtime::ExecutionPlan, Vec<Buffer>), OnnxError> {
+    use crate::cache::CompilationCache;
+    use crate::graph_builder::GraphContext;
+    use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
+    use crate::shape::DIM_DYNAMIC;
+    use crate::Shape;
+
+    let groups = partition_nodes(&model.nodes);
+    let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
+        assign_buffer_slots(model, &groups);
+
+    eprintln!(
+        "[plan] {} nodes → {} kernels, {} buffer slots",
+        model.nodes.len(),
+        groups.len(),
+        num_slots
+    );
+
+    // Seed shape info from model inputs.
+    let mut shape_info: HashMap<String, ValueShapeInfo> = HashMap::new();
+    for (spec, buf) in model.dynamic_inputs.iter().zip(inputs.iter()) {
+        let shape: Vec<Option<u64>> = spec
+            .dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d {
+                Dim::Fixed(v) if *v == DIM_DYNAMIC => None,
+                Dim::Fixed(v) => Some(*v),
+                Dim::Symbolic(name) if keep_dynamic.contains(name) => None,
+                Dim::Symbolic(_) => Some(buf.shape().0[i]),
+            })
+            .collect();
+        shape_info.insert(spec.name.clone(), ValueShapeInfo {
+            shape,
+            dtype: spec.dtype,
+        });
+    }
+
+    // Seed shape info from weights.
+    let weight_names: HashSet<String> = model.initializers.iter().map(|(n, _)| n.clone()).collect();
+    for (name, buf) in &model.initializers {
+        shape_info.insert(name.clone(), ValueShapeInfo {
+            shape: buf.shape().0.iter().map(|&d| Some(d)).collect(),
+            dtype: buf.dtype(),
+        });
+    }
+
+    // Seed const_i64 from small integer initializers.
+    let mut const_i64: HashMap<String, Vec<i64>> = HashMap::new();
+    for (name, buf) in &model.initializers {
+        if buf.shape().num_elements() <= 64 {
+            if let Ok(vals) = read_i64_buffer(buf) {
+                const_i64.insert(name.clone(), vals);
+            }
+        }
+    }
+
+    // Collect weights in initializer order.
+    let weights: Vec<Buffer> = model.initializers.iter().map(|(_, b)| b.clone()).collect();
+
+    // Build input_shapes for cache key.
+    let input_shapes: Vec<Shape> = model
+        .dynamic_inputs
+        .iter()
+        .zip(inputs.iter())
+        .map(|(spec, buf)| {
+            let dims: Vec<u64> = spec
+                .dims
+                .iter()
+                .enumerate()
+                .map(|(i, d)| match d {
+                    Dim::Fixed(v) if *v == DIM_DYNAMIC => DIM_DYNAMIC,
+                    Dim::Fixed(v) => *v,
+                    Dim::Symbolic(name) if keep_dynamic.contains(name) => DIM_DYNAMIC,
+                    Dim::Symbolic(_) => buf.shape().0[i],
+                })
+                .collect();
+            Shape(dims)
+        })
+        .collect();
+    let model_cache_key = model_bytes.map(|b| {
+        let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
+        CompilationCache::cache_key(b, &shape_refs)
+    });
+
+    // Compile each kernel.
+    let mut kernels: Vec<crate::runtime::CompiledGraph> = Vec::new();
+    let mut steps: Vec<KernelStep> = Vec::new();
+
+    for (gi, (group, io)) in groups.iter().zip(kernel_ios.iter()).enumerate() {
+        let t0 = std::time::Instant::now();
+        let ctx = GraphContext::new();
+        let mut builder = ctx.builder();
+        let mut local_value_map: HashMap<String, EmitValue> = HashMap::new();
+
+        // Add inputs to this kernel's builder.
+        for (name, _slot) in &io.input_slots {
+            let info = shape_info.get(name).unwrap_or_else(|| {
+                panic!("kernel {gi}: no shape info for input '{name}'")
+            });
+            let t = builder.input(&info.shape, info.dtype);
+            local_value_map.insert(name.clone(), EmitValue::Tensor(t));
+        }
+
+        // Emit all nodes in this kernel group.
+        for &ni in &group.node_indices {
+            emit_node(&model.nodes[ni], &mut local_value_map, &mut const_i64, &mut builder)?;
+        }
+
+        // Record output shapes for downstream kernels.
+        for (name, _slot) in &io.output_slots {
+            if let Some(ev) = local_value_map.get(name) {
+                let t = ev.as_tensor(&mut builder);
+                shape_info.insert(name.clone(), ValueShapeInfo {
+                    shape: t.shape(),
+                    dtype: t.dtype(),
+                });
+            }
+        }
+
+        // Collect output tensors.
+        let output_tensors: Vec<crate::graph_builder::Tensor> = io
+            .output_slots
+            .iter()
+            .map(|(name, _)| {
+                local_value_map
+                    .get(name)
+                    .unwrap_or_else(|| panic!("kernel {gi}: output '{name}' not in value_map"))
+                    .as_tensor(&mut builder)
+            })
+            .collect();
+        let output_refs: Vec<&crate::graph_builder::Tensor> = output_tensors.iter().collect();
+
+        // Compile with per-kernel cache key.
+        let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
+        let compiled = builder
+            .compile_with_cache(&output_refs, cache_key.as_deref())
+            .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
+
+        eprintln!(
+            "[plan] kernel {gi} ({} nodes, {} in / {} out): {}ms",
+            group.node_indices.len(),
+            io.input_slots.len(),
+            io.output_slots.len(),
+            t0.elapsed().as_millis()
+        );
+
+        let kernel_idx = kernels.len();
+        kernels.push(compiled);
+        steps.push(KernelStep {
+            kernel_idx,
+            input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
+            output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
+        });
+    }
+
+    // Build slot descriptors.
+    let slot_descs: Vec<SlotDesc> = slot_names
+        .iter()
+        .map(|name| {
+            let info = shape_info.get(name).unwrap_or_else(|| {
+                panic!("no shape info for slot '{name}'")
+            });
+            let shape = Shape(
+                info.shape.iter().map(|d| d.unwrap_or(DIM_DYNAMIC)).collect(),
+            );
+            SlotDesc {
+                shape,
+                dtype: info.dtype,
+            }
+        })
+        .collect();
+
+    let plan = ExecutionPlan {
+        kernels,
+        steps,
+        num_slots,
+        input_slots,
+        weight_slots,
+        output_slots,
+        slot_descs,
+    };
+
+    Ok((plan, weights))
+}

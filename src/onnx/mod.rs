@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use crate::{
     Shape,
     cache::CompilationCache,
-    runtime::{Buffer, CompiledGraph, OutputDesc},
+    runtime::{Buffer, CompiledGraph, ExecutionPlan, OutputDesc},
     shape::DIM_DYNAMIC,
 };
 use parser::{Dim, OnnxError, OnnxModel};
@@ -17,7 +17,7 @@ use parser::{Dim, OnnxError, OnnxModel};
 // ── Compiled state ─────────────────────────────────────────────────────────────
 
 struct CompiledState {
-    compiled: CompiledGraph,
+    plan: ExecutionPlan,
     weights: Vec<Buffer>,
     /// Input shapes used during compilation (for shape-change detection).
     /// Dynamic dims are represented as `DIM_DYNAMIC` so the shapes-changed
@@ -187,27 +187,7 @@ impl Model {
         }
 
         let state = guard.as_ref().unwrap();
-        let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + state.weights.len());
-        all_args.extend_from_slice(inputs);
-        for w in &state.weights {
-            all_args.push(w);
-        }
-
-        // Check if any outputs have dynamic dims — if so, compute concrete output
-        // shapes from the actual input buffer shapes and use run_dynamic.
-        let output_descs = state.compiled.output_descs();
-        let has_dynamic_outputs = output_descs.iter().any(|d| d.shape.has_dynamic_dims());
-
-        if has_dynamic_outputs {
-            let parsed = self.parsed.as_ref()
-                .expect("parsed model must be present when outputs have dynamic dims");
-            let concrete_output_shapes = compute_concrete_output_shapes(
-                parsed, inputs, &self.keep_dynamic,
-            );
-            Ok(state.compiled.run_dynamic(&all_args, &concrete_output_shapes))
-        } else {
-            Ok(state.compiled.run(&all_args))
-        }
+        Ok(state.plan.run(inputs, &state.weights))
     }
 
     fn do_compile(
@@ -221,7 +201,12 @@ impl Model {
     /// Returns the compiled output descriptors, or `None` if not yet compiled.
     pub fn output_descs(&self) -> Option<Vec<OutputDesc>> {
         let guard = self.state.lock().unwrap();
-        guard.as_ref().map(|s| s.compiled.output_descs().to_vec())
+        guard.as_ref().map(|s| {
+            s.plan.output_slot_descs().iter().map(|sd| OutputDesc {
+                shape: sd.shape.clone(),
+                dtype: sd.dtype,
+            }).collect()
+        })
     }
 
     /// Run inference with caller-provided output shapes.
@@ -277,29 +262,27 @@ impl Model {
         }
 
         let state = guard.as_ref().unwrap();
-        let mut all_args: Vec<&Buffer> = Vec::with_capacity(inputs.len() + state.weights.len());
-        all_args.extend_from_slice(inputs);
-        for w in &state.weights {
-            all_args.push(w);
-        }
-
-        Ok(state.compiled.run_dynamic(&all_args, output_shapes))
+        // TODO: run_with_output_shapes needs per-kernel dynamic shape support.
+        // For now, use the plan's normal run path (which handles dynamic outputs
+        // via slot_descs). The caller-provided output_shapes are ignored.
+        let _ = output_shapes;
+        Ok(state.plan.run(inputs, &state.weights))
     }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Compile an `OnnxModel` using the GraphBuilder emitter.
+/// Compile an `OnnxModel` using per-kernel compilation.
 ///
-/// Emits MLIR ops directly without the intermediate Trace/Op system.
+/// Each heavy op (Conv, MatMul, Gemm) becomes its own compiled kernel with
+/// its own MLIR context + pass pipeline. Buffer routing between kernels is
+/// handled by the returned `ExecutionPlan`.
 fn compile_model_emitter(
     model: &OnnxModel,
     inputs: &[&Buffer],
     model_bytes: Option<&[u8]>,
     keep_dynamic: &HashSet<String>,
 ) -> Result<CompiledState, OnnxError> {
-    use crate::graph_builder::GraphContext;
-
     // Build input_shapes for recompilation detection.
     let input_shapes: Vec<Shape> = model
         .dynamic_inputs
@@ -321,24 +304,11 @@ fn compile_model_emitter(
         })
         .collect();
 
-    // Build MLIR via the emitter.
-    let ctx = GraphContext::new();
-    let mut builder = ctx.builder();
-    let (output_tensors, weights) = emitter::emit_graph(model, &mut builder, keep_dynamic)?;
-
-    let output_refs: Vec<&crate::graph_builder::Tensor<'_>> = output_tensors.iter().collect();
-
-    let cache_key = model_bytes.map(|b| {
-        let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
-        format!("gb_{}", CompilationCache::cache_key(b, &shape_refs))
-    });
-
-    let compiled = builder
-        .compile_with_cache(&output_refs, cache_key.as_deref())
-        .map_err(|e| OnnxError::CompileError(e.to_string()))?;
+    let (plan, weights) =
+        emitter::emit_and_compile_plan(model, inputs, model_bytes, keep_dynamic)?;
 
     Ok(CompiledState {
-        compiled,
+        plan,
         weights,
         input_shapes,
     })
