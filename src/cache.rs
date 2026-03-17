@@ -268,6 +268,10 @@ pub fn bucket_pad(len: usize) -> usize {
 /// - Homura crate version (codegen changes)
 /// - LLVM version (backend changes)
 /// - Host CPU name + features (AVX2, SSE4.2, etc.)
+/// Bump this when the pass pipeline changes in a way that invalidates cached
+/// .so files (e.g. adding OpenMP threading support).
+const PIPELINE_VERSION: u32 = 2;
+
 fn compiler_fingerprint() -> String {
     use std::sync::OnceLock;
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
@@ -296,7 +300,7 @@ fn compiler_fingerprint() -> String {
 
                 (cpu, feat, llvm_ver)
             };
-            format!("homura={homura_version};llvm={llvm_version};cpu={cpu};features={features}")
+            format!("homura={homura_version};pipeline={PIPELINE_VERSION};llvm={llvm_version};cpu={cpu};features={features}")
         })
         .clone()
 }

@@ -167,11 +167,14 @@ impl Compiler {
                 func.func(lower-vector-multi-reduction,lower-vector-mask),\
                 one-shot-bufferize{function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+                scf-forall-to-parallel,\
                 fold-memref-alias-ops,\
                 convert-vector-to-scf,\
                 convert-linalg-to-loops,\
                 fold-memref-alias-ops,\
                 lower-affine,\
+                convert-scf-to-openmp,\
+                convert-openmp-to-llvm,\
                 convert-scf-to-cf,\
                 canonicalize,\
                 cse,\
@@ -513,28 +516,64 @@ unsafe fn emit_packed_wrapper(
     } // end unsafe
 }
 
+/// Return the MLIR/LLVM library prefix directory.
+///
+/// Reads `MLIR_SYS_210_PREFIX` (set by env-llvm21-dev.sh) and returns its
+/// `lib/` subdirectory. Falls back to `/usr/lib/llvm/21/lib64`.
+fn mlir_lib_dir() -> std::path::PathBuf {
+    if let Ok(prefix) = std::env::var("MLIR_SYS_210_PREFIX") {
+        return std::path::PathBuf::from(prefix).join("lib");
+    }
+    std::path::PathBuf::from("/usr/lib/llvm/21/lib64")
+}
+
 /// Return the path to `libmlir_c_runner_utils.so`.
 ///
-/// Reads `MLIR_RUNNER_UTILS_PATH` if set, otherwise falls back to the
-/// well-known LLVM 21 install path on this system.
+/// Reads `MLIR_RUNNER_UTILS_PATH` if set, otherwise derives from the MLIR
+/// prefix.
 fn runner_utils_lib_path() -> std::path::PathBuf {
     if let Ok(path) = std::env::var("MLIR_RUNNER_UTILS_PATH") {
         return std::path::PathBuf::from(path);
     }
-    std::path::PathBuf::from("/usr/lib/llvm/21/lib64/libmlir_c_runner_utils.so")
+    mlir_lib_dir().join("libmlir_c_runner_utils.so")
+}
+
+/// Return the path to `libomp.so`.
+///
+/// Reads `OMP_LIB_PATH` if set, otherwise derives from the MLIR prefix.
+/// The LLVM 21 build installs libomp under a target-triple subdirectory.
+fn omp_lib_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("OMP_LIB_PATH") {
+        return std::path::PathBuf::from(path);
+    }
+    let base = mlir_lib_dir();
+    // LLVM installs libomp under lib/<triple>/ (e.g. lib/x86_64-unknown-linux-gnu/)
+    let triple_dir = base.join("x86_64-unknown-linux-gnu").join("libomp.so");
+    if triple_dir.exists() {
+        return triple_dir;
+    }
+    // Fall back to lib/libomp.so (system LLVM installs)
+    base.join("libomp.so")
 }
 
 /// Link an object file into a shared library.
 ///
-/// Links `runner_utils` by full path and bakes its directory into the
-/// `.so`'s `DT_RUNPATH` so the dynamic linker finds it at dlopen time
-/// without requiring `LD_LIBRARY_PATH`.
+/// Links `runner_utils` and `libomp` by full path and bakes their directories
+/// into the `.so`'s `DT_RUNPATH` so the dynamic linker finds them at dlopen
+/// time without requiring `LD_LIBRARY_PATH`.
 fn link_shared_lib(
     obj_path: &std::path::Path,
     so_path: &std::path::Path,
 ) -> Result<(), CompileError> {
     let runner_utils_path = runner_utils_lib_path();
     let runner_utils_dir = runner_utils_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/usr/lib/llvm/21/lib64"))
+        .to_str()
+        .unwrap_or("/usr/lib/llvm/21/lib64");
+
+    let omp_path = omp_lib_path();
+    let omp_dir = omp_path
         .parent()
         .unwrap_or(std::path::Path::new("/usr/lib/llvm/21/lib64"))
         .to_str()
@@ -548,8 +587,10 @@ fn link_shared_lib(
             so_path.to_str().unwrap(),
             obj_path.to_str().unwrap(),
             runner_utils_path.to_str().unwrap(),
+            omp_path.to_str().unwrap(),
             "-lm",
             &format!("-Wl,-rpath,{runner_utils_dir}"),
+            &format!("-Wl,-rpath,{omp_dir}"),
         ])
         .status()
         .map_err(|e| CompileError::Link(format!("failed to run cc: {e}")))?;
@@ -717,42 +758,45 @@ fn build_transform_schedule<'c>(
     // ── @tile_contraction ─────────────────────────────────────────────────────
     //
     // transform.named_sequence @tile_contraction(%op: !transform.any_op {transform.consumed}) {
-    //   %tiled, %l0, %l1, %l2 = transform.structured.tile_using_for %op
-    //       tile_sizes [32, 32, 32]
+    //   %tiled, %forall = transform.structured.tile_using_forall %op
+    //       tile_sizes [32, 32, 0]   -- M, N parallel; K sequential
+    //   %tiled_reg, ... = transform.structured.tile_using_for %tiled
+    //       tile_sizes [8, 8, 1]     -- register tile for vectorization
+    //   transform.structured.pad %tiled_reg ...
     //   transform.yield
     // }
 
     let tile_outer_block = Block::new(&[(any_op_type, location)]);
     let op_to_tile: melior::ir::Value = tile_outer_block.argument(0).unwrap().into();
 
-    // tile_sizes [32, 32, 32] — 3 non-zero sizes produce 3 loop handles
-    let tile_sizes: &[i64] = &[32, 32, 32];
-    let num_loops = tile_sizes.len(); // all are non-zero
-    let mut tile_result_types = vec![any_op_type]; // tiled op
-    tile_result_types.extend(std::iter::repeat(any_op_type).take(num_loops)); // loop handles
-
-    let static_sizes_attr = Attribute::parse(
-        context,
-        &format!(
-            "array<i64: {}>",
-            tile_sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
-        ),
-    )
-    .expect("parse static_sizes");
-
+    // L1 cache tile: tile_using_forall with tile_sizes [32, 32, 0].
+    // M and N are parallel (mapped to scf.forall threads), K (reduction) is
+    // not tiled here (0 = full size) — it stays sequential and is handled by
+    // the register tile below.
+    let static_tile_sizes_attr = Attribute::parse(context, "array<i64: 32, 32, 0>")
+        .expect("parse static_tile_sizes");
+    let static_num_threads_attr = Attribute::parse(context, "array<i64>")
+        .expect("parse static_num_threads");
     let scalable_sizes_attr =
         Attribute::parse(context, "array<i1: false, false, false>")
             .expect("parse scalable_sizes");
 
-    let tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+    // operandSegmentSizes: target=1, num_threads=0, tile_sizes=0,
+    // packed_num_threads=0, packed_tile_sizes=0
+    let operand_segment_sizes = Attribute::parse(context, "array<i32: 1, 0, 0, 0, 0>")
+        .expect("parse operandSegmentSizes");
+
+    let tile_op = OperationBuilder::new("transform.structured.tile_using_forall", location)
         .add_operands(&[op_to_tile])
         .add_attributes(&[
-            (Identifier::new(context, "static_sizes"), static_sizes_attr),
+            (Identifier::new(context, "static_num_threads"), static_num_threads_attr),
+            (Identifier::new(context, "static_tile_sizes"), static_tile_sizes_attr),
             (Identifier::new(context, "scalable_sizes"), scalable_sizes_attr),
+            (Identifier::new(context, "operandSegmentSizes"), operand_segment_sizes),
         ])
-        .add_results(&tile_result_types)
+        .add_results(&[any_op_type, any_op_type]) // (tiled_op, forall_op)
         .build()
-        .expect("build structured.tile_using_for (cache tile)");
+        .expect("build structured.tile_using_forall (cache tile)");
     let tile_l1_ref = tile_outer_block.append_operation(tile_op);
     let tiled_l1: melior::ir::Value = tile_l1_ref.result(0).unwrap().into();
 
