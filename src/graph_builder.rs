@@ -3028,13 +3028,16 @@ impl<'c> GraphBuilder<'c> {
                 )
             }
             (3, 2) => {
-                // [B,M,K] x [K,N] → unsqueeze rhs to [1,K,N], broadcast to [B,K,N], batch_matmul
+                // [B,M,K] x [K,N] → unsqueeze rhs to [1,K,N], use projected batch dim
+                // in the matmul indexing map (rhs batch → 0) to avoid copying the weight.
                 let rhs_3d = self.emit_unsqueeze(rhs, &[0]); // [K,N] → [1,K,N]
                 let rhs_3d_shape = rhs_3d.shape();
-                let b = lhs_shape[0];
-                let bcast_shape = vec![b, rhs_3d_shape[1], rhs_3d_shape[2]];
-                let bcasted = self.broadcast_to(&rhs_3d, &bcast_shape);
-                self.emit_batch_matmul_3d(lhs.value(), &lhs_shape, bcasted.value(), &bcast_shape)
+                self.emit_batch_matmul_3d_broadcast_rhs(
+                    lhs.value(),
+                    &lhs_shape,
+                    rhs_3d.value(),
+                    &rhs_3d_shape,
+                )
             }
             (2, 3) => {
                 // [M,K] x [B,K,N] → unsqueeze lhs to [1,M,K], broadcast to [B,M,K], batch_matmul
@@ -3236,6 +3239,86 @@ impl<'c> GraphBuilder<'c> {
                     .add_regions([matmul_region])
                     .build()
                     .expect("linalg.generic batch matmul 3d"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
+    /// Batch matmul [B,M,K] × [1,K,N] → [B,M,N] with broadcast on rhs batch.
+    ///
+    /// Like `emit_batch_matmul_3d` but the rhs has batch=1 and we use a
+    /// projected indexing map `(d0,d1,d2,d3) -> (0, d3, d2)` instead of
+    /// `(d0,d1,d2,d3) -> (d0, d3, d2)`. This avoids a full copy of the
+    /// rhs weight matrix when B is dynamic (e.g. LM head 768×50257).
+    fn emit_batch_matmul_3d_broadcast_rhs(
+        &mut self,
+        lhs_val: melior::ir::Value<'c, 'c>,
+        lhs_shape: &[Option<u64>], // [B, M, K]
+        rhs_val: melior::ir::Value<'c, 'c>,
+        _rhs_shape: &[Option<u64>], // [1, K, N] — batch dim is 1
+    ) -> Tensor<'c> {
+        let b = lhs_shape[0];
+        let m = lhs_shape[1];
+        let n = _rhs_shape[2];
+        let out_shape = vec![b, m, n];
+        let dtype = self.value_dtype(lhs_val);
+
+        // Build dyn_sources for each None dim in out_shape [B, M, N].
+        let mut dyn_sources = Vec::new();
+        if b.is_none() {
+            dyn_sources.push((lhs_val, 0usize)); // B from lhs dim 0
+        }
+        if m.is_none() {
+            dyn_sources.push((lhs_val, 1)); // M from lhs dim 1
+        }
+        if n.is_none() {
+            dyn_sources.push((rhs_val, 2)); // N from rhs dim 2
+        }
+        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("batch_matmul segment sizes");
+        let matmul_region = self.make_matmul_region(dtype);
+
+        // 4 iteration dims: d0=B, d1=M, d2=N, d3=K
+        // rhs uses 0 for batch dim instead of d0 (broadcast from batch=1).
+        let lhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>";
+        let rhs_map = "affine_map<(d0, d1, d2, d3) -> (0, d3, d2)>";
+        let out_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>";
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{lhs_map}, {rhs_map}, {out_map}]"))
+                .expect("batch matmul 3d broadcast rhs indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+        ).expect("batch matmul 3d broadcast rhs iterator types");
+
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[lhs_val, rhs_val, filled])
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
+                    ])
+                    .add_regions([matmul_region])
+                    .build()
+                    .expect("linalg.generic batch matmul 3d broadcast rhs"),
             )
             .result(0)
             .unwrap()
