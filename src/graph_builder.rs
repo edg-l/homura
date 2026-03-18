@@ -7252,7 +7252,22 @@ impl<'c> GraphBuilder<'c> {
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
 
+/// Register an atexit handler that calls `_exit(0)` to skip LLVM shared lib
+/// destructors (known double-free bug in teardown). Safe to call multiple
+/// times — only registers once.
+pub(crate) fn register_force_exit() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        extern "C" fn force_exit() {
+            unsafe { libc::_exit(0) }
+        }
+        unsafe { libc::atexit(force_exit); }
+    });
+}
+
 fn create_context() -> Context {
+    register_force_exit();
+
     let context = Context::new();
     context.attach_diagnostic_handler(|diagnostic| {
         eprintln!("[mlir] {diagnostic}");
