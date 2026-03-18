@@ -1635,10 +1635,8 @@ pub fn emit_and_compile_plan(
         assign_buffer_slots(model, &groups);
 
     eprintln!(
-        "[plan] {} nodes → {} kernels, {} buffer slots",
-        model.nodes.len(),
-        groups.len(),
-        num_slots
+        "[{:>8.2}s] [plan] {} nodes → {} kernels, {} buffer slots",
+        crate::log_ts(), model.nodes.len(), groups.len(), num_slots
     );
 
     // Seed shape info from model inputs.
@@ -1793,7 +1791,7 @@ pub fn emit_and_compile_plan(
     }
 
     // Phase 2: Compile all kernels in parallel.
-    eprintln!("[plan] compiling {} kernels in parallel...", emit_results.len());
+    eprintln!("[{:>8.2}s] [plan] compiling {} kernels in parallel...", crate::log_ts(), emit_results.len());
     let compile_start = std::time::Instant::now();
 
     let kernels: Vec<crate::runtime::CompiledGraph> = {
@@ -1802,18 +1800,20 @@ pub fn emit_and_compile_plan(
             .par_iter()
             .map(|er| {
                 let t0 = std::time::Instant::now();
+                let label = format!("k{}", er.group_idx);
                 let compiled = crate::graph_builder::compile_from_mlir(
                     &er.mlir_text,
                     er.num_inputs,
                     &er.output_descs,
                     er.cache_key.as_deref(),
+                    &label,
                 )
                 .map_err(|e| OnnxError::CompileError(
                     format!("kernel {}: {e}", er.group_idx)
                 ))?;
                 eprintln!(
-                    "[plan] kernel {} ({} nodes, {} in / {} out): {}ms",
-                    er.group_idx, er.num_nodes, er.num_in, er.num_out,
+                    "[{:>8.2}s] [plan] kernel {} ({} nodes, {} in / {} out): {}ms",
+                    crate::log_ts(), er.group_idx, er.num_nodes, er.num_in, er.num_out,
                     t0.elapsed().as_millis()
                 );
                 Ok(compiled)
@@ -1823,9 +1823,8 @@ pub fn emit_and_compile_plan(
     };
 
     eprintln!(
-        "[plan] all {} kernels compiled: {}ms total",
-        kernels.len(),
-        compile_start.elapsed().as_millis()
+        "[{:>8.2}s] [plan] all {} kernels compiled: {}ms total",
+        crate::log_ts(), kernels.len(), compile_start.elapsed().as_millis()
     );
 
     // Build slot descriptors.

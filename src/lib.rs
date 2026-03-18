@@ -13,6 +13,14 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod trace;
 
+/// Timestamp prefix for compile-time logging. Returns seconds since process start.
+pub(crate) fn log_ts() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 pub use compiler::Compiler;
 pub use dtype::DType;
 pub use graph_builder::{GraphBuilder, GraphContext};

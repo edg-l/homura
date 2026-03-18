@@ -144,7 +144,7 @@ impl Compiler {
 
         // ---- Run lowering passes ----------------------------------------------
         let pipeline_start = std::time::Instant::now();
-        eprintln!("[pipeline] starting MLIR passes (compiler path)...");
+        eprintln!("[{:>8.2}s] [pipeline] starting MLIR passes (compiler path)...", crate::log_ts());
         register_all_passes();
         let pass_manager = pass::PassManager::new(&context);
         parse_pass_pipeline(
@@ -193,7 +193,7 @@ impl Compiler {
 
         let mut module = module;
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-        eprintln!("[pipeline] MLIR passes done: {}ms", pipeline_start.elapsed().as_millis());
+        eprintln!("[{:>8.2}s] [pipeline] MLIR passes done: {}ms", crate::log_ts(), pipeline_start.elapsed().as_millis());
 
         // Dump pre-lowering IR to /tmp for debugging dynamic shapes
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
@@ -214,7 +214,7 @@ impl Compiler {
         let suffix = format!("{}_{:08x}", std::process::id(), nanos);
         let tmp_so = tmp_dir.join(format!("homura_{suffix}.so"));
 
-        let obj_paths = emit_object_files(&module, &tmp_dir, &format!("homura_{suffix}"))?;
+        let obj_paths = emit_object_files(&module, &tmp_dir, &format!("homura_{suffix}"), "codegen")?;
         link_shared_lib(&obj_paths, &tmp_so)?;
         for p in &obj_paths {
             std::fs::remove_file(p).ok();
@@ -384,6 +384,7 @@ fn emit_object_files(
     module: &melior::ir::Module,
     output_dir: &std::path::Path,
     base_name: &str,
+    label: &str,
 ) -> Result<Vec<std::path::PathBuf>, CompileError> {
     use crate::llvm_ffi::{mlirTranslateModuleToLLVMIR, LLVMSplitModule};
     use llvm_sys::bit_reader::LLVMParseBitcodeInContext2;
@@ -408,7 +409,7 @@ fn emit_object_files(
         let llvm_ctx = LLVMContextCreate();
         let llvm_module =
             mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_ctx);
-        eprintln!("[codegen] MLIR → LLVM IR translation: {}ms", translate_start.elapsed().as_millis());
+        eprintln!("[{:>8.2}s] [{label}] MLIR→LLVM: {}ms", crate::log_ts(), translate_start.elapsed().as_millis());
 
         if !llvm_module.is_null() {
             let dl = CString::new(
@@ -449,9 +450,17 @@ fn emit_object_files(
             f = LLVMGetNextFunction(f);
         }
 
-        // Monolithic path: single function or parallelism disabled.
-        if n_threads <= 1 || n_funcs <= 1 {
-            eprintln!("[codegen] monolithic path: {n_funcs} function(s), {n_threads} thread(s)");
+        // Monolithic path: few functions or parallelism disabled.
+        // Per-kernel modules typically have 1 real function + 2 dead transform
+        // schedule stubs — splitting those is counterproductive.
+        if n_threads <= 1 || n_funcs <= 4 {
+            let bc_size = {
+                let mb = LLVMWriteBitcodeToMemoryBuffer(llvm_module);
+                let sz = LLVMGetBufferSize(mb);
+                LLVMDisposeMemoryBuffer(mb);
+                sz
+            };
+            eprintln!("[{:>8.2}s] [{label}] monolithic: {n_funcs} func, {}KB", crate::log_ts(), bc_size / 1024);
             let obj_path = output_dir.join(format!("{base_name}.o"));
             optimise_and_emit(llvm_module, llvm_ctx, &obj_path, "O2")?;
             return Ok(vec![obj_path]);
@@ -459,7 +468,7 @@ fn emit_object_files(
 
         // Don't create more partitions than functions.
         let n_parts = n_threads.min(n_funcs);
-        eprintln!("[codegen] parallel path: {n_funcs} functions → {n_parts} partitions");
+        eprintln!("[{:>8.2}s] [{label}] split: {n_funcs} funcs → {n_parts} parts", crate::log_ts());
 
         tracing::info!(
             n_funcs,
@@ -503,8 +512,8 @@ fn emit_object_files(
         LLVMContextDispose(llvm_ctx);
 
         let split_ms = split_start.elapsed().as_millis() as u64;
-        eprintln!("[codegen] split + serialise: {split_ms}ms, partition sizes (KB): {:?}",
-            bitcode_bufs.iter().map(|b| b.len() / 1024).collect::<Vec<_>>());
+        eprintln!("[{:>8.2}s] [{label}] split+ser: {split_ms}ms, sizes(KB): {:?}",
+            crate::log_ts(), bitcode_bufs.iter().map(|b| b.len() / 1024).collect::<Vec<_>>());
 
         // Compile each partition in parallel: fresh LLVMContext per thread.
         let obj_paths: Vec<std::path::PathBuf> = (0..bitcode_bufs.len())
@@ -535,10 +544,11 @@ fn emit_object_files(
                         }
                         // O3 for small partitions, O2 for large ones
                         // (O3 is superlinear in IR size)
-                        let opt = if bc.len() < 1_000_000 { "O3" } else { "O1" };
+                        let bc_bytes = bc.len();
+                        let opt = if bc_bytes < 50_000 { "O3" } else { "O2" };
                         match optimise_and_emit(part_module, ctx, obj_path, opt) {
                             Ok(()) => {
-                                eprintln!("[codegen] partition {i} ({opt}) done: {}ms", t0.elapsed().as_millis());
+                                eprintln!("[{:>8.2}s] [{label}] part {i} ({opt}, {}KB): {}ms", crate::log_ts(), bc_bytes / 1024, t0.elapsed().as_millis());
                                 None
                             }
                             Err(e) => Some(e),
@@ -570,8 +580,8 @@ fn emit_object_files(
             }
         }
 
-        eprintln!("[codegen] all {} partitions complete: {}ms total",
-            obj_paths.len(), split_start.elapsed().as_millis());
+        eprintln!("[{:>8.2}s] [{label}] all {} parts: {}ms",
+            crate::log_ts(), obj_paths.len(), split_start.elapsed().as_millis());
 
         Ok(obj_paths)
     }
@@ -1106,27 +1116,96 @@ pub(crate) fn build_transform_schedule<'c>(
         3, // M, N, K non-zero in register tile (B is 0, so no loop for B)
     ));
 
+    // ── @match_conv_nchw ────────────────────────────────────────────────────
+    // Matches linalg.conv_2d_nchw_fchw by operation name.
+    {
+        let match_block = Block::new(&[(any_op_type, location)]);
+        let candidate: melior::ir::Value = match_block.argument(0).unwrap().into();
+
+        // Filter to linalg.conv_2d_nchw_fchw only.
+        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
+            .add_operands(&[candidate])
+            .add_attributes(&[(
+                Identifier::new(context, "op_names"),
+                ArrayAttribute::new(
+                    context,
+                    &[StringAttribute::new(context, "linalg.conv_2d_nchw_fchw").into()],
+                )
+                .into(),
+            )])
+            .build()
+            .expect("build transform.match.operation_name (conv)");
+        match_block.append_operation(op_name_filter);
+
+        let yield_op = OperationBuilder::new("transform.yield", location)
+            .add_operands(&[candidate])
+            .build()
+            .expect("build transform.yield (match_conv)");
+        match_block.append_operation(yield_op);
+
+        let match_region = Region::new();
+        match_region.append_block(match_block);
+
+        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
+        let match_arg_attrs =
+            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
+
+        let match_seq = OperationBuilder::new("transform.named_sequence", location)
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "sym_name"),
+                    StringAttribute::new(context, "match_conv_nchw").into(),
+                ),
+                (
+                    Identifier::new(context, "function_type"),
+                    TypeAttribute::new(match_func_type.into()).into(),
+                ),
+                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
+                (
+                    Identifier::new(context, "sym_visibility"),
+                    StringAttribute::new(context, "private").into(),
+                ),
+            ])
+            .add_regions([match_region])
+            .build()
+            .expect("build @match_conv_nchw");
+        module.body().append_operation(match_seq);
+    }
+
+    // ── @tile_conv_nchw ──────────────────────────────────────────────────────
+    // Conv iteration dims: [N, CO, OH, OW, CI, KH, KW]
+    // Cache tile:    [0, 32, 4, 4, 0, 0, 0] — tile CO+spatial for L1
+    // Register tile: [0,  8, 1, 1, 1, 0, 0] — vectorize over CO=8
+    // Pad dims [1, 4] (CO, CI) to multiples [8, 1]
+    module.body().append_operation(build_tile_seq(
+        "tile_conv_nchw",
+        "array<i64: 0, 32, 4, 4, 0, 0, 0>",
+        "array<i1: false, false, false, false, false, false, false>",
+        "array<i64: 0, 8, 1, 1, 1, 0, 0>",
+        "array<i1: false, false, false, false, false, false, false>",
+        "[1, 4]",
+        "array<i64: 8, 1>",
+        4, // non-zero register dims: CO=8, OH=1, OW=1, CI=1
+    ));
+
     // ── @__transform_main ─────────────────────────────────────────────────────
-    //
-    // transform.named_sequence @__transform_main(%module: !transform.any_op {transform.consumed}) {
-    //   transform.foreach_match in %module
-    //       @match_contraction_3d -> @tile_contraction_3d,
-    //       @match_contraction_4d -> @tile_contraction_4d
-    //   transform.yield
-    // }
-    // vectorize_children_and_apply_patterns runs on all func.func ops after
-    // tiling. It both vectorizes structured ops and applies cleanup patterns
-    // that make the tiled tensor IR bufferizable.
+    // Tiles + vectorizes matched ops. Vectorization happens per-op inside each
+    // tile sequence (on the innermost tiled micro-kernel only), not as a blanket
+    // pass over all functions. Untiled ops stay scalar.
 
     let main_block = Block::new(&[(any_op_type, location)]);
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
 
-    let matchers_attr =
-        Attribute::parse(context, "[@match_contraction_3d, @match_contraction_4d]")
-            .expect("parse matchers attr");
-    let actions_attr =
-        Attribute::parse(context, "[@tile_contraction_3d, @tile_contraction_4d]")
-            .expect("parse actions attr");
+    let matchers_attr = Attribute::parse(
+        context,
+        "[@match_contraction_3d, @match_contraction_4d, @match_conv_nchw]",
+    )
+    .expect("parse matchers attr");
+    let actions_attr = Attribute::parse(
+        context,
+        "[@tile_contraction_3d, @tile_contraction_4d, @tile_conv_nchw]",
+    )
+    .expect("parse actions attr");
 
     let foreach_op = OperationBuilder::new("transform.foreach_match", location)
         .add_operands(&[module_handle])
@@ -1140,10 +1219,9 @@ pub(crate) fn build_transform_schedule<'c>(
     let foreach_ref = main_block.append_operation(foreach_op);
     let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
 
-    // Vectorize tiled contractions inside all functions. This also applies
-    // cleanup patterns that make the tiled IR bufferizable.
-    // Note: vectorize_nd_extract is NOT set, so tensor.extract ops (gather
-    // patterns) are left untouched — only structured linalg ops get vectorized.
+    // Vectorize all tiled linalg ops inside functions. After tiling, the
+    // inner micro-kernels are small linalg ops that vectorize into compact IR.
+    // Untiled ops (elementwise, etc.) also get vectorized but they are small.
     let ops_attr = ArrayAttribute::new(
         context,
         &[StringAttribute::new(context, "func.func").into()],
@@ -7111,8 +7189,9 @@ pub(crate) fn emit_object_files_pub(
     module: &melior::ir::Module,
     output_dir: &std::path::Path,
     base_name: &str,
+    label: &str,
 ) -> Result<Vec<std::path::PathBuf>, CompileError> {
-    emit_object_files(module, output_dir, base_name)
+    emit_object_files(module, output_dir, base_name, label)
 }
 
 /// Public wrapper so `graph_builder` can call the shared lib linker.

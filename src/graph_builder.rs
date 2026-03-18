@@ -153,6 +153,7 @@ pub fn compile_from_mlir(
     num_inputs: usize,
     output_descs: &[OutputDesc],
     cache_key: Option<&str>,
+    label: &str,
 ) -> Result<CompiledGraph, CompileError> {
     use melior::ir::Module;
     use melior::pass;
@@ -234,7 +235,7 @@ pub fn compile_from_mlir(
     let tmp_so = tmp_dir.join(format!("homura_pk_{suffix}.so"));
 
     let obj_paths = crate::compiler::emit_object_files_pub(
-        &module, &tmp_dir, &format!("homura_pk_{suffix}"),
+        &module, &tmp_dir, &format!("homura_pk_{suffix}"), label,
     )?;
     crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
     for p in &obj_paths {
@@ -6677,7 +6678,7 @@ impl<'c> GraphBuilder<'c> {
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
         let pipeline_start = std::time::Instant::now();
-        eprintln!("[pipeline] starting MLIR passes...");
+        eprintln!("[{:>8.2}s] [pipeline] starting MLIR passes...", crate::log_ts());
         register_all_passes();
         let pass_manager = pass::PassManager::new(context);
         parse_pass_pipeline(
@@ -6719,7 +6720,7 @@ impl<'c> GraphBuilder<'c> {
         .map_err(CompileError::Pass)?;
 
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-        eprintln!("[pipeline] MLIR passes done: {}ms", pipeline_start.elapsed().as_millis());
+        eprintln!("[{:>8.2}s] [pipeline] MLIR passes done: {}ms", crate::log_ts(), pipeline_start.elapsed().as_millis());
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write("/tmp/homura_gb_post_passes.mlir", module.as_operation().to_string());
@@ -6737,7 +6738,7 @@ impl<'c> GraphBuilder<'c> {
         let suffix = format!("{}_{:08x}", std::process::id(), nanos);
         let tmp_so = tmp_dir.join(format!("homura_gb_{suffix}.so"));
 
-        let obj_paths = crate::compiler::emit_object_files_pub(&module, &tmp_dir, &format!("homura_gb_{suffix}"))?;
+        let obj_paths = crate::compiler::emit_object_files_pub(&module, &tmp_dir, &format!("homura_gb_{suffix}"), "gb")?;
         crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
         for p in &obj_paths {
             std::fs::remove_file(p).ok();
