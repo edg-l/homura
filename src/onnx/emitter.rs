@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::parser::{Dim, OnnxAttribute, OnnxError, OnnxModel, OnnxNode};
+use super::sym_shapes;
 
 /// Sentinel for partially-known const_i64 values. Used when a Concat input
 /// doesn't have const values — downstream consumers (Reshape) treat this as
@@ -1612,225 +1613,6 @@ struct ValueShapeInfo {
     dtype: DType,
 }
 
-/// Run a probe emission pass with all-concrete shapes, then match DIM_DYNAMIC dims
-/// to input dimensions to build resolution rules.
-fn build_dim_resolutions(
-    model: &OnnxModel,
-    inputs: &[&Buffer],
-    groups: &[KernelGroup],
-    kernel_ios: &[KernelIO],
-    slot_names: &[String],
-    slot_descs: &[crate::runtime::SlotDesc],
-    input_slots: &[usize],
-) -> Result<Vec<crate::runtime::DimResolution>, OnnxError> {
-    use crate::runtime::{DimResolution, DimRule};
-    use crate::shape::DIM_DYNAMIC;
-
-    // Identify which (input_idx, dim) are DIM_DYNAMIC in the template slot_descs.
-    // Assign each a unique perturbation so we can reliably match outputs to inputs.
-    struct InputDynDim {
-        input_idx: usize,
-        dim: usize,
-        slot: usize,
-    }
-    let mut input_dyn_dims: Vec<InputDynDim> = Vec::new();
-    for (input_idx, &slot) in input_slots.iter().enumerate() {
-        for (d, &dim_val) in slot_descs[slot].shape.0.iter().enumerate() {
-            if dim_val == DIM_DYNAMIC {
-                input_dyn_dims.push(InputDynDim { input_idx, dim: d, slot });
-            }
-        }
-    }
-
-    if input_dyn_dims.is_empty() {
-        // No dynamic input dims but some intermediate slots have DIM_DYNAMIC.
-        // All must be Fixed — resolve from a single probe pass.
-        let probe_shapes = run_probe_pass(model, inputs, groups, kernel_ios, slot_names, None)?;
-        let input_slot_set: HashSet<usize> = input_slots.iter().copied().collect();
-        let mut resolutions = Vec::new();
-        for (slot, desc) in slot_descs.iter().enumerate() {
-            if input_slot_set.contains(&slot) { continue; }
-            for (d, &dim_val) in desc.shape.0.iter().enumerate() {
-                if dim_val == DIM_DYNAMIC {
-                    if let Some(&Some(v)) = probe_shapes.get(&slot_names[slot])
-                        .and_then(|info| info.shape.get(d))
-                    {
-                        resolutions.push(DimResolution {
-                            slot, dim: d, rule: DimRule::Fixed(v),
-                        });
-                    }
-                }
-            }
-        }
-        return Ok(resolutions);
-    }
-
-    // Two-probe approach: run shape inference with actual shapes and with uniformly
-    // perturbed dynamic dims. A uniform perturbation (+50 for ALL dynamic input dims)
-    // preserves inter-dim relationships (e.g., past_seq_len and past_seq_len+1).
-    //
-    // If delta == 0 → Fixed. If delta == perturbation → linked to an input dim.
-    // Match the specific input dim by comparing values with small offsets.
-    let probe1 = run_probe_pass(model, inputs, groups, kernel_ios, slot_names, None)?;
-
-    let perturbation: u64 = 50;
-    let mut slot_perturbations: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
-    for idd in &input_dyn_dims {
-        slot_perturbations.entry(slot_names[idd.slot].clone())
-            .or_default()
-            .push((idd.dim, perturbation));
-    }
-    let probe2 = run_probe_pass(model, inputs, groups, kernel_ios, slot_names, Some(&slot_perturbations))?;
-
-    // Collect actual values for input dynamic dims (from probe1 / actual shapes).
-    let input_actual_vals: Vec<u64> = input_dyn_dims.iter()
-        .map(|idd| inputs[idd.input_idx].shape().0[idd.dim])
-        .collect();
-
-    let input_slot_set: HashSet<usize> = input_slots.iter().copied().collect();
-    let mut resolutions = Vec::new();
-
-    for (slot, desc) in slot_descs.iter().enumerate() {
-        if input_slot_set.contains(&slot) { continue; }
-        let name = &slot_names[slot];
-        let p1_info = match probe1.get(name) { Some(i) => i, None => continue };
-        let p2_info = match probe2.get(name) { Some(i) => i, None => continue };
-
-        for (d, &template_dim) in desc.shape.0.iter().enumerate() {
-            if template_dim != DIM_DYNAMIC { continue; }
-            let v1 = match p1_info.shape.get(d) { Some(&Some(v)) => v, _ => continue };
-            let v2 = match p2_info.shape.get(d) { Some(&Some(v)) => v, _ => continue };
-            let delta = v2 as i64 - v1 as i64;
-
-            if delta == 0 {
-                // This dim didn't change when dynamic inputs changed → Fixed.
-                resolutions.push(DimResolution {
-                    slot, dim: d, rule: DimRule::Fixed(v1),
-                });
-                continue;
-            }
-
-            if delta == perturbation as i64 {
-                // This dim tracks the dynamic input dims linearly.
-                // Find the best matching input dim (prefer offset=0, then smallest offset).
-                let mut best: Option<(usize, i64)> = None; // (input_dyn_idx, offset)
-                for (i, &actual_val) in input_actual_vals.iter().enumerate() {
-                    let offset = v1 as i64 - actual_val as i64;
-                    match best {
-                        None => best = Some((i, offset)),
-                        Some((_, best_off)) if offset.abs() < best_off.abs() => {
-                            best = Some((i, offset));
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some((best_idx, offset)) = best {
-                    let idd = &input_dyn_dims[best_idx];
-                    let rule = if offset == 0 {
-                        DimRule::SameAsInput { input_idx: idd.input_idx, dim: idd.dim }
-                    } else {
-                        DimRule::InputDimPlusOffset { input_idx: idd.input_idx, dim: idd.dim, offset }
-                    };
-                    resolutions.push(DimResolution { slot, dim: d, rule });
-                    continue;
-                }
-            }
-
-            // Unexpected delta — use Fixed as fallback.
-            resolutions.push(DimResolution {
-                slot, dim: d, rule: DimRule::Fixed(v1),
-            });
-            tracing::warn!(
-                slot, dim = d, v1, delta,
-                "DIM_DYNAMIC: unexpected delta, using Fixed"
-            );
-        }
-    }
-
-    Ok(resolutions)
-}
-
-/// Run a shape-inference probe pass through all kernel groups.
-///
-/// If `perturbations` is Some, adds the specified deltas to the actual input shapes
-/// for the named slots. Returns shape info for all named values.
-fn run_probe_pass(
-    model: &OnnxModel,
-    inputs: &[&Buffer],
-    groups: &[KernelGroup],
-    kernel_ios: &[KernelIO],
-    slot_names: &[String],
-    perturbations: Option<&HashMap<String, Vec<(usize, u64)>>>,
-) -> Result<HashMap<String, ValueShapeInfo>, OnnxError> {
-    use crate::graph_builder::GraphContext;
-
-    let mut shape_info: HashMap<String, ValueShapeInfo> = HashMap::new();
-
-    // Seed from actual input buffers, with optional perturbations.
-    for (spec, buf) in model.dynamic_inputs.iter().zip(inputs.iter()) {
-        let mut shape: Vec<Option<u64>> = buf.shape().0.iter().map(|&d| Some(d)).collect();
-        if let Some(perturbs) = perturbations {
-            if let Some(deltas) = perturbs.get(&spec.name) {
-                for &(dim, delta) in deltas {
-                    if let Some(Some(v)) = shape.get_mut(dim) {
-                        *v += delta;
-                    }
-                }
-            }
-        }
-        shape_info.insert(spec.name.clone(), ValueShapeInfo { shape, dtype: spec.dtype });
-    }
-    for (name, buf) in &model.initializers {
-        shape_info.insert(name.clone(), ValueShapeInfo {
-            shape: buf.shape().0.iter().map(|&d| Some(d)).collect(),
-            dtype: buf.dtype(),
-        });
-    }
-
-    let mut const_i64: HashMap<String, Vec<i64>> = HashMap::new();
-    for (name, buf) in &model.initializers {
-        if buf.shape().num_elements() <= 64 {
-            if let Ok(vals) = read_i64_buffer(buf) {
-                const_i64.insert(name.clone(), vals);
-            }
-        }
-    }
-
-    for (gi, (group, io)) in groups.iter().zip(kernel_ios.iter()).enumerate() {
-        let ctx = GraphContext::new();
-        let mut builder = ctx.builder();
-        let mut local_value_map: HashMap<String, EmitValue> = HashMap::new();
-
-        for (name, _slot) in &io.input_slots {
-            let info = shape_info.get(name).unwrap_or_else(|| {
-                panic!("probe pass kernel {gi}: no shape info for input '{name}'")
-            });
-            let t = builder.input(&info.shape, info.dtype);
-            local_value_map.insert(name.clone(), EmitValue::Tensor(t));
-        }
-
-        for &ni in &group.node_indices {
-            emit_node(&model.nodes[ni], &mut local_value_map, &mut const_i64, &mut builder)?;
-        }
-
-        for (name, _slot) in &io.output_slots {
-            if let Some(ev) = local_value_map.get(name) {
-                let t = ev.as_tensor(&mut builder);
-                shape_info.insert(name.clone(), ValueShapeInfo {
-                    shape: t.shape(),
-                    dtype: t.dtype(),
-                });
-            }
-        }
-    }
-
-    // Also ensure we have entries for all slot_names by looking up what we have.
-    // (input/weight slots were seeded, intermediate/output slots come from emission.)
-    let _ = slot_names; // used by caller to index into shape_info
-
-    Ok(shape_info)
-}
-
 /// Emit and compile all kernels, producing an ExecutionPlan.
 ///
 /// This is the per-kernel replacement for `emit_graph` + `compile_with_cache`.
@@ -1895,6 +1677,55 @@ pub fn emit_and_compile_plan(
         }
     }
 
+    // Seed symbolic shape info from model inputs.
+    // DIM_DYNAMIC (sentinel u64::MAX) is NOT stored in sym_shape_info — it would
+    // overflow when propagated through symbolic arithmetic.
+    let mut sym_shape_info: HashMap<String, crate::shape::SymShape> = HashMap::new();
+    for (spec, buf) in model.dynamic_inputs.iter().zip(inputs.iter()) {
+        let sym_shape: crate::shape::SymShape = spec
+            .dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d {
+                Dim::Fixed(v) if *v == DIM_DYNAMIC => {
+                    // Truly unknown — represent with a placeholder var so downstream
+                    // propagation can still track the dimension symbolically.
+                    crate::shape::SymDim::Var(format!("__dyn_{i}"))
+                }
+                Dim::Fixed(v) => crate::shape::SymDim::Concrete(*v),
+                Dim::Symbolic(name) if keep_dynamic.contains(name) => crate::shape::SymDim::Var(name.clone()),
+                Dim::Symbolic(_) => crate::shape::SymDim::Concrete(buf.shape().0[i]),
+            })
+            .collect();
+        sym_shape_info.insert(spec.name.clone(), sym_shape);
+    }
+
+    // Seed symbolic shape info from initializers (all concrete).
+    for (name, buf) in &model.initializers {
+        let sym_shape: crate::shape::SymShape = buf
+            .shape().0.iter()
+            .map(|&d| crate::shape::SymDim::Concrete(d))
+            .collect();
+        sym_shape_info.insert(name.clone(), sym_shape);
+    }
+
+    // Seed sym_const_i64 from small non-negative integer initializers (all concrete).
+    // Negative values (sentinels like -1 or CONST_I64_UNKNOWN) are excluded to prevent
+    // u64 overflow when these propagate through arithmetic.
+    let mut sym_const_i64: HashMap<String, Vec<crate::shape::SymDim>> = HashMap::new();
+    for (name, buf) in &model.initializers {
+        if buf.shape().num_elements() <= 64 {
+            if let Ok(vals) = read_i64_buffer(buf) {
+                if vals.iter().all(|&v| v >= 0) {
+                    sym_const_i64.insert(
+                        name.clone(),
+                        vals.iter().map(|&v| crate::shape::SymDim::Concrete(v as u64)).collect(),
+                    );
+                }
+            }
+        }
+    }
+
     // Collect weights in initializer order.
     let weights: Vec<Buffer> = model.initializers.iter().map(|(_, b)| b.clone()).collect();
 
@@ -1955,7 +1786,30 @@ pub fn emit_and_compile_plan(
 
         // Emit all nodes in this kernel group.
         for &ni in &group.node_indices {
-            emit_node(&model.nodes[ni], &mut local_value_map, &mut const_i64, &mut builder)?;
+            let node = &model.nodes[ni];
+            emit_node(node, &mut local_value_map, &mut const_i64, &mut builder)?;
+
+            // Propagate symbolic shapes for this node.
+            // Use a default empty shape for inputs not in sym_shape_info to preserve
+            // positional alignment (e.g., Gemm needs input[0]=data, input[1]=weight).
+            let empty_sym: crate::shape::SymShape = vec![];
+            let input_sym_refs: Vec<&crate::shape::SymShape> = node.inputs.iter()
+                .map(|name| sym_shape_info.get(name.as_str()).unwrap_or(&empty_sym))
+                .collect();
+            let (out_sym_shapes, sym_updates) = sym_shapes::propagate_sym_shapes(
+                node,
+                &input_sym_refs,
+                &sym_const_i64,
+                &const_i64,
+            );
+            for (name, val) in sym_updates {
+                sym_const_i64.insert(name, val);
+            }
+            for (out_name, sym_shape) in node.outputs.iter().zip(out_sym_shapes) {
+                if !out_name.is_empty() {
+                    sym_shape_info.insert(out_name.clone(), sym_shape);
+                }
+            }
         }
 
         // Record output shapes for downstream kernels.
@@ -2075,20 +1929,14 @@ pub fn emit_and_compile_plan(
             let shape = Shape(
                 info.shape.iter().map(|d| d.unwrap_or(DIM_DYNAMIC)).collect(),
             );
+            let sym_shape = sym_shape_info.get(name).cloned();
             SlotDesc {
                 shape,
                 dtype: info.dtype,
+                sym_shape,
             }
         })
         .collect();
-
-    // Build dim resolution rules for slots with DIM_DYNAMIC.
-    let has_any_dynamic = slot_descs.iter().any(|sd| sd.shape.has_dynamic_dims());
-    let dim_resolutions = if has_any_dynamic {
-        build_dim_resolutions(model, inputs, &groups, &kernel_ios, &slot_names, &slot_descs, &input_slots)?
-    } else {
-        vec![]
-    };
 
     let plan = ExecutionPlan {
         kernels,
@@ -2098,7 +1946,6 @@ pub fn emit_and_compile_plan(
         weight_slots,
         output_slots,
         slot_descs,
-        dim_resolutions,
     };
 
     Ok((plan, weights))

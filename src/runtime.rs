@@ -471,25 +471,9 @@ impl CompiledGraph {
 pub struct SlotDesc {
     pub shape: Shape,
     pub dtype: DType,
-}
-
-/// Resolution rule for a single dynamic dimension in a buffer slot.
-#[derive(Clone, Debug)]
-pub enum DimRule {
-    /// Copy from input_slots[input_idx] shape dim.
-    SameAsInput { input_idx: usize, dim: usize },
-    /// input_slots[input_idx] shape dim + offset.
-    InputDimPlusOffset { input_idx: usize, dim: usize, offset: i64 },
-    /// Always this fixed value (from probe pass).
-    Fixed(u64),
-}
-
-/// Specifies how to resolve one DIM_DYNAMIC entry at runtime.
-#[derive(Clone, Debug)]
-pub struct DimResolution {
-    pub slot: usize,
-    pub dim: usize,
-    pub rule: DimRule,
+    /// Symbolic shape tracking (e.g., Var("past_sequence_length")).
+    /// `None` if symbolic propagation did not reach this slot.
+    pub sym_shape: Option<crate::shape::SymShape>,
 }
 
 /// One step in the execution plan: invoke a kernel with specific buffer routing.
@@ -526,8 +510,6 @@ pub struct ExecutionPlan {
     pub(crate) output_slots: Vec<usize>,
     /// Shape + dtype for every slot (used to allocate intermediate buffers).
     pub(crate) slot_descs: Vec<SlotDesc>,
-    /// Rules for resolving DIM_DYNAMIC entries at runtime.
-    pub(crate) dim_resolutions: Vec<DimResolution>,
 }
 
 /// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
@@ -558,22 +540,60 @@ impl ExecutionPlan {
         self.output_slots.iter().map(|&s| &self.slot_descs[s]).collect()
     }
 
-    /// Build concrete shapes for all slots, resolving DIM_DYNAMIC via dim_resolutions.
+    /// Build concrete shapes for all slots by evaluating symbolic dim expressions
+    /// with variable bindings extracted from actual input shapes.
     fn resolve_slot_shapes(&self, inputs: &[&Buffer]) -> Vec<Shape> {
-        let mut shapes: Vec<Shape> = self.slot_descs.iter().map(|sd| sd.shape.clone()).collect();
-        for res in &self.dim_resolutions {
-            let concrete = match &res.rule {
-                DimRule::SameAsInput { input_idx, dim } => {
-                    inputs[*input_idx].shape().0[*dim]
+        use std::collections::HashMap;
+
+        let mut bindings: HashMap<String, u64> = HashMap::new();
+
+        // Extract variable bindings from input slots.
+        for (input_idx, &slot) in self.input_slots.iter().enumerate() {
+            if let Some(sym_shape) = &self.slot_descs[slot].sym_shape {
+                let actual_shape = &inputs[input_idx].shape().0;
+                for (dim, sym) in sym_shape.iter().enumerate() {
+                    if let crate::shape::SymDim::Var(name) = sym {
+                        let actual = actual_shape[dim];
+                        if let Some(&existing) = bindings.get(name) {
+                            if existing != actual {
+                                tracing::warn!(
+                                    name, existing, actual,
+                                    "conflicting sym dim binding"
+                                );
+                            }
+                        }
+                        bindings.insert(name.clone(), actual);
+                    }
                 }
-                DimRule::InputDimPlusOffset { input_idx, dim, offset } => {
-                    (inputs[*input_idx].shape().0[*dim] as i64 + offset) as u64
-                }
-                DimRule::Fixed(v) => *v,
-            };
-            shapes[res.slot].0[res.dim] = concrete;
+            }
         }
-        shapes
+
+        // Evaluate every slot's sym_shape to get concrete dims.
+        self.slot_descs
+            .iter()
+            .map(|desc| {
+                match &desc.sym_shape {
+                    Some(sym_shape) => {
+                        let dims: Vec<u64> = sym_shape
+                            .iter()
+                            .enumerate()
+                            .map(|(d, sym)| {
+                                sym.eval(&bindings).unwrap_or_else(|| {
+                                    panic!(
+                                        "unresolvable sym dim [{d}] = {sym} \
+                                         for slot with shape {:?}, bindings: {bindings:?}",
+                                        desc.shape
+                                    )
+                                })
+                            })
+                            .collect();
+                        Shape(dims)
+                    }
+                    // No sym_shape — use the static shape (all concrete).
+                    None => desc.shape.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Execute the plan with the given model inputs and weight buffers.
@@ -801,12 +821,11 @@ mod tests {
             weight_slots: vec![],
             output_slots: vec![3],
             slot_descs: vec![
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
             ],
-            dim_resolutions: vec![],
         };
 
         let a = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
@@ -848,11 +867,10 @@ mod tests {
             weight_slots: vec![1],
             output_slots: vec![2],
             slot_descs: vec![
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
             ],
-            dim_resolutions: vec![],
         };
 
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);

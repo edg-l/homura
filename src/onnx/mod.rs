@@ -1,6 +1,7 @@
 pub mod emitter;
 pub mod parser;
 pub mod proto;
+pub(crate) mod sym_shapes;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
