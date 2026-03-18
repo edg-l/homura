@@ -1084,6 +1084,150 @@ impl<'c> GraphBuilder<'c> {
         self.emit_linalg_unary("math.sqrt", input)
     }
 
+    /// SiLU activation: x * sigmoid(x) = x / (1 + exp(-x)).
+    ///
+    /// Decomposed into existing ops; a fused kernel can replace this later.
+    pub fn emit_silu(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
+        let neg_x = self.emit_neg(input);
+        let exp_neg = self.emit_exp(&neg_x);
+        let one = self.emit_arith_constant(1.0, input.dtype());
+        let denom = self.emit_add(&one, &exp_neg);
+        self.emit_div(input, &denom)
+    }
+
+    /// RMSNorm: x * rsqrt(mean(x², axis=-1, keepdim=true) + eps) * weight.
+    ///
+    /// `weight` must be broadcastable to `input` (typically shape `[hidden_size]`).
+    pub fn emit_rms_norm(
+        &mut self,
+        input: &Tensor<'c>,
+        weight: &Tensor<'c>,
+        eps: f32,
+    ) -> Tensor<'c> {
+        // x² = x * x
+        let x_sq = self.emit_mul(input, input);
+        // variance = mean(x², axis=-1, keepdim=true)
+        let variance = self.emit_reduce_mean(&x_sq, &[-1], true);
+        // variance + eps
+        let eps_tensor = self.emit_arith_constant(eps as f64, input.dtype());
+        let var_eps = self.emit_add(&variance, &eps_tensor);
+        // rsqrt(variance + eps)
+        let inv_rms = self.emit_rsqrt(&var_eps);
+        // x * inv_rms  (inv_rms broadcasts via keepdim shape)
+        let normalized = self.emit_mul(input, &inv_rms);
+        // normalized * weight  (weight broadcasts on the last dim)
+        self.emit_mul(&normalized, weight)
+    }
+
+    /// GQA head expansion: repeat each KV head `repeats` times along the heads axis.
+    ///
+    /// Input shape:  `[batch, seq, kv_heads, head_dim]`
+    /// Output shape: `[batch, seq, kv_heads * repeats, head_dim]`
+    ///
+    /// When `repeats == 1` the input is returned unchanged.
+    pub fn emit_repeat_kv(&mut self, input: &Tensor<'c>, repeats: usize) -> Tensor<'c> {
+        if repeats == 1 {
+            return *input;
+        }
+        // Unsqueeze: [b, s, kv_h, d] → [b, s, kv_h, 1, d]
+        let expanded = self.emit_unsqueeze(input, &[3]);
+        // Concat `repeats` copies along axis 3 → [b, s, kv_h, repeats, d]
+        let copies: Vec<Tensor<'c>> = (0..repeats).map(|_| expanded).collect();
+        let tiled = self.emit_concat(&copies, 3);
+        // Collapse dims 2 and 3 → [b, s, kv_h * repeats, d]
+        let in_shape = input.shape();
+        let batch = in_shape[0];
+        let seq = in_shape[1];
+        let kv_heads = in_shape[2];
+        let head_dim = in_shape[3];
+        let q_heads = kv_heads.map(|h| h * repeats as u64);
+        let out_shape = [batch, seq, q_heads, head_dim];
+        // reassociation: [[0], [1], [2, 3], [4]] merges the kv_heads and repeats dims
+        self.emit_collapse_shape_with_reassoc(
+            tiled.value(),
+            &out_shape,
+            "[[0], [1], [2, 3], [4]]",
+        )
+    }
+
+    /// Embedding lookup: gather rows from `weight` by `indices`.
+    ///
+    /// `weight`:  `[vocab_size, hidden_size]` (F32)
+    /// `indices`: `[batch, seq]` (I64)
+    /// Output:    `[batch, seq, hidden_size]`
+    pub fn emit_embedding(&mut self, weight: &Tensor<'c>, indices: &Tensor<'c>) -> Tensor<'c> {
+        self.emit_gather(weight, indices, 0)
+    }
+
+    /// Apply Rotary Position Embeddings (RoPE) to Q or K tensor.
+    ///
+    /// `x`:   `[batch, seq, heads, head_dim]` — the Q or K tensor
+    /// `cos`: `[seq, head_dim/2]` — precomputed cosine table (already gathered by position)
+    /// `sin`: `[seq, head_dim/2]` — precomputed sine table (already gathered by position)
+    ///
+    /// The rotation pairs even/odd elements of head_dim:
+    ///   out[..., 2i]   = x[..., 2i] * cos[..., i] - x[..., 2i+1] * sin[..., i]
+    ///   out[..., 2i+1] = x[..., 2i] * sin[..., i] + x[..., 2i+1] * cos[..., i]
+    ///
+    /// Decomposed into slices + elementwise ops. The MLIR pass pipeline fuses
+    /// the elementwise chain into a single tiled kernel.
+    pub fn emit_rope(
+        &mut self,
+        x: &Tensor<'c>,
+        cos: &Tensor<'c>,
+        sin: &Tensor<'c>,
+    ) -> Tensor<'c> {
+        let shape = x.shape();
+        let head_dim = shape[3].expect("head_dim must be static for RoPE");
+
+        // Split into even and odd elements along the last axis (step=2).
+        // x_even: [b, s, h, d/2] — elements at indices 0, 2, 4, ...
+        // x_odd:  [b, s, h, d/2] — elements at indices 1, 3, 5, ...
+        let x_even = self.emit_slice(
+            x,
+            &[0],
+            &[head_dim as i64],
+            &[-1],
+            &[2],
+        );
+        let x_odd = self.emit_slice(
+            x,
+            &[1],
+            &[head_dim as i64],
+            &[-1],
+            &[2],
+        );
+
+        // cos/sin are [seq, d/2] — unsqueeze to [1, seq, 1, d/2] for broadcast
+        // against x_even/x_odd which are [batch, seq, heads, d/2].
+        let cos_4d = self.emit_unsqueeze(cos, &[0, 2]);
+        let sin_4d = self.emit_unsqueeze(sin, &[0, 2]);
+
+        // out_even = x_even * cos - x_odd * sin
+        let even_cos = self.emit_mul(&x_even, &cos_4d);
+        let odd_sin = self.emit_mul(&x_odd, &sin_4d);
+        let out_even = self.emit_sub(&even_cos, &odd_sin);
+
+        // out_odd = x_even * sin + x_odd * cos
+        let even_sin = self.emit_mul(&x_even, &sin_4d);
+        let odd_cos = self.emit_mul(&x_odd, &cos_4d);
+        let out_odd = self.emit_add(&even_sin, &odd_cos);
+
+        // Interleave: stack [out_even, out_odd] on a new last dim then flatten.
+        // [b, s, h, d/2] → [b, s, h, d/2, 1] for each
+        let even_5d = self.emit_unsqueeze(&out_even, &[4]);
+        let odd_5d = self.emit_unsqueeze(&out_odd, &[4]);
+        // concat on axis 4 → [b, s, h, d/2, 2]
+        let interleaved = self.emit_concat(&[even_5d, odd_5d], 4);
+        // collapse last two dims → [b, s, h, d]
+        let out_shape = [shape[0], shape[1], shape[2], Some(head_dim)];
+        self.emit_collapse_shape_with_reassoc(
+            interleaved.value(),
+            &out_shape,
+            "[[0], [1], [2], [3, 4]]",
+        )
+    }
+
     // ── linalg.generic helpers ────────────────────────────────────────────────
 
     /// Compute the broadcast output shape from two input shapes.
@@ -9439,4 +9583,199 @@ mod tests {
     // emit_resolve_reshape_dims work with raw MLIR Values at the index type
     // level. They are exercised through the ONNX integration tests (MNIST,
     // ResNet, GPT-2) which provide the correct type context.
+
+    // ── Phase 2 HuggingFace ops ───────────────────────────────────────────────
+
+    #[test]
+    fn silu_basic() {
+        // silu(x) = x / (1 + exp(-x))
+        // Reference values computed as: x * sigmoid(x)
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(4)], DType::F32);
+        let out = gb.emit_silu(&x);
+        let graph = gb.compile(&[&out]).expect("compile silu");
+
+        let data = [0.0f32, 1.0, -1.0, 2.0];
+        let buf = Buffer::from_slice(&data, &[4], DType::F32);
+        let result = graph.run(&[&buf]);
+        let got = result[0].as_slice::<f32>();
+
+        // silu(x) = x * sigmoid(x)
+        let expected: Vec<f32> = data
+            .iter()
+            .map(|&x| x / (1.0 + (-x).exp()))
+            .collect();
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "silu({}) got {g} expected {e}",
+                // recover input from expected: silu is monotone so we just show index
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn rms_norm_basic() {
+        // RMSNorm([1, 2, 3, 4], weight=[1,1,1,1], eps=1e-6)
+        // rms = sqrt(mean([1,4,9,16]) + eps) = sqrt(7.5 + eps)
+        // normalized = x / rms; output = normalized * weight = normalized
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        // shape: [1, 4]  — batch=1, hidden=4
+        let x = gb.input(&[Some(1), Some(4)], DType::F32);
+        let w = gb.input(&[Some(1), Some(4)], DType::F32);
+        let out = gb.emit_rms_norm(&x, &w, 1e-6);
+        let graph = gb.compile(&[&out]).expect("compile rms_norm");
+
+        let x_data = [1.0f32, 2.0, 3.0, 4.0];
+        let w_data = [1.0f32, 1.0, 1.0, 1.0];
+        let x_buf = Buffer::from_slice(&x_data, &[1, 4], DType::F32);
+        let w_buf = Buffer::from_slice(&w_data, &[1, 4], DType::F32);
+        let result = graph.run(&[&x_buf, &w_buf]);
+        let got = result[0].as_slice::<f32>();
+
+        // Reference: rms = sqrt((1+4+9+16)/4) = sqrt(7.5)
+        let rms = (7.5f32 + 1e-6).sqrt();
+        let expected: Vec<f32> = x_data.iter().map(|&v| v / rms).collect();
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!((g - e).abs() < 1e-4, "rms_norm got {g} expected {e}");
+        }
+    }
+
+    #[test]
+    fn repeat_kv_repeats_2() {
+        // Input: [1, 2, 2, 3]  (batch=1, seq=2, kv_heads=2, head_dim=3), repeats=2
+        // Expected output: [1, 2, 4, 3]
+        // Each KV head is repeated twice: [h0, h0, h1, h1]
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(1), Some(2), Some(2), Some(3)], DType::F32);
+        let out = gb.emit_repeat_kv(&x, 2);
+        assert_eq!(out.shape(), vec![Some(1), Some(2), Some(4), Some(3)]);
+        let graph = gb.compile(&[&out]).expect("compile repeat_kv");
+
+        // Input data: head 0 = [1,2,3; 7,8,9], head 1 = [4,5,6; 10,11,12]
+        // Layout [1,2,2,3]: batch0, seq0→[h0=[1,2,3], h1=[4,5,6]]; seq1→[h0=[7,8,9], h1=[10,11,12]]
+        #[rustfmt::skip]
+        let data = [
+            1.0f32, 2.0, 3.0,   // [0,0,0,:]
+            4.0,    5.0, 6.0,   // [0,0,1,:]
+            7.0,    8.0, 9.0,   // [0,1,0,:]
+            10.0,   11.0, 12.0, // [0,1,1,:]
+        ];
+        let buf = Buffer::from_slice(&data, &[1, 2, 2, 3], DType::F32);
+        let result = graph.run(&[&buf]);
+        assert_eq!(result[0].shape().0, vec![1, 2, 4, 3]);
+
+        // Expected: each kv head appears twice → [h0,h0,h1,h1] per seq pos
+        #[rustfmt::skip]
+        let expected = [
+            1.0f32, 2.0, 3.0,   // [0,0,0,:] = h0
+            1.0,    2.0, 3.0,   // [0,0,1,:] = h0 (repeat)
+            4.0,    5.0, 6.0,   // [0,0,2,:] = h1
+            4.0,    5.0, 6.0,   // [0,0,3,:] = h1 (repeat)
+            7.0,    8.0, 9.0,   // [0,1,0,:] = h0
+            7.0,    8.0, 9.0,   // [0,1,1,:] = h0 (repeat)
+            10.0,   11.0, 12.0, // [0,1,2,:] = h1
+            10.0,   11.0, 12.0, // [0,1,3,:] = h1 (repeat)
+        ];
+        assert_eq!(result[0].as_slice::<f32>(), &expected);
+    }
+
+    #[test]
+    fn repeat_kv_repeats_1_noop() {
+        // repeats=1 should return the input unchanged
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(1), Some(2), Some(2), Some(3)], DType::F32);
+        let out = gb.emit_repeat_kv(&x, 1);
+        // Same value, same shape
+        assert_eq!(out.shape(), vec![Some(1), Some(2), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn embedding_basic() {
+        // weight: [4, 3]  (vocab=4, hidden=3)
+        // indices: [2, 2]  (batch=2, seq=2)
+        // output: [2, 2, 3]
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let weight = gb.input(&[Some(4), Some(3)], DType::F32);
+        let indices = gb.input(&[Some(2), Some(2)], DType::I64);
+        let out = gb.emit_embedding(&weight, &indices);
+        assert_eq!(out.shape(), vec![Some(2), Some(2), Some(3)]);
+        let graph = gb.compile(&[&out]).expect("compile embedding");
+
+        // weight rows: row0=[0,0,0], row1=[1,1,1], row2=[2,2,2], row3=[3,3,3]
+        let w_data = [
+            0.0f32, 0.0, 0.0, // row 0
+            1.0,    1.0, 1.0, // row 1
+            2.0,    2.0, 2.0, // row 2
+            3.0,    3.0, 3.0, // row 3
+        ];
+        // indices: [[0, 2], [1, 3]]
+        let idx_data = [0i64, 2, 1, 3];
+        let w_buf = Buffer::from_slice(&w_data, &[4, 3], DType::F32);
+        let i_buf = Buffer::from_slice(&idx_data, &[2, 2], DType::I64);
+        let result = graph.run(&[&w_buf, &i_buf]);
+        assert_eq!(result[0].shape().0, vec![2, 2, 3]);
+        // Expected: row0, row2, row1, row3
+        let expected = [
+            0.0f32, 0.0, 0.0, // [0,0,:] = row0
+            2.0,    2.0, 2.0, // [0,1,:] = row2
+            1.0,    1.0, 1.0, // [1,0,:] = row1
+            3.0,    3.0, 3.0, // [1,1,:] = row3
+        ];
+        assert_eq!(result[0].as_slice::<f32>(), &expected);
+    }
+
+    #[test]
+    fn rope_basic() {
+        // x:   [1, 2, 1, 4] — batch=1, seq=2, heads=1, head_dim=4
+        // cos: [2, 2]        — seq=2, head_dim/2=2
+        // sin: [2, 2]
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(1), Some(2), Some(1), Some(4)], DType::F32);
+        let cos = gb.input(&[Some(2), Some(2)], DType::F32);
+        let sin = gb.input(&[Some(2), Some(2)], DType::F32);
+        let out = gb.emit_rope(&x, &cos, &sin);
+        assert_eq!(out.shape(), vec![Some(1), Some(2), Some(1), Some(4)]);
+        let graph = gb.compile(&[&out]).expect("compile rope");
+
+        // x = [1, 2, 3, 4,  5, 6, 7, 8]  (two positions, head_dim=4)
+        // even indices: [1, 3, 5, 7], odd indices: [2, 4, 6, 8]
+        let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        // cos/sin for position 0 and 1:
+        // cos = [[1.0, 0.5], [0.0, 1.0]]
+        // sin = [[0.0, 0.5], [1.0, 0.0]]
+        let cos_data: Vec<f32> = vec![1.0, 0.5, 0.0, 1.0];
+        let sin_data: Vec<f32> = vec![0.0, 0.5, 1.0, 0.0];
+
+        let x_buf = Buffer::from_slice(&x_data, &[1, 2, 1, 4], DType::F32);
+        let cos_buf = Buffer::from_slice(&cos_data, &[2, 2], DType::F32);
+        let sin_buf = Buffer::from_slice(&sin_data, &[2, 2], DType::F32);
+        let result = graph.run(&[&x_buf, &cos_buf, &sin_buf]);
+        let out = result[0].as_slice::<f32>();
+
+        // Position 0: cos=[1.0, 0.5], sin=[0.0, 0.5]
+        //   x_even=[1, 3], x_odd=[2, 4]
+        //   out_even = [1*1.0 - 2*0.0, 3*0.5 - 4*0.5] = [1.0, -0.5]
+        //   out_odd  = [1*0.0 + 2*1.0, 3*0.5 + 4*0.5] = [2.0, 3.5]
+        //   interleaved: [1.0, 2.0, -0.5, 3.5]
+        // Position 1: cos=[0.0, 1.0], sin=[1.0, 0.0]
+        //   x_even=[5, 7], x_odd=[6, 8]
+        //   out_even = [5*0.0 - 6*1.0, 7*1.0 - 8*0.0] = [-6.0, 7.0]
+        //   out_odd  = [5*1.0 + 6*0.0, 7*0.0 + 8*1.0] = [5.0, 8.0]
+        //   interleaved: [-6.0, 5.0, 7.0, 8.0]
+        let expected: Vec<f32> = vec![1.0, 2.0, -0.5, 3.5, -6.0, 5.0, 7.0, 8.0];
+        for (i, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "rope mismatch at [{i}]: got {got}, want {want}"
+            );
+        }
+    }
 }
