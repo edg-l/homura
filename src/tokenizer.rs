@@ -18,7 +18,10 @@ pub struct Tokenizer {
 /// The remaining 256 - 188 = 68 bytes map to U+0100 onwards.
 fn build_byte_encoder() -> HashMap<u8, char> {
     // These byte values map to themselves (all printable).
-    let mut bs: Vec<u8> = (b'!'..=b'~').chain(0xA1u8..=0xACu8).chain(0xAEu8..=0xFFu8).collect();
+    let mut bs: Vec<u8> = (b'!'..=b'~')
+        .chain(0xA1u8..=0xACu8)
+        .chain(0xAEu8..=0xFFu8)
+        .collect();
 
     // Start counter for unmapped bytes at U+0100.
     let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
@@ -43,8 +46,7 @@ impl Tokenizer {
         let vocab_str = std::fs::read_to_string(vocab_path)?;
         let encoder: HashMap<String, u32> = serde_json::from_str(&vocab_str)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let decoder: HashMap<u32, String> =
-            encoder.iter().map(|(k, &v)| (v, k.clone())).collect();
+        let decoder: HashMap<u32, String> = encoder.iter().map(|(k, &v)| (v, k.clone())).collect();
 
         // Load merges.txt: first line is "#version: 0.2", then "tok1 tok2" per line.
         let merges_str = std::fs::read_to_string(merges_path)?;
@@ -61,8 +63,7 @@ impl Tokenizer {
             .collect();
 
         let byte_encoder = build_byte_encoder();
-        let byte_decoder: HashMap<char, u8> =
-            byte_encoder.iter().map(|(&b, &c)| (c, b)).collect();
+        let byte_decoder: HashMap<char, u8> = byte_encoder.iter().map(|(&b, &c)| (c, b)).collect();
 
         // GPT-2 pre-tokenization regex (uses lookahead, so requires fancy-regex).
         let pattern = Regex::new(
@@ -129,10 +130,7 @@ impl Tokenizer {
             };
 
             // Convert UTF-8 bytes to byte-unicode representation.
-            let byte_encoded: String = word_str
-                .bytes()
-                .map(|b| self.byte_encoder[&b])
-                .collect();
+            let byte_encoded: String = word_str.bytes().map(|b| self.byte_encoder[&b]).collect();
 
             for piece in self.bpe(&byte_encoded) {
                 if let Some(&id) = self.encoder.get(&piece) {
@@ -165,11 +163,7 @@ mod tests {
     use super::*;
 
     fn load_tokenizer() -> Tokenizer {
-        Tokenizer::from_files(
-            "tests/fixtures/vocab.json",
-            "tests/fixtures/merges.txt",
-        )
-        .unwrap()
+        Tokenizer::from_files("tests/fixtures/vocab.json", "tests/fixtures/merges.txt").unwrap()
     }
 
     #[test]

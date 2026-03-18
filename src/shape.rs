@@ -416,7 +416,9 @@ mod tests {
     #[test]
     fn sym_dim_simplify_div_cancel() {
         // Div(Mul(768, x), 768) -> x
-        let d = SymDim::Concrete(768).mul(SymDim::var("x")).div(SymDim::Concrete(768));
+        let d = SymDim::Concrete(768)
+            .mul(SymDim::var("x"))
+            .div(SymDim::Concrete(768));
         assert_eq!(d.simplify(), SymDim::var("x"));
     }
 

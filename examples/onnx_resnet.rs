@@ -15,8 +15,7 @@ fn load_class_labels() -> Vec<String> {
 
 fn main() {
     let t0 = Instant::now();
-    let model =
-        Model::load("tests/fixtures/resnet18-v1-7.onnx").expect("failed to load resnet18");
+    let model = Model::load("tests/fixtures/resnet18-v1-7.onnx").expect("failed to load resnet18");
     let compile_ms = t0.elapsed().as_millis();
 
     let classes = load_class_labels();
@@ -47,7 +46,10 @@ fn main() {
     println!("Top 5 predictions:");
     for (rank, &(class_idx, logit)) in indexed.iter().take(5).enumerate() {
         let name = classes.get(class_idx).map(|s| s.as_str()).unwrap_or("?");
-        println!("  #{}: {name} (class {class_idx}, logit {logit:.3})", rank + 1);
+        println!(
+            "  #{}: {name} (class {class_idx}, logit {logit:.3})",
+            rank + 1
+        );
     }
     println!("\ncompile: {compile_ms}ms | inference: {run_ms}ms");
 

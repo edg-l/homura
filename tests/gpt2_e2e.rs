@@ -75,7 +75,10 @@ fn gpt2_prefill_emitter_only() {
     assert_eq!(outputs[0].shape().0, vec![1, 4, 50257], "logits shape");
 
     let logits = outputs[0].as_slice::<f32>();
-    assert!(logits.iter().all(|v| v.is_finite()), "logits contain NaN/Inf");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "logits contain NaN/Inf"
+    );
 }
 
 /// Task 8.8: GPT-2 decode model with dynamic `past_sequence_length` compiles
@@ -124,8 +127,7 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
     // Attention mask: 1s for the PAST_LEN real positions, 1 for the new token.
     let mask_len = PAST_LEN + 1;
     let mask_data: Vec<i64> = vec![1i64; mask_len];
-    let attention_mask =
-        Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
+    let attention_mask = Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
 
     // Build input slice: [input_ids, kv[0..23], attention_mask] (26 total).
     let mut input_refs: Vec<&Buffer> = Vec::with_capacity(26);
@@ -141,7 +143,11 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
     assert_eq!(outputs.len(), 25, "expected 25 outputs");
 
     // Logits: [1, 1, 50257].
-    assert_eq!(outputs[0].shape().0, vec![1, 1, 50257], "logits shape mismatch");
+    assert_eq!(
+        outputs[0].shape().0,
+        vec![1, 1, 50257],
+        "logits shape mismatch"
+    );
     assert_eq!(outputs[0].dtype(), DType::F32);
 
     // New KV tensors: [1, 12, PAST_LEN+1, 64].
@@ -167,5 +173,8 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .unwrap()
         .0;
-    assert!(predicted < 50257, "predicted token {predicted} out of vocab range");
+    assert!(
+        predicted < 50257,
+        "predicted token {predicted} out of vocab range"
+    );
 }

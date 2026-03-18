@@ -1,11 +1,6 @@
 use std::path::Path;
 
-use crate::{
-    DType,
-    onnx::Model,
-    runtime::Buffer,
-    tokenizer::Tokenizer,
-};
+use crate::{DType, onnx::Model, runtime::Buffer, tokenizer::Tokenizer};
 
 const EOS_TOKEN_ID: u32 = 50256;
 
@@ -41,10 +36,8 @@ impl Generator {
         tracing::info!(path = %model_path.display(), "loading model");
         let model = Model::load(&model_path)?;
         tracing::info!("loading tokenizer");
-        let tokenizer = Tokenizer::from_files(
-            vocab_path.to_str().unwrap(),
-            merges_path.to_str().unwrap(),
-        )?;
+        let tokenizer =
+            Tokenizer::from_files(vocab_path.to_str().unwrap(), merges_path.to_str().unwrap())?;
 
         Ok(Generator { model, tokenizer })
     }
@@ -82,17 +75,9 @@ impl Generator {
             let seq_len = token_ids.len();
             let step_start = Instant::now();
 
-            let input_ids = Buffer::from_slice::<i64>(
-                &token_ids,
-                &[1, seq_len as u64],
-                DType::I64,
-            );
+            let input_ids = Buffer::from_slice::<i64>(&token_ids, &[1, seq_len as u64], DType::I64);
             let mask: Vec<i64> = vec![1i64; seq_len];
-            let attention_mask = Buffer::from_slice::<i64>(
-                &mask,
-                &[1, seq_len as u64],
-                DType::I64,
-            );
+            let attention_mask = Buffer::from_slice::<i64>(&mask, &[1, seq_len as u64], DType::I64);
 
             let outputs = match self.model.run(&[&input_ids, &attention_mask]) {
                 Ok(o) => o,

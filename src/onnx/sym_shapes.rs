@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-use crate::shape::{SymDim, SymShape};
 use super::parser::{OnnxAttribute, OnnxNode};
+use crate::shape::{SymDim, SymShape};
 
 // ── Broadcasting ──────────────────────────────────────────────────────────────
 
@@ -61,21 +61,42 @@ fn normalize_axis(axis: i64, rank: usize) -> usize {
 // ── Attribute helpers (mirrors emitter.rs helpers but without error) ──────────
 
 fn get_int_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str, default: i64) -> i64 {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v) } else { None }
-    }).unwrap_or(default)
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 fn get_bool_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str) -> bool {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v != 0) } else { None }
-    }).unwrap_or(false)
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v != 0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
 }
 
 fn get_keepdims_attr(attrs: &HashMap<String, OnnxAttribute>, default: bool) -> bool {
-    attrs.get("keepdims").and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v != 0) } else { None }
-    }).unwrap_or(default)
+    attrs
+        .get("keepdims")
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v != 0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 // ── Main dispatch ─────────────────────────────────────────────────────────────
@@ -98,7 +119,13 @@ pub fn propagate_sym_shapes(
     const_i64: &HashMap<String, Vec<i64>>,
 ) -> (Vec<SymShape>, HashMap<String, Vec<SymDim>>) {
     let mut sym_updates: HashMap<String, Vec<SymDim>> = HashMap::new();
-    let outputs = propagate_inner(node, input_sym_shapes, sym_const_i64, const_i64, &mut sym_updates);
+    let outputs = propagate_inner(
+        node,
+        input_sym_shapes,
+        sym_const_i64,
+        const_i64,
+        &mut sym_updates,
+    );
     (outputs, sym_updates)
 }
 
@@ -154,9 +181,11 @@ fn propagate_inner(
                         sym_const_i64.get(&node.inputs[0]),
                         sym_const_i64.get(&node.inputs[1]),
                     ) {
-                        let result = sym_const_i64_elementwise(va, vb, |x, y| x.add(
-                            SymDim::Concrete(0).add(y) // placeholder: x - y not a native SymDim op
-                        ));
+                        let result = sym_const_i64_elementwise(va, vb, |x, y| {
+                            x.add(
+                                SymDim::Concrete(0).add(y), // placeholder: x - y not a native SymDim op
+                            )
+                        });
                         // For Sub, just skip (no Sub in SymDim).
                         let _ = result;
                     }
@@ -226,12 +255,20 @@ fn propagate_inner(
 
         // ── Softmax ───────────────────────────────────────────────────────────
         "Softmax" => {
-            if let Some(s) = get(0) { vec![s.clone()] } else { vec![] }
+            if let Some(s) = get(0) {
+                vec![s.clone()]
+            } else {
+                vec![]
+            }
         }
 
         // ── LayerNorm / GroupNorm (if present) ────────────────────────────────
         "LayerNormalization" => {
-            if let Some(s) = get(0) { vec![s.clone()] } else { vec![] }
+            if let Some(s) = get(0) {
+                vec![s.clone()]
+            } else {
+                vec![]
+            }
         }
 
         // ── Transpose ─────────────────────────────────────────────────────────
@@ -243,10 +280,17 @@ fn propagate_inner(
                 } else {
                     (0..rank as i64).rev().collect()
                 };
-                let out: SymShape = perm.iter().map(|&p| {
-                    let idx = if p < 0 { (rank as i64 + p) as usize } else { p as usize };
-                    s.get(idx).cloned().unwrap_or(SymDim::Concrete(0))
-                }).collect();
+                let out: SymShape = perm
+                    .iter()
+                    .map(|&p| {
+                        let idx = if p < 0 {
+                            (rank as i64 + p) as usize
+                        } else {
+                            p as usize
+                        };
+                        s.get(idx).cloned().unwrap_or(SymDim::Concrete(0))
+                    })
+                    .collect();
                 vec![out]
             } else {
                 vec![]
@@ -268,18 +312,15 @@ fn propagate_inner(
             if let Some(target_vals) = const_i64.get(shape_name) {
                 // Check for CONST_I64_UNKNOWN sentinel (i64::MIN).
                 if target_vals.iter().all(|&v| v != i64::MIN) {
-                    let out_sym = reshape_sym_with_concrete_target(
-                        input_sym, target_vals, allowzero != 0,
-                    );
+                    let out_sym =
+                        reshape_sym_with_concrete_target(input_sym, target_vals, allowzero != 0);
                     return vec![out_sym];
                 }
             }
 
             // Case 2: symbolic const target from sym_const_i64.
             if let Some(sym_target) = sym_const_i64.get(shape_name) {
-                let out_sym = reshape_sym_with_sym_target(
-                    input_sym, sym_target, allowzero != 0,
-                );
+                let out_sym = reshape_sym_with_sym_target(input_sym, sym_target, allowzero != 0);
                 return vec![out_sym];
             }
 
@@ -303,7 +344,8 @@ fn propagate_inner(
             let mut out = first.clone();
 
             // Sum all inputs along concat axis.
-            let mut concat_dim: SymDim = first.get(axis_usize)
+            let mut concat_dim: SymDim = first
+                .get(axis_usize)
                 .cloned()
                 .unwrap_or(SymDim::Concrete(0));
             for i in 1..node.inputs.len() {
@@ -373,14 +415,17 @@ fn propagate_inner(
                 let idx_concrete = const_i64.get(indices_name);
                 if let (Some(dv), Some(iv)) = (data_vals, idx_concrete) {
                     if !dv.is_empty() {
-                        let gathered: Vec<SymDim> = iv.iter().filter_map(|&idx| {
-                            let i = if idx < 0 {
-                                (dv.len() as i64 + idx).max(0) as usize
-                            } else {
-                                idx as usize
-                            };
-                            dv.get(i).cloned()
-                        }).collect();
+                        let gathered: Vec<SymDim> = iv
+                            .iter()
+                            .filter_map(|&idx| {
+                                let i = if idx < 0 {
+                                    (dv.len() as i64 + idx).max(0) as usize
+                                } else {
+                                    idx as usize
+                                };
+                                dv.get(i).cloned()
+                            })
+                            .collect();
                         if !gathered.is_empty() {
                             sym_updates.insert(node.outputs[0].clone(), gathered);
                         }
@@ -390,13 +435,19 @@ fn propagate_inner(
                 let idx_sym_vals = sym_const_i64.get(indices_name);
                 if let (Some(dv), Some(iv)) = (data_vals, idx_sym_vals) {
                     // Only extract if ALL indices are concrete.
-                    let all_concrete: Option<Vec<usize>> = iv.iter().map(|d| {
-                        if let SymDim::Concrete(v) = d { Some(*v as usize) } else { None }
-                    }).collect();
+                    let all_concrete: Option<Vec<usize>> = iv
+                        .iter()
+                        .map(|d| {
+                            if let SymDim::Concrete(v) = d {
+                                Some(*v as usize)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if let Some(idxs) = all_concrete {
-                        let gathered: Vec<SymDim> = idxs.iter().filter_map(|&i| {
-                            dv.get(i).cloned()
-                        }).collect();
+                        let gathered: Vec<SymDim> =
+                            idxs.iter().filter_map(|&i| dv.get(i).cloned()).collect();
                         if !gathered.is_empty() {
                             sym_updates.insert(node.outputs[0].clone(), gathered);
                         }
@@ -430,12 +481,13 @@ fn propagate_inner(
 
             // Try sym_const_i64 first (symbolic shape).
             if let Some(sym_vals) = sym_const_i64.get(shape_name) {
-                let out: SymShape = sym_vals.iter().map(|d| {
-                    match d {
+                let out: SymShape = sym_vals
+                    .iter()
+                    .map(|d| match d {
                         SymDim::Concrete(v) => SymDim::Concrete(*v),
                         other => other.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 return vec![out];
             }
 
@@ -461,30 +513,58 @@ fn propagate_inner(
             let axes: Vec<usize> = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
                 // axes from second input.
                 if let Some(vals) = const_i64.get(&node.inputs[1]) {
-                    vals.iter().map(|&a| {
-                        let a = if a < 0 { (rank as i64 + a) as usize } else { a as usize };
-                        a.min(rank.saturating_sub(1))
-                    }).collect()
+                    vals.iter()
+                        .map(|&a| {
+                            let a = if a < 0 {
+                                (rank as i64 + a) as usize
+                            } else {
+                                a as usize
+                            };
+                            a.min(rank.saturating_sub(1))
+                        })
+                        .collect()
                 } else {
                     return vec![];
                 }
             } else if let Some(OnnxAttribute::Ints(v)) = attrs.get("axes") {
-                v.iter().map(|&a| {
-                    let a = if a < 0 { (rank as i64 + a) as usize } else { a as usize };
-                    a.min(rank.saturating_sub(1))
-                }).collect()
+                v.iter()
+                    .map(|&a| {
+                        let a = if a < 0 {
+                            (rank as i64 + a) as usize
+                        } else {
+                            a as usize
+                        };
+                        a.min(rank.saturating_sub(1))
+                    })
+                    .collect()
             } else {
                 // No axes = reduce all.
                 (0..rank).collect()
             };
 
             let out: SymShape = if keepdim {
-                input_sym.iter().enumerate().map(|(i, d)| {
-                    if axes.contains(&i) { SymDim::Concrete(1) } else { d.clone() }
-                }).collect()
+                input_sym
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        if axes.contains(&i) {
+                            SymDim::Concrete(1)
+                        } else {
+                            d.clone()
+                        }
+                    })
+                    .collect()
             } else {
-                input_sym.iter().enumerate()
-                    .filter_map(|(i, d)| if axes.contains(&i) { None } else { Some(d.clone()) })
+                input_sym
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, d)| {
+                        if axes.contains(&i) {
+                            None
+                        } else {
+                            Some(d.clone())
+                        }
+                    })
                     .collect()
             };
             vec![out]
@@ -511,9 +591,16 @@ fn propagate_inner(
             };
 
             let out_rank = input_sym.len() + axes.len();
-            let mut norm_axes: Vec<usize> = axes.iter().map(|&a| {
-                if a < 0 { (out_rank as i64 + a) as usize } else { a as usize }
-            }).collect();
+            let mut norm_axes: Vec<usize> = axes
+                .iter()
+                .map(|&a| {
+                    if a < 0 {
+                        (out_rank as i64 + a) as usize
+                    } else {
+                        a as usize
+                    }
+                })
+                .collect();
             norm_axes.sort_unstable();
 
             let mut out: SymShape = Vec::with_capacity(out_rank);
@@ -522,7 +609,12 @@ fn propagate_inner(
                 if norm_axes.contains(&i) {
                     out.push(SymDim::Concrete(1));
                 } else {
-                    out.push(input_sym.get(src_idx).cloned().unwrap_or(SymDim::Concrete(1)));
+                    out.push(
+                        input_sym
+                            .get(src_idx)
+                            .cloned()
+                            .unwrap_or(SymDim::Concrete(1)),
+                    );
                     src_idx += 1;
                 }
             }
@@ -552,19 +644,37 @@ fn propagate_inner(
                 v.clone()
             } else {
                 // Squeeze all size-1 dims.
-                return vec![input_sym.iter()
-                    .filter(|d| !matches!(d, SymDim::Concrete(1)))
-                    .cloned()
-                    .collect()];
+                return vec![
+                    input_sym
+                        .iter()
+                        .filter(|d| !matches!(d, SymDim::Concrete(1)))
+                        .cloned()
+                        .collect(),
+                ];
             };
 
             let rank = input_sym.len();
-            let norm_axes: Vec<usize> = axes.iter().map(|&a| {
-                if a < 0 { (rank as i64 + a) as usize } else { a as usize }
-            }).collect();
+            let norm_axes: Vec<usize> = axes
+                .iter()
+                .map(|&a| {
+                    if a < 0 {
+                        (rank as i64 + a) as usize
+                    } else {
+                        a as usize
+                    }
+                })
+                .collect();
 
-            let out: SymShape = input_sym.iter().enumerate()
-                .filter_map(|(i, d)| if norm_axes.contains(&i) { None } else { Some(d.clone()) })
+            let out: SymShape = input_sym
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    if norm_axes.contains(&i) {
+                        None
+                    } else {
+                        Some(d.clone())
+                    }
+                })
                 .collect();
 
             // Propagate sym_const_i64 through Squeeze (values unchanged).
@@ -586,12 +696,19 @@ fn propagate_inner(
             let starts_static = const_i64.get(node.inputs.get(1).map(|s| s.as_str()).unwrap_or(""));
             let ends_static = const_i64.get(node.inputs.get(2).map(|s| s.as_str()).unwrap_or(""));
 
-            let result: SymShape = if let (Some(starts), Some(ends)) = (starts_static, ends_static) {
+            let result: SymShape = if let (Some(starts), Some(ends)) = (starts_static, ends_static)
+            {
                 let axes: Vec<usize> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
                     if let Some(vals) = const_i64.get(&node.inputs[3]) {
-                        vals.iter().map(|&a| {
-                            if a < 0 { (rank as i64 + a) as usize } else { a as usize }
-                        }).collect()
+                        vals.iter()
+                            .map(|&a| {
+                                if a < 0 {
+                                    (rank as i64 + a) as usize
+                                } else {
+                                    a as usize
+                                }
+                            })
+                            .collect()
                     } else {
                         (0..starts.len()).collect()
                     }
@@ -610,15 +727,27 @@ fn propagate_inner(
                 };
 
                 let mut out = data_sym.clone();
-                for ((&start, &end), (&axis, &step)) in
-                    starts.iter().zip(ends.iter()).zip(axes.iter().zip(steps.iter()))
+                for ((&start, &end), (&axis, &step)) in starts
+                    .iter()
+                    .zip(ends.iter())
+                    .zip(axes.iter().zip(steps.iter()))
                 {
-                    if axis >= rank { continue; }
+                    if axis >= rank {
+                        continue;
+                    }
                     // Try to compute concrete output dim for this axis.
                     if let SymDim::Concrete(dim_val) = &data_sym[axis] {
                         let n = *dim_val as i64;
-                        let s = if start < 0 { (n + start).max(0) } else { start.min(n) };
-                        let e = if end < 0 { (n + end).max(0) } else { end.min(n) };
+                        let s = if start < 0 {
+                            (n + start).max(0)
+                        } else {
+                            start.min(n)
+                        };
+                        let e = if end < 0 {
+                            (n + end).max(0)
+                        } else {
+                            end.min(n)
+                        };
                         let size = ((e - s) as f64 / step.abs() as f64).ceil().max(0.0) as u64;
                         out[axis] = SymDim::Concrete(size);
                     } else {
@@ -640,9 +769,18 @@ fn propagate_inner(
                 ) {
                     if starts.len() == 1 && ends.len() == 1 {
                         let n = data_vals.len() as i64;
-                        let s = if starts[0] < 0 { (n + starts[0]).max(0) as usize } else { (starts[0] as usize).min(data_vals.len()) };
-                        let e = if ends[0] < 0 { (n + ends[0]).max(0) as usize } else { (ends[0] as usize).min(data_vals.len()) };
-                        let step = const_i64.get(node.inputs.get(4).map(|s| s.as_str()).unwrap_or(""))
+                        let s = if starts[0] < 0 {
+                            (n + starts[0]).max(0) as usize
+                        } else {
+                            (starts[0] as usize).min(data_vals.len())
+                        };
+                        let e = if ends[0] < 0 {
+                            (n + ends[0]).max(0) as usize
+                        } else {
+                            (ends[0] as usize).min(data_vals.len())
+                        };
+                        let step = const_i64
+                            .get(node.inputs.get(4).map(|s| s.as_str()).unwrap_or(""))
                             .and_then(|v| v.first().copied())
                             .unwrap_or(1);
                         if step == 1 && s <= e {
@@ -687,13 +825,16 @@ fn propagate_inner(
                 }
             };
 
-            split_sizes.into_iter().map(|size| {
-                let mut out = input_sym.clone();
-                if axis_usize < out.len() {
-                    out[axis_usize] = size;
-                }
-                out
-            }).collect()
+            split_sizes
+                .into_iter()
+                .map(|size| {
+                    let mut out = input_sym.clone();
+                    if axis_usize < out.len() {
+                        out[axis_usize] = size;
+                    }
+                    out
+                })
+                .collect()
         }
 
         // ── Flatten ───────────────────────────────────────────────────────────
@@ -710,13 +851,17 @@ fn propagate_inner(
             let outer: SymDim = if axis == 0 {
                 SymDim::Concrete(1)
             } else {
-                input_sym[..axis].iter().fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
+                input_sym[..axis]
+                    .iter()
+                    .fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
             };
             // Inner product.
             let inner: SymDim = if axis >= rank {
                 SymDim::Concrete(1)
             } else {
-                input_sym[axis..].iter().fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
+                input_sym[axis..]
+                    .iter()
+                    .fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
             };
 
             vec![vec![outer, inner]]
@@ -731,7 +876,12 @@ fn propagate_inner(
                 // Negative values are ONNX sentinels (-1 = infer, etc.); casting to u64 overflows.
                 if buf.shape().num_elements() <= 64 {
                     if let Ok(vals) = read_i64_buf(buf) {
-                        if vals.iter().all(|&v| v >= 0) { sym_updates.insert(node.outputs[0].clone(), vals.iter().map(|&v| SymDim::Concrete(v as u64)).collect()); }
+                        if vals.iter().all(|&v| v >= 0) {
+                            sym_updates.insert(
+                                node.outputs[0].clone(),
+                                vals.iter().map(|&v| SymDim::Concrete(v as u64)).collect(),
+                            );
+                        }
                     }
                 }
                 vec![out]
@@ -753,7 +903,7 @@ fn propagate_inner(
                     let size = ((lv[0] - sv[0] + dv[0] - 1) / dv[0]).max(0) as u64;
                     vec![vec![SymDim::Concrete(size)]]
                 }
-                _ => vec![vec![]],  // unknown size
+                _ => vec![vec![]], // unknown size
             }
         }
 
@@ -765,11 +915,19 @@ fn propagate_inner(
 
         "BatchNormalization" => {
             // Output shape = input shape.
-            if let Some(s) = get(0) { vec![s.clone()] } else { vec![] }
+            if let Some(s) = get(0) {
+                vec![s.clone()]
+            } else {
+                vec![]
+            }
         }
 
         "Clip" => {
-            if let Some(s) = get(0) { vec![s.clone()] } else { vec![] }
+            if let Some(s) = get(0) {
+                vec![s.clone()]
+            } else {
+                vec![]
+            }
         }
 
         // ── Fallback ──────────────────────────────────────────────────────────
@@ -811,7 +969,12 @@ fn sym_const_i64_elementwise(
 ) -> Option<Vec<SymDim>> {
     let apply = |x: SymDim, y: SymDim| op(x, y).simplify();
     if a.len() == b.len() {
-        Some(a.iter().zip(b.iter()).map(|(x, y)| apply(x.clone(), y.clone())).collect())
+        Some(
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| apply(x.clone(), y.clone()))
+                .collect(),
+        )
     } else if a.len() == 1 {
         Some(b.iter().map(|y| apply(a[0].clone(), y.clone())).collect())
     } else if b.len() == 1 {
@@ -831,32 +994,40 @@ fn reshape_sym_with_concrete_target(
 ) -> SymShape {
     // Compute total input elements (symbolic).
     let total_sym: Option<SymDim> = input_sym.map(|s| {
-        s.iter().fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
+        s.iter()
+            .fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
     });
 
     // Compute known product of non-(-1) target dims.
     let known_product: Option<u64> = target.iter().try_fold(1u64, |acc, &d| {
-        if d == -1 { Some(acc) }  // skip -1 in product
-        else if d > 0 { Some(acc * d as u64) }
-        else { None }
+        if d == -1 {
+            Some(acc)
+        }
+        // skip -1 in product
+        else if d > 0 {
+            Some(acc * d as u64)
+        } else {
+            None
+        }
     });
 
-    target.iter().map(|&d| {
-        if d > 0 {
-            SymDim::Concrete(d as u64)
-        } else if d == -1 {
-            // Infer: total / known_product
-            match (total_sym.clone(), known_product) {
-                (Some(total), Some(kp)) if kp > 0 => {
-                    total.div(SymDim::Concrete(kp)).simplify()
+    target
+        .iter()
+        .map(|&d| {
+            if d > 0 {
+                SymDim::Concrete(d as u64)
+            } else if d == -1 {
+                // Infer: total / known_product
+                match (total_sym.clone(), known_product) {
+                    (Some(total), Some(kp)) if kp > 0 => total.div(SymDim::Concrete(kp)).simplify(),
+                    _ => SymDim::Concrete(0), // can't infer
                 }
-                _ => SymDim::Concrete(0), // can't infer
+            } else {
+                // d == 0: copy from input (allowzero=0 case)
+                SymDim::Concrete(0)
             }
-        } else {
-            // d == 0: copy from input (allowzero=0 case)
-            SymDim::Concrete(0)
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Compute symbolic output shape for Reshape with a symbolic target shape.
@@ -867,7 +1038,8 @@ fn reshape_sym_with_sym_target(
 ) -> SymShape {
     // Compute total input elements (symbolic).
     let total_sym: Option<SymDim> = input_sym.map(|s| {
-        s.iter().fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
+        s.iter()
+            .fold(SymDim::Concrete(1), |acc, d| acc.mul(d.clone()).simplify())
     });
 
     // Compute known product of non-(-1) target dims.
@@ -882,19 +1054,22 @@ fn reshape_sym_with_sym_target(
         }
     });
 
-    sym_target.iter().map(|d| {
-        match d {
-            SymDim::Concrete(v) if *v == u64::MAX => {
-                // This is the -1 (infer) dimension.
-                if let Some(total) = total_sym.clone() {
-                    total.div(known_product.clone()).simplify()
-                } else {
-                    SymDim::Concrete(0)
+    sym_target
+        .iter()
+        .map(|d| {
+            match d {
+                SymDim::Concrete(v) if *v == u64::MAX => {
+                    // This is the -1 (infer) dimension.
+                    if let Some(total) = total_sym.clone() {
+                        total.div(known_product.clone()).simplify()
+                    } else {
+                        SymDim::Concrete(0)
+                    }
                 }
+                other => other.clone(),
             }
-            other => other.clone(),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // ── Buffer reading helper ─────────────────────────────────────────────────────
@@ -913,8 +1088,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn concrete(v: u64) -> SymDim { SymDim::Concrete(v) }
-    fn var(s: &str) -> SymDim { SymDim::var(s) }
+    fn concrete(v: u64) -> SymDim {
+        SymDim::Concrete(v)
+    }
+    fn var(s: &str) -> SymDim {
+        SymDim::var(s)
+    }
 
     #[test]
     fn broadcast_sym_shapes_test() {
@@ -953,7 +1132,10 @@ mod tests {
         };
         let shape: SymShape = vec![concrete(1), concrete(12), var("seq"), concrete(64)];
         let (outs, _) = propagate_sym_shapes(&node, &[&shape], &HashMap::new(), &HashMap::new());
-        assert_eq!(outs[0], vec![concrete(1), var("seq"), concrete(12), concrete(64)]);
+        assert_eq!(
+            outs[0],
+            vec![concrete(1), var("seq"), concrete(12), concrete(64)]
+        );
     }
 
     #[test]
@@ -965,7 +1147,8 @@ mod tests {
             attributes: HashMap::new(),
         };
         let shape: SymShape = vec![concrete(1), concrete(12), var("past"), concrete(64)];
-        let (outs, updates) = propagate_sym_shapes(&node, &[&shape], &HashMap::new(), &HashMap::new());
+        let (outs, updates) =
+            propagate_sym_shapes(&node, &[&shape], &HashMap::new(), &HashMap::new());
         assert_eq!(outs[0], vec![concrete(4)]);
         assert_eq!(updates.get("shape_out").unwrap(), &shape);
     }
@@ -1011,6 +1194,10 @@ mod tests {
         let dim1 = &outs[0][1];
         let mut bindings = HashMap::new();
         bindings.insert("seq".to_string(), 10u64);
-        assert_eq!(dim1.eval(&bindings), Some(10), "dim[1] should eval to seq=10, got {dim1:?}");
+        assert_eq!(
+            dim1.eval(&bindings),
+            Some(10),
+            "dim[1] should eval to seq=10, got {dim1:?}"
+        );
     }
 }

@@ -44,9 +44,8 @@ fn mnist_predicts_7_from_image() {
 /// MNIST through the GraphBuilder emitter predicts digit 7.
 #[test]
 fn mnist_emitter_predicts_7_from_image() {
-    let model =
-        Model::load_with_dynamic_dims("tests/fixtures/mnist-12.onnx", HashSet::new())
-            .expect("load failed");
+    let model = Model::load_with_dynamic_dims("tests/fixtures/mnist-12.onnx", HashSet::new())
+        .expect("load failed");
     let pixels = load_image("tests/fixtures/digit7.png");
     let input = Buffer::from_slice::<f32>(&pixels, &[1, 1, 28, 28], DType::F32);
     let outputs = model.run(&[&input]).expect("inference failed");
@@ -85,7 +84,9 @@ fn mnist_emitter_split_threshold_50() {
     .expect("emit_graph_with_split");
 
     let output_refs: Vec<&homura::graph_builder::Tensor<'_>> = output_tensors.iter().collect();
-    let graph = builder.compile(&output_refs).expect("compile with splitting");
+    let graph = builder
+        .compile(&output_refs)
+        .expect("compile with splitting");
 
     // Build input buffer.
     let pixels = load_image("tests/fixtures/digit7.png");
@@ -100,7 +101,10 @@ fn mnist_emitter_split_threshold_50() {
     let logits = outputs[0].as_slice::<f32>();
 
     assert_eq!(logits.len(), 10);
-    assert!(logits.iter().all(|v| v.is_finite()), "logits contain NaN/Inf");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "logits contain NaN/Inf"
+    );
 
     let predicted = logits
         .iter()
