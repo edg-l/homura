@@ -1633,6 +1633,192 @@ struct KernelGroup {
     node_indices: Vec<usize>,
 }
 
+/// Returns true if this node is a KV-cache Concat:
+/// - op_type == "Concat"
+/// - raw axis attribute == -2 (sequence dimension in [B, heads, seq, head_dim])
+/// - exactly 2 inputs (past + new)
+fn is_kv_concat(node: &OnnxNode) -> bool {
+    if node.op_type != "Concat" || node.inputs.len() != 2 {
+        return false;
+    }
+    let axis_raw = node
+        .attributes
+        .get("axis")
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    axis_raw == -2
+}
+
+/// Split kernel groups containing KV Concat nodes into sub-groups.
+///
+/// For each group containing KV Concat(s), produces:
+/// - pre_concat: all transitive inputs of the KV Concats within the group
+/// - one single-node group per KV Concat (will become NativeOp::Concat steps)
+/// - post_concat: all transitive consumers of KV Concat outputs within the group
+///
+/// Groups without KV Concats pass through unchanged.
+///
+/// Returns (new_groups, set of KV Concat node indices, ordered list of KV Concat node indices).
+fn split_kv_concat_groups(
+    nodes: &[OnnxNode],
+    groups: Vec<KernelGroup>,
+) -> (Vec<KernelGroup>, HashSet<usize>, Vec<usize>) {
+    let mut result: Vec<KernelGroup> = Vec::new();
+    let mut kv_concat_indices: HashSet<usize> = HashSet::new();
+    let mut kv_concat_ordered: Vec<usize> = Vec::new();
+
+    for group in groups {
+        // Quick check: does this group contain any KV Concat?
+        let kv_concats: Vec<usize> = group
+            .node_indices
+            .iter()
+            .copied()
+            .filter(|&ni| is_kv_concat(&nodes[ni]))
+            .collect();
+
+        if kv_concats.is_empty() {
+            result.push(group);
+            continue;
+        }
+
+        // Build intra-group DAG.
+        // producer: value_name → node_index (only for nodes IN this group)
+        let mut producer: HashMap<&str, usize> = HashMap::new();
+        for &ni in &group.node_indices {
+            for out in &nodes[ni].outputs {
+                if !out.is_empty() {
+                    producer.insert(out.as_str(), ni);
+                }
+            }
+        }
+
+        // dependencies: node → set of nodes that produce its inputs (within group)
+        // consumers: node → set of nodes that consume its outputs (within group)
+        let mut consumers: HashMap<usize, HashSet<usize>> = HashMap::new();
+        let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for &ni in &group.node_indices {
+            for input_name in &nodes[ni].inputs {
+                if let Some(&prod_ni) = producer.get(input_name.as_str()) {
+                    if prod_ni != ni {
+                        consumers.entry(prod_ni).or_default().insert(ni);
+                        dependencies.entry(ni).or_default().insert(prod_ni);
+                    }
+                }
+            }
+        }
+
+        let kv_concat_set: HashSet<usize> = kv_concats.iter().copied().collect();
+
+        // Walk backwards from KV Concats to find all ancestors (pre-concat nodes).
+        let mut pre_concat: HashSet<usize> = HashSet::new();
+        {
+            let mut stack: Vec<usize> = Vec::new();
+            for &ci in &kv_concats {
+                if let Some(deps) = dependencies.get(&ci) {
+                    for &d in deps {
+                        if !kv_concat_set.contains(&d) {
+                            stack.push(d);
+                        }
+                    }
+                }
+            }
+            while let Some(ni) = stack.pop() {
+                if !pre_concat.insert(ni) {
+                    continue;
+                }
+                if let Some(deps) = dependencies.get(&ni) {
+                    for &d in deps {
+                        if !kv_concat_set.contains(&d) && !pre_concat.contains(&d) {
+                            stack.push(d);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Walk forwards from KV Concats to find all descendants (post-concat nodes).
+        let mut post_concat: HashSet<usize> = HashSet::new();
+        {
+            let mut stack: Vec<usize> = Vec::new();
+            for &ci in &kv_concats {
+                if let Some(cons) = consumers.get(&ci) {
+                    for &c in cons {
+                        if !kv_concat_set.contains(&c) {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+            while let Some(ni) = stack.pop() {
+                if !post_concat.insert(ni) {
+                    continue;
+                }
+                if let Some(cons) = consumers.get(&ni) {
+                    for &c in cons {
+                        if !kv_concat_set.contains(&c) && !post_concat.contains(&c) {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Nodes in both pre and post: keep in pre (value crosses boundary via buffer slots).
+        post_concat.retain(|ni| !pre_concat.contains(ni));
+
+        // Nodes in neither pre nor post (e.g., Constants not connected to Concat): place in pre.
+        for &ni in &group.node_indices {
+            if !kv_concat_set.contains(&ni)
+                && !pre_concat.contains(&ni)
+                && !post_concat.contains(&ni)
+            {
+                pre_concat.insert(ni);
+            }
+        }
+
+        // Build sub-groups, maintaining original node order within each.
+        let pre_nodes: Vec<usize> = group
+            .node_indices
+            .iter()
+            .copied()
+            .filter(|ni| pre_concat.contains(ni))
+            .collect();
+        let post_nodes: Vec<usize> = group
+            .node_indices
+            .iter()
+            .copied()
+            .filter(|ni| post_concat.contains(ni))
+            .collect();
+
+        // Emit sub-groups in order: pre, concat(s), post.
+        if !pre_nodes.is_empty() {
+            result.push(KernelGroup {
+                node_indices: pre_nodes,
+            });
+        }
+        for &ci in &kv_concats {
+            kv_concat_indices.insert(ci);
+            kv_concat_ordered.push(ci);
+            result.push(KernelGroup {
+                node_indices: vec![ci],
+            });
+        }
+        if !post_nodes.is_empty() {
+            result.push(KernelGroup {
+                node_indices: post_nodes,
+            });
+        }
+    }
+
+    (result, kv_concat_indices, kv_concat_ordered)
+}
+
 /// Partition ONNX nodes into kernel groups: each heavy op becomes its own
 /// kernel, lightweight ops between heavy ops are grouped together.
 fn partition_nodes(nodes: &[OnnxNode]) -> Vec<KernelGroup> {
@@ -1826,7 +2012,7 @@ fn detect_and_absorb_gemm_residual(
                 .node_indices
                 .retain(|ni| !to_absorb.contains(ni));
 
-            fusions.insert(gi, fusion);
+            fusions.insert(gemm_ni, fusion);
         }
 
         gi += 1;
@@ -2029,10 +2215,38 @@ pub fn emit_and_compile_plan(
             gemm_residual_fusions.len()
         );
     }
-    let kv_concat_node_indices: HashSet<usize> = HashSet::new();
+    let (groups, kv_concat_node_indices, kv_concat_ordered) =
+        split_kv_concat_groups(&model.nodes, groups);
+    if !kv_concat_node_indices.is_empty() {
+        eprintln!(
+            "[{:>8.2}s] [plan] split {} KV Concat nodes into native ops",
+            crate::log_ts(),
+            kv_concat_node_indices.len()
+        );
+    }
 
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
         assign_buffer_slots(model, &groups);
+
+    // Build KV Concat metadata: map node_index → (layer, is_value).
+    // KV Concats come in pairs (K then V) per layer, in model order.
+    let mut kv_concat_meta: HashMap<usize, (usize, bool)> = HashMap::new();
+    for (i, &ni) in kv_concat_ordered.iter().enumerate() {
+        let layer = i / 2;
+        let is_value = (i % 2) == 1;
+        kv_concat_meta.insert(ni, (layer, is_value));
+    }
+
+    // Build model input name set for identifying "past" KV inputs.
+    let model_input_names: HashSet<&str> = model
+        .dynamic_inputs
+        .iter()
+        .map(|inp| inp.name.as_str())
+        .collect();
+
+    // Track past_kv input slots and present_kv output slots for KvPlanInfo.
+    let mut past_kv_input_slots: Vec<usize> = Vec::new();
+    let mut present_kv_output_slots: Vec<usize> = Vec::new();
 
     eprintln!(
         "[{:>8.2}s] [plan] {} nodes → {} kernels, {} buffer slots",
@@ -2184,6 +2398,7 @@ pub fn emit_and_compile_plan(
 
     let mut emit_results: Vec<KernelEmitResult> = Vec::new();
     let mut steps: Vec<KernelStep> = Vec::new();
+    let mut next_kernel_idx: usize = 0;
 
     for (gi, (group, io)) in groups.iter().zip(kernel_ios.iter()).enumerate() {
         // Skip MLIR emission for native-op groups (KV Concat).
@@ -2236,12 +2451,37 @@ pub fn emit_and_compile_plan(
                     sym_shape_info.insert(node.outputs[0].clone(), out_sym);
                 }
             }
-            steps.push(KernelStep {
-                kernel_idx: usize::MAX, // sentinel — no compiled kernel
-                input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
-                output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
-                native_op: Some(crate::runtime::NativeOp::Concat { axis }),
-            });
+            let ni = group.node_indices[0];
+            let all_input_slots: Vec<usize> = io.input_slots.iter().map(|(_, s)| *s).collect();
+            let all_output_slots: Vec<usize> = io.output_slots.iter().map(|(_, s)| *s).collect();
+
+            if let Some(&(layer, is_value)) = kv_concat_meta.get(&ni) {
+                // Track which input is "past" (model input) and which is "new".
+                for (name, slot) in &io.input_slots {
+                    if model_input_names.contains(name.as_str()) {
+                        past_kv_input_slots.push(*slot);
+                    }
+                }
+                for (_, slot) in &io.output_slots {
+                    present_kv_output_slots.push(*slot);
+                }
+
+                // KvAppend keeps both inputs so run() can fall back to Concat.
+                // run_kv() knows which input is "new" (the non-past one).
+                steps.push(KernelStep {
+                    kernel_idx: usize::MAX,
+                    input_slots: all_input_slots,
+                    output_slots: all_output_slots,
+                    native_op: Some(crate::runtime::NativeOp::KvAppend { layer, is_value }),
+                });
+            } else {
+                steps.push(KernelStep {
+                    kernel_idx: usize::MAX,
+                    input_slots: all_input_slots,
+                    output_slots: all_output_slots,
+                    native_op: Some(crate::runtime::NativeOp::Concat { axis }),
+                });
+            }
             continue;
         }
 
@@ -2265,7 +2505,7 @@ pub fn emit_and_compile_plan(
 
             // In a fused group, replace the Gemm emission with the fused version
             // and skip the Add node (its output is produced by the fused Gemm).
-            if let Some(fusion) = gemm_residual_fusions.get(&gi) {
+            if let Some(fusion) = gemm_residual_fusions.get(&group.node_indices[0]) {
                 if ni == fusion.add_idx {
                     // Skip — the Add output was already produced by the fused Gemm.
                     // But we still need to propagate sym shapes (handled below).
@@ -2460,12 +2700,19 @@ pub fn emit_and_compile_plan(
         });
 
         steps.push(KernelStep {
-            kernel_idx: gi,
+            kernel_idx: next_kernel_idx,
             input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
             output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
             native_op: None,
         });
+        next_kernel_idx += 1;
     }
+
+    assert_eq!(
+        emit_results.len(),
+        next_kernel_idx,
+        "compiled kernel count mismatch"
+    );
 
     // Phase 2: Compile all kernels in parallel.
     eprintln!(
@@ -2615,6 +2862,45 @@ pub fn emit_and_compile_plan(
         slot_descs,
     );
     plan.set_shared_lib(lib);
+
+    // Attach KV cache info if KV Concats were detected.
+    if !kv_concat_ordered.is_empty() {
+        assert_eq!(
+            kv_concat_ordered.len() % 2,
+            0,
+            "expected even number of KV Concat nodes (K+V pairs)"
+        );
+        let num_layers = kv_concat_ordered.len() / 2;
+
+        // Extract num_heads and head_dim from the first KV Concat's new input shape.
+        let first_node = &model.nodes[kv_concat_ordered[0]];
+        let new_input_name = if model_input_names.contains(first_node.inputs[0].as_str()) {
+            &first_node.inputs[1]
+        } else {
+            &first_node.inputs[0]
+        };
+        let new_info = shape_info
+            .get(new_input_name)
+            .expect("no shape info for KV Concat new input");
+        // Shape: [1, num_heads, 1, head_dim]
+        let num_heads = new_info.shape[1].expect("KV num_heads must be static") as usize;
+        let head_dim = new_info.shape[3].expect("KV head_dim must be static") as usize;
+
+        plan.set_kv_info(crate::runtime::KvPlanInfo {
+            num_layers,
+            num_heads,
+            head_dim,
+            past_kv_input_slots,
+            present_kv_output_slots,
+        });
+        eprintln!(
+            "[{:>8.2}s] [plan] KV cache: {} layers, {} heads, head_dim={}",
+            crate::log_ts(),
+            num_layers,
+            num_heads,
+            head_dim
+        );
+    }
 
     Ok((plan, weights))
 }

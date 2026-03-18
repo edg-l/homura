@@ -210,6 +210,220 @@ fn row_major_strides(shape: &[u64]) -> Vec<i64> {
     strides
 }
 
+// ── KV Cache ──────────────────────────────────────────────────────────────────
+
+/// Per-layer KV cache: pre-allocated K and V buffers for max_seq_len.
+struct KvLayerCache {
+    /// Pre-allocated key buffer: [1, num_heads, max_seq_len, head_dim].
+    key: Vec<u8>,
+    /// Pre-allocated value buffer: same shape as key.
+    value: Vec<u8>,
+}
+
+/// Persistent KV cache for autoregressive decoding.
+///
+/// Pre-allocates buffers for `max_seq_len` tokens per layer. Each decode step
+/// appends one new K/V entry via `append()`, and `view()` returns a Buffer
+/// covering `[0..current_len]` without re-allocating.
+///
+/// The append writes only `num_heads * head_dim * elem_size` bytes per tensor
+/// (e.g., 3KB for GPT-2). Views copy the valid region into a fresh Buffer —
+/// a future optimization can make this zero-copy with borrowed buffer support.
+pub struct KvCache {
+    layers: Vec<KvLayerCache>,
+    current_len: usize,
+    max_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    dtype: DType,
+}
+
+impl KvCache {
+    /// Create a new KV cache pre-allocated for the given dimensions.
+    ///
+    /// Each layer gets two buffers (K, V) of shape
+    /// `[1, num_heads, max_len, head_dim]`, zero-initialized.
+    pub fn new(
+        num_layers: usize,
+        num_heads: usize,
+        max_len: usize,
+        head_dim: usize,
+        dtype: DType,
+    ) -> Self {
+        let elem_size = dtype.size_bytes();
+        let buf_bytes = num_heads * max_len * head_dim * elem_size;
+        let layers = (0..num_layers)
+            .map(|_| KvLayerCache {
+                key: vec![0u8; buf_bytes],
+                value: vec![0u8; buf_bytes],
+            })
+            .collect();
+        Self {
+            layers,
+            current_len: 0,
+            max_len,
+            num_heads,
+            head_dim,
+            dtype,
+        }
+    }
+
+    /// Append new K/V entries at position `current_len` for the given layer.
+    ///
+    /// `new_k` and `new_v` must have shape `[1, num_heads, 1, head_dim]`.
+    /// Copies `num_heads * head_dim * elem_size` bytes into the pre-allocated
+    /// buffer at the correct offset.
+    pub fn append(&mut self, layer: usize, new_k: &Buffer, new_v: &Buffer) {
+        assert!(
+            self.current_len < self.max_len,
+            "KV cache full: current_len={} >= max_len={}",
+            self.current_len,
+            self.max_len
+        );
+        let elem_size = self.dtype.size_bytes();
+        let row_bytes = self.head_dim * elem_size;
+        let stride_seq = self.head_dim * elem_size; // stride along seq dimension
+
+        // Copy each head's new entry into the correct position.
+        // Layout: [1, num_heads, max_len, head_dim] row-major.
+        // Offset for head h, seq s = (h * max_len + s) * head_dim * elem_size.
+        for h in 0..self.num_heads {
+            let dst_offset = (h * self.max_len + self.current_len) * stride_seq;
+            let src_offset = h * row_bytes; // new_k is [1, heads, 1, head_dim]
+            self.layers[layer].key[dst_offset..dst_offset + row_bytes]
+                .copy_from_slice(&new_k.data[src_offset..src_offset + row_bytes]);
+            self.layers[layer].value[dst_offset..dst_offset + row_bytes]
+                .copy_from_slice(&new_v.data[src_offset..src_offset + row_bytes]);
+        }
+    }
+
+    /// Return Buffer views of the KV cache for the given layer,
+    /// covering `[1, num_heads, 0..current_len, head_dim]`.
+    ///
+    /// Currently copies the valid region into new Buffers. The pre-allocated
+    /// buffer uses max_len strides, so we extract the contiguous sub-region.
+    pub fn view(&self, layer: usize) -> (Buffer, Buffer) {
+        let elem_size = self.dtype.size_bytes();
+        let view_shape = [
+            1u64,
+            self.num_heads as u64,
+            self.current_len as u64,
+            self.head_dim as u64,
+        ];
+        let row_bytes = self.head_dim * elem_size;
+        let view_bytes = self.num_heads * self.current_len * self.head_dim * elem_size;
+
+        let mut k_data = vec![0u8; view_bytes];
+        let mut v_data = vec![0u8; view_bytes];
+
+        // Copy each head's [0..current_len] rows from the max_len-strided buffer.
+        for h in 0..self.num_heads {
+            for s in 0..self.current_len {
+                let src_off = (h * self.max_len + s) * row_bytes;
+                let dst_off = (h * self.current_len + s) * row_bytes;
+                k_data[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.layers[layer].key[src_off..src_off + row_bytes]);
+                v_data[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&self.layers[layer].value[src_off..src_off + row_bytes]);
+            }
+        }
+
+        let k_buf = Buffer {
+            data: k_data,
+            shape: Shape(view_shape.to_vec()),
+            strides: row_major_strides(&view_shape),
+            dtype: self.dtype,
+        };
+        let v_buf = Buffer {
+            data: v_data,
+            shape: Shape(view_shape.to_vec()),
+            strides: row_major_strides(&view_shape),
+            dtype: self.dtype,
+        };
+        (k_buf, v_buf)
+    }
+
+    /// Append a new K entry at position `current_len` for the given layer.
+    pub fn append_key(&mut self, layer: usize, new_k: &Buffer) {
+        assert!(self.current_len < self.max_len, "KV cache full");
+        let row_bytes = self.head_dim * self.dtype.size_bytes();
+        for h in 0..self.num_heads {
+            let dst = (h * self.max_len + self.current_len) * row_bytes;
+            let src = h * row_bytes;
+            self.layers[layer].key[dst..dst + row_bytes]
+                .copy_from_slice(&new_k.data[src..src + row_bytes]);
+        }
+    }
+
+    /// Append a new V entry at position `current_len` for the given layer.
+    pub fn append_value(&mut self, layer: usize, new_v: &Buffer) {
+        assert!(self.current_len < self.max_len, "KV cache full");
+        let row_bytes = self.head_dim * self.dtype.size_bytes();
+        for h in 0..self.num_heads {
+            let dst = (h * self.max_len + self.current_len) * row_bytes;
+            let src = h * row_bytes;
+            self.layers[layer].value[dst..dst + row_bytes]
+                .copy_from_slice(&new_v.data[src..src + row_bytes]);
+        }
+    }
+
+    /// Return a K view covering `[1, heads, 0..current_len+1, head_dim]`.
+    /// Includes the entry just appended at `current_len` (before `advance()`).
+    pub fn view_key(&self, layer: usize) -> Buffer {
+        self.view_single(&self.layers[layer].key, self.current_len + 1)
+    }
+
+    /// Return a V view covering `[1, heads, 0..current_len+1, head_dim]`.
+    pub fn view_value(&self, layer: usize) -> Buffer {
+        self.view_single(&self.layers[layer].value, self.current_len + 1)
+    }
+
+    /// Extract a contiguous view of `[1, heads, 0..seq_len, head_dim]` from
+    /// a max_len-strided buffer.
+    fn view_single(&self, src: &[u8], seq_len: usize) -> Buffer {
+        let elem_size = self.dtype.size_bytes();
+        let row_bytes = self.head_dim * elem_size;
+        let view_shape = [
+            1u64,
+            self.num_heads as u64,
+            seq_len as u64,
+            self.head_dim as u64,
+        ];
+        let view_bytes = self.num_heads * seq_len * self.head_dim * elem_size;
+        let mut data = vec![0u8; view_bytes];
+
+        for h in 0..self.num_heads {
+            let src_off = h * self.max_len * row_bytes;
+            let dst_off = h * seq_len * row_bytes;
+            let chunk = seq_len * row_bytes;
+            data[dst_off..dst_off + chunk].copy_from_slice(&src[src_off..src_off + chunk]);
+        }
+
+        Buffer {
+            data,
+            shape: Shape(view_shape.to_vec()),
+            strides: row_major_strides(&view_shape),
+            dtype: self.dtype,
+        }
+    }
+
+    /// Advance the sequence position after all layers have appended.
+    pub fn advance(&mut self) {
+        self.current_len += 1;
+    }
+
+    /// Reset for a new sequence. If `initial_len > 0`, the caller must
+    /// populate the cache with prefill data via `append` calls.
+    pub fn reset(&mut self, initial_len: usize) {
+        self.current_len = initial_len;
+    }
+
+    /// Current sequence length stored in the cache.
+    pub fn current_len(&self) -> usize {
+        self.current_len
+    }
+}
+
 // ── Memref descriptor ─────────────────────────────────────────────────────────
 
 /// Build a rank-N MLIR memref descriptor as a raw byte blob.
@@ -634,6 +848,28 @@ pub enum NativeOp {
     /// Concatenate inputs along `axis` into the output buffer.
     /// Inputs: [past, new], output: past ++ new along axis.
     Concat { axis: usize },
+    /// Append new K or V entry to the KV cache and produce a view.
+    /// Input: [new_k] or [new_v] (1 tensor, shape [1, heads, 1, head_dim]).
+    /// Output: [present_k] or [present_v] (view of [1, heads, seq_len+1, head_dim]).
+    KvAppend { layer: usize, is_value: bool },
+}
+
+/// Metadata for KV cache management within an ExecutionPlan.
+/// Present only when the model has KV Concat ops that were converted to KvAppend.
+#[derive(Clone, Debug)]
+pub struct KvPlanInfo {
+    /// Number of transformer layers with KV caching.
+    pub num_layers: usize,
+    /// Number of attention heads.
+    pub num_heads: usize,
+    /// Per-head dimension.
+    pub head_dim: usize,
+    /// Buffer slot indices for past_kv model inputs (to be excluded from external inputs).
+    /// Ordered: [layer0_k, layer0_v, layer1_k, layer1_v, ...].
+    pub past_kv_input_slots: Vec<usize>,
+    /// Buffer slot indices for present_kv model outputs (to be excluded from external outputs).
+    /// Same ordering as past_kv_input_slots.
+    pub present_kv_output_slots: Vec<usize>,
 }
 
 /// A compiled model consisting of multiple independently-compiled kernels
@@ -664,6 +900,10 @@ pub struct ExecutionPlan {
     /// `None` means the slot is never read (model output only) or is
     /// an input/weight that lives for the entire run.
     slot_last_read: Vec<Option<usize>>,
+    /// KV cache metadata. Present when the model has KV Concat ops.
+    pub(crate) kv_info: Option<KvPlanInfo>,
+    /// Persistent KV cache, created on first `run_kv` call.
+    kv_cache: Option<KvCache>,
 }
 
 /// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
@@ -738,7 +978,19 @@ impl ExecutionPlan {
             output_slots,
             slot_descs,
             slot_last_read: last_read,
+            kv_info: None,
+            kv_cache: None,
         }
+    }
+
+    /// Attach KV cache metadata to this plan.
+    pub(crate) fn set_kv_info(&mut self, info: KvPlanInfo) {
+        self.kv_info = Some(info);
+    }
+
+    /// Whether this plan has KV cache support.
+    pub fn has_kv_cache(&self) -> bool {
+        self.kv_info.is_some()
     }
 
     /// Set the unified shared library handle (transfers ownership).
@@ -856,8 +1108,6 @@ impl ExecutionPlan {
 
         // Execute steps.
         for (step_idx, step) in self.steps.iter().enumerate() {
-            let kernel = &self.kernels[step.kernel_idx];
-
             // Gather input refs for this kernel.
             let step_inputs: Vec<&Buffer> = step
                 .input_slots
@@ -906,6 +1156,15 @@ impl ExecutionPlan {
                         let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
                         (buf, out_slot)
                     }
+                    NativeOp::KvAppend { .. } => {
+                        // Fallback: in run() (no KV cache), treat as Concat (axis=2).
+                        assert_eq!(step.output_slots.len(), 1);
+                        let out_slot = step.output_slots[0];
+                        let out_shape = &resolved_shapes[out_slot];
+                        let dtype = self.slot_descs[out_slot].dtype;
+                        let buf = native_concat(&step_inputs, 2, &out_shape.0, dtype);
+                        (buf, out_slot)
+                    }
                 };
                 if let Some(t0) = t0 {
                     let shapes: Vec<Vec<u64>> =
@@ -926,6 +1185,9 @@ impl ExecutionPlan {
                 }
                 continue;
             }
+
+            // Compiled kernel — safe to index now (native ops continued above).
+            let kernel = &self.kernels[step.kernel_idx];
 
             // Check if any output has dynamic dims — if so, resolve from slot_descs.
             let has_dynamic = kernel
@@ -1040,6 +1302,329 @@ impl ExecutionPlan {
                     .into_owned()
             })
             .collect()
+    }
+
+    /// Run the plan with internal KV cache management.
+    ///
+    /// `inputs` should contain only the non-KV model inputs (e.g., input_ids +
+    /// attention_mask). The past_kv inputs are populated from the internal
+    /// KvCache, and present_kv outputs are fed back to the cache automatically.
+    ///
+    /// On first call, initializes the KV cache with `max_seq_len` capacity.
+    /// Returns only the non-KV model outputs (e.g., logits).
+    ///
+    /// After each call, the cache advances by 1 position.
+    pub fn run_kv(
+        &mut self,
+        inputs: &[&Buffer],
+        weights: &[Buffer],
+        max_seq_len: usize,
+    ) -> Vec<Buffer> {
+        let kv_info = self
+            .kv_info
+            .as_ref()
+            .expect("run_kv called but plan has no KV cache info")
+            .clone();
+
+        // Initialize KV cache on first call.
+        if self.kv_cache.is_none() {
+            self.kv_cache = Some(KvCache::new(
+                kv_info.num_layers,
+                kv_info.num_heads,
+                max_seq_len,
+                kv_info.head_dim,
+                DType::F32,
+            ));
+        }
+
+        // The external inputs exclude past_kv slots. Map them to the
+        // non-KV input slots (those not in past_kv_input_slots).
+        let past_kv_set: std::collections::HashSet<usize> =
+            kv_info.past_kv_input_slots.iter().copied().collect();
+        let non_kv_input_slots: Vec<usize> = self
+            .input_slots
+            .iter()
+            .copied()
+            .filter(|s| !past_kv_set.contains(s))
+            .collect();
+        assert_eq!(
+            inputs.len(),
+            non_kv_input_slots.len(),
+            "run_kv: expected {} non-KV inputs, got {}",
+            non_kv_input_slots.len(),
+            inputs.len()
+        );
+
+        // Resolve shapes using the full input set (including KV cache views
+        // for past_kv slots). Build temporary Buffer refs for shape resolution.
+        let cache = self.kv_cache.as_ref().unwrap();
+        let kv_views: Vec<Buffer> = (0..kv_info.num_layers)
+            .flat_map(|layer| {
+                let (k, v) = cache.view(layer);
+                vec![k, v]
+            })
+            .collect();
+
+        // Build the full input list matching input_slots order.
+        let mut full_inputs: Vec<&Buffer> = Vec::with_capacity(self.input_slots.len());
+        let mut ext_idx = 0;
+        let mut kv_idx = 0;
+        for &slot in &self.input_slots {
+            if past_kv_set.contains(&slot) {
+                full_inputs.push(&kv_views[kv_idx]);
+                kv_idx += 1;
+            } else {
+                full_inputs.push(inputs[ext_idx]);
+                ext_idx += 1;
+            }
+        }
+
+        let resolved_shapes = self.resolve_slot_shapes(&full_inputs);
+
+        let profile = std::env::var("HOMURA_PROFILE").is_ok();
+        let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = Vec::new();
+
+        // Initialize pool.
+        let mut pool: Vec<Option<PoolEntry<'_>>> = (0..self.num_slots).map(|_| None).collect();
+        for (&slot, input) in self.input_slots.iter().zip(full_inputs.iter()) {
+            pool[slot] = Some(PoolEntry::Borrowed(input));
+        }
+        for (&slot, weight) in self.weight_slots.iter().zip(weights.iter()) {
+            pool[slot] = Some(PoolEntry::Borrowed(weight));
+        }
+
+        let mut free_list: Vec<Buffer> = Vec::new();
+
+        // Execute steps — same as run(), but with KvAppend handling.
+        for (step_idx, step) in self.steps.iter().enumerate() {
+            let step_inputs: Vec<&Buffer> = step
+                .input_slots
+                .iter()
+                .map(|&s| {
+                    pool[s]
+                        .as_ref()
+                        .unwrap_or_else(|| {
+                            panic!("buffer slot {s} not populated at step {step_idx}")
+                        })
+                        .as_ref()
+                })
+                .collect();
+
+            let has_zero_output = step
+                .output_slots
+                .iter()
+                .any(|&slot| resolved_shapes[slot].0.iter().any(|&d| d == 0));
+            if has_zero_output {
+                for &slot in &step.output_slots {
+                    let shape = &resolved_shapes[slot];
+                    let dtype = self.slot_descs[slot].dtype;
+                    pool[slot] = Some(PoolEntry::Owned(Buffer::new(&shape.0, dtype)));
+                }
+                continue;
+            }
+
+            if let Some(ref native_op) = step.native_op {
+                let t0 = if profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let (buf, out_slot) = match native_op {
+                    NativeOp::Concat { axis } => {
+                        let out_slot = step.output_slots[0];
+                        let out_shape = &resolved_shapes[out_slot];
+                        let dtype = self.slot_descs[out_slot].dtype;
+                        let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
+                        (buf, out_slot)
+                    }
+                    NativeOp::KvAppend { layer, is_value } => {
+                        let cache = self.kv_cache.as_mut().expect("KvAppend but no KvCache");
+                        // Find the "new" input: the one whose slot is NOT a past_kv slot.
+                        let new_idx = step
+                            .input_slots
+                            .iter()
+                            .position(|s| !past_kv_set.contains(s))
+                            .expect("KvAppend has no non-past input slot");
+                        let new_data = step_inputs[new_idx];
+                        if *is_value {
+                            cache.append_value(*layer, new_data);
+                        } else {
+                            cache.append_key(*layer, new_data);
+                        }
+                        let out_slot = step.output_slots[0];
+                        let view = if *is_value {
+                            cache.view_value(*layer)
+                        } else {
+                            cache.view_key(*layer)
+                        };
+                        (view, out_slot)
+                    }
+                };
+                if let Some(t0) = t0 {
+                    let shapes: Vec<Vec<u64>> =
+                        step_inputs.iter().map(|b| b.shape().0.clone()).collect();
+                    step_times.push((step.kernel_idx, t0.elapsed(), shapes));
+                }
+                drop(step_inputs);
+                pool[out_slot] = Some(PoolEntry::Owned(buf));
+                for &slot in &step.input_slots {
+                    if let Some(last) = self.slot_last_read[slot] {
+                        if last == step_idx {
+                            if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                                free_list.push(buf);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let kernel = &self.kernels[step.kernel_idx];
+            let has_dynamic = kernel
+                .output_descs()
+                .iter()
+                .any(|d| d.shape.has_dynamic_dims());
+
+            let t0 = if profile {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            let out_shapes: Vec<(&[u64], DType)> = if has_dynamic {
+                step.output_slots
+                    .iter()
+                    .map(|&slot| {
+                        (
+                            resolved_shapes[slot].0.as_slice(),
+                            self.slot_descs[slot].dtype,
+                        )
+                    })
+                    .collect()
+            } else {
+                kernel
+                    .output_descs()
+                    .iter()
+                    .map(|desc| (desc.shape.0.as_slice(), desc.dtype))
+                    .collect()
+            };
+
+            let mut out_bufs: Vec<Buffer> = out_shapes
+                .iter()
+                .map(|&(shape, dtype)| {
+                    let need_bytes = shape.iter().product::<u64>() as usize * dtype.size_bytes();
+                    let reuse_idx = free_list
+                        .iter()
+                        .position(|b| b.data.capacity() >= need_bytes);
+                    let mut buf = if let Some(idx) = reuse_idx {
+                        free_list.swap_remove(idx)
+                    } else {
+                        Buffer::new(shape, dtype)
+                    };
+                    buf.reconfigure(shape, dtype);
+                    buf
+                })
+                .collect();
+
+            kernel.run_into(&step_inputs, &mut out_bufs);
+
+            if let Some(t0) = t0 {
+                let shapes: Vec<Vec<u64>> =
+                    step_inputs.iter().map(|b| b.shape().0.clone()).collect();
+                step_times.push((step.kernel_idx, t0.elapsed(), shapes));
+            }
+
+            for (buf, &slot) in out_bufs.into_iter().zip(step.output_slots.iter()) {
+                pool[slot] = Some(PoolEntry::Owned(buf));
+            }
+
+            for &slot in &step.input_slots {
+                if let Some(last) = self.slot_last_read[slot] {
+                    if last == step_idx {
+                        if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                            free_list.push(buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Advance KV cache.
+        if let Some(ref mut cache) = self.kv_cache {
+            cache.advance();
+        }
+
+        // Extract non-KV outputs only.
+        let present_kv_set: std::collections::HashSet<usize> =
+            kv_info.present_kv_output_slots.iter().copied().collect();
+        self.output_slots
+            .iter()
+            .filter(|s| !present_kv_set.contains(s))
+            .map(|&s| {
+                pool[s]
+                    .take()
+                    .unwrap_or_else(|| panic!("output slot {s} not populated"))
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// Initialize the KV cache from prefill output buffers.
+    ///
+    /// `kv_buffers` should contain `num_layers * 2` buffers (K and V alternating),
+    /// each shaped `[1, heads, seq_len, head_dim]`.
+    pub fn init_kv_cache(&mut self, kv_buffers: &[Buffer], max_seq_len: usize) {
+        let kv_info = self
+            .kv_info
+            .as_ref()
+            .expect("init_kv_cache called but plan has no KV cache info");
+        let num_layers = kv_info.num_layers;
+        let num_heads = kv_info.num_heads;
+        let head_dim = kv_info.head_dim;
+        assert_eq!(
+            kv_buffers.len(),
+            num_layers * 2,
+            "expected {} KV buffers, got {}",
+            num_layers * 2,
+            kv_buffers.len()
+        );
+
+        let mut cache = KvCache::new(num_layers, num_heads, max_seq_len, head_dim, DType::F32);
+
+        // Bulk-load prefill KV data.
+        let seq_len = kv_buffers[0].shape().0[2] as usize;
+        let elem_size = DType::F32.size_bytes();
+        let row_bytes = head_dim * elem_size;
+
+        for layer in 0..num_layers {
+            let k_buf = &kv_buffers[layer * 2];
+            let v_buf = &kv_buffers[layer * 2 + 1];
+            // Copy each head's [0..seq_len] into the max_len-strided buffer.
+            for h in 0..num_heads {
+                let src_off = h * seq_len * row_bytes;
+                let dst_off = h * max_seq_len * row_bytes;
+                let chunk = seq_len * row_bytes;
+                cache.layers[layer].key[dst_off..dst_off + chunk]
+                    .copy_from_slice(&k_buf.data[src_off..src_off + chunk]);
+                cache.layers[layer].value[dst_off..dst_off + chunk]
+                    .copy_from_slice(&v_buf.data[src_off..src_off + chunk]);
+            }
+        }
+        cache.current_len = seq_len;
+
+        self.kv_cache = Some(cache);
+    }
+
+    /// Reset the KV cache for a new sequence.
+    pub fn reset_kv_cache(&mut self) {
+        if let Some(ref mut cache) = self.kv_cache {
+            cache.reset(0);
+        }
+    }
+
+    /// Current sequence length in the KV cache.
+    pub fn kv_cache_len(&self) -> usize {
+        self.kv_cache.as_ref().map(|c| c.current_len()).unwrap_or(0)
     }
 }
 
@@ -1314,5 +1899,76 @@ mod tests {
 
         let result = plan.run(&[&input], &[weight]);
         assert_eq!(result[0].as_slice::<f32>(), &[1.5, 2.5, 3.5]);
+    }
+
+    // ── KvCache unit tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn kv_cache_append_and_view() {
+        use super::KvCache;
+
+        // 1 layer, 2 heads, max 4 tokens, head_dim=3, f32
+        let mut cache = KvCache::new(1, 2, 4, 3, DType::F32);
+        assert_eq!(cache.current_len(), 0);
+
+        // Append first token: new_k shape [1, 2, 1, 3]
+        let k0 =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 2, 1, 3], DType::F32);
+        let v0 = Buffer::from_slice::<f32>(
+            &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            &[1, 2, 1, 3],
+            DType::F32,
+        );
+        cache.append(0, &k0, &v0);
+        cache.advance();
+        assert_eq!(cache.current_len(), 1);
+
+        // View should be [1, 2, 1, 3]
+        let (kv, vv) = cache.view(0);
+        assert_eq!(kv.shape().0, vec![1, 2, 1, 3]);
+        assert_eq!(kv.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(vv.as_slice::<f32>(), &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+
+        // Append second token.
+        let k1 =
+            Buffer::from_slice::<f32>(&[7.0, 8.0, 9.0, 0.1, 0.2, 0.3], &[1, 2, 1, 3], DType::F32);
+        let v1 = Buffer::from_slice::<f32>(
+            &[70.0, 80.0, 90.0, 0.4, 0.5, 0.6],
+            &[1, 2, 1, 3],
+            DType::F32,
+        );
+        cache.append(0, &k1, &v1);
+        cache.advance();
+        assert_eq!(cache.current_len(), 2);
+
+        // View should be [1, 2, 2, 3] with both tokens.
+        let (kv, vv) = cache.view(0);
+        assert_eq!(kv.shape().0, vec![1, 2, 2, 3]);
+        // Head 0: [tok0, tok1], Head 1: [tok0, tok1]
+        assert_eq!(
+            kv.as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 7.0, 8.0, 9.0, 4.0, 5.0, 6.0, 0.1, 0.2, 0.3]
+        );
+        assert_eq!(
+            vv.as_slice::<f32>(),
+            &[
+                10.0, 20.0, 30.0, 70.0, 80.0, 90.0, 40.0, 50.0, 60.0, 0.4, 0.5, 0.6
+            ]
+        );
+    }
+
+    #[test]
+    fn kv_cache_reset() {
+        use super::KvCache;
+
+        let mut cache = KvCache::new(2, 1, 8, 4, DType::F32);
+        let k = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 1, 4], DType::F32);
+        let v = Buffer::from_slice::<f32>(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 1, 4], DType::F32);
+        cache.append(0, &k, &v);
+        cache.advance();
+        assert_eq!(cache.current_len(), 1);
+
+        cache.reset(0);
+        assert_eq!(cache.current_len(), 0);
     }
 }

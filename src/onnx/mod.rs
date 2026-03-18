@@ -278,6 +278,63 @@ impl Model {
         let _ = output_shapes;
         Ok(state.plan.run(inputs, &state.weights))
     }
+
+    /// Whether the compiled plan has KV cache support.
+    pub fn has_kv_cache(&self) -> bool {
+        let guard = self.state.lock().unwrap();
+        guard.as_ref().is_some_and(|s| s.plan.has_kv_cache())
+    }
+
+    /// Run inference using the internal KV cache.
+    ///
+    /// `inputs` should contain only non-KV model inputs (e.g., input_ids + attention_mask).
+    /// Past KV is supplied by the cache; present KV is fed back automatically.
+    /// Returns only non-KV outputs (e.g., logits).
+    pub fn run_kv(&self, inputs: &[&Buffer], max_seq_len: usize) -> Result<Vec<Buffer>, OnnxError> {
+        let mut guard = self.state.lock().unwrap();
+
+        if guard.is_none() {
+            // Trigger lazy compilation with a full input set (including dummy KV).
+            // This shouldn't normally happen — the model should be compiled first
+            // via a normal run() or explicit compilation.
+            return Err(OnnxError::CompileError(
+                "run_kv: model not compiled yet. Call run() first to compile.".into(),
+            ));
+        }
+
+        let state = guard.as_mut().unwrap();
+        Ok(state.plan.run_kv(inputs, &state.weights, max_seq_len))
+    }
+
+    /// Initialize the KV cache from prefill output buffers.
+    ///
+    /// `kv_buffers` should contain `num_layers * 2` buffers (K, V alternating per layer).
+    pub fn init_kv_cache(
+        &self,
+        kv_buffers: &[crate::runtime::Buffer],
+        max_seq_len: usize,
+    ) -> Result<(), OnnxError> {
+        let mut guard = self.state.lock().unwrap();
+        let state = guard.as_mut().ok_or_else(|| {
+            OnnxError::CompileError("init_kv_cache: model not compiled yet".into())
+        })?;
+        state.plan.init_kv_cache(kv_buffers, max_seq_len);
+        Ok(())
+    }
+
+    /// Reset the KV cache for a new sequence.
+    pub fn reset_kv_cache(&self) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(state) = guard.as_mut() {
+            state.plan.reset_kv_cache();
+        }
+    }
+
+    /// Current KV cache sequence length.
+    pub fn kv_cache_len(&self) -> usize {
+        let guard = self.state.lock().unwrap();
+        guard.as_ref().map(|s| s.plan.kv_cache_len()).unwrap_or(0)
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

@@ -258,8 +258,50 @@ impl KvGenerator {
             "  \x1b[36m[1/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m \x1b[2m(prefill)\x1b[0m"
         );
 
-        // Decode loop
-        for step in 1..max_new_tokens {
+        // First decode step: triggers compilation and produces present_kv for cache init.
+        if max_new_tokens > 1 && real_pos < self.config.max_seq_len {
+            let step_start = std::time::Instant::now();
+            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos, step_start) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("decode step 1 failed: {e}");
+                    return self.tokenizer.decode(&generated_ids);
+                }
+            };
+            real_pos += 1;
+
+            let token_text = self.tokenizer.decode(&[next_token]);
+            let step_elapsed = step_start.elapsed().as_secs_f64();
+            let tok_s = 1.0 / step_elapsed;
+            eprintln!(
+                "  \x1b[36m[2/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m  \
+                 \x1b[33m{:.0}ms\x1b[0m  \x1b[32m{tok_s:.1} tok/s\x1b[0m",
+                step_elapsed * 1000.0,
+            );
+
+            if next_token == self.config.eos_token_id {
+                tracing::info!("EOS token reached");
+                generated_ids.push(next_token);
+                return self.tokenizer.decode(&generated_ids);
+            }
+            generated_ids.push(next_token);
+        }
+
+        // Initialize persistent KV cache from first decode step's present_kv.
+        let use_kv_cache = self.decode_model.has_kv_cache();
+        if use_kv_cache {
+            if let Err(e) = self
+                .decode_model
+                .init_kv_cache(&kv_cache, self.config.max_seq_len)
+            {
+                tracing::error!("init_kv_cache failed: {e}");
+                return self.tokenizer.decode(&generated_ids);
+            }
+            tracing::info!("KV cache initialized ({real_pos} positions)");
+        }
+
+        // Remaining decode loop
+        for step in 2..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
                 tracing::warn!(
                     max_seq_len = self.config.max_seq_len,
@@ -269,7 +311,11 @@ impl KvGenerator {
             }
 
             let step_start = std::time::Instant::now();
-            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos, step_start) {
+            next_token = match if use_kv_cache {
+                self.decode_step_kv(next_token, real_pos)
+            } else {
+                self.decode_step(next_token, &mut kv_cache, real_pos, step_start)
+            } {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("decode step failed: {e}");
@@ -538,6 +584,27 @@ impl KvGenerator {
 
         Ok(result_token)
     }
+
+    /// Run one decode step using the persistent KV cache.
+    fn decode_step_kv(
+        &self,
+        next_token: u32,
+        real_pos: usize,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let input_ids = Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
+        let attention_mask =
+            Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
+
+        let outputs = self
+            .decode_model
+            .run_kv(&[&input_ids, &attention_mask], self.config.max_seq_len)?;
+
+        let logits = &outputs[0];
+        let vocab_size = logits.shape().0[2] as usize;
+        Ok(argmax_at_position(logits, 0, vocab_size))
+    }
 }
 
 // ── UnifiedKvGenerator ────────────────────────────────────────────────────
@@ -654,7 +721,7 @@ impl UnifiedKvGenerator {
 
         // Prefill
         let step_start = std::time::Instant::now();
-        let (mut next_token, mut kv_cache, mut real_pos) = match self.prefill(&token_ids) {
+        let (mut next_token, kv_cache, mut real_pos) = match self.prefill(&token_ids) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("prefill failed: {e}");
@@ -663,6 +730,16 @@ impl UnifiedKvGenerator {
         };
         let prefill_s = step_start.elapsed().as_secs_f64();
         tracing::info!("prefill complete in {prefill_s:.2}s");
+
+        // Initialize persistent KV cache from prefill outputs.
+        let use_kv_cache = self.model.has_kv_cache();
+        if use_kv_cache {
+            if let Err(e) = self.model.init_kv_cache(&kv_cache, self.config.max_seq_len) {
+                tracing::error!("init_kv_cache failed: {e}");
+                return String::new();
+            }
+            tracing::info!("KV cache initialized from prefill ({real_pos} positions)");
+        }
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
@@ -677,7 +754,10 @@ impl UnifiedKvGenerator {
              \x1b[2m(prefill)\x1b[0m"
         );
 
-        // Decode loop
+        // Decode loop — uses persistent KV cache if available.
+        // With KV cache: only pass [input_ids, attention_mask], cache managed internally.
+        // Without: fall back to passing KV buffers explicitly (old path).
+        let mut kv_buffers = if use_kv_cache { Vec::new() } else { kv_cache };
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
                 tracing::warn!(
@@ -688,7 +768,11 @@ impl UnifiedKvGenerator {
             }
 
             let step_start = std::time::Instant::now();
-            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos) {
+            next_token = match if use_kv_cache {
+                self.decode_step_kv(next_token, real_pos)
+            } else {
+                self.decode_step(next_token, &mut kv_buffers, real_pos)
+            } {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("decode step failed: {e}");
@@ -842,6 +926,30 @@ impl UnifiedKvGenerator {
         }
 
         Ok(result_token)
+    }
+
+    /// Run one decode step using the persistent KV cache.
+    ///
+    /// Only passes [input_ids, attention_mask] — KV is managed internally.
+    fn decode_step_kv(
+        &self,
+        next_token: u32,
+        real_pos: usize,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let input_ids = Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
+        let attention_mask =
+            Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
+
+        let outputs = self
+            .model
+            .run_kv(&[&input_ids, &attention_mask], self.config.max_seq_len)?;
+
+        // run_kv returns only non-KV outputs: [logits]
+        let logits = &outputs[0];
+        let vocab_size = logits.shape().0[2] as usize;
+        Ok(argmax_at_position(logits, 0, vocab_size))
     }
 }
 
