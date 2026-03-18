@@ -1657,24 +1657,27 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         .append_operation(build_match_seq("match_contraction_4d", 4));
 
     // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
-    // 3D matmul (M, N, K): forall N=1024 (parallel), for N=16 K=16 (register).
+    // 3D matmul (M, N, K): forall N=1024 (parallel), for K=16 only.
+    // K is the only inner tile — N streams contiguously within each forall
+    // chunk, which is optimal for M=1 vector-matrix multiply (read weight
+    // matrix row by row, broadcast A[k] across all N).
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_3d",
         "array<i64: 0, 1024, 0>",        // forall: tile N=1024, skip M and K
         "array<i1: false, false, false>",
-        "array<i64: 0, 16, 16>",         // for: tile N=16, K=16, skip M
+        "array<i64: 0, 0, 16>",          // for: tile K=16 only, N streams freely
         "array<i1: false, false, false>",
-        2,                                // 2 non-zero for-tile dims (N, K)
+        1,                                // 1 non-zero for-tile dim (K)
     ));
     // ── @tile_parallel_contraction_4d ─────────────────────────────────────────
-    // 4D batched matmul (B, M, N, K): forall N=1024 (parallel), for N=16 K=16.
+    // 4D batched matmul (B, M, N, K): forall N=1024 (parallel), for K=16.
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_4d",
         "array<i64: 0, 0, 1024, 0>",              // forall: tile N=1024, skip B, M, K
         "array<i1: false, false, false, false>",
-        "array<i64: 0, 0, 16, 16>",               // for: tile N=16, K=16, skip B and M
+        "array<i64: 0, 0, 0, 16>",                // for: tile K=16 only
         "array<i1: false, false, false, false>",
-        2,                                          // 2 non-zero for-tile dims (N, K)
+        1,                                          // 1 non-zero for-tile dim (K)
     ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
