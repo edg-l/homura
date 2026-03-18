@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use homura::{Buffer, DType, Model};
+extern crate libc;
 
 fn main() {
     let t0 = Instant::now();
@@ -43,6 +44,9 @@ fn main() {
         .0;
     println!("\nPredicted digit: {predicted}");
     println!("compile: {compile_ms}ms | inference: {run_ms}ms");
+
+    // Skip destructors to avoid LLVM shared lib teardown double-free.
+    unsafe { libc::_exit(0) };
 }
 
 fn load_image(path: &str) -> Vec<f32> {

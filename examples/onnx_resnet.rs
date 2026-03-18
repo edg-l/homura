@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use homura::{Buffer, DType, Model};
+extern crate libc;
 
 // ImageNet mean/std (RGB order)
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -49,6 +50,9 @@ fn main() {
         println!("  #{}: {name} (class {class_idx}, logit {logit:.3})", rank + 1);
     }
     println!("\ncompile: {compile_ms}ms | inference: {run_ms}ms");
+
+    // Skip destructors to avoid LLVM shared lib teardown double-free.
+    unsafe { libc::_exit(0) };
 }
 
 fn load_and_preprocess(path: &str) -> Vec<f32> {
