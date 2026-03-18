@@ -9,7 +9,7 @@ context + module, compiled in parallel via rayon.
 |---|---|---|---|
 | MNIST | 6 | 97ms | 2 Conv + MatMul + lightweight |
 | ResNet-18 | 41 | 467ms | 20 Conv + Gemm + BatchNorm groups |
-| GPT-2 | ~150+ | untested | Per-kernel approach, should scale well |
+| GPT-2 decode | 146 | ~1.2s | 12 layers × MatMul/Gemm/attention/MLP |
 
 Compilation is cached per-kernel. Subsequent runs with same model skip
 compilation entirely.
@@ -34,36 +34,35 @@ compilation entirely.
 
 ### GPT-2 small (124M params) decode
 
-- **4.3 tok/s** (233ms/token) single-threaded on Ryzen 9 7900X3D
-- Reference: llama.cpp does ~100+ tok/s on similar hardware (~25x faster)
-- 232ms/token breakdown: **99% JIT execution**, <1% setup, <1% argmax/KV update
+- **~3 tok/s** (~150-200ms/token) on Ryzen 9 7900X3D
+- FMA enabled: 2689 `vfmadd` instructions across 72/146 decode kernels
+- Prefill (5 tokens): ~1.8s (runs all 12 layers on full prompt)
+- Reference: llama.cpp does ~100+ tok/s on similar hardware (~30x faster)
+
+### What's been done
+
+- **FMA fusion**: `vector-contract-lowering=outerproduct` + `fastmath<contract>`
+  on all float arith ops + LLVM-level `AllowContract` flag. Produces `vfmadd`
+  instead of separate `vmulps + vaddps`.
+- **Symbolic shape tracking**: `SymDim` expressions propagate through the op
+  graph. Models with dynamic dims compile once, shapes resolve at runtime.
+  Eliminates the earlier two-probe dim resolution hack.
 
 ## Bottlenecks
 
-### 1. Single-threaded execution
+### 1. GEMM performance
 
-All `scf.for` loops are sequential. GPT-2 decode has ~24 matmuls per
-token. Each runs on one core out of 12 available.
-
-**Fix**: The transform schedule tiles with `tile_using_forall` which
-produces `scf.forall` → `scf.parallel` → OpenMP. The pass pipeline
-includes `convert-scf-to-openmp`. Need to verify it's actually producing
-multi-threaded code at runtime.
-
-### 2. Naive GEMM kernels
-
-Generated code is tiled (32x32 cache + 8x8x1 register) and vectorized
-(`vector.contract` → AVX2), but still far from hand-tuned BLAS. Missing:
+Generated code is tiled (32x32 cache + 8x8x1 register) and vectorized with
+FMA (outerproduct → `vfmadd`), but still far from hand-tuned BLAS. Missing:
 - Register blocking with explicit accumulator registers
 - Software pipelining (prefetch next tile while computing current)
 - Optimal loop ordering for the micro-kernel
-- AVX-512 utilization (CPU supports it)
 
 **Fix** (MLIR-native, no external BLAS):
 - `transform.structured.pack` for packed GEMM data layout
 - Tune tile sizes and loop ordering for the micro-kernel
 - Explicit unroll-and-jam via transform schedule
-- AVX-512 targeting via wider vector_sizes
+- Wider vector_sizes for AVX-512
 
 ### 3. KV cache memory traffic
 
@@ -80,36 +79,42 @@ All MLIR-native — no external BLAS. Each phase builds on the previous.
 
 Each heavy op compiled independently with its own MLIR context. Parallel
 compilation via rayon. Targeted vectorization via outline pattern.
-Compilation times: MNIST 97ms, ResNet-18 467ms.
+Compilation times: MNIST 97ms, ResNet-18 467ms, GPT-2 ~1.2s.
 
-### Phase 1: Verify multi-threading — TODO
+### Phase 0.5: FMA + symbolic shapes — DONE
 
-Confirm OpenMP parallelization is working at runtime. Measure with
-`perf stat` to verify all cores active during inference. Expected
-~6-10x speedup → **25-40 tok/s**.
+- Outerproduct vector contract lowering → `vfmadd` instructions
+- `fastmath<contract>` on MLIR arith ops + LLVM-level `AllowContract`
+- Symbolic dim tracking (`SymDim`) replaces two-probe hack
+- GPT-2 decode: ~3 tok/s (from ~4.3 tok/s baseline, with FMA)
 
-### Phase 2: Packed GEMM layout (2-4x → ~50-120 tok/s)
+### Phase 1: Packed GEMM layout (2-4x)
 
 `transform.structured.pack` for cache-friendly data layout.
-See previous perf.md for detailed plan.
 
-### Phase 3: Micro-kernel tuning (1.5-2x → ~80-200 tok/s)
+### Phase 2: Micro-kernel tuning (1.5-2x)
 
-AVX-512, unroll-and-jam, loop permutation, prefetch intrinsics.
+Wider vector_sizes for AVX-512, unroll-and-jam, loop permutation, prefetch.
 
-### Phase 4: Inference-specific optimizations
+### Phase 3: Inference-specific optimizations
 
-Weight prepacking, operator fusion, KV cache quantization.
+Weight prepacking, operator fusion, KV cache quantization, unified
+single-model inference (eliminate separate prefill/decode models).
+
+### Phase 4: Modern model support
+
+SmolLM2/Llama-family architecture: SiLU, RMSNorm, RoPE, GQA.
 
 ## Summary
 
 | Phase | Change | Status | Target tok/s |
 |---|---|---|---|
-| 0 | Per-kernel compilation + targeted vectorize | **Done** | compile: <500ms |
-| 1 | Multi-threading (OpenMP) | Verify | ×6-10 |
-| 2 | Packed GEMM layout | Not started | ×2-4 |
-| 3 | AVX-512 + unroll + loop order | Not started | ×1.5-2 |
-| 4 | Fusion + weight prepack + KV quant | Not started | ×1.3-2 |
+| 0 | Per-kernel compilation + targeted vectorize | **Done** | compile: <1.5s |
+| 0.5 | FMA (outerproduct) + symbolic shapes | **Done** | ~3 tok/s |
+| 1 | Packed GEMM layout | Not started | ×2-4 |
+| 2 | AVX-512 + unroll + loop order | Not started | ×1.5-2 |
+| 3 | Fusion + weight prepack + KV quant | Not started | ×1.3-2 |
+| 4 | Modern models (Llama-family) | Not started | — |
 
 All phases use MLIR transform dialect + standard passes. No external
 BLAS, no hand-written assembly. The compiler generates everything.

@@ -34,7 +34,9 @@ ONNX model
   → ExecutionPlan routes buffers between kernels
 ```
 
-The transform schedule tiles matmuls (3D, 4D contractions) and Conv2D into cache-level + register-level tiles, outlines the tiled region into a temporary function, and vectorizes it with `vectorize_children_and_apply_patterns`. Untiled ops stay as scalar loops — LLVM's O2 handles them. This keeps LLVM IR compact and compilation fast.
+The transform schedule tiles matmuls (3D, 4D contractions) and Conv2D into cache-level + register-level tiles, outlines the tiled region into a temporary function, and vectorizes it with `vectorize_children_and_apply_patterns`. Vector contractions lower via outerproduct for FMA fusion (`vfmadd`). Untiled ops stay as scalar loops — LLVM's O2 handles them. This keeps LLVM IR compact and compilation fast.
+
+Models with dynamic dimensions (e.g., KV cache sequence length) are compiled once with symbolic shape tracking — a parallel `SymDim` expression system resolves buffer shapes at runtime without recompilation.
 
 Compiled kernels are cached on disk per-kernel. Subsequent runs with the same model load instantly.
 
@@ -62,19 +64,21 @@ cargo run -- clean-cache                          # clear compilation cache
 cargo test                                        # ~150 tests
 ```
 
-## Compilation performance
+## Performance
 
-| Model | Kernels | Compile time |
-|---|---|---|
-| MNIST | 6 | 97ms |
-| ResNet-18 | 41 | 467ms |
+| Model | Kernels | Compile time | Inference |
+|---|---|---|---|
+| MNIST | 6 | 97ms | — |
+| ResNet-18 | 41 | 467ms | — |
+| GPT-2 (124M) | 146 | ~1.2s | ~3 tok/s decode |
 
 ## Current status
 
 - **ONNX ops**: Conv2d, MatMul, Gemm, BatchNorm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, MaxPool, GlobalAvgPool, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Squeeze, Unsqueeze, Where, Cast, Shape, ConstantOfShape, Range, and more
 - **Compilation**: Per-kernel MLIR → LLVM, parallel via rayon, cached on disk
 - **Tiling**: Transform dialect schedule for matmul (3D, 4D) and Conv2D (7D NCHW)
-- **Vectorization**: Targeted via outline → vectorize pattern (only tiled micro-kernels)
+- **Vectorization**: Outerproduct lowering with FMA fusion (`vfmadd` on AVX-512/AVX2)
+- **Dynamic shapes**: Symbolic dim tracking (`SymDim` expressions) — compile once, resolve at runtime
 - **Dtype**: F32, F64, I32, I64
 - **Tokenizer**: Byte-level BPE (GPT-2 compatible)
 - **Generation**: Autoregressive text generation with KV-cache
@@ -85,7 +89,8 @@ cargo test                                        # ~150 tests
 See [perf.md](perf.md) for the performance improvement roadmap.
 
 Next priorities:
-- Verify OpenMP multi-threading at runtime
+- Unified single-model inference (eliminate separate prefill/decode models)
 - Packed GEMM layout for better cache utilization
 - AVX-512 micro-kernel tuning
 - Operator fusion (matmul + bias + relu as one kernel)
+- Support for modern models (SmolLM2, Llama-family architecture)
