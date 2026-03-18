@@ -1045,6 +1045,31 @@ pub(crate) fn build_transform_schedule<'c>(
             .expect("build structured.pad");
         tile_outer_block.append_operation(pad_op);
 
+        // Outline the forall loop into a temporary function so we can
+        // vectorize it with vectorize_children_and_apply_patterns (which
+        // requires an "isolated from above" parent, i.e. func.func).
+        // LLVM will inline it back during O2 codegen.
+        let outline_name = StringAttribute::new(context, &format!("{name}_kernel"));
+        let outline_op = OperationBuilder::new("transform.loop.outline", location)
+            .add_operands(&[forall_loop])
+            .add_attributes(&[(Identifier::new(context, "func_name"), outline_name.into())])
+            .add_results(&[any_op_type, any_op_type])
+            .build()
+            .expect("build transform.loop.outline");
+        let outline_ref = tile_outer_block.append_operation(outline_op);
+        let outlined_func: melior::ir::Value = outline_ref.result(0).unwrap().into();
+
+        // Vectorize the outlined function (+ cleanup patterns for bufferization).
+        let vectorize_op = OperationBuilder::new(
+            "transform.structured.vectorize_children_and_apply_patterns",
+            location,
+        )
+        .add_operands(&[outlined_func])
+        .add_results(&[any_op_type])
+        .build()
+        .expect("build vectorize_children_and_apply_patterns (outlined)");
+        tile_outer_block.append_operation(vectorize_op);
+
         let tile_yield_op = OperationBuilder::new("transform.yield", location)
             .build()
             .expect("build transform.yield (tile_contraction)");
@@ -1217,37 +1242,11 @@ pub(crate) fn build_transform_schedule<'c>(
         .add_results(&[any_op_type])
         .build()
         .expect("build transform.foreach_match");
-    let foreach_ref = main_block.append_operation(foreach_op);
-    let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
+    main_block.append_operation(foreach_op);
 
-    // Vectorize tiled ops inside all functions. The foreach_match above
-    // tiles matmuls and convs into small micro-kernels; the blanket
-    // vectorize converts those into compact vector IR.
-    // Kernels without tileable ops should skip the transform schedule
-    // entirely (no transform.with_named_sequence attribute) so this
-    // vectorize never runs on untiled BatchNorm/elementwise ops.
-    let ops_attr = ArrayAttribute::new(
-        context,
-        &[StringAttribute::new(context, "func.func").into()],
-    );
-    let match_func_op = OperationBuilder::new("transform.structured.match", location)
-        .add_operands(&[updated_module])
-        .add_attributes(&[(Identifier::new(context, "ops"), ops_attr.into())])
-        .add_results(&[any_op_type])
-        .build()
-        .expect("build transform.structured.match func.func");
-    let match_func_ref = main_block.append_operation(match_func_op);
-    let func_handle: melior::ir::Value = match_func_ref.result(0).unwrap().into();
-
-    let vectorize_op = OperationBuilder::new(
-        "transform.structured.vectorize_children_and_apply_patterns",
-        location,
-    )
-    .add_operands(&[func_handle])
-    .add_results(&[any_op_type])
-    .build()
-    .expect("build vectorize_children_and_apply_patterns");
-    main_block.append_operation(vectorize_op);
+    // No blanket vectorize — each tile sequence outlines the tiled region
+    // into a temporary function and vectorizes it there. Untiled ops stay
+    // scalar. LLVM inlines the outlined functions during O2.
 
     let main_yield_op = OperationBuilder::new("transform.yield", location)
         .build()

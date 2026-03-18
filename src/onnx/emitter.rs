@@ -1766,15 +1766,11 @@ pub fn emit_and_compile_plan(
             .collect();
         let output_refs: Vec<&crate::graph_builder::Tensor> = output_tensors.iter().collect();
 
-        // Attach transform schedule only for kernels with tileable ops.
-        let has_tileable = group.node_indices.iter().any(|&ni| {
-            let op = model.nodes[ni].op_type.as_str();
-            HEAVY_OPS.contains(&op) || op == "MatMul" || op == "Gemm"
-        });
-
         // Finalize module to MLIR text for deferred parallel compilation.
+        // All kernels get the transform schedule — untiled ops won't match
+        // and the schedule is a no-op for them.
         let (mlir_text, num_inputs, output_descs) = builder
-            .finalize_to_mlir(&output_refs, has_tileable)
+            .finalize_to_mlir(&output_refs, true)
             .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
 
         let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));

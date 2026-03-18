@@ -7255,7 +7255,7 @@ impl<'c> GraphBuilder<'c> {
 fn create_context() -> Context {
     let context = Context::new();
     context.attach_diagnostic_handler(|diagnostic| {
-        tracing::debug!("{diagnostic}");
+        eprintln!("[mlir] {diagnostic}");
         true
     });
     let registry = DialectRegistry::new();
