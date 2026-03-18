@@ -218,10 +218,7 @@ mod tests {
         let header_len = header_bytes.len() as u64;
 
         // Data: [1.0f32, 2.0f32]
-        let data: Vec<u8> = [1.0f32, 2.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 
         let mut file_bytes = Vec::new();
         file_bytes.extend_from_slice(&header_len.to_le_bytes());
@@ -251,7 +248,11 @@ mod tests {
         let t = std::time::Instant::now();
         let tensors = load_safetensors(path).unwrap();
         let elapsed = t.elapsed();
-        eprintln!("loaded {} tensors in {:.2}s", tensors.len(), elapsed.as_secs_f64());
+        eprintln!(
+            "loaded {} tensors in {:.2}s",
+            tensors.len(),
+            elapsed.as_secs_f64()
+        );
 
         assert_eq!(tensors.len(), 290);
 
@@ -271,8 +272,14 @@ mod tests {
         // Check bias exists
         assert!(tensors.contains_key("model.layers.0.self_attn.q_proj.bias"));
 
-        let total_bytes: usize = tensors.values().map(|b| b.shape().num_elements() as usize * 4).sum();
-        eprintln!("total f32 weight memory: {:.1} MB", total_bytes as f64 / 1_048_576.0);
+        let total_bytes: usize = tensors
+            .values()
+            .map(|b| b.shape().num_elements() as usize * 4)
+            .sum();
+        eprintln!(
+            "total f32 weight memory: {:.1} MB",
+            total_bytes as f64 / 1_048_576.0
+        );
     }
 
     #[test]
