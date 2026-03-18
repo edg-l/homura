@@ -640,6 +640,10 @@ impl ExecutionPlan {
             pool[slot] = Some(PoolEntry::Borrowed(&weights[i]));
         }
 
+        // Per-step profiling (enabled by HOMURA_PROFILE=1).
+        let profile = std::env::var("HOMURA_PROFILE").is_ok_and(|v| v == "1");
+        let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = Vec::new();
+
         // Execute steps.
         for step in &self.steps {
             let kernel = &self.kernels[step.kernel_idx];
@@ -682,6 +686,8 @@ impl ExecutionPlan {
                 .iter()
                 .any(|d| d.shape.has_dynamic_dims());
 
+            let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+
             let outputs: Vec<Buffer> = if has_dynamic {
                 let concrete_shapes: Vec<Shape> = step
                     .output_slots
@@ -692,6 +698,11 @@ impl ExecutionPlan {
             } else {
                 kernel.run(&step_inputs)
             };
+
+            if let Some(t0) = t0 {
+                let shapes: Vec<Vec<u64>> = step_inputs.iter().map(|b| b.shape().0.clone()).collect();
+                step_times.push((step.kernel_idx, t0.elapsed(), shapes));
+            }
 
             // Place outputs into pool.
             assert_eq!(
@@ -705,6 +716,21 @@ impl ExecutionPlan {
             for (buf, &slot) in outputs.into_iter().zip(step.output_slots.iter()) {
                 pool[slot] = Some(PoolEntry::Owned(buf));
             }
+        }
+
+        // Print per-step profiling summary.
+        if profile && !step_times.is_empty() {
+            let total: std::time::Duration = step_times.iter().map(|(_, d, _)| *d).sum();
+            eprintln!("  ┌─ kernel profile ({} steps, {:.1}ms total)", step_times.len(), total.as_secs_f64() * 1000.0);
+            for (kid, dur, shapes) in &step_times {
+                let ms = dur.as_secs_f64() * 1000.0;
+                if ms >= 0.5 {
+                    let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+                    let shape_str: Vec<String> = shapes.iter().map(|s| format!("{:?}", s)).collect();
+                    eprintln!("  │ k{:<4} {:>8.2}ms  ({:>5.1}%)  {}", kid, ms, pct, shape_str.join(" × "));
+                }
+            }
+            eprintln!("  └─");
         }
 
         // Extract model outputs.
