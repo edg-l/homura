@@ -139,6 +139,24 @@ impl Buffer {
     pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
         &mut self.data
     }
+
+    /// Reconfigure this buffer for a new shape/dtype, reusing the existing
+    /// allocation when it has sufficient capacity.  Does **not** zero the data
+    /// — the caller (compiled kernel) is expected to write every output byte.
+    ///
+    /// # Safety contract
+    ///
+    /// The returned buffer's `data` contents are **uninitialized** (or stale).
+    /// Only pass it to a compiled kernel that overwrites the entire output.
+    pub(crate) fn reconfigure(&mut self, shape: &[u64], dtype: DType) {
+        let s = Shape(shape.to_vec());
+        let num_bytes = s.num_elements() as usize * dtype.size_bytes();
+        self.data.clear();
+        self.data.resize(num_bytes, 0u8);
+        self.shape = s;
+        self.strides = row_major_strides(shape);
+        self.dtype = dtype;
+    }
 }
 
 /// Compute row-major strides for `shape`. For a scalar (rank 0) returns `[]`.
@@ -368,7 +386,37 @@ impl CompiledGraph {
         output_bufs
     }
 
-    /// Shared JIT-call implementation for `run` and `run_dynamic`.
+    /// Execute the graph, writing results into pre-allocated `output_bufs`.
+    ///
+    /// Each output buffer must already have the correct shape, strides, dtype,
+    /// and sufficient allocation.  The kernel overwrites all output bytes.
+    pub fn run_into(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
+        assert_eq!(inputs.len(), self.num_inputs);
+        assert_eq!(output_bufs.len(), self.outputs.len());
+        self.run_with_output_bufs(inputs, output_bufs);
+    }
+
+    /// Like `run_into` but reconfigures each output buffer to `output_shapes`
+    /// first (reusing the allocation when possible).
+    pub fn run_dynamic_into(
+        &self,
+        inputs: &[&Buffer],
+        output_shapes: &[Shape],
+        output_bufs: &mut Vec<Buffer>,
+    ) {
+        assert_eq!(inputs.len(), self.num_inputs);
+        assert_eq!(output_shapes.len(), self.outputs.len());
+        assert_eq!(output_bufs.len(), self.outputs.len());
+        for (buf, (shape, desc)) in output_bufs
+            .iter_mut()
+            .zip(output_shapes.iter().zip(self.outputs.iter()))
+        {
+            buf.reconfigure(&shape.0, desc.dtype);
+        }
+        self.run_with_output_bufs(inputs, output_bufs);
+    }
+
+    /// Shared JIT-call implementation for `run`, `run_dynamic`, and `*_into`.
     fn run_with_output_bufs(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
         // Build memref descriptors for inputs. The function only reads inputs,
         // so the const→mut cast is safe.
@@ -514,6 +562,10 @@ pub struct ExecutionPlan {
     pub(crate) output_slots: Vec<usize>,
     /// Shape + dtype for every slot (used to allocate intermediate buffers).
     pub(crate) slot_descs: Vec<SlotDesc>,
+    /// For each slot, the last step index that reads it as an input.
+    /// `None` means the slot is never read (model output only) or is
+    /// an input/weight that lives for the entire run.
+    slot_last_read: Vec<Option<usize>>,
 }
 
 /// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
@@ -539,6 +591,43 @@ impl<'a> PoolEntry<'a> {
 }
 
 impl ExecutionPlan {
+    /// Build an execution plan, precomputing buffer lifetime metadata.
+    pub fn new(
+        kernels: Vec<CompiledGraph>,
+        steps: Vec<KernelStep>,
+        num_slots: usize,
+        input_slots: Vec<usize>,
+        weight_slots: Vec<usize>,
+        output_slots: Vec<usize>,
+        slot_descs: Vec<SlotDesc>,
+    ) -> Self {
+        // Compute last-read step index for each slot.
+        let mut last_read: Vec<Option<usize>> = vec![None; num_slots];
+        for (step_idx, step) in steps.iter().enumerate() {
+            for &slot in &step.input_slots {
+                last_read[slot] = Some(step_idx);
+            }
+        }
+        // Output slots must survive the entire run — mark as None.
+        for &slot in &output_slots {
+            last_read[slot] = None;
+        }
+        // Input/weight slots are borrowed — never recyclable.
+        for &slot in input_slots.iter().chain(weight_slots.iter()) {
+            last_read[slot] = None;
+        }
+        Self {
+            kernels,
+            steps,
+            num_slots,
+            input_slots,
+            weight_slots,
+            output_slots,
+            slot_descs,
+            slot_last_read: last_read,
+        }
+    }
+
     /// Return the `SlotDesc` for each model output slot.
     pub fn output_slot_descs(&self) -> Vec<&SlotDesc> {
         self.output_slots
@@ -644,8 +733,11 @@ impl ExecutionPlan {
         let profile = std::env::var("HOMURA_PROFILE").is_ok_and(|v| v == "1");
         let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = Vec::new();
 
+        // Free-list for buffer reuse: recycle dead intermediate buffers.
+        let mut free_list: Vec<Buffer> = Vec::new();
+
         // Execute steps.
-        for step in &self.steps {
+        for (step_idx, step) in self.steps.iter().enumerate() {
             let kernel = &self.kernels[step.kernel_idx];
 
             // Gather input refs for this kernel.
@@ -686,48 +778,98 @@ impl ExecutionPlan {
                 .iter()
                 .any(|d| d.shape.has_dynamic_dims());
 
-            let t0 = if profile { Some(std::time::Instant::now()) } else { None };
-
-            let outputs: Vec<Buffer> = if has_dynamic {
-                let concrete_shapes: Vec<Shape> = step
-                    .output_slots
-                    .iter()
-                    .map(|&s| resolved_shapes[s].clone())
-                    .collect();
-                kernel.run_dynamic(&step_inputs, &concrete_shapes)
+            let t0 = if profile {
+                Some(std::time::Instant::now())
             } else {
-                kernel.run(&step_inputs)
+                None
             };
 
+            // Try to grab recycled buffers from the free-list for outputs.
+            // For non-dynamic kernels, use the kernel's compiled output shape
+            // (matches original `kernel.run()` behavior). For dynamic kernels,
+            // use the resolved slot shapes.
+            let out_shapes: Vec<(&[u64], DType)> = if has_dynamic {
+                step.output_slots
+                    .iter()
+                    .map(|&slot| {
+                        (
+                            resolved_shapes[slot].0.as_slice(),
+                            self.slot_descs[slot].dtype,
+                        )
+                    })
+                    .collect()
+            } else {
+                kernel
+                    .output_descs()
+                    .iter()
+                    .map(|desc| (desc.shape.0.as_slice(), desc.dtype))
+                    .collect()
+            };
+
+            let mut out_bufs: Vec<Buffer> = out_shapes
+                .iter()
+                .map(|&(shape, dtype)| {
+                    let need_bytes = shape.iter().product::<u64>() as usize * dtype.size_bytes();
+                    // Find a free buffer with enough capacity.
+                    let reuse_idx = free_list
+                        .iter()
+                        .position(|b| b.data.capacity() >= need_bytes);
+                    let mut buf = if let Some(idx) = reuse_idx {
+                        free_list.swap_remove(idx)
+                    } else {
+                        Buffer::new(shape, dtype)
+                    };
+                    buf.reconfigure(shape, dtype);
+                    buf
+                })
+                .collect();
+
+            kernel.run_into(&step_inputs, &mut out_bufs);
+
             if let Some(t0) = t0 {
-                let shapes: Vec<Vec<u64>> = step_inputs.iter().map(|b| b.shape().0.clone()).collect();
+                let shapes: Vec<Vec<u64>> =
+                    step_inputs.iter().map(|b| b.shape().0.clone()).collect();
                 step_times.push((step.kernel_idx, t0.elapsed(), shapes));
             }
 
             // Place outputs into pool.
-            assert_eq!(
-                outputs.len(),
-                step.output_slots.len(),
-                "kernel {} produced {} outputs but step expects {}",
-                step.kernel_idx,
-                outputs.len(),
-                step.output_slots.len()
-            );
-            for (buf, &slot) in outputs.into_iter().zip(step.output_slots.iter()) {
+            for (buf, &slot) in out_bufs.into_iter().zip(step.output_slots.iter()) {
                 pool[slot] = Some(PoolEntry::Owned(buf));
+            }
+
+            // Recycle dead intermediate buffers into the free-list.
+            for &slot in &step.input_slots {
+                if let Some(last) = self.slot_last_read[slot] {
+                    if last == step_idx {
+                        if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                            free_list.push(buf);
+                        }
+                    }
+                }
             }
         }
 
         // Print per-step profiling summary.
         if profile && !step_times.is_empty() {
             let total: std::time::Duration = step_times.iter().map(|(_, d, _)| *d).sum();
-            eprintln!("  ┌─ kernel profile ({} steps, {:.1}ms total)", step_times.len(), total.as_secs_f64() * 1000.0);
+            eprintln!(
+                "  ┌─ kernel profile ({} steps, {:.1}ms total)",
+                step_times.len(),
+                total.as_secs_f64() * 1000.0
+            );
             for (kid, dur, shapes) in &step_times {
                 let ms = dur.as_secs_f64() * 1000.0;
                 if ms >= 0.5 {
                     let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
-                    let shape_str: Vec<String> = shapes.iter().map(|s| format!("{:?}", s)).collect();
-                    eprintln!("  │ k{:<4} {:>8.2}ms  ({:>5.1}%)  {}", kid, ms, pct, shape_str.join(" × "));
+                    let shape_str: Vec<String> =
+                        shapes.iter().map(|s| format!("{:?}", s)).collect();
+                    eprintln!(
+                        "  │ k{:<4} {:>8.2}ms  ({:>5.1}%)  {}",
+                        kid,
+                        ms,
+                        pct,
+                        shape_str.join(" × ")
+                    );
                 }
             }
             eprintln!("  └─");
@@ -857,9 +999,9 @@ mod tests {
         //   1 = input b
         //   2 = intermediate c (output of kernel0)
         //   3 = output d (output of kernel1)
-        let plan = ExecutionPlan {
-            kernels: vec![k0, k1],
-            steps: vec![
+        let plan = ExecutionPlan::new(
+            vec![k0, k1],
+            vec![
                 KernelStep {
                     kernel_idx: 0,
                     input_slots: vec![0, 1], // a, b
@@ -871,11 +1013,11 @@ mod tests {
                     output_slots: vec![3],   // d
                 },
             ],
-            num_slots: 4,
-            input_slots: vec![0, 1],
-            weight_slots: vec![],
-            output_slots: vec![3],
-            slot_descs: vec![
+            4,
+            vec![0, 1],
+            vec![],
+            vec![3],
+            vec![
                 SlotDesc {
                     shape: Shape(vec![4]),
                     dtype: DType::F32,
@@ -897,7 +1039,7 @@ mod tests {
                     sym_shape: None,
                 },
             ],
-        };
+        );
 
         let a = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
         let b = Buffer::from_slice::<f32>(&[10.0, 20.0, 30.0, 40.0], &[4], DType::F32);
@@ -924,18 +1066,18 @@ mod tests {
         let z = gb.emit_add(&x, &y);
         let k = gb.compile(&[&z]).expect("compile");
 
-        let plan = ExecutionPlan {
-            kernels: vec![k],
-            steps: vec![KernelStep {
+        let plan = ExecutionPlan::new(
+            vec![k],
+            vec![KernelStep {
                 kernel_idx: 0,
                 input_slots: vec![0, 1],
                 output_slots: vec![2],
             }],
-            num_slots: 3,
-            input_slots: vec![0, 1],
-            weight_slots: vec![],
-            output_slots: vec![2],
-            slot_descs: vec![
+            3,
+            vec![0, 1],
+            vec![],
+            vec![2],
+            vec![
                 SlotDesc {
                     shape: Shape(vec![0]),
                     dtype: DType::F32,
@@ -952,7 +1094,7 @@ mod tests {
                     sym_shape: None,
                 },
             ],
-        };
+        );
 
         let a = Buffer::new(&[0], DType::F32);
         let b = Buffer::new(&[0], DType::F32);
@@ -978,18 +1120,18 @@ mod tests {
         let k = gb.compile(&[&y]).expect("compile");
 
         // Slots: 0=input, 1=weight, 2=output
-        let plan = ExecutionPlan {
-            kernels: vec![k],
-            steps: vec![KernelStep {
+        let plan = ExecutionPlan::new(
+            vec![k],
+            vec![KernelStep {
                 kernel_idx: 0,
                 input_slots: vec![0, 1],
                 output_slots: vec![2],
             }],
-            num_slots: 3,
-            input_slots: vec![0],
-            weight_slots: vec![1],
-            output_slots: vec![2],
-            slot_descs: vec![
+            3,
+            vec![0],
+            vec![1],
+            vec![2],
+            vec![
                 SlotDesc {
                     shape: Shape(vec![3]),
                     dtype: DType::F32,
@@ -1006,7 +1148,7 @@ mod tests {
                     sym_shape: None,
                 },
             ],
-        };
+        );
 
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
         let weight = Buffer::from_slice::<f32>(&[0.5, 0.5, 0.5], &[3], DType::F32);

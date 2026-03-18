@@ -2097,11 +2097,15 @@ pub fn emit_and_compile_plan(
                     // Small attention MatMuls (dynamic N, tiny at runtime)
                     // stay on VectorizeOnly to avoid fork/join overhead.
                     let is_gemm = node.op_type.as_str() == "Gemm";
-                    let has_large_static_n = node.inputs.get(1).and_then(|inp| {
-                        shape_info.get(inp).and_then(|info| {
-                            info.shape.last().copied().flatten()
+                    let has_large_static_n = node
+                        .inputs
+                        .get(1)
+                        .and_then(|inp| {
+                            shape_info
+                                .get(inp)
+                                .and_then(|info| info.shape.last().copied().flatten())
                         })
-                    }).map_or(false, |n| n > 256);
+                        .map_or(false, |n| n > 256);
                     if is_gemm || has_large_static_n {
                         crate::graph_builder::TransformMode::TileParallel
                     } else {
@@ -2232,7 +2236,7 @@ pub fn emit_and_compile_plan(
         })
         .collect();
 
-    let plan = ExecutionPlan {
+    let plan = ExecutionPlan::new(
         kernels,
         steps,
         num_slots,
@@ -2240,7 +2244,7 @@ pub fn emit_and_compile_plan(
         weight_slots,
         output_slots,
         slot_descs,
-    };
+    );
 
     Ok((plan, weights))
 }
