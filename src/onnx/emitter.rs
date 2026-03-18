@@ -2070,11 +2070,37 @@ pub fn emit_and_compile_plan(
             .collect();
         let output_refs: Vec<&crate::graph_builder::Tensor> = output_tensors.iter().collect();
 
+        // Skip the tiling + OpenMP transform schedule for matmul/gemm kernels
+        // whose M dimension is dynamic. During autoregressive decode M=1, and
+        // the overhead of OpenMP fork/join + 32×32 cache tiling on a single-row
+        // vector-matrix multiply is catastrophic (measured ~100× slower than
+        // memory bandwidth allows). The lightweight pipeline produces simple
+        // loops that LLVM auto-vectorizes effectively for small M.
+        //
+        // For MatMul [.., M, K] × [K, N]: check all dims except the last (K)
+        // of the first input. If any is dynamic, skip the schedule.
+        let use_transform_schedule = if group.node_indices.len() == 1 {
+            let node = &model.nodes[group.node_indices[0]];
+            let is_matmul_like = matches!(node.op_type.as_str(), "MatMul" | "Gemm");
+            if is_matmul_like && !node.inputs.is_empty() {
+                let first_input = &node.inputs[0];
+                shape_info
+                    .get(first_input)
+                    .map(|info| {
+                        let m_dims = &info.shape[..info.shape.len().saturating_sub(1)];
+                        !m_dims.iter().any(|d| d.is_none())
+                    })
+                    .unwrap_or(true)
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
         // Finalize module to MLIR text for deferred parallel compilation.
-        // All kernels get the transform schedule — untiled ops won't match
-        // and the schedule is a no-op for them.
         let (mlir_text, num_inputs, output_descs) = builder
-            .finalize_to_mlir(&output_refs, true)
+            .finalize_to_mlir(&output_refs, use_transform_schedule)
             .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
 
         let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
