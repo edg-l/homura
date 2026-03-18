@@ -1004,6 +1004,7 @@ pub(crate) fn build_transform_schedule<'c>(
             .expect("build structured.tile_using_forall (cache tile)");
         let tile_l1_ref = tile_outer_block.append_operation(tile_op);
         let tiled_l1: melior::ir::Value = tile_l1_ref.result(0).unwrap().into();
+        let forall_loop: melior::ir::Value = tile_l1_ref.result(1).unwrap().into();
 
         let reg_static_sizes = Attribute::parse(context, reg_sizes)
             .expect("parse reg static_sizes");
@@ -1219,9 +1220,12 @@ pub(crate) fn build_transform_schedule<'c>(
     let foreach_ref = main_block.append_operation(foreach_op);
     let updated_module: melior::ir::Value = foreach_ref.result(0).unwrap().into();
 
-    // Vectorize all tiled linalg ops inside functions. After tiling, the
-    // inner micro-kernels are small linalg ops that vectorize into compact IR.
-    // Untiled ops (elementwise, etc.) also get vectorized but they are small.
+    // Vectorize tiled ops inside all functions. The foreach_match above
+    // tiles matmuls and convs into small micro-kernels; the blanket
+    // vectorize converts those into compact vector IR.
+    // Kernels without tileable ops should skip the transform schedule
+    // entirely (no transform.with_named_sequence attribute) so this
+    // vectorize never runs on untiled BatchNorm/elementwise ops.
     let ops_attr = ArrayAttribute::new(
         context,
         &[StringAttribute::new(context, "func.func").into()],

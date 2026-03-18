@@ -180,11 +180,15 @@ pub fn compile_from_mlir(
     let mut module = Module::parse(&context, mlir_text)
         .ok_or_else(|| CompileError::Verification)?;
 
-    // Run pass pipeline.
+    // Run pass pipeline. Use the full pipeline (with transform-interpreter +
+    // vector lowering) only for modules with a transform schedule. Lightweight
+    // kernels (BatchNorm, elementwise) skip tiling/vectorization entirely.
+    let passes_start = std::time::Instant::now();
+    let has_schedule = mlir_text.contains("transform.with_named_sequence");
     register_all_passes();
     let pass_manager = pass::PassManager::new(&context);
-    parse_pass_pipeline(
-        pass_manager.as_operation_pass_manager(),
+
+    let pipeline = if has_schedule {
         "builtin.module(\
             func.func(canonicalize,cse),\
             transform-interpreter,\
@@ -217,11 +221,38 @@ pub fn compile_from_mlir(
             convert-func-to-llvm,\
             convert-openmp-to-llvm,\
             reconcile-unrealized-casts\
-        )",
-    )
-    .map_err(CompileError::Pass)?;
+        )"
+    } else {
+        // Lightweight pipeline: no tiling, no vectorization, just
+        // bufferize + lower to LLVM.
+        "builtin.module(\
+            func.func(canonicalize,cse),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            fold-memref-alias-ops,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
+    };
+    parse_pass_pipeline(pass_manager.as_operation_pass_manager(), pipeline)
+        .map_err(CompileError::Pass)?;
 
     pass_manager.run(&mut module).map_err(CompileError::Pass)?;
+    eprintln!("[{:>8.2}s] [{label}] passes: {}ms", crate::log_ts(), passes_start.elapsed().as_millis());
 
     // AOT compile.
     let tmp_dir = tempfile_dir().ok_or_else(|| {
@@ -231,13 +262,16 @@ pub fn compile_from_mlir(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    let suffix = format!("{}_{:08x}", std::process::id(), nanos);
+    let tid = std::thread::current().id();
+    let suffix = format!("{}_{}_{:08x}", std::process::id(), format!("{:?}", tid).replace("ThreadId(", "").replace(")", ""), nanos);
     let tmp_so = tmp_dir.join(format!("homura_pk_{suffix}.so"));
 
     let obj_paths = crate::compiler::emit_object_files_pub(
         &module, &tmp_dir, &format!("homura_pk_{suffix}"), label,
     )?;
+    let link_start = std::time::Instant::now();
     crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
+    eprintln!("[{:>8.2}s] [{label}] link: {}ms", crate::log_ts(), link_start.elapsed().as_millis());
     for p in &obj_paths {
         std::fs::remove_file(p).ok();
     }
@@ -6375,6 +6409,7 @@ impl<'c> GraphBuilder<'c> {
     pub fn finalize_to_mlir(
         self,
         outputs: &[&Tensor<'c>],
+        attach_transform_schedule: bool,
     ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
         if outputs.is_empty() {
             return Err(CompileError::NoOutputs);
@@ -6493,12 +6528,16 @@ impl<'c> GraphBuilder<'c> {
         );
         module.body().append_operation(function);
 
-        // Attach transform schedule.
-        module.as_operation_mut().set_attribute(
-            "transform.with_named_sequence",
-            Attribute::unit(context),
-        );
-        crate::compiler::build_transform_schedule(context, &module, location);
+        // Attach transform schedule only if the kernel has tileable ops.
+        // Kernels with only elementwise/BatchNorm ops skip the schedule,
+        // so transform-interpreter is a no-op and no vectorization occurs.
+        if attach_transform_schedule {
+            module.as_operation_mut().set_attribute(
+                "transform.with_named_sequence",
+                Attribute::unit(context),
+            );
+            crate::compiler::build_transform_schedule(context, &module, location);
+        }
 
         // Verify.
         if !module.as_operation().verify() {
