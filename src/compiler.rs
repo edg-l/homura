@@ -1254,14 +1254,15 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
 
     // Helper: build a @vectorize_contraction_Nd named_sequence.
     //
-    // Tiles N dimension with tile_using_for (no forall → no OpenMP) to get
-    // manageable vector sizes (16 floats = AVX-512), pads to multiple,
-    // then vectorizes the parent function.
-    //
-    // tile_sizes:     [0, 16, 0] for 3D, [0, 0, 16, 0] for 4D — tile N only
-    // scalable:       all false
-    // n_tile_loops:   1 (only N is non-zero)
-    // pad_dims/mults: pad N to multiple of 16
+    // Tiles N and K with tile_using_for to create small inner loops
+    // (16 iterations each). Does NOT use MLIR vectorization — LLVM's
+    // own O2/O3 vectorizer handles the tiled scalar loops and produces
+    // AVX-512 FMA instructions. This avoids two problems:
+    //   1. vectorize_children_and_apply_patterns on the parent func
+    //      creates vector<Nxf32> for full-dimension tensor copies
+    //      (e.g. vector<50257xf32> for LM head) which hangs LLVM.
+    //   2. Outlining + padding for isolation introduces memrefCopy
+    //      allocas that crash at runtime.
     let build_vectorize_seq = |name: &str,
                                 tile_sizes: &str,
                                 scalable: &str,
@@ -1269,26 +1270,8 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
         let vec_block = Block::new(&[(any_op_type, location)]);
         let op_handle: melior::ir::Value = vec_block.argument(0).unwrap().into();
 
-        // Get parent func BEFORE tiling (op_handle is consumed by tile_using_for).
-        let get_parent_op = OperationBuilder::new("transform.get_parent_op", location)
-            .add_operands(&[op_handle])
-            .add_results(&[any_op_type])
-            .add_attributes(&[
-                (
-                    Identifier::new(context, "op_name"),
-                    StringAttribute::new(context, "func.func").into(),
-                ),
-                (
-                    Identifier::new(context, "deduplicate"),
-                    Attribute::unit(context),
-                ),
-            ])
-            .build()
-            .expect("build transform.get_parent_op");
-        let get_parent_ref = vec_block.append_operation(get_parent_op);
-        let func_handle: melior::ir::Value = get_parent_ref.result(0).unwrap().into();
-
-        // tile_using_for on N dimension only — produces scf.for, not scf.forall.
+        // tile_using_for on N and K dimensions — produces scf.for loops.
+        // LLVM's Loop Vectorizer + SLP Vectorizer handle the inner loops.
         let static_sizes =
             Attribute::parse(context, tile_sizes).expect("parse tile static_sizes");
         let scalable_sizes =
@@ -1307,20 +1290,6 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
             .build()
             .expect("build structured.tile_using_for (vectorize-only)");
         vec_block.append_operation(tile_op);
-
-        // No padding — dynamic M can't be padded. N is already tiled to 16
-        // which is a clean vector width. K (768, 2304, 3072) divides evenly.
-
-        // Vectorize the parent function (which now contains tiled ops).
-        let vectorize_op = OperationBuilder::new(
-            "transform.structured.vectorize_children_and_apply_patterns",
-            location,
-        )
-        .add_operands(&[func_handle])
-        .add_results(&[any_op_type])
-        .build()
-        .expect("build vectorize_children_and_apply_patterns");
-        vec_block.append_operation(vectorize_op);
 
         let vec_yield_op = OperationBuilder::new("transform.yield", location)
             .build()
@@ -1364,8 +1333,8 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
         .append_operation(build_match_seq("match_contraction_4d", 4));
 
     // ── @vectorize_contraction_3d ──────────────────────────────────────────────
-    // 3D matmul (M, N, K): tile N=16 and K=16. No padding (M is dynamic).
-    // Produces vector<16xf32> on N, with K=16 inner reduction.
+    // 3D matmul (M, N, K): tile N=16, K=16. LLVM O2 auto-vectorizes the
+    // tiled inner loops to AVX-512 FMA (vfmadd132ps + vbroadcastss).
     module.body().append_operation(build_vectorize_seq(
         "vectorize_contraction_3d",
         "array<i64: 0, 16, 16>",         // tile N=16, K=16, skip M
@@ -1373,7 +1342,7 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
         2,                                // 2 non-zero tile dims (N, K)
     ));
     // ── @vectorize_contraction_4d ──────────────────────────────────────────────
-    // 4D batched matmul (B, M, N, K): tile N=16 and K=16.
+    // 4D batched matmul (B, M, N, K): tile N=16, K=16.
     module.body().append_operation(build_vectorize_seq(
         "vectorize_contraction_4d",
         "array<i64: 0, 0, 16, 16>",             // tile N=16, K=16, skip B and M

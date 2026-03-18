@@ -2082,9 +2082,7 @@ pub fn emit_and_compile_plan(
         // of the first input. If any is dynamic → VectorizeOnly, else Full.
         let transform_mode = if group.node_indices.len() == 1 {
             let node = &model.nodes[group.node_indices[0]];
-            // Only Gemm benefits from vectorize-only — MatMul (e.g. LM head
-            // 768×50257) causes LLVM to hang during O3 codegen with vectors.
-            let is_matmul_like = node.op_type.as_str() == "Gemm";
+            let is_matmul_like = matches!(node.op_type.as_str(), "Gemm" | "MatMul");
             if is_matmul_like && !node.inputs.is_empty() {
                 let first_input = &node.inputs[0];
                 let has_dynamic_m = shape_info
