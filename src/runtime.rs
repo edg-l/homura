@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::slice;
 
-use crate::{DType, Shape};
 use crate::shape::DIM_DYNAMIC;
+use crate::{DType, Shape};
 
 // ── Buffer ────────────────────────────────────────────────────────────────────
 
@@ -232,7 +232,9 @@ unsafe impl Sync for CompiledGraph {}
 impl Drop for CompiledGraph {
     fn drop(&mut self) {
         if !self._lib.is_null() {
-            unsafe { libc::dlclose(self._lib); }
+            unsafe {
+                libc::dlclose(self._lib);
+            }
         }
     }
 }
@@ -254,8 +256,7 @@ impl CompiledGraph {
         let path_str = so_path
             .to_str()
             .ok_or_else(|| format!("non-UTF-8 path: {}", so_path.display()))?;
-        let path_cstr =
-            CString::new(path_str).map_err(|e| format!("path contains NUL: {e}"))?;
+        let path_cstr = CString::new(path_str).map_err(|e| format!("path contains NUL: {e}"))?;
 
         let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
         if lib.is_null() {
@@ -272,8 +273,7 @@ impl CompiledGraph {
 
         // `_mlir__mlir_ciface_compute` is the packed-convention wrapper:
         // takes void** where each void* points to a MemRefDescriptor.
-        let sym_name =
-            CString::new("_mlir__mlir_ciface_compute").expect("static name has no NUL");
+        let sym_name = CString::new("_mlir__mlir_ciface_compute").expect("static name has no NUL");
         let sym = unsafe { libc::dlsym(lib, sym_name.as_ptr()) };
         if sym.is_null() {
             unsafe {
@@ -287,7 +287,12 @@ impl CompiledGraph {
 
         let func: unsafe extern "C" fn(*mut *mut ()) = unsafe { std::mem::transmute(sym) };
 
-        Ok(Self { _lib: lib, func, num_inputs, outputs })
+        Ok(Self {
+            _lib: lib,
+            func,
+            num_inputs,
+            outputs,
+        })
     }
 
     /// Return the output descriptors (shape + dtype) for all outputs.
@@ -365,7 +370,6 @@ impl CompiledGraph {
 
     /// Shared JIT-call implementation for `run` and `run_dynamic`.
     fn run_with_output_bufs(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
-
         // Build memref descriptors for inputs. The function only reads inputs,
         // so the const→mut cast is safe.
         let input_shapes: Vec<Vec<i64>> = inputs
@@ -537,7 +541,10 @@ impl<'a> PoolEntry<'a> {
 impl ExecutionPlan {
     /// Return the `SlotDesc` for each model output slot.
     pub fn output_slot_descs(&self) -> Vec<&SlotDesc> {
-        self.output_slots.iter().map(|&s| &self.slot_descs[s]).collect()
+        self.output_slots
+            .iter()
+            .map(|&s| &self.slot_descs[s])
+            .collect()
     }
 
     /// Build concrete shapes for all slots by evaluating symbolic dim expressions
@@ -557,7 +564,9 @@ impl ExecutionPlan {
                         if let Some(&existing) = bindings.get(name) {
                             if existing != actual {
                                 tracing::warn!(
-                                    name, existing, actual,
+                                    name,
+                                    existing,
+                                    actual,
                                     "conflicting sym dim binding"
                                 );
                             }
@@ -647,16 +656,17 @@ impl ExecutionPlan {
                 })
                 .collect();
 
-            // Skip kernel if any input has a zero dimension — the output is
-            // trivially zero-filled.  This is the industry-standard approach
-            // (PyTorch, ONNX Runtime, TF all do this).
-            let has_zero_dim = step_inputs
+            // Skip kernel if any output has a zero dimension — the output is
+            // trivially zero-filled.  Check outputs (not inputs) so that ops
+            // like Concat with a zero-dim input but non-zero output still run.
+            let has_zero_output = step
+                .output_slots
                 .iter()
-                .any(|b| b.shape().0.iter().any(|&d| d == 0));
-            if has_zero_dim {
+                .any(|&slot| resolved_shapes[slot].0.iter().any(|&d| d == 0));
+            if has_zero_output {
                 tracing::debug!(
                     kernel = step.kernel_idx,
-                    "skipping kernel: input has zero dimension"
+                    "skipping kernel: output has zero dimension"
                 );
                 for &slot in &step.output_slots {
                     let shape = &resolved_shapes[slot];
@@ -796,9 +806,9 @@ mod tests {
     fn execution_plan_two_kernels() {
         // Build a plan: kernel0 = add(a, b) → c, kernel1 = mul(c, b) → d
         // Equivalent to: d = (a + b) * b
-        use crate::graph_builder::GraphContext;
         use super::{ExecutionPlan, KernelStep, SlotDesc};
         use crate::Shape;
+        use crate::graph_builder::GraphContext;
 
         // Kernel 0: add(x, y) → z
         let ctx0 = GraphContext::new();
@@ -826,13 +836,13 @@ mod tests {
             steps: vec![
                 KernelStep {
                     kernel_idx: 0,
-                    input_slots: vec![0, 1],  // a, b
-                    output_slots: vec![2],     // c
+                    input_slots: vec![0, 1], // a, b
+                    output_slots: vec![2],   // c
                 },
                 KernelStep {
                     kernel_idx: 1,
-                    input_slots: vec![2, 1],  // c, b
-                    output_slots: vec![3],     // d
+                    input_slots: vec![2, 1], // c, b
+                    output_slots: vec![3],   // d
                 },
             ],
             num_slots: 4,
@@ -840,10 +850,26 @@ mod tests {
             weight_slots: vec![],
             output_slots: vec![3],
             slot_descs: vec![
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![4]), dtype: DType::F32, sym_shape: None },
+                SlotDesc {
+                    shape: Shape(vec![4]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![4]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![4]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![4]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
             ],
         };
 
@@ -853,19 +879,16 @@ mod tests {
         let result = plan.run(&[&a, &b], &[]);
         // d = (a + b) * b = (11, 22, 33, 44) * (10, 20, 30, 40) = (110, 440, 990, 1760)
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].as_slice::<f32>(),
-            &[110.0, 440.0, 990.0, 1760.0]
-        );
+        assert_eq!(result[0].as_slice::<f32>(), &[110.0, 440.0, 990.0, 1760.0]);
     }
 
     #[test]
     fn execution_plan_zero_dim_skips_kernel() {
         // When an input has a zero dimension, the kernel should be skipped
         // and the output should be a zero-filled buffer with the resolved shape.
-        use crate::graph_builder::GraphContext;
         use super::{ExecutionPlan, KernelStep, SlotDesc};
         use crate::Shape;
+        use crate::graph_builder::GraphContext;
 
         // Compile a real kernel (add) — it won't actually be called.
         let ctx = GraphContext::new();
@@ -887,9 +910,21 @@ mod tests {
             weight_slots: vec![],
             output_slots: vec![2],
             slot_descs: vec![
-                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
+                SlotDesc {
+                    shape: Shape(vec![0]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![0]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![0]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
             ],
         };
 
@@ -905,9 +940,9 @@ mod tests {
     #[test]
     fn execution_plan_with_weights() {
         // kernel0 = add(input, weight) → output
-        use crate::graph_builder::GraphContext;
         use super::{ExecutionPlan, KernelStep, SlotDesc};
         use crate::Shape;
+        use crate::graph_builder::GraphContext;
 
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
@@ -929,9 +964,21 @@ mod tests {
             weight_slots: vec![1],
             output_slots: vec![2],
             slot_descs: vec![
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
-                SlotDesc { shape: Shape(vec![3]), dtype: DType::F32, sym_shape: None },
+                SlotDesc {
+                    shape: Shape(vec![3]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![3]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
+                SlotDesc {
+                    shape: Shape(vec![3]),
+                    dtype: DType::F32,
+                    sym_shape: None,
+                },
             ],
         };
 

@@ -125,7 +125,11 @@ pub enum OnnxError {
         expected: usize,
     },
     /// Two inputs assign different concrete values to the same symbolic dim name.
-    ConflictingSymbolicDim { name: String, first: u64, second: u64 },
+    ConflictingSymbolicDim {
+        name: String,
+        first: u64,
+        second: u64,
+    },
     /// A symbolic dim appears in the model but no input resolves it.
     UnresolvedSymbolicDim(String),
     /// Input shape changed after lazy compilation (symbolic-dim model).
@@ -158,7 +162,11 @@ impl std::fmt::Display for OnnxError {
             OnnxError::RawDataLengthMismatch { got, expected } => {
                 write!(f, "raw_data length {got} != expected {expected}")
             }
-            OnnxError::ConflictingSymbolicDim { name, first, second } => {
+            OnnxError::ConflictingSymbolicDim {
+                name,
+                first,
+                second,
+            } => {
                 write!(
                     f,
                     "conflicting values for symbolic dim '{name}': {first} vs {second}"
@@ -167,7 +175,11 @@ impl std::fmt::Display for OnnxError {
             OnnxError::UnresolvedSymbolicDim(name) => {
                 write!(f, "symbolic dim '{name}' was not resolved by any input")
             }
-            OnnxError::ShapeMismatch { input_index, expected, got } => {
+            OnnxError::ShapeMismatch {
+                input_index,
+                expected,
+                got,
+            } => {
                 write!(
                     f,
                     "input {input_index} shape mismatch: compiled for {expected:?}, got {got:?}"
@@ -263,9 +275,11 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
 
     // Output edge names and shapes.
     let outputs = graph.output.iter().map(|vi| vi.name.clone()).collect();
-    let output_shapes = graph.output.iter().map(|vi| {
-        parse_output_dims(vi)
-    }).collect();
+    let output_shapes = graph
+        .output
+        .iter()
+        .map(|vi| parse_output_dims(vi))
+        .collect();
 
     Ok(OnnxModel {
         nodes,
@@ -291,8 +305,11 @@ fn try_extract_if_then_branch(graph: &mut proto::GraphProto) -> Option<proto::Gr
     let mut subgraph = then_attr.g.clone()?;
 
     // Names already declared in the subgraph.
-    let sub_init_names: HashSet<String> =
-        subgraph.initializer.iter().map(|t| t.name.clone()).collect();
+    let sub_init_names: HashSet<String> = subgraph
+        .initializer
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
     let sub_input_names: HashSet<String> =
         subgraph.input.iter().map(|vi| vi.name.clone()).collect();
 
@@ -316,8 +333,11 @@ fn try_extract_if_then_branch(graph: &mut proto::GraphProto) -> Option<proto::Gr
 
     // Clone parent inputs that the subgraph references but doesn't declare
     // (and that weren't already merged as initializers).
-    let sub_init_names: HashSet<String> =
-        subgraph.initializer.iter().map(|t| t.name.clone()).collect();
+    let sub_init_names: HashSet<String> = subgraph
+        .initializer
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
     for vi in &graph.input {
         if !sub_input_names.contains(&vi.name)
             && !sub_init_names.contains(&vi.name)
@@ -332,8 +352,8 @@ fn try_extract_if_then_branch(graph: &mut proto::GraphProto) -> Option<proto::Gr
 
 /// Parse dims from an output ValueInfoProto. Returns empty vec if shape info is missing.
 fn parse_output_dims(vi: &crate::onnx::proto::ValueInfoProto) -> Vec<Dim> {
-    use crate::onnx::proto::type_proto::Value as TypeValue;
     use crate::onnx::proto::tensor_shape_proto::dimension::Value as DimValue;
+    use crate::onnx::proto::type_proto::Value as TypeValue;
 
     let type_proto = match &vi.r#type {
         Some(tp) => tp,
@@ -348,13 +368,16 @@ fn parse_output_dims(vi: &crate::onnx::proto::ValueInfoProto) -> Vec<Dim> {
         None => return Vec::new(),
     };
 
-    shape_proto.dim.iter().enumerate().map(|(idx, dim)| {
-        match &dim.value {
+    shape_proto
+        .dim
+        .iter()
+        .enumerate()
+        .map(|(idx, dim)| match &dim.value {
             Some(DimValue::DimValue(v)) => Dim::Fixed(*v as u64),
             Some(DimValue::DimParam(p)) => Dim::Symbolic(p.clone()),
             None => Dim::Symbolic(format!("output_{}_{}", vi.name, idx)),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use homura::generate::Generator;
-use homura::kv_generate::{KvGenerator, has_with_past_model};
+use homura::kv_generate::{
+    KvGenerator, UnifiedKvGenerator, has_unified_model, has_with_past_model,
+};
 use homura::onnx::parser;
 use homura::{Buffer, DType, Model};
 
@@ -140,7 +142,10 @@ fn cmd_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
             count += 1;
         }
     }
-    println!("Removed {count} cached files ({:.1} MB)", bytes as f64 / 1_048_576.0);
+    println!(
+        "Removed {count} cached files ({:.1} MB)",
+        bytes as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
@@ -216,15 +221,23 @@ fn cmd_generate(
             .to_path_buf()
     };
 
-    let model_dir_str = model_dir
-        .to_str()
-        .ok_or("model path is not valid UTF-8")?;
+    let model_dir_str = model_dir.to_str().ok_or("model path is not valid UTF-8")?;
 
     tracing::info!(dir = %model_dir.display(), "loading generator");
     let t_load = Instant::now();
 
-    // Prefer the two-model KV cache approach when a with-past model is present.
-    let generated = if has_with_past_model(&model_dir) {
+    // Prefer unified single-model, then two-model KV cache, then full-recompute.
+    let generated = if has_unified_model(&model_dir) {
+        tracing::info!("using unified KV cache generator — single-model approach");
+        let generator = UnifiedKvGenerator::load(model_dir_str, 1024, 50256)?;
+        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
+
+        tracing::info!(max_tokens, "generating");
+        let t_gen = Instant::now();
+        let text = generator.generate(prompt, max_tokens);
+        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
+        text
+    } else if has_with_past_model(&model_dir) {
         tracing::info!("using KV cache generator — two-model approach");
         let generator = KvGenerator::load(model_dir_str, 1024, 50256)?;
         tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
@@ -435,8 +448,8 @@ mod tests {
 
     #[test]
     fn cli_run_no_prompt_keeps_existing_behavior() {
-        let cli = Cli::try_parse_from(["homura", "run", "model.onnx"])
-            .expect("failed to parse CLI");
+        let cli =
+            Cli::try_parse_from(["homura", "run", "model.onnx"]).expect("failed to parse CLI");
 
         match cli.command {
             Commands::Run { prompt, input, .. } => {

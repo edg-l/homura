@@ -122,7 +122,12 @@ impl Model {
                 })
                 .collect();
             let dummy_refs: Vec<&Buffer> = dummy_inputs.iter().collect();
-            let state = compile_model_emitter(&onnx_model, &dummy_refs, model_bytes.as_deref(), &keep_dynamic)?;
+            let state = compile_model_emitter(
+                &onnx_model,
+                &dummy_refs,
+                model_bytes.as_deref(),
+                &keep_dynamic,
+            )?;
             Ok(Model {
                 num_dynamic_inputs: num_dynamic,
                 parsed: None,
@@ -161,21 +166,20 @@ impl Model {
 
         // For models with symbolic dims, recompile only if non-dynamic dims changed.
         if self.parsed.is_some() {
-            let shapes_changed = {
-                let state = guard.as_ref().unwrap();
-                inputs.iter().enumerate().any(|(i, buf)| {
-                    let compiled_shape = &state.input_shapes[i];
-                    buf.shape()
-                        .0
-                        .iter()
-                        .zip(compiled_shape.0.iter())
-                        .any(|(actual, compiled)| {
-                            // Skip dims that are DIM_DYNAMIC in the compiled shape —
-                            // those are intentionally dynamic and should not trigger recompilation.
-                            *compiled != DIM_DYNAMIC && actual != compiled
-                        })
-                })
-            };
+            let shapes_changed =
+                {
+                    let state = guard.as_ref().unwrap();
+                    inputs.iter().enumerate().any(|(i, buf)| {
+                        let compiled_shape = &state.input_shapes[i];
+                        buf.shape().0.iter().zip(compiled_shape.0.iter()).any(
+                            |(actual, compiled)| {
+                                // Skip dims that are DIM_DYNAMIC in the compiled shape —
+                                // those are intentionally dynamic and should not trigger recompilation.
+                                *compiled != DIM_DYNAMIC && actual != compiled
+                            },
+                        )
+                    })
+                };
             if shapes_changed {
                 let parsed = self
                     .parsed
@@ -195,17 +199,26 @@ impl Model {
         model: &OnnxModel,
         inputs: &[&Buffer],
     ) -> Result<CompiledState, OnnxError> {
-        compile_model_emitter(model, inputs, self.model_bytes.as_deref(), &self.keep_dynamic)
+        compile_model_emitter(
+            model,
+            inputs,
+            self.model_bytes.as_deref(),
+            &self.keep_dynamic,
+        )
     }
 
     /// Returns the compiled output descriptors, or `None` if not yet compiled.
     pub fn output_descs(&self) -> Option<Vec<OutputDesc>> {
         let guard = self.state.lock().unwrap();
         guard.as_ref().map(|s| {
-            s.plan.output_slot_descs().iter().map(|sd| OutputDesc {
-                shape: sd.shape.clone(),
-                dtype: sd.dtype,
-            }).collect()
+            s.plan
+                .output_slot_descs()
+                .iter()
+                .map(|sd| OutputDesc {
+                    shape: sd.shape.clone(),
+                    dtype: sd.dtype,
+                })
+                .collect()
         })
     }
 
@@ -238,19 +251,16 @@ impl Model {
 
         // Recompile if non-dynamic dims changed.
         if self.parsed.is_some() {
-            let shapes_changed = {
-                let state = guard.as_ref().unwrap();
-                inputs.iter().enumerate().any(|(i, buf)| {
-                    let compiled_shape = &state.input_shapes[i];
-                    buf.shape()
-                        .0
-                        .iter()
-                        .zip(compiled_shape.0.iter())
-                        .any(|(actual, compiled)| {
-                            *compiled != DIM_DYNAMIC && actual != compiled
-                        })
-                })
-            };
+            let shapes_changed =
+                {
+                    let state = guard.as_ref().unwrap();
+                    inputs.iter().enumerate().any(|(i, buf)| {
+                        let compiled_shape = &state.input_shapes[i];
+                        buf.shape().0.iter().zip(compiled_shape.0.iter()).any(
+                            |(actual, compiled)| *compiled != DIM_DYNAMIC && actual != compiled,
+                        )
+                    })
+                };
             if shapes_changed {
                 let parsed = self
                     .parsed
@@ -304,8 +314,7 @@ fn compile_model_emitter(
         })
         .collect();
 
-    let (plan, weights) =
-        emitter::emit_and_compile_plan(model, inputs, model_bytes, keep_dynamic)?;
+    let (plan, weights) = emitter::emit_and_compile_plan(model, inputs, model_bytes, keep_dynamic)?;
 
     Ok(CompiledState {
         plan,
@@ -370,8 +379,10 @@ fn resolve_symbolic_dims(
     }
 
     // Build a resolved OnnxModel clone.
-    // keep_dynamic dims become Dim::Fixed(DIM_DYNAMIC) so the mapper sees them
-    // as a concrete value that the compiler interprets as `?` when building types.
+    // keep_dynamic dims stay as Dim::Symbolic so the emitter preserves their
+    // original name (e.g. "sequence_length" vs "past_sequence_length") for
+    // correct sym_shape tracking.  The emitter's DIM_DYNAMIC branch is only
+    // a fallback for truly anonymous dims.
     let resolved_inputs = model
         .dynamic_inputs
         .iter()
@@ -382,7 +393,7 @@ fn resolve_symbolic_dims(
                 .map(|d| match d {
                     Dim::Fixed(v) => Dim::Fixed(*v),
                     Dim::Symbolic(name) if keep_dynamic.contains(name) => {
-                        Dim::Fixed(DIM_DYNAMIC)
+                        Dim::Symbolic(name.clone())
                     }
                     Dim::Symbolic(name) => Dim::Fixed(*sym_map.get(name).unwrap()),
                 })
@@ -1000,9 +1011,7 @@ mod tests {
 
         let sym_dim = Dimension {
             value: Some(
-                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(
-                    sym_name.into(),
-                ),
+                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimParam(sym_name.into()),
             ),
             ..Default::default()
         };
@@ -1099,10 +1108,7 @@ mod tests {
         let result = model.run(&[&x, &y]);
 
         assert!(
-            matches!(
-                result,
-                Err(OnnxError::ConflictingSymbolicDim { .. })
-            ),
+            matches!(result, Err(OnnxError::ConflictingSymbolicDim { .. })),
             "expected ConflictingSymbolicDim, got {result:?}"
         );
     }
@@ -1208,9 +1214,7 @@ mod tests {
         // 1 is never visited → UnresolvedSymbolicDim.
         use crate::onnx::proto::tensor_shape_proto::Dimension as D2;
         let fixed_dim = D2 {
-            value: Some(
-                crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(4),
-            ),
+            value: Some(crate::onnx::proto::tensor_shape_proto::dimension::Value::DimValue(4)),
             ..Default::default()
         };
         let sym2 = D2 {

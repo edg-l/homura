@@ -4,8 +4,8 @@ use crate::{
     DType,
     cache::bucket_pad,
     generate::argmax_at_position,
-    onnx::{Model, parser},
     onnx::parser::Dim,
+    onnx::{Model, parser},
     runtime::Buffer,
     tokenizer::Tokenizer,
 };
@@ -49,11 +49,7 @@ impl ModelConfig {
             .collect();
 
         if kv_inputs.is_empty() {
-            return Err(format!(
-                "no 'past_key_values' inputs found in {}",
-                path.display()
-            )
-            .into());
+            return Err(format!("no 'past_key_values' inputs found in {}", path.display()).into());
         }
 
         let num_kv_tensors = kv_inputs.len();
@@ -162,10 +158,8 @@ impl KvGenerator {
         tracing::info!(path = %prompt_path.display(), "loading prefill model");
         // Prefill runs once per generation — no need to keep sequence_length dynamic.
         // Resolving it to the concrete bucket size avoids DIM_DYNAMIC in output shapes.
-        let prompt_model = Model::load_with_dynamic_dims(
-            &prompt_path,
-            std::collections::HashSet::new(),
-        )?;
+        let prompt_model =
+            Model::load_with_dynamic_dims(&prompt_path, std::collections::HashSet::new())?;
 
         tracing::info!(path = %decode_path.display(), "loading decode model");
         // Keep past_sequence_length (and derived dims like "past_sequence_length + 1")
@@ -228,11 +222,7 @@ impl KvGenerator {
         // Leave room for at least 1 generated token.
         let max_prompt = self.config.max_seq_len - 1;
         if token_ids.len() > max_prompt {
-            tracing::warn!(
-                from = token_ids.len(),
-                to = max_prompt,
-                "truncating prompt"
-            );
+            tracing::warn!(from = token_ids.len(), to = max_prompt, "truncating prompt");
             token_ids.truncate(max_prompt);
         }
 
@@ -271,7 +261,10 @@ impl KvGenerator {
         // Decode loop
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
-                tracing::warn!(max_seq_len = self.config.max_seq_len, "context limit reached");
+                tracing::warn!(
+                    max_seq_len = self.config.max_seq_len,
+                    "context limit reached"
+                );
                 break;
             }
 
@@ -305,7 +298,11 @@ impl KvGenerator {
         let total = gen_start.elapsed();
         let decode_tokens = generated_ids.len();
         let total_s = total.as_secs_f64();
-        let per_tok = if decode_tokens == 0 { 0.0 } else { total_s / decode_tokens as f64 };
+        let per_tok = if decode_tokens == 0 {
+            0.0
+        } else {
+            total_s / decode_tokens as f64
+        };
         let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
         eprintln!(
             "  \x1b[1;35m── done ──\x1b[0m {decode_tokens} tokens in \
@@ -340,10 +337,8 @@ impl KvGenerator {
         let mut mask = vec![1i64; seq_len];
         mask.resize(bucket, 0i64);
 
-        let input_ids =
-            Buffer::from_slice::<i64>(&padded_ids, &[1, bucket as u64], DType::I64);
-        let attention_mask =
-            Buffer::from_slice::<i64>(&mask, &[1, bucket as u64], DType::I64);
+        let input_ids = Buffer::from_slice::<i64>(&padded_ids, &[1, bucket as u64], DType::I64);
+        let attention_mask = Buffer::from_slice::<i64>(&mask, &[1, bucket as u64], DType::I64);
 
         let outputs = self.prompt_model.run(&[&input_ids, &attention_mask])?;
 
@@ -428,8 +423,7 @@ impl KvGenerator {
         let head_dim = self.config.head_dim as usize;
 
         // input_ids: [1, 1]
-        let input_ids =
-            Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
+        let input_ids = Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
 
         // attention_mask: [1, kv_seq_len + 1] — all ones.
         // KV cache is trimmed (no padding gap), so every position is real.
@@ -487,7 +481,9 @@ impl KvGenerator {
         let t_setup = step_start.elapsed();
 
         let jit_start = std::time::Instant::now();
-        let mut outputs = self.decode_model.run_with_output_shapes(&args, &output_shapes)?;
+        let mut outputs = self
+            .decode_model
+            .run_with_output_shapes(&args, &output_shapes)?;
         let t_jit = jit_start.elapsed();
 
         let post_start = std::time::Instant::now();
@@ -538,6 +534,311 @@ impl KvGenerator {
                 t_jit.as_secs_f64() * 1000.0,
                 t_post.as_secs_f64() * 1000.0,
             );
+        }
+
+        Ok(result_token)
+    }
+}
+
+// ── UnifiedKvGenerator ────────────────────────────────────────────────────
+
+/// Single-model KV cache text generator for causal language models.
+///
+/// Uses a single unified ONNX model (extracted from the merged "If" wrapper)
+/// for both prefill and decode phases. All sequence-length dims are compiled
+/// as dynamic so the model compiles once and accepts any shapes at runtime.
+///
+/// Prefill passes empty KV tensors `[1, heads, 0, head_dim]`; the zero-dim
+/// guard in `ExecutionPlan` skips kernels whose *outputs* are zero-element,
+/// while Concat produces the correct non-zero output shape.
+pub struct UnifiedKvGenerator {
+    model: Model,
+    tokenizer: Tokenizer,
+    config: ModelConfig,
+}
+
+impl UnifiedKvGenerator {
+    /// Load a unified KV cache generator from a directory.
+    ///
+    /// Looks for model files (first match wins):
+    /// - `decoder_model_merged.onnx` (optimum export with If wrapper — auto-extracted)
+    /// - `gpt2_decoder_model_merged.onnx`
+    /// - `gpt2_unified_model.onnx` (pre-extracted then_branch)
+    pub fn load(
+        model_dir: &str,
+        max_seq_len: usize,
+        eos_token_id: u32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let dir = Path::new(model_dir);
+
+        let model_path = find_unified_model(dir).ok_or_else(|| {
+            format!(
+                "no unified model found in {} \
+                 (tried decoder_model_merged.onnx, gpt2_decoder_model_merged.onnx, \
+                 gpt2_unified_model.onnx)",
+                dir.display()
+            )
+        })?;
+
+        tracing::info!(path = %model_path.display(), "loading unified model");
+        let keep_dynamic: std::collections::HashSet<String> = [
+            "sequence_length",
+            "past_sequence_length",
+            "attention_mask_sequence_length",
+            // Output dim expressions from HF export annotations
+            "past_sequence_length + 1",
+            "past_sequence_length + sequence_length",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let model = Model::load_with_dynamic_dims(&model_path, keep_dynamic)?;
+
+        tracing::info!(path = %model_path.display(), "detecting model config");
+        let config = ModelConfig::from_onnx_model(&model_path, max_seq_len, eos_token_id)?;
+        tracing::info!(
+            num_kv_tensors = config.num_kv_tensors,
+            num_heads = config.num_heads,
+            head_dim = config.head_dim,
+            max_seq_len = config.max_seq_len,
+            "model config"
+        );
+
+        let vocab_path = dir.join("vocab.json");
+        let merges_path = dir.join("merges.txt");
+        tracing::info!("loading tokenizer");
+        let tokenizer = Tokenizer::from_files(
+            vocab_path
+                .to_str()
+                .ok_or("vocab.json path is not valid UTF-8")?,
+            merges_path
+                .to_str()
+                .ok_or("merges.txt path is not valid UTF-8")?,
+        )?;
+
+        Ok(UnifiedKvGenerator {
+            model,
+            tokenizer,
+            config,
+        })
+    }
+
+    /// Generate text using the unified model for both prefill and decode.
+    ///
+    /// Returns only the generated text (prompt excluded).
+    pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> String {
+        let mut token_ids: Vec<i64> = self
+            .tokenizer
+            .encode(prompt)
+            .into_iter()
+            .map(|id| id as i64)
+            .collect();
+
+        if token_ids.is_empty() || max_new_tokens == 0 {
+            return String::new();
+        }
+
+        let max_prompt = self.config.max_seq_len - 1;
+        if token_ids.len() > max_prompt {
+            tracing::warn!(from = token_ids.len(), to = max_prompt, "truncating prompt");
+            token_ids.truncate(max_prompt);
+        }
+
+        tracing::info!(
+            prompt_tokens = token_ids.len(),
+            max_new_tokens,
+            "starting unified generation"
+        );
+
+        let gen_start = std::time::Instant::now();
+
+        // Prefill
+        let step_start = std::time::Instant::now();
+        let (mut next_token, mut kv_cache, mut real_pos) = match self.prefill(&token_ids) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("prefill failed: {e}");
+                return String::new();
+            }
+        };
+        let prefill_s = step_start.elapsed().as_secs_f64();
+        tracing::info!("prefill complete in {prefill_s:.2}s");
+
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+        if next_token == self.config.eos_token_id {
+            tracing::info!("EOS after prefill");
+            return String::new();
+        }
+        generated_ids.push(next_token);
+        let token_text = self.tokenizer.decode(&[next_token]);
+        eprintln!(
+            "  \x1b[36m[1/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m \
+             \x1b[2m(prefill)\x1b[0m"
+        );
+
+        // Decode loop
+        for step in 1..max_new_tokens {
+            if real_pos >= self.config.max_seq_len {
+                tracing::warn!(
+                    max_seq_len = self.config.max_seq_len,
+                    "context limit reached"
+                );
+                break;
+            }
+
+            let step_start = std::time::Instant::now();
+            next_token = match self.decode_step(next_token, &mut kv_cache, real_pos) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("decode step failed: {e}");
+                    break;
+                }
+            };
+            real_pos += 1;
+
+            let token_text = self.tokenizer.decode(&[next_token]);
+            let step_elapsed = step_start.elapsed().as_secs_f64();
+            let tok_s = 1.0 / step_elapsed;
+            eprintln!(
+                "  \x1b[36m[{}/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m  \
+                 \x1b[33m{:.0}ms\x1b[0m  \x1b[32m{tok_s:.1} tok/s\x1b[0m",
+                step + 1,
+                step_elapsed * 1000.0,
+            );
+
+            if next_token == self.config.eos_token_id {
+                tracing::info!("EOS token reached");
+                break;
+            }
+            generated_ids.push(next_token);
+        }
+
+        let total = gen_start.elapsed();
+        let decode_tokens = generated_ids.len();
+        let total_s = total.as_secs_f64();
+        let per_tok = if decode_tokens == 0 {
+            0.0
+        } else {
+            total_s / decode_tokens as f64
+        };
+        let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
+        eprintln!(
+            "  \x1b[1;35m── done ──\x1b[0m {decode_tokens} tokens in \
+             \x1b[33m{total_s:.2}s\x1b[0m · \x1b[32m{tok_s:.1} tok/s\x1b[0m · \
+             {:.0}ms/tok",
+            per_tok * 1000.0,
+        );
+
+        self.tokenizer.decode(&generated_ids)
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Run the unified model in prefill mode: full prompt, empty KV cache.
+    fn prefill(
+        &self,
+        token_ids: &[i64],
+    ) -> Result<(u32, Vec<Buffer>, usize), Box<dyn std::error::Error>> {
+        let seq_len = token_ids.len();
+
+        // input_ids: [1, seq_len] — exact length, no bucket padding needed
+        let input_ids = Buffer::from_slice::<i64>(token_ids, &[1, seq_len as u64], DType::I64);
+
+        // attention_mask: [1, seq_len] — all ones
+        let mask = vec![1i64; seq_len];
+        let attention_mask = Buffer::from_slice::<i64>(&mask, &[1, seq_len as u64], DType::I64);
+
+        // Empty KV cache: [1, heads, 0, head_dim] per tensor
+        let kv_inputs: Vec<Buffer> = (0..self.config.num_kv_tensors)
+            .map(|_| {
+                Buffer::new(
+                    &[1, self.config.num_heads, 0, self.config.head_dim],
+                    DType::F32,
+                )
+            })
+            .collect();
+
+        // Args order must match ONNX model inputs:
+        // [input_ids, attention_mask, kv[0], kv[1], ..., kv[23]]
+        let mut args: Vec<&Buffer> = Vec::with_capacity(2 + self.config.num_kv_tensors);
+        args.push(&input_ids);
+        args.push(&attention_mask);
+        for kv in &kv_inputs {
+            args.push(kv);
+        }
+
+        let outputs = self.model.run(&args)?;
+
+        // outputs[0] = logits [1, seq_len, vocab_size]
+        let logits = &outputs[0];
+        let vocab_size = logits.shape().0[2] as usize;
+        let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
+
+        // outputs[1..] = present KV [1, heads, 0+seq_len, head_dim]
+        let kv_count = self.config.num_kv_tensors;
+        if outputs.len() < 1 + kv_count {
+            return Err(format!(
+                "unified model returned {} outputs, expected at least {}",
+                outputs.len(),
+                1 + kv_count
+            )
+            .into());
+        }
+        let kv_cache: Vec<Buffer> = outputs[1..1 + kv_count].to_vec();
+
+        Ok((next_token, kv_cache, seq_len))
+    }
+
+    /// Run one decode step with the unified model.
+    fn decode_step(
+        &self,
+        next_token: u32,
+        kv_cache: &mut Vec<Buffer>,
+        real_pos: usize,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        assert!(
+            real_pos < self.config.max_seq_len,
+            "KV cache full (real_pos={} >= max_seq_len={})",
+            real_pos,
+            self.config.max_seq_len
+        );
+
+        // input_ids: [1, 1]
+        let input_ids = Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
+
+        // attention_mask: [1, real_pos + 1] — all ones
+        let mask_len = real_pos + 1;
+        let mask_data = vec![1i64; mask_len];
+        let attention_mask =
+            Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
+
+        let mut args: Vec<&Buffer> = Vec::with_capacity(2 + kv_cache.len());
+        args.push(&input_ids);
+        args.push(&attention_mask);
+        for kv in kv_cache.iter() {
+            args.push(kv);
+        }
+
+        let mut outputs = self.model.run(&args)?;
+
+        // logits: [1, 1, vocab_size]
+        let logits = &outputs[0];
+        let vocab_size = logits.shape().0[2] as usize;
+        let result_token = argmax_at_position(logits, 0, vocab_size);
+
+        // Replace KV cache with present values
+        let kv_count = self.config.num_kv_tensors;
+        if outputs.len() < 1 + kv_count {
+            return Err(format!(
+                "decode: unified model returned {} outputs, expected at least {}",
+                outputs.len(),
+                1 + kv_count
+            )
+            .into());
+        }
+        for i in 0..kv_count {
+            kv_cache[i] = outputs.remove(1);
         }
 
         Ok(result_token)
@@ -598,6 +899,23 @@ pub fn has_with_past_model(model_dir: &Path) -> bool {
     .is_some()
 }
 
+/// Return the path to a unified/merged model file in the directory, if present.
+fn find_unified_model(dir: &Path) -> Option<PathBuf> {
+    find_file(
+        dir,
+        &[
+            "decoder_model_merged.onnx",
+            "gpt2_decoder_model_merged.onnx",
+            "gpt2_unified_model.onnx",
+        ],
+    )
+}
+
+/// Return `true` if the given directory contains a unified/merged model file.
+pub fn has_unified_model(model_dir: &Path) -> bool {
+    find_unified_model(model_dir).is_some()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -624,7 +942,12 @@ mod tests {
         let result = trimmed.as_slice::<f32>();
         // Head 0: positions 0-1 → elements 0..6
         // Head 1: positions 0-1 → elements 12..18
-        assert_eq!(result, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]);
+        assert_eq!(
+            result,
+            &[
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0
+            ]
+        );
     }
 
     #[test]
@@ -649,6 +972,12 @@ mod tests {
         assert_eq!(config.eos_token_id, 50256);
     }
 
+    #[test]
+    fn has_unified_model_returns_false_for_missing_dir() {
+        let dir = Path::new("/nonexistent_dir_that_does_not_exist_xyz");
+        assert!(!has_unified_model(dir));
+    }
+
     // ── Slow / integration tests ──────────────────────────────────────────────
 
     /// Load the two GPT-2 ONNX models and generate 3 tokens with the KV cache.
@@ -666,5 +995,21 @@ mod tests {
         let text = kv_gen.generate("Hello", 3);
         assert!(!text.is_empty(), "should generate at least one token");
         eprintln!("Generated: {text:?}");
+    }
+
+    /// Load the unified GPT-2 ONNX model and generate 3 tokens.
+    ///
+    /// Requires `tests/fixtures/gpt2_unified_model.onnx` (or
+    /// `gpt2_decoder_model_merged.onnx`), `vocab.json`, `merges.txt`.
+    ///
+    /// Run with: cargo test unified_kv_generate_produces_tokens -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn unified_kv_generate_produces_tokens() {
+        let generator = UnifiedKvGenerator::load("tests/fixtures", 1024, 50256)
+            .expect("failed to load UnifiedKvGenerator from tests/fixtures");
+        let text = generator.generate("Hello", 3);
+        assert!(!text.is_empty(), "should generate at least one token");
+        eprintln!("Generated (unified): {text:?}");
     }
 }
