@@ -47,6 +47,34 @@ impl std::error::Error for CompileError {}
 
 /// Translate a lowered MLIR module to native code and emit an object file.
 ///
+/// Walk every instruction in every function of the LLVM module and set
+/// the `AllowContract` fast-math flag on all float operations.
+/// This lets LLVM fuse `fmul + fadd → fma` without enabling other
+/// fast-math transforms. Safe for inference (FMA has higher precision).
+unsafe fn set_contract_fastmath_flags(module: llvm_sys::prelude::LLVMModuleRef) {
+    use llvm_sys::core::*;
+    const ALLOW_CONTRACT: u32 = 1 << 5; // LLVMFastMathAllowContract
+
+    unsafe {
+        let mut func = LLVMGetFirstFunction(module);
+        while !func.is_null() {
+            let mut bb = LLVMGetFirstBasicBlock(func);
+            while !bb.is_null() {
+                let mut inst = LLVMGetFirstInstruction(bb);
+                while !inst.is_null() {
+                    if LLVMCanValueUseFastMathFlags(inst) != 0 {
+                        let existing = LLVMGetFastMathFlags(inst);
+                        LLVMSetFastMathFlags(inst, existing | ALLOW_CONTRACT);
+                    }
+                    inst = LLVMGetNextInstruction(inst);
+                }
+                bb = LLVMGetNextBasicBlock(bb);
+            }
+            func = LLVMGetNextFunction(func);
+        }
+    }
+}
+
 /// Initialises LLVM targets on first call (via `OnceLock`), translates the
 /// module to LLVM IR, runs the O3 optimisation pipeline, and writes a PIC
 /// object file to `output_path`.
@@ -99,6 +127,11 @@ unsafe fn optimise_and_emit(
             LLVMRelocMode::LLVMRelocPIC,
             LLVMCodeModel::LLVMCodeModelDefault,
         );
+
+        // Set AllowContract fast-math flag on all float instructions.
+        // This enables FMA fusion (fmul + fadd → fma) without other fast-math transforms.
+        // The flag is safe for inference — FMA is more precise (single rounding).
+        set_contract_fastmath_flags(llvm_module);
 
         let opts = LLVMCreatePassBuilderOptions();
         let passes = CString::new(format!("default<{opt_level}>")).unwrap();

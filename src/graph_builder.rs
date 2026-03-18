@@ -208,7 +208,7 @@ pub fn compile_from_mlir(
             canonicalize,\
             cse,\
             sccp,\
-            convert-vector-to-llvm,\
+            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
             convert-ub-to-llvm,\
             convert-math-to-llvm,\
             expand-strided-metadata,\
@@ -781,6 +781,16 @@ impl<'c> GraphBuilder<'c> {
         self.context
     }
 
+    /// Build the `fastmath = #arith.fastmath<contract>` attribute pair.
+    /// Enables FMA fusion (mul+add → fma) without enabling other fast-math transforms.
+    fn fastmath_contract_attr(&self) -> (Identifier<'c>, Attribute<'c>) {
+        (
+            Identifier::new(self.context, "fastmath"),
+            Attribute::parse(self.context, "#arith.fastmath<contract>")
+                .expect("#arith.fastmath<contract>"),
+        )
+    }
+
     /// Access the MLIR location.
     pub fn location(&self) -> Location<'c> {
         self.location
@@ -1329,12 +1339,17 @@ impl<'c> GraphBuilder<'c> {
         ]);
         let a: melior::ir::Value = body_block.argument(0).unwrap().into();
         let b: melior::ir::Value = body_block.argument(1).unwrap().into();
+        let mut builder = OperationBuilder::new(body_op, self.location)
+            .add_operands(&[a, b])
+            .add_results(&[elem_type]);
+        if body_op.ends_with('f') {
+            // Float arith ops: enable FMA contraction.
+            let (id, val) = self.fastmath_contract_attr();
+            builder = builder.add_attributes(&[(id, val)]);
+        }
         let op_result = body_block
             .append_operation(
-                OperationBuilder::new(body_op, self.location)
-                    .add_operands(&[a, b])
-                    .add_results(&[elem_type])
-                    .build()
+                builder.build()
                     .unwrap_or_else(|e| panic!("{body_op} in linalg body: {e}")),
             )
             .result(0)
@@ -3014,17 +3029,21 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let mul: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => block
-                .append_operation(
-                    OperationBuilder::new("arith.mulf", self.location)
-                        .add_operands(&[lhs_e, rhs_e])
-                        .add_results(&[elem_type])
-                        .build()
-                        .expect("arith.mulf"),
-                )
-                .result(0)
-                .unwrap()
-                .into(),
+            DType::F32 | DType::F64 => {
+                let (fmid, fmval) = self.fastmath_contract_attr();
+                block
+                    .append_operation(
+                        OperationBuilder::new("arith.mulf", self.location)
+                            .add_operands(&[lhs_e, rhs_e])
+                            .add_results(&[elem_type])
+                            .add_attributes(&[(fmid, fmval)])
+                            .build()
+                            .expect("arith.mulf"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            }
             DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.muli", self.location)
@@ -3038,17 +3057,21 @@ impl<'c> GraphBuilder<'c> {
                 .into(),
         };
         let add: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => block
-                .append_operation(
-                    OperationBuilder::new("arith.addf", self.location)
-                        .add_operands(&[acc_e, mul])
-                        .add_results(&[elem_type])
-                        .build()
-                        .expect("arith.addf"),
-                )
-                .result(0)
-                .unwrap()
-                .into(),
+            DType::F32 | DType::F64 => {
+                let (fmid, fmval) = self.fastmath_contract_attr();
+                block
+                    .append_operation(
+                        OperationBuilder::new("arith.addf", self.location)
+                            .add_operands(&[acc_e, mul])
+                            .add_results(&[elem_type])
+                            .add_attributes(&[(fmid, fmval)])
+                            .build()
+                            .expect("arith.addf"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            }
             DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.addi", self.location)
@@ -5094,6 +5117,7 @@ impl<'c> GraphBuilder<'c> {
                 OperationBuilder::new("arith.mulf", self.location)
                     .add_operands(&[x, sc])
                     .add_results(&[elem_type])
+                    .add_attributes(&[self.fastmath_contract_attr()])
                     .build()
                     .expect("arith.mulf scale"),
             )
@@ -6000,15 +6024,19 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let prod: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => block
-                .append_operation(
-                    OperationBuilder::new("arith.mulf", self.location)
-                        .add_operands(&[in_e, filter_e])
-                        .add_results(&[elem_type])
-                        .build()
-                        .expect("arith.mulf conv2d"),
-                )
-                .result(0).unwrap().into(),
+            DType::F32 | DType::F64 => {
+                let (fmid, fmval) = self.fastmath_contract_attr();
+                block
+                    .append_operation(
+                        OperationBuilder::new("arith.mulf", self.location)
+                            .add_operands(&[in_e, filter_e])
+                            .add_results(&[elem_type])
+                            .add_attributes(&[(fmid, fmval)])
+                            .build()
+                            .expect("arith.mulf conv2d"),
+                    )
+                    .result(0).unwrap().into()
+            }
             DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.muli", self.location)
@@ -6020,15 +6048,19 @@ impl<'c> GraphBuilder<'c> {
                 .result(0).unwrap().into(),
         };
         let sum: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => block
-                .append_operation(
-                    OperationBuilder::new("arith.addf", self.location)
-                        .add_operands(&[acc_e, prod])
-                        .add_results(&[elem_type])
-                        .build()
-                        .expect("arith.addf conv2d"),
-                )
-                .result(0).unwrap().into(),
+            DType::F32 | DType::F64 => {
+                let (fmid, fmval) = self.fastmath_contract_attr();
+                block
+                    .append_operation(
+                        OperationBuilder::new("arith.addf", self.location)
+                            .add_operands(&[acc_e, prod])
+                            .add_results(&[elem_type])
+                            .add_attributes(&[(fmid, fmval)])
+                            .build()
+                            .expect("arith.addf conv2d"),
+                    )
+                    .result(0).unwrap().into()
+            }
             DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.addi", self.location)
@@ -6742,7 +6774,7 @@ impl<'c> GraphBuilder<'c> {
                 canonicalize,\
                 cse,\
                 sccp,\
-                convert-vector-to-llvm,\
+                convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
                 convert-ub-to-llvm,\
                 convert-math-to-llvm,\
                 expand-strided-metadata,\
@@ -7043,29 +7075,26 @@ impl<'c> GraphBuilder<'c> {
 
         // Cast index to element type, then compute start + idx * delta.
         let idx_cast = self.emit_index_to_elem_in_block(&body_block, idx, dtype);
+        let is_float = matches!(dtype, DType::F32 | DType::F64);
+        let mut mul_builder = OperationBuilder::new(
+            if is_float { "arith.mulf" } else { "arith.muli" },
+            self.location,
+        )
+            .add_operands(&[idx_cast, delta_elem])
+            .add_results(&[elem_type]);
+        if is_float { mul_builder = mul_builder.add_attributes(&[self.fastmath_contract_attr()]); }
         let prod: melior::ir::Value = body_block
-            .append_operation(
-                OperationBuilder::new(
-                    if matches!(dtype, DType::F32 | DType::F64) { "arith.mulf" } else { "arith.muli" },
-                    self.location,
-                )
-                    .add_operands(&[idx_cast, delta_elem])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect("range mul"),
-            )
+            .append_operation(mul_builder.build().expect("range mul"))
             .result(0).unwrap().into();
+        let mut add_builder = OperationBuilder::new(
+            if is_float { "arith.addf" } else { "arith.addi" },
+            self.location,
+        )
+            .add_operands(&[start_elem, prod])
+            .add_results(&[elem_type]);
+        if is_float { add_builder = add_builder.add_attributes(&[self.fastmath_contract_attr()]); }
         let val: melior::ir::Value = body_block
-            .append_operation(
-                OperationBuilder::new(
-                    if matches!(dtype, DType::F32 | DType::F64) { "arith.addf" } else { "arith.addi" },
-                    self.location,
-                )
-                    .add_operands(&[start_elem, prod])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect("range add"),
-            )
+            .append_operation(add_builder.build().expect("range add"))
             .result(0).unwrap().into();
 
         body_block.append_operation(
