@@ -193,6 +193,7 @@ pub fn compile_from_mlir(
             func.func(canonicalize,cse),\
             transform-interpreter,\
             func.func(canonicalize,cse),\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
             symbol-dce,\
             func.func(lower-vector-multi-reduction,lower-vector-mask),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
@@ -226,7 +227,7 @@ pub fn compile_from_mlir(
         // Lightweight pipeline: no tiling, no vectorization, just
         // bufferize + lower to LLVM.
         "builtin.module(\
-            func.func(canonicalize,cse),\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
             func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
             fold-memref-alias-ops,\
