@@ -1717,6 +1717,7 @@ pub fn emit_and_compile_plan(
         num_nodes: usize,
         num_in: usize,
         num_out: usize,
+        ops_label: String,
     }
 
     let mut emit_results: Vec<KernelEmitResult> = Vec::new();
@@ -1772,6 +1773,25 @@ pub fn emit_and_compile_plan(
 
         let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
 
+        // Build a short label for the kernel's op types.
+        let ops_label = if group.node_indices.len() == 1 {
+            model.nodes[group.node_indices[0]].op_type.clone()
+        } else {
+            let types: Vec<&str> = group.node_indices.iter()
+                .map(|&ni| model.nodes[ni].op_type.as_str())
+                .collect();
+            // Deduplicate for compact display.
+            let mut unique: Vec<&str> = Vec::new();
+            for t in &types {
+                if !unique.contains(t) { unique.push(t); }
+            }
+            if unique.len() <= 3 {
+                unique.join("+")
+            } else {
+                format!("{}+...({})", unique[..2].join("+"), types.len())
+            }
+        };
+
         emit_results.push(KernelEmitResult {
             mlir_text,
             num_inputs,
@@ -1781,6 +1801,7 @@ pub fn emit_and_compile_plan(
             num_nodes: group.node_indices.len(),
             num_in: io.input_slots.len(),
             num_out: io.output_slots.len(),
+            ops_label,
         });
 
         steps.push(KernelStep {
@@ -1800,7 +1821,7 @@ pub fn emit_and_compile_plan(
             .par_iter()
             .map(|er| {
                 let t0 = std::time::Instant::now();
-                let label = format!("k{}", er.group_idx);
+                let label = format!("k{}:{}", er.group_idx, er.ops_label);
                 let compiled = crate::graph_builder::compile_from_mlir(
                     &er.mlir_text,
                     er.num_inputs,
@@ -1812,8 +1833,8 @@ pub fn emit_and_compile_plan(
                     format!("kernel {}: {e}", er.group_idx)
                 ))?;
                 eprintln!(
-                    "[{:>8.2}s] [plan] kernel {} ({} nodes, {} in / {} out): {}ms",
-                    crate::log_ts(), er.group_idx, er.num_nodes, er.num_in, er.num_out,
+                    "[{:>8.2}s] [plan] k{} [{}] ({} in / {} out): {}ms",
+                    crate::log_ts(), er.group_idx, er.ops_label, er.num_in, er.num_out,
                     t0.elapsed().as_millis()
                 );
                 Ok(compiled)
