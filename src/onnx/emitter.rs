@@ -1666,6 +1666,178 @@ fn partition_nodes(nodes: &[OnnxNode]) -> Vec<KernelGroup> {
     groups
 }
 
+/// Info about a Gemm→Reshape→Add fusion detected in the graph.
+struct GemmResidualFusion {
+    /// Node index of the Reshape that expands Gemm output to 3D.
+    reshape_idx: usize,
+    /// Node index of the Add (residual connection).
+    add_idx: usize,
+    /// ONNX value name of the residual input to the Add (the non-Gemm input).
+    residual_name: String,
+    /// ONNX value name of the Add output (what downstream nodes consume).
+    add_output_name: String,
+}
+
+/// Shape-prep op types that appear between Gemm output and Reshape.
+const SHAPE_PREP_OPS: &[&str] = &[
+    "Constant",
+    "Unsqueeze",
+    "Concat",
+    "Gather",
+    "Shape",
+    "Slice",
+    "Squeeze",
+];
+
+/// Detect `Gemm → [shape_prep...] → Reshape → Add(residual)` patterns.
+///
+/// Returns a map from Gemm group index → fusion info. When detected, the
+/// shape_prep + Reshape + Add nodes are absorbed into the Gemm group.
+fn detect_and_absorb_gemm_residual(
+    nodes: &[OnnxNode],
+    groups: &mut Vec<KernelGroup>,
+) -> HashMap<usize, GemmResidualFusion> {
+    let mut fusions: HashMap<usize, GemmResidualFusion> = HashMap::new();
+
+    // Build: value_name → producing node index.
+    let mut producer: HashMap<&str, usize> = HashMap::new();
+    for (ni, node) in nodes.iter().enumerate() {
+        for out in &node.outputs {
+            producer.insert(out.as_str(), ni);
+        }
+    }
+
+    let gi_count = groups.len();
+    let mut gi = 0;
+    while gi + 1 < gi_count {
+        // Is this group a single Gemm with alpha=1, beta=1, rank-1 bias?
+        if groups[gi].node_indices.len() != 1 {
+            gi += 1;
+            continue;
+        }
+        let gemm_ni = groups[gi].node_indices[0];
+        let gemm_node = &nodes[gemm_ni];
+        if gemm_node.op_type != "Gemm" {
+            gi += 1;
+            continue;
+        }
+        let alpha = get_float_attr(&gemm_node.attributes, "alpha", 1.0) as f32;
+        let beta = get_float_attr(&gemm_node.attributes, "beta", 1.0) as f32;
+        if (alpha - 1.0).abs() > f32::EPSILON || (beta - 1.0).abs() > f32::EPSILON {
+            gi += 1;
+            continue;
+        }
+
+        // Look at the next (lightweight) group for the Reshape→Add pattern.
+        let next_gi = gi + 1;
+        let next_nodes = &groups[next_gi].node_indices;
+
+        // Walk the lightweight group to find: shape_prep... → Reshape(gemm_out) → Add.
+        let gemm_out = &gemm_node.outputs[0];
+        let mut reshape_idx = None;
+        let mut add_idx = None;
+        for &ni in next_nodes {
+            let node = &nodes[ni];
+            if SHAPE_PREP_OPS.contains(&node.op_type.as_str()) {
+                // Shape prep — candidate for absorption.
+                // Only absorb if it feeds the Reshape (checked indirectly below).
+                continue;
+            }
+            if node.op_type == "Reshape" && reshape_idx.is_none() {
+                // Check: does this Reshape consume the Gemm output?
+                if node.inputs[0] == *gemm_out {
+                    reshape_idx = Some(ni);
+                    continue;
+                }
+            }
+            if node.op_type == "Add" && reshape_idx.is_some() && add_idx.is_none() {
+                let reshape_out = &nodes[reshape_idx.unwrap()].outputs[0];
+                // One Add input must be the Reshape output.
+                if node.inputs[0] == *reshape_out || node.inputs[1] == *reshape_out {
+                    add_idx = Some(ni);
+                    // Find the residual (the other input).
+                    let residual = if node.inputs[0] == *reshape_out {
+                        &node.inputs[1]
+                    } else {
+                        &node.inputs[0]
+                    };
+                    // The residual must NOT be produced within this lightweight group
+                    // (it comes from outside — the actual residual connection).
+                    let produced_in_group = next_nodes
+                        .iter()
+                        .any(|&nj| nodes[nj].outputs.contains(residual));
+                    if produced_in_group {
+                        add_idx = None; // Not a residual pattern
+                    }
+                }
+                break; // Stop after first Add
+            }
+        }
+
+        if let (Some(r_idx), Some(a_idx)) = (reshape_idx, add_idx) {
+            let add_node = &nodes[a_idx];
+            let reshape_out = &nodes[r_idx].outputs[0];
+            let residual = if add_node.inputs[0] == *reshape_out {
+                add_node.inputs[1].clone()
+            } else {
+                add_node.inputs[0].clone()
+            };
+
+            // Determine which shape_prep nodes to absorb: walk transitive
+            // dependencies of the Reshape and Add within this lightweight group.
+            let mut to_absorb: Vec<usize> = vec![r_idx, a_idx];
+            // Iterate until no new nodes are found (transitive closure).
+            loop {
+                let mut changed = false;
+                for &ni in next_nodes {
+                    if to_absorb.contains(&ni) {
+                        continue;
+                    }
+                    let node = &nodes[ni];
+                    if !SHAPE_PREP_OPS.contains(&node.op_type.as_str()) {
+                        continue;
+                    }
+                    // Check if any output feeds an already-absorbed node.
+                    let feeds_absorbed = node
+                        .outputs
+                        .iter()
+                        .any(|out| to_absorb.iter().any(|&nj| nodes[nj].inputs.contains(out)));
+                    if feeds_absorbed {
+                        to_absorb.push(ni);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            let fusion = GemmResidualFusion {
+                reshape_idx: r_idx,
+                add_idx: a_idx,
+                residual_name: residual,
+                add_output_name: add_node.outputs[0].clone(),
+            };
+
+            // Absorb into Gemm group, maintaining original graph order.
+            groups[gi].node_indices.extend_from_slice(&to_absorb);
+            groups[gi].node_indices.sort_unstable();
+            groups[next_gi]
+                .node_indices
+                .retain(|ni| !to_absorb.contains(ni));
+
+            fusions.insert(gi, fusion);
+        }
+
+        gi += 1;
+    }
+
+    // Remove empty groups.
+    groups.retain(|g| !g.node_indices.is_empty());
+
+    fusions
+}
+
 /// I/O mapping for a single kernel: which ONNX value names are inputs/outputs
 /// and which buffer pool slot they map to.
 struct KernelIO {
@@ -1848,7 +2020,15 @@ pub fn emit_and_compile_plan(
     use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
     use crate::shape::DIM_DYNAMIC;
 
-    let groups = partition_nodes(&model.nodes);
+    let mut groups = partition_nodes(&model.nodes);
+    let gemm_residual_fusions = detect_and_absorb_gemm_residual(&model.nodes, &mut groups);
+    if !gemm_residual_fusions.is_empty() {
+        eprintln!(
+            "[{:>8.2}s] [plan] fused {} Gemm+residual Add pairs",
+            crate::log_ts(),
+            gemm_residual_fusions.len()
+        );
+    }
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
         assign_buffer_slots(model, &groups);
 
@@ -2018,9 +2198,57 @@ pub fn emit_and_compile_plan(
         }
 
         // Emit all nodes in this kernel group.
+        // For fused Gemm+residual groups, emit the fused path.
         for &ni in &group.node_indices {
             let node = &model.nodes[ni];
-            emit_node(node, &mut local_value_map, &mut const_i64, &mut builder)?;
+
+            // In a fused group, replace the Gemm emission with the fused version
+            // and skip the Add node (its output is produced by the fused Gemm).
+            if let Some(fusion) = gemm_residual_fusions.get(&gi) {
+                if ni == fusion.add_idx {
+                    // Skip — the Add output was already produced by the fused Gemm.
+                    // But we still need to propagate sym shapes (handled below).
+                    // Alias the Add output to the Reshape output.
+                    let reshape_out = &model.nodes[fusion.reshape_idx].outputs[0];
+                    let t = get_tensor(&mut local_value_map, &mut builder, reshape_out)?;
+                    insert_tensor(&mut local_value_map, &fusion.add_output_name, t);
+                    // Fall through to sym shape propagation below.
+                } else if node.op_type == "Gemm" && group.node_indices[0] == ni {
+                    // Fused Gemm: emit_gemm_with_residual.
+                    let a = get_tensor(&mut local_value_map, &mut builder, &node.inputs[0])?;
+                    let b = get_tensor(&mut local_value_map, &mut builder, &node.inputs[1])?;
+                    let bias = if node.inputs.len() > 2 && !node.inputs[2].is_empty() {
+                        get_tensor(&mut local_value_map, &mut builder, &node.inputs[2])?
+                    } else {
+                        builder.emit_arith_constant(0.0, a.dtype())
+                    };
+                    // The residual is 3D [B,S,N] — collapse to 2D [M,N] for the matmul.
+                    let residual_3d =
+                        get_tensor(&mut local_value_map, &mut builder, &fusion.residual_name)?;
+                    let residual_2d = if residual_3d.rank() == 3 {
+                        builder.emit_flatten_leading(&residual_3d)
+                    } else {
+                        residual_3d
+                    };
+                    let trans_a = get_bool_attr(&node.attributes, "transA");
+                    let trans_b = get_bool_attr(&node.attributes, "transB");
+                    let out = builder.emit_gemm_with_residual(
+                        &a,
+                        &b,
+                        &bias,
+                        &residual_2d,
+                        trans_a,
+                        trans_b,
+                    );
+                    insert_tensor(&mut local_value_map, &node.outputs[0], out);
+                    // Fall through to sym shape propagation.
+                } else {
+                    // Non-Gemm, non-Add node in the fused group (shape prep, Reshape).
+                    emit_node(node, &mut local_value_map, &mut const_i64, &mut builder)?;
+                }
+            } else {
+                emit_node(node, &mut local_value_map, &mut const_i64, &mut builder)?;
+            }
 
             // Propagate symbolic shapes for this node.
             // Use a default empty shape for inputs not in sym_shape_info to preserve
@@ -2080,9 +2308,14 @@ pub fn emit_and_compile_plan(
         //
         // For MatMul [.., M, K] × [K, N]: check all dims except the last (K)
         // of the first input. If any is dynamic → VectorizeOnly, else Full.
-        let transform_mode = if group.node_indices.len() == 1 {
-            let node = &model.nodes[group.node_indices[0]];
-            let is_matmul_like = matches!(node.op_type.as_str(), "Gemm" | "MatMul");
+        // Find the primary heavy op (Gemm/MatMul) in this group.
+        let heavy_node = group
+            .node_indices
+            .iter()
+            .find(|&&ni| matches!(model.nodes[ni].op_type.as_str(), "Gemm" | "MatMul"));
+        let transform_mode = if let Some(&heavy_ni) = heavy_node {
+            let node = &model.nodes[heavy_ni];
+            let is_matmul_like = true;
             if is_matmul_like && !node.inputs.is_empty() {
                 let first_input = &node.inputs[0];
                 let has_dynamic_m = shape_info

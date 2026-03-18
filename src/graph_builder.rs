@@ -199,7 +199,10 @@ pub fn compile_from_mlir(
 
     // Dump pre-pass IR for specific kernels.
     if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
-        let _ = std::fs::write("/tmp/homura_kernel_pre.mlir", module.as_operation().to_string());
+        let _ = std::fs::write(
+            "/tmp/homura_kernel_pre.mlir",
+            module.as_operation().to_string(),
+        );
         eprintln!("[dump] {label} pre-pass IR → /tmp/homura_kernel_pre.mlir");
     }
 
@@ -320,7 +323,10 @@ pub fn compile_from_mlir(
 
     // Dump post-pass IR for specific kernels.
     if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
-        let _ = std::fs::write("/tmp/homura_kernel_post.mlir", module.as_operation().to_string());
+        let _ = std::fs::write(
+            "/tmp/homura_kernel_post.mlir",
+            module.as_operation().to_string(),
+        );
         eprintln!("[dump] {label} post-pass IR → /tmp/homura_kernel_post.mlir");
     }
 
@@ -1209,11 +1215,7 @@ impl<'c> GraphBuilder<'c> {
         let q_heads = kv_heads.map(|h| h * repeats as u64);
         let out_shape = [batch, seq, q_heads, head_dim];
         // reassociation: [[0], [1], [2, 3], [4]] merges the kv_heads and repeats dims
-        self.emit_collapse_shape_with_reassoc(
-            tiled.value(),
-            &out_shape,
-            "[[0], [1], [2, 3], [4]]",
-        )
+        self.emit_collapse_shape_with_reassoc(tiled.value(), &out_shape, "[[0], [1], [2, 3], [4]]")
     }
 
     /// Embedding lookup: gather rows from `weight` by `indices`.
@@ -1237,32 +1239,15 @@ impl<'c> GraphBuilder<'c> {
     ///
     /// Decomposed into slices + elementwise ops. The MLIR pass pipeline fuses
     /// the elementwise chain into a single tiled kernel.
-    pub fn emit_rope(
-        &mut self,
-        x: &Tensor<'c>,
-        cos: &Tensor<'c>,
-        sin: &Tensor<'c>,
-    ) -> Tensor<'c> {
+    pub fn emit_rope(&mut self, x: &Tensor<'c>, cos: &Tensor<'c>, sin: &Tensor<'c>) -> Tensor<'c> {
         let shape = x.shape();
         let head_dim = shape[3].expect("head_dim must be static for RoPE");
 
         // Split into even and odd elements along the last axis (step=2).
         // x_even: [b, s, h, d/2] — elements at indices 0, 2, 4, ...
         // x_odd:  [b, s, h, d/2] — elements at indices 1, 3, 5, ...
-        let x_even = self.emit_slice(
-            x,
-            &[0],
-            &[head_dim as i64],
-            &[-1],
-            &[2],
-        );
-        let x_odd = self.emit_slice(
-            x,
-            &[1],
-            &[head_dim as i64],
-            &[-1],
-            &[2],
-        );
+        let x_even = self.emit_slice(x, &[0], &[head_dim as i64], &[-1], &[2]);
+        let x_odd = self.emit_slice(x, &[1], &[head_dim as i64], &[-1], &[2]);
 
         // cos/sin are [seq, d/2] — unsqueeze to [1, seq, 1, d/2] for broadcast
         // against x_even/x_odd which are [batch, seq, heads, d/2].
@@ -3085,8 +3070,8 @@ impl<'c> GraphBuilder<'c> {
         // Fast path: alpha=1, beta=1, C is a 1D bias vector.
         // Fuse the bias into the matmul by broadcasting it as the initial
         // accumulator. Eliminates a separate add pass over the output.
-        let is_unit_scale = (alpha - 1.0f32).abs() <= f32::EPSILON
-            && (beta - 1.0f32).abs() <= f32::EPSILON;
+        let is_unit_scale =
+            (alpha - 1.0f32).abs() <= f32::EPSILON && (beta - 1.0f32).abs() <= f32::EPSILON;
         if is_unit_scale && c.rank() == 1 {
             return self.emit_matmul_2d_with_bias(
                 a_used.value(),
@@ -3114,6 +3099,44 @@ impl<'c> GraphBuilder<'c> {
         };
 
         self.emit_add(&ab_scaled, &c_scaled)
+    }
+
+    /// Emit `Y = A @ B + bias + residual` in one fused matmul.
+    ///
+    /// Combines the 1D bias broadcast and 2D residual add into a single
+    /// accumulator init, then runs matmul. Result: two passes (init + matmul)
+    /// instead of three (bias_broadcast + matmul + residual_add).
+    ///
+    /// Requires alpha=1, beta=1 (caller must verify).
+    pub fn emit_gemm_with_residual(
+        &mut self,
+        a: &Tensor<'c>,
+        b: &Tensor<'c>,
+        bias: &Tensor<'c>,
+        residual: &Tensor<'c>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Tensor<'c> {
+        let a_used = if transpose_a {
+            self.emit_linalg_transpose_2d(a)
+        } else {
+            *a
+        };
+        let b_used = if transpose_b {
+            self.emit_linalg_transpose_2d(b)
+        } else {
+            *b
+        };
+
+        self.emit_matmul_2d_with_bias_and_residual(
+            a_used.value(),
+            &a_used.shape(),
+            b_used.value(),
+            &b_used.shape(),
+            bias.value(),
+            residual.value(),
+            &residual.shape(),
+        )
     }
 
     // ── Matmul internals ──────────────────────────────────────────────────────
@@ -3326,7 +3349,10 @@ impl<'c> GraphBuilder<'c> {
                     .add_operands(&[bias_val, empty])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), bcast_indexing),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            bcast_indexing,
+                        ),
                         (Identifier::new(self.context, "iterator_types"), bcast_iters),
                         (
                             Identifier::new(self.context, "operandSegmentSizes"),
@@ -3365,7 +3391,10 @@ impl<'c> GraphBuilder<'c> {
                     .add_operands(&[lhs_val, rhs_val, filled_result])
                     .add_results(&[out_type2])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
                         (
                             Identifier::new(self.context, "iterator_types"),
                             iterator_types,
@@ -3378,6 +3407,156 @@ impl<'c> GraphBuilder<'c> {
                     .add_regions([matmul_region])
                     .build()
                     .expect("linalg.generic matmul 2d with bias"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
+    /// Emit `Y = A @ B + bias + residual` as a single matmul with fused
+    /// accumulator.  The init pass computes `bias[n] + residual[m,n]` per
+    /// element, then the matmul accumulates `A[m,k]*B[k,n]` on top.
+    fn emit_matmul_2d_with_bias_and_residual(
+        &mut self,
+        lhs_val: melior::ir::Value<'c, 'c>,
+        lhs_shape: &[Option<u64>], // [M, K]
+        rhs_val: melior::ir::Value<'c, 'c>,
+        rhs_shape: &[Option<u64>],               // [K, N]
+        bias_val: melior::ir::Value<'c, 'c>,     // [N]
+        residual_val: melior::ir::Value<'c, 'c>, // [M, N]
+        _residual_shape: &[Option<u64>],         // [M, N]
+    ) -> Tensor<'c> {
+        let m = lhs_shape[0];
+        let n = rhs_shape[1];
+        let out_shape = vec![m, n];
+        let dtype = self.value_dtype(lhs_val);
+
+        // Build init tensor: bias[n] + residual[m,n] for each (m,n).
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let mut dyn_sources = Vec::new();
+        if m.is_none() {
+            // M is dynamic — get it from the residual's dim 0.
+            dyn_sources.push((residual_val, 0usize));
+        }
+        if n.is_none() {
+            dyn_sources.push((rhs_val, 1));
+        }
+        let empty = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+
+        // linalg.generic: ins(bias[N], residual[M,N]) outs(empty[M,N])
+        //   body: yield bias_elem + residual_elem
+        let bias_map = "affine_map<(d0, d1) -> (d1)>"; // broadcast N
+        let res_map = "affine_map<(d0, d1) -> (d0, d1)>";
+        let out_map = "affine_map<(d0, d1) -> (d0, d1)>";
+        let init_indexing =
+            Attribute::parse(self.context, &format!("[{bias_map}, {res_map}, {out_map}]"))
+                .expect("bias+residual init indexing maps");
+        let init_iters = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>]",
+        )
+        .expect("bias+residual init iterator types");
+        let init_segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("bias+residual segment");
+
+        let init_region = {
+            let f32_type = dtype.to_mlir_type(self.context);
+            let block = Block::new(&[
+                (f32_type, self.location),
+                (f32_type, self.location),
+                (f32_type, self.location),
+            ]);
+            let bias_elem: melior::ir::Value = block.argument(0).unwrap().into();
+            let res_elem: melior::ir::Value = block.argument(1).unwrap().into();
+            let sum: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.addf", self.location)
+                        .add_operands(&[bias_elem, res_elem])
+                        .add_results(&[f32_type])
+                        .build()
+                        .expect("arith.addf (bias+residual)"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let yield_op = OperationBuilder::new("linalg.yield", self.location)
+                .add_operands(&[sum])
+                .build()
+                .expect("linalg.yield (bias+residual init)");
+            block.append_operation(yield_op);
+            let region = Region::new();
+            region.append_block(block);
+            region
+        };
+
+        let filled_result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[bias_val, residual_val, empty])
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            init_indexing,
+                        ),
+                        (Identifier::new(self.context, "iterator_types"), init_iters),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            init_segment,
+                        ),
+                    ])
+                    .add_regions([init_region])
+                    .build()
+                    .expect("linalg.generic bias+residual init"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        // Now emit the matmul with the fused init as accumulator.
+        let out_type2 = self.make_tensor_type(&out_shape, dtype);
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
+        let matmul_region = self.make_matmul_region(dtype);
+
+        let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
+        let rhs_matmul_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
+        let out_matmul_map = "affine_map<(d0, d1, d2) -> (d0, d1)>";
+        let indexing_maps = Attribute::parse(
+            self.context,
+            &format!("[{lhs_map}, {rhs_matmul_map}, {out_matmul_map}]"),
+        )
+        .expect("matmul 2d with bias+residual indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+        ).expect("matmul 2d with bias+residual iterator types");
+
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[lhs_val, rhs_val, filled_result])
+                    .add_results(&[out_type2])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
+                    ])
+                    .add_regions([matmul_region])
+                    .build()
+                    .expect("linalg.generic matmul 2d with bias+residual"),
             )
             .result(0)
             .unwrap()
@@ -6107,6 +6286,24 @@ impl<'c> GraphBuilder<'c> {
 
     /// Collapse a 2D tensor to 1D via `tensor.collapse_shape`.
     /// Reassociation: `[[0, 1]]` — source dims 0,1 collapse into target dim 0.
+    /// Collapse leading dimensions of a tensor: [d0, d1, ..., dN] → [d0*d1, ..., dN].
+    /// Used to flatten 3D [B, S, N] → 2D [M, N] for matmul.
+    pub fn emit_flatten_leading(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
+        let shape = input.shape();
+        assert!(shape.len() >= 2, "emit_flatten_leading requires rank >= 2");
+        // Merge dims 0..=(rank-2) into one, keep last dim separate.
+        let last = *shape.last().unwrap();
+        // The merged dim is dynamic if any of the leading dims is dynamic.
+        let merged: Option<u64> = shape[..shape.len() - 1]
+            .iter()
+            .try_fold(1u64, |acc, d| d.map(|v| acc * v));
+        let tgt_shape = vec![merged, last];
+        // Reassociation: [[0, 1, ...rank-2], [rank-1]]
+        let leading: Vec<String> = (0..shape.len() - 1).map(|i| i.to_string()).collect();
+        let reassoc = format!("[[{}], [{}]]", leading.join(", "), shape.len() - 1);
+        self.emit_collapse_shape_with_reassoc(input.value(), &tgt_shape, &reassoc)
+    }
+
     fn emit_collapse_shape_2d_to_1d(
         &mut self,
         input: melior::ir::Value<'c, 'c>,
@@ -9913,10 +10110,7 @@ mod tests {
         let got = result[0].as_slice::<f32>();
 
         // silu(x) = x * sigmoid(x)
-        let expected: Vec<f32> = data
-            .iter()
-            .map(|&x| x / (1.0 + (-x).exp()))
-            .collect();
+        let expected: Vec<f32> = data.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
         for (g, e) in got.iter().zip(expected.iter()) {
             assert!(
                 (g - e).abs() < 1e-5,
@@ -10022,9 +10216,9 @@ mod tests {
         // weight rows: row0=[0,0,0], row1=[1,1,1], row2=[2,2,2], row3=[3,3,3]
         let w_data = [
             0.0f32, 0.0, 0.0, // row 0
-            1.0,    1.0, 1.0, // row 1
-            2.0,    2.0, 2.0, // row 2
-            3.0,    3.0, 3.0, // row 3
+            1.0, 1.0, 1.0, // row 1
+            2.0, 2.0, 2.0, // row 2
+            3.0, 3.0, 3.0, // row 3
         ];
         // indices: [[0, 2], [1, 3]]
         let idx_data = [0i64, 2, 1, 3];
@@ -10035,9 +10229,9 @@ mod tests {
         // Expected: row0, row2, row1, row3
         let expected = [
             0.0f32, 0.0, 0.0, // [0,0,:] = row0
-            2.0,    2.0, 2.0, // [0,1,:] = row2
-            1.0,    1.0, 1.0, // [1,0,:] = row1
-            3.0,    3.0, 3.0, // [1,1,:] = row3
+            2.0, 2.0, 2.0, // [0,1,:] = row2
+            1.0, 1.0, 1.0, // [1,0,:] = row1
+            3.0, 3.0, 3.0, // [1,1,:] = row3
         ];
         assert_eq!(result[0].as_slice::<f32>(), &expected);
     }
