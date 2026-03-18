@@ -3082,24 +3082,37 @@ impl<'c> GraphBuilder<'c> {
             *b
         };
 
-        // Compute A @ B via 2D matmul.
+        // Fast path: alpha=1, beta=1, C is a 1D bias vector.
+        // Fuse the bias into the matmul by broadcasting it as the initial
+        // accumulator. Eliminates a separate add pass over the output.
+        let is_unit_scale = (alpha - 1.0f32).abs() <= f32::EPSILON
+            && (beta - 1.0f32).abs() <= f32::EPSILON;
+        if is_unit_scale && c.rank() == 1 {
+            return self.emit_matmul_2d_with_bias(
+                a_used.value(),
+                &a_used.shape(),
+                b_used.value(),
+                &b_used.shape(),
+                c.value(),
+                &c.shape(),
+            );
+        }
+
+        // General path: matmul then scale and add.
         let ab = self.emit_matmul(&a_used, &b_used);
 
-        // Scale by alpha if != 1.0.
         let ab_scaled = if (alpha - 1.0f32).abs() > f32::EPSILON {
             self.emit_linalg_scale_f32(ab, alpha)
         } else {
             ab
         };
 
-        // Scale C by beta if != 1.0.
         let c_scaled = if (beta - 1.0f32).abs() > f32::EPSILON {
             self.emit_linalg_scale_f32(*c, beta)
         } else {
             *c
         };
 
-        // Add: (alpha * A@B) + (beta * C).
         self.emit_add(&ab_scaled, &c_scaled)
     }
 
@@ -3239,6 +3252,132 @@ impl<'c> GraphBuilder<'c> {
                     .add_regions([matmul_region])
                     .build()
                     .expect("linalg.generic batch matmul 3d"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
+    /// Emit `linalg.generic` matmul for 2D inputs with a 1D bias fused in.
+    /// `[M,K] x [K,N] + [N] -> [M,N]`.
+    /// The bias is broadcast to [M,N] as the initial accumulator, so the
+    /// matmul body `out += a * b` starts from `bias[n]` instead of `0`.
+    fn emit_matmul_2d_with_bias(
+        &mut self,
+        lhs_val: melior::ir::Value<'c, 'c>,
+        lhs_shape: &[Option<u64>], // [M, K]
+        rhs_val: melior::ir::Value<'c, 'c>,
+        rhs_shape: &[Option<u64>], // [K, N]
+        bias_val: melior::ir::Value<'c, 'c>,
+        _bias_shape: &[Option<u64>], // [N]
+    ) -> Tensor<'c> {
+        let m = lhs_shape[0];
+        let n = rhs_shape[1];
+        let out_shape = vec![m, n];
+        let dtype = self.value_dtype(lhs_val);
+
+        // Broadcast bias [N] to [M, N] using linalg.generic with projected map.
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let mut dyn_sources = Vec::new();
+        if m.is_none() {
+            dyn_sources.push((lhs_val, 0usize));
+        }
+        if n.is_none() {
+            dyn_sources.push((rhs_val, 1));
+        }
+        // Use zero-filled tensor as the output for the broadcast generic.
+        // The broadcast body overwrites every element with bias[n].
+        let empty = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+
+        let bias_map = "affine_map<(d0, d1) -> (d1)>"; // broadcast N
+        let out_map_bcast = "affine_map<(d0, d1) -> (d0, d1)>";
+        let bcast_indexing =
+            Attribute::parse(self.context, &format!("[{bias_map}, {out_map_bcast}]"))
+                .expect("bias broadcast indexing maps");
+        let bcast_iters = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>]",
+        )
+        .expect("bias broadcast iterator types");
+        let bcast_segment =
+            Attribute::parse(self.context, "array<i32: 1, 1>").expect("bias broadcast segment");
+
+        let bcast_region = {
+            let block = Block::new(&[
+                (dtype.to_mlir_type(self.context), self.location),
+                (dtype.to_mlir_type(self.context), self.location),
+            ]);
+            let in_val: melior::ir::Value = block.argument(0).unwrap().into();
+            let yield_op = OperationBuilder::new("linalg.yield", self.location)
+                .add_operands(&[in_val])
+                .build()
+                .expect("linalg.yield (bias broadcast)");
+            block.append_operation(yield_op);
+            let region = Region::new();
+            region.append_block(block);
+            region
+        };
+
+        let filled_result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[bias_val, empty])
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (Identifier::new(self.context, "indexing_maps"), bcast_indexing),
+                        (Identifier::new(self.context, "iterator_types"), bcast_iters),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            bcast_segment,
+                        ),
+                    ])
+                    .add_regions([bcast_region])
+                    .build()
+                    .expect("linalg.generic bias broadcast"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        // Now emit the matmul using the bias-filled tensor as accumulator.
+        let out_type2 = self.make_tensor_type(&out_shape, dtype);
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
+        let matmul_region = self.make_matmul_region(dtype);
+
+        let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
+        let rhs_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
+        let out_map = "affine_map<(d0, d1, d2) -> (d0, d1)>";
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{lhs_map}, {rhs_map}, {out_map}]"))
+                .expect("matmul 2d with bias indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
+        ).expect("matmul 2d with bias iterator types");
+
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[lhs_val, rhs_val, filled_result])
+                    .add_results(&[out_type2])
+                    .add_attributes(&[
+                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
+                    ])
+                    .add_regions([matmul_region])
+                    .build()
+                    .expect("linalg.generic matmul 2d with bias"),
             )
             .result(0)
             .unwrap()
