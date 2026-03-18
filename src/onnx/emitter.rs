@@ -1500,7 +1500,7 @@ fn assign_buffer_slots(
     let mut slot_names: Vec<String> = Vec::new();
     let mut next_slot = 0usize;
 
-    let mut alloc_slot = |name: &str, name_to_slot: &mut HashMap<String, usize>,
+    let alloc_slot = |name: &str, name_to_slot: &mut HashMap<String, usize>,
                           slot_names: &mut Vec<String>, next: &mut usize| -> usize {
         if let Some(&s) = name_to_slot.get(name) {
             s
@@ -1522,7 +1522,6 @@ fn assign_buffer_slots(
 
     // Assign slots for weights (in order).
     let mut weight_slots: Vec<usize> = Vec::new();
-    let weight_names: HashSet<String> = model.initializers.iter().map(|(n, _)| n.clone()).collect();
     for (name, _) in &model.initializers {
         let s = alloc_slot(name, &mut name_to_slot, &mut slot_names, &mut next_slot);
         weight_slots.push(s);
@@ -1542,7 +1541,7 @@ fn assign_buffer_slots(
 
     // Build per-kernel I/O.
     let mut kernel_ios: Vec<KernelIO> = Vec::new();
-    for (gi, group) in groups.iter().enumerate() {
+    for group in groups.iter() {
         let mut produced_in_group: HashSet<String> = HashSet::new();
         for &ni in &group.node_indices {
             for out_name in &model.nodes[ni].outputs {
@@ -1660,7 +1659,6 @@ pub fn emit_and_compile_plan(
     }
 
     // Seed shape info from weights.
-    let weight_names: HashSet<String> = model.initializers.iter().map(|(n, _)| n.clone()).collect();
     for (name, buf) in &model.initializers {
         shape_info.insert(name.clone(), ValueShapeInfo {
             shape: buf.shape().0.iter().map(|&d| Some(d)).collect(),
@@ -1714,7 +1712,6 @@ pub fn emit_and_compile_plan(
         output_descs: Vec<crate::runtime::OutputDesc>,
         cache_key: Option<String>,
         group_idx: usize,
-        num_nodes: usize,
         num_in: usize,
         num_out: usize,
         ops_label: String,
@@ -1800,7 +1797,6 @@ pub fn emit_and_compile_plan(
             output_descs,
             cache_key,
             group_idx: gi,
-            num_nodes: group.node_indices.len(),
             num_in: io.input_slots.len(),
             num_out: io.output_slots.len(),
             ops_label,

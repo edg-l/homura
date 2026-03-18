@@ -93,9 +93,9 @@ fn mlir_element_type_to_dtype(ty: melior::ir::Type) -> DType {
 
 /// Tracks one function argument.
 struct ArgInfo {
-    shape: Vec<Option<u64>>,
-    dtype: DType,
-    is_input: bool,
+    _shape: Vec<Option<u64>>,
+    _dtype: DType,
+    _is_input: bool,
 }
 
 /// A completed sub-function ready to be emitted into the MLIR module.
@@ -159,7 +159,6 @@ pub fn compile_from_mlir(
     use melior::pass;
 
     let context = create_context();
-    let location = Location::unknown(&context);
 
     // Cache check.
     if let Some(key) = cache_key {
@@ -635,7 +634,8 @@ fn try_expand(
                             None => {
                                 reassoc[in_i].push(out_fwd);
                                 out_fwd += 1;
-                                has_dynamic = true;
+                                #[allow(unused_assignments)]
+                                { has_dynamic = true; }
                                 // If last input group, consume all remaining.
                                 if in_i == in_end - 1 {
                                     while out_fwd < out_end {
@@ -1420,7 +1420,7 @@ impl<'c> GraphBuilder<'c> {
         out_shape: &[Option<u64>],
         lhs_shape: &[Option<u64>],
         lhs_val: melior::ir::Value<'c, 'c>,
-        rhs_shape: &[Option<u64>],
+        _rhs_shape: &[Option<u64>],
         rhs_val: melior::ir::Value<'c, 'c>,
         dtype: DType,
     ) -> melior::ir::Value<'c, 'c> {
@@ -6842,7 +6842,7 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
 
-        self.args.push(ArgInfo { shape: shape.to_vec(), dtype, is_input });
+        self.args.push(ArgInfo { _shape: shape.to_vec(), _dtype: dtype, _is_input: is_input });
 
         Tensor::from_value(tensor_val)
     }

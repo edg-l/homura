@@ -21,8 +21,8 @@ unsafe extern "C" {
     pub fn LLVMSplitModule(
         M: LLVMModuleRef,
         N: std::ffi::c_uint,
-        Callback: unsafe extern "C" fn(MPart: LLVMModuleRef, UserData: *mut std::ffi::c_void),
-        UserData: *mut std::ffi::c_void,
+        Callback: unsafe extern "C" fn(m_part: LLVMModuleRef, user_data: *mut std::ffi::c_void),
+        user_data: *mut std::ffi::c_void,
     );
 }
 
