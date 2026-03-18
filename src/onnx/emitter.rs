@@ -2457,20 +2457,24 @@ pub fn emit_and_compile_plan(
 
             if let Some(&(layer, is_value)) = kv_concat_meta.get(&ni) {
                 // Track which input is "past" (model input) and which is "new".
+                let mut new_slot = None;
                 for (name, slot) in &io.input_slots {
                     if model_input_names.contains(name.as_str()) {
                         past_kv_input_slots.push(*slot);
+                    } else {
+                        new_slot = Some(*slot);
                     }
                 }
+                let new_slot = new_slot.expect("KvAppend Concat has no non-past (new) input slot");
                 for (_, slot) in &io.output_slots {
                     present_kv_output_slots.push(*slot);
                 }
 
-                // KvAppend keeps both inputs so run() can fall back to Concat.
-                // run_kv() knows which input is "new" (the non-past one).
+                // Only keep the "new" input slot — run_kv() uses step_inputs[0] directly.
+                // run() no longer falls back to Concat for KvAppend steps.
                 steps.push(KernelStep {
                     kernel_idx: usize::MAX,
-                    input_slots: all_input_slots,
+                    input_slots: vec![new_slot],
                     output_slots: all_output_slots,
                     native_op: Some(crate::runtime::NativeOp::KvAppend { layer, is_value }),
                 });

@@ -1157,13 +1157,7 @@ impl ExecutionPlan {
                         (buf, out_slot)
                     }
                     NativeOp::KvAppend { .. } => {
-                        // Fallback: in run() (no KV cache), treat as Concat (axis=2).
-                        assert_eq!(step.output_slots.len(), 1);
-                        let out_slot = step.output_slots[0];
-                        let out_shape = &resolved_shapes[out_slot];
-                        let dtype = self.slot_descs[out_slot].dtype;
-                        let buf = native_concat(&step_inputs, 2, &out_shape.0, dtype);
-                        (buf, out_slot)
+                        panic!("KvAppend in run() — use run_kv() for KV-cached models");
                     }
                 };
                 if let Some(t0) = t0 {
@@ -1439,13 +1433,8 @@ impl ExecutionPlan {
                     }
                     NativeOp::KvAppend { layer, is_value } => {
                         let cache = self.kv_cache.as_mut().expect("KvAppend but no KvCache");
-                        // Find the "new" input: the one whose slot is NOT a past_kv slot.
-                        let new_idx = step
-                            .input_slots
-                            .iter()
-                            .position(|s| !past_kv_set.contains(s))
-                            .expect("KvAppend has no non-past input slot");
-                        let new_data = step_inputs[new_idx];
+                        // input_slots contains only the "new" slot (emitter guarantees this).
+                        let new_data = step_inputs[0];
                         if *is_value {
                             cache.append_value(*layer, new_data);
                         } else {

@@ -222,63 +222,6 @@ impl Model {
         })
     }
 
-    /// Run inference with caller-provided output shapes.
-    ///
-    /// Use this when the model has dynamic output dimensions and the caller
-    /// knows the exact output shapes (e.g., KV cache decode step).
-    pub fn run_with_output_shapes(
-        &self,
-        inputs: &[&Buffer],
-        output_shapes: &[Shape],
-    ) -> Result<Vec<Buffer>, OnnxError> {
-        if inputs.len() != self.num_dynamic_inputs {
-            return Err(OnnxError::WrongInputCount {
-                expected: self.num_dynamic_inputs,
-                got: inputs.len(),
-            });
-        }
-
-        let mut guard = self.state.lock().unwrap();
-
-        if guard.is_none() {
-            let parsed = self
-                .parsed
-                .as_ref()
-                .expect("parsed model must be present when state is None");
-            let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-            *guard = Some(self.do_compile(&resolved, inputs)?);
-        }
-
-        // Recompile if non-dynamic dims changed.
-        if self.parsed.is_some() {
-            let shapes_changed =
-                {
-                    let state = guard.as_ref().unwrap();
-                    inputs.iter().enumerate().any(|(i, buf)| {
-                        let compiled_shape = &state.input_shapes[i];
-                        buf.shape().0.iter().zip(compiled_shape.0.iter()).any(
-                            |(actual, compiled)| *compiled != DIM_DYNAMIC && actual != compiled,
-                        )
-                    })
-                };
-            if shapes_changed {
-                let parsed = self
-                    .parsed
-                    .as_ref()
-                    .expect("parsed model must be present when symbolic dims exist");
-                let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
-                *guard = Some(self.do_compile(&resolved, inputs)?);
-            }
-        }
-
-        let state = guard.as_ref().unwrap();
-        // TODO: run_with_output_shapes needs per-kernel dynamic shape support.
-        // For now, use the plan's normal run path (which handles dynamic outputs
-        // via slot_descs). The caller-provided output_shapes are ignored.
-        let _ = output_shapes;
-        Ok(state.plan.run(inputs, &state.weights))
-    }
-
     /// Whether the compiled plan has KV cache support.
     pub fn has_kv_cache(&self) -> bool {
         let guard = self.state.lock().unwrap();
@@ -294,16 +237,58 @@ impl Model {
         let mut guard = self.state.lock().unwrap();
 
         if guard.is_none() {
-            // Trigger lazy compilation with a full input set (including dummy KV).
-            // This shouldn't normally happen — the model should be compiled first
-            // via a normal run() or explicit compilation.
-            return Err(OnnxError::CompileError(
-                "run_kv: model not compiled yet. Call run() first to compile.".into(),
-            ));
+            // Trigger compilation with dummy KV inputs. The KV dims are
+            // keep_dynamic so their concrete size doesn't matter — use 0.
+            let parsed = self
+                .parsed
+                .as_ref()
+                .expect("parsed model must be present when state is None");
+            let full_inputs = self.build_full_inputs_for_compile(parsed, inputs);
+            let full_refs: Vec<&Buffer> = full_inputs.iter().collect();
+            let resolved = resolve_symbolic_dims(parsed, &full_refs, &self.keep_dynamic)?;
+            *guard = Some(self.do_compile(&resolved, &full_refs)?);
         }
 
         let state = guard.as_mut().unwrap();
         Ok(state.plan.run_kv(inputs, &state.weights, max_seq_len))
+    }
+
+    /// Build a full input list for compilation by inserting dummy KV buffers
+    /// at the positions expected by the model's dynamic_inputs.
+    ///
+    /// `non_kv_inputs` are the caller-provided inputs (e.g., input_ids + mask).
+    /// KV inputs (those with "past_key_values" in their name) get zero-filled
+    /// dummy buffers with the symbolic sequence dim set to 0.
+    fn build_full_inputs_for_compile(
+        &self,
+        parsed: &OnnxModel,
+        non_kv_inputs: &[&Buffer],
+    ) -> Vec<Buffer> {
+        let mut full: Vec<Buffer> = Vec::with_capacity(parsed.dynamic_inputs.len());
+        let mut ext_idx = 0;
+        for di in &parsed.dynamic_inputs {
+            if di.name.contains("past_key_values") {
+                // Dummy KV: use fixed dims from the spec, 0 for symbolic (dynamic) dims.
+                let shape: Vec<u64> = di
+                    .dims
+                    .iter()
+                    .map(|d| match d {
+                        parser::Dim::Fixed(v) => *v,
+                        parser::Dim::Symbolic(_) => 0,
+                    })
+                    .collect();
+                full.push(Buffer::new(&shape, di.dtype));
+            } else {
+                assert!(
+                    ext_idx < non_kv_inputs.len(),
+                    "run_kv: not enough non-KV inputs (expected more, got {})",
+                    non_kv_inputs.len()
+                );
+                full.push(non_kv_inputs[ext_idx].clone());
+                ext_idx += 1;
+            }
+        }
+        full
     }
 
     /// Initialize the KV cache from prefill output buffers.
@@ -315,9 +300,48 @@ impl Model {
         max_seq_len: usize,
     ) -> Result<(), OnnxError> {
         let mut guard = self.state.lock().unwrap();
-        let state = guard.as_mut().ok_or_else(|| {
-            OnnxError::CompileError("init_kv_cache: model not compiled yet".into())
-        })?;
+
+        if guard.is_none() {
+            // Need to compile first. Use the KV buffers themselves to build
+            // a full input set (non-KV inputs get dummies — only shapes matter).
+            let parsed = self
+                .parsed
+                .as_ref()
+                .expect("parsed model must be present when state is None");
+            let dummy_non_kv: Vec<Buffer> = parsed
+                .dynamic_inputs
+                .iter()
+                .filter(|di| !di.name.contains("past_key_values"))
+                .map(|di| {
+                    let shape: Vec<u64> = di
+                        .dims
+                        .iter()
+                        .map(|d| match d {
+                            parser::Dim::Fixed(v) => *v,
+                            parser::Dim::Symbolic(_) => 1,
+                        })
+                        .collect();
+                    Buffer::new(&shape, di.dtype)
+                })
+                .collect();
+            let mut full: Vec<Buffer> = Vec::with_capacity(parsed.dynamic_inputs.len());
+            let mut kv_idx = 0;
+            let mut non_kv_idx = 0;
+            for di in &parsed.dynamic_inputs {
+                if di.name.contains("past_key_values") {
+                    full.push(kv_buffers[kv_idx].clone());
+                    kv_idx += 1;
+                } else {
+                    full.push(dummy_non_kv[non_kv_idx].clone());
+                    non_kv_idx += 1;
+                }
+            }
+            let full_refs: Vec<&Buffer> = full.iter().collect();
+            let resolved = resolve_symbolic_dims(parsed, &full_refs, &self.keep_dynamic)?;
+            *guard = Some(self.do_compile(&resolved, &full_refs)?);
+        }
+
+        let state = guard.as_mut().unwrap();
         state.plan.init_kv_cache(kv_buffers, max_seq_len);
         Ok(())
     }

@@ -108,10 +108,8 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
     const NUM_HEADS: usize = 12;
     const HEAD_DIM: usize = 64;
 
-    // Single input token (e.g., token 257 = "a").
-    let input_ids = Buffer::from_slice::<i64>(&[257], &[1, 1], DType::I64);
-
-    // 24 KV cache tensors, each [1, 12, PAST_LEN, 64] filled with zeros.
+    // 24 KV cache tensors, each [1, 12, PAST_LEN, 64] filled with zeros —
+    // simulating prefill output that seeds the persistent KV cache.
     let kv_size = NUM_HEADS * PAST_LEN * HEAD_DIM;
     let kv_data: Vec<f32> = vec![0.0; kv_size];
     let kv_buffers: Vec<Buffer> = (0..NUM_KV)
@@ -124,23 +122,26 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
         })
         .collect();
 
+    // Initialize the persistent KV cache from the simulated prefill outputs.
+    const MAX_SEQ_LEN: usize = 1024;
+    model
+        .init_kv_cache(&kv_buffers, MAX_SEQ_LEN)
+        .expect("init_kv_cache failed");
+
+    // Single input token (e.g., token 257 = "a").
+    let input_ids = Buffer::from_slice::<i64>(&[257], &[1, 1], DType::I64);
+
     // Attention mask: 1s for the PAST_LEN real positions, 1 for the new token.
     let mask_len = PAST_LEN + 1;
     let mask_data: Vec<i64> = vec![1i64; mask_len];
     let attention_mask = Buffer::from_slice::<i64>(&mask_data, &[1, mask_len as u64], DType::I64);
 
-    // Build input slice: [input_ids, kv[0..23], attention_mask] (26 total).
-    let mut input_refs: Vec<&Buffer> = Vec::with_capacity(26);
-    input_refs.push(&input_ids);
-    for kv in &kv_buffers {
-        input_refs.push(kv);
-    }
-    input_refs.push(&attention_mask);
+    let outputs = model
+        .run_kv(&[&input_ids, &attention_mask], MAX_SEQ_LEN)
+        .expect("decode inference failed");
 
-    let outputs = model.run(&input_refs).expect("decode inference failed");
-
-    // Should produce 25 outputs: logits + 24 new KV tensors.
-    assert_eq!(outputs.len(), 25, "expected 25 outputs");
+    // run_kv returns only non-KV outputs: [logits].
+    assert_eq!(outputs.len(), 1, "expected 1 output (logits only)");
 
     // Logits: [1, 1, 50257].
     assert_eq!(
@@ -149,15 +150,6 @@ fn gpt2_decode_emitter_dynamic_past_sequence_length() {
         "logits shape mismatch"
     );
     assert_eq!(outputs[0].dtype(), DType::F32);
-
-    // New KV tensors: [1, 12, PAST_LEN+1, 64].
-    for i in 1..25 {
-        assert_eq!(
-            outputs[i].shape().0,
-            vec![1, NUM_HEADS as u64, (PAST_LEN + 1) as u64, HEAD_DIM as u64],
-            "KV tensor {i} shape mismatch"
-        );
-    }
 
     // Logits must be finite.
     let logits = outputs[0].as_slice::<f32>();
