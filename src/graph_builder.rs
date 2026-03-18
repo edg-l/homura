@@ -8673,4 +8673,27 @@ mod tests {
         // (x+y)*y = (1+10)*10, (2+20)*20, (3+30)*30, (4+40)*40 = 110, 440, 990, 1760
         assert_eq!(data, &[110.0, 440.0, 990.0, 1760.0]);
     }
+
+    // ── Coverage for previously-untested emit_* methods ──────────────────────
+
+    #[test]
+    fn reshape_with_tensor() {
+        // Reshape [2,3] → [3,2] using a shape tensor
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let input = gb.input(&[Some(2), Some(3)], DType::F32);
+        let shape_tensor = gb.emit_dense_constant("[3, 2]", &[2], DType::I64);
+        let out = gb.emit_reshape_with_tensor(&input, shape_tensor.value(), &[Some(3), Some(2)]);
+        let graph = gb.compile(&[&out]).expect("compile reshape_with_tensor");
+
+        let buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
+        let result = graph.run(&[&buf]);
+        assert_eq!(result[0].shape().0, vec![3, 2]);
+        assert_eq!(result[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    // Note: emit_dynamic_slice, emit_range, emit_tensor_extract_scalar, and
+    // emit_resolve_reshape_dims work with raw MLIR Values at the index type
+    // level. They are exercised through the ONNX integration tests (MNIST,
+    // ResNet, GPT-2) which provide the correct type context.
 }
