@@ -23,6 +23,19 @@ use crate::{
     runtime::{CompiledGraph, OutputDesc},
 };
 
+// ── Transform schedule mode ───────────────────────────────────────────────────
+
+/// Controls which transform schedule is attached to a compiled kernel.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TransformMode {
+    /// No transform schedule — lightweight pipeline (elementwise, BatchNorm).
+    None,
+    /// Full tiling + vectorize + OpenMP schedule.
+    Full,
+    /// Vectorize only — no tiling, no OpenMP. For dynamic-M matmuls (M=1 decode).
+    VectorizeOnly,
+}
+
 // ── Tensor wrapper ────────────────────────────────────────────────────────────
 
 /// A tensor value in a graph being built. Wraps an MLIR `Value` — shape and
@@ -180,15 +193,23 @@ pub fn compile_from_mlir(
     let mut module =
         Module::parse(&context, mlir_text).ok_or_else(|| CompileError::Verification)?;
 
+    // Dump pre-pass IR for specific kernels.
+    if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
+        let _ = std::fs::write("/tmp/homura_kernel_pre.mlir", module.as_operation().to_string());
+        eprintln!("[dump] {label} pre-pass IR → /tmp/homura_kernel_pre.mlir");
+    }
+
     // Run pass pipeline. Use the full pipeline (with transform-interpreter +
     // vector lowering) only for modules with a transform schedule. Lightweight
     // kernels (BatchNorm, elementwise) skip tiling/vectorization entirely.
     let passes_start = std::time::Instant::now();
     let has_schedule = mlir_text.contains("transform.with_named_sequence");
+    let vectorize_only = mlir_text.contains("homura.vectorize_only");
     register_all_passes();
     let pass_manager = pass::PassManager::new(&context);
 
-    let pipeline = if has_schedule {
+    let pipeline = if has_schedule && !vectorize_only {
+        // Full pipeline: tiling + vectorize + OpenMP (for static-M matmuls).
         "builtin.module(\
             func.func(canonicalize,cse),\
             transform-interpreter,\
@@ -223,9 +244,43 @@ pub fn compile_from_mlir(
             convert-openmp-to-llvm,\
             reconcile-unrealized-casts\
         )"
+    } else if has_schedule {
+        // Vectorize-only pipeline: vectorize without tiling or OpenMP.
+        // No scf-forall-to-parallel, no convert-scf-to-openmp, no convert-openmp-to-llvm.
+        // Suitable for dynamic-M matmuls (M=1 decode) where OpenMP overhead dominates.
+        "builtin.module(\
+            func.func(canonicalize,cse),\
+            transform-interpreter,\
+            func.func(canonicalize,cse),\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
+            symbol-dce,\
+            func.func(lower-vector-multi-reduction,lower-vector-mask),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            fold-memref-alias-ops,\
+            convert-vector-to-scf,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
+            convert-ub-to-llvm,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
     } else {
         // Lightweight pipeline: no tiling, no vectorization, just
-        // bufferize + lower to LLVM.
+        // bufferize + lower to LLVM (for elementwise / BatchNorm kernels).
         "builtin.module(\
             func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
@@ -258,6 +313,12 @@ pub fn compile_from_mlir(
         crate::log_ts(),
         passes_start.elapsed().as_millis()
     );
+
+    // Dump post-pass IR for specific kernels.
+    if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
+        let _ = std::fs::write("/tmp/homura_kernel_post.mlir", module.as_operation().to_string());
+        eprintln!("[dump] {label} post-pass IR → /tmp/homura_kernel_post.mlir");
+    }
 
     // AOT compile.
     let tmp_dir = tempfile_dir()
@@ -7157,7 +7218,7 @@ impl<'c> GraphBuilder<'c> {
     pub fn finalize_to_mlir(
         self,
         outputs: &[&Tensor<'c>],
-        attach_transform_schedule: bool,
+        transform_mode: TransformMode,
     ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
         if outputs.is_empty() {
             return Err(CompileError::NoOutputs);
@@ -7288,14 +7349,28 @@ impl<'c> GraphBuilder<'c> {
         );
         module.body().append_operation(function);
 
-        // Attach transform schedule only if the kernel has tileable ops.
-        // Kernels with only elementwise/BatchNorm ops skip the schedule,
-        // so transform-interpreter is a no-op and no vectorization occurs.
-        if attach_transform_schedule {
-            module
-                .as_operation_mut()
-                .set_attribute("transform.with_named_sequence", Attribute::unit(context));
-            crate::compiler::build_transform_schedule(context, &module, location);
+        // Attach transform schedule based on mode.
+        // - Full: tiling + vectorize + OpenMP (for static-M matmuls).
+        // - VectorizeOnly: vectorize without tiling/OpenMP (for dynamic-M matmuls).
+        // - None: skip schedule entirely (elementwise / BatchNorm kernels).
+        match transform_mode {
+            TransformMode::Full => {
+                module
+                    .as_operation_mut()
+                    .set_attribute("transform.with_named_sequence", Attribute::unit(context));
+                crate::compiler::build_transform_schedule(context, &module, location);
+            }
+            TransformMode::VectorizeOnly => {
+                module
+                    .as_operation_mut()
+                    .set_attribute("transform.with_named_sequence", Attribute::unit(context));
+                // Mark the module so compile_from_mlir can select the vectorize-only pipeline.
+                module
+                    .as_operation_mut()
+                    .set_attribute("homura.vectorize_only", Attribute::unit(context));
+                crate::compiler::build_vectorize_only_schedule(context, &module, location);
+            }
+            TransformMode::None => {}
         }
 
         // Verify.
