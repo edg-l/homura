@@ -212,7 +212,17 @@ pub fn parse_model(path: impl AsRef<Path>) -> Result<OnnxModel, OnnxError> {
 /// Useful in tests where the model is built in-memory.
 pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
     let model = ModelProto::decode(bytes)?;
-    let graph = model.graph.ok_or(OnnxError::MissingGraph)?;
+    let mut graph = model.graph.ok_or(OnnxError::MissingGraph)?;
+
+    // If the graph is a single "If" node wrapper (merged decoder models from
+    // optimum export), extract the then_branch subgraph transparently.
+    let graph = match try_extract_if_then_branch(&mut graph) {
+        Some(subgraph) => {
+            tracing::info!("extracted then_branch from single-If merged model");
+            subgraph
+        }
+        None => graph,
+    };
 
     // Build a set of initializer names for fast lookup.
     let init_names: HashSet<&str> = graph.initializer.iter().map(|t| t.name.as_str()).collect();
@@ -264,6 +274,60 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
         outputs,
         output_shapes,
     })
+}
+
+/// If the graph is a single "If" node wrapper (common in merged ONNX decoder
+/// models exported by optimum), extract the `then_branch` subgraph and merge
+/// outer-scope initializers and inputs into it.
+///
+/// Returns `None` if the graph does not match this pattern.
+fn try_extract_if_then_branch(graph: &mut proto::GraphProto) -> Option<proto::GraphProto> {
+    if graph.node.len() != 1 || graph.node[0].op_type != "If" {
+        return None;
+    }
+
+    let if_node = &graph.node[0];
+    let then_attr = if_node.attribute.iter().find(|a| a.name == "then_branch")?;
+    let mut subgraph = then_attr.g.clone()?;
+
+    // Names already declared in the subgraph.
+    let sub_init_names: HashSet<String> =
+        subgraph.initializer.iter().map(|t| t.name.clone()).collect();
+    let sub_input_names: HashSet<String> =
+        subgraph.input.iter().map(|vi| vi.name.clone()).collect();
+
+    // All tensor names referenced by subgraph nodes.
+    let mut referenced: HashSet<String> = HashSet::new();
+    for node in &subgraph.node {
+        for inp in &node.input {
+            if !inp.is_empty() {
+                referenced.insert(inp.clone());
+            }
+        }
+    }
+
+    // Move parent initializers that the subgraph references but doesn't own.
+    // Uses drain() to avoid cloning large weight tensors.
+    for init in graph.initializer.drain(..) {
+        if !sub_init_names.contains(&init.name) && referenced.contains(&init.name) {
+            subgraph.initializer.push(init);
+        }
+    }
+
+    // Clone parent inputs that the subgraph references but doesn't declare
+    // (and that weren't already merged as initializers).
+    let sub_init_names: HashSet<String> =
+        subgraph.initializer.iter().map(|t| t.name.clone()).collect();
+    for vi in &graph.input {
+        if !sub_input_names.contains(&vi.name)
+            && !sub_init_names.contains(&vi.name)
+            && referenced.contains(&vi.name)
+        {
+            subgraph.input.push(vi.clone());
+        }
+    }
+
+    Some(subgraph)
 }
 
 /// Parse dims from an output ValueInfoProto. Returns empty vec if shape info is missing.
@@ -957,6 +1021,102 @@ mod tests {
     }
 
     // ── Regression: Issue 7 — negative dim returns error ─────────────────────
+
+    // ── If-node extraction ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_if_then_branch_subgraph() {
+        // Simulate a merged ONNX model: single "If" node wrapping a subgraph
+        // that references a parent initializer (W) and a parent input (X).
+        let weight_tensor = TensorProto {
+            name: "W".into(),
+            dims: vec![3],
+            data_type: 1,
+            float_data: vec![0.1, 0.2, 0.3],
+            ..Default::default()
+        };
+
+        let subgraph = GraphProto {
+            node: vec![NodeProto {
+                op_type: "Add".into(),
+                input: vec!["X".into(), "W".into()],
+                output: vec!["Y".into()],
+                ..Default::default()
+            }],
+            output: vec![value_info("Y", &[3])],
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![NodeProto {
+                    op_type: "If".into(),
+                    input: vec!["cond".into()],
+                    output: vec!["Y".into()],
+                    attribute: vec![AttributeProto {
+                        name: "then_branch".into(),
+                        r#type: 5, // GRAPH
+                        g: Some(subgraph),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                initializer: vec![weight_tensor],
+                input: vec![value_info("X", &[3])],
+                output: vec![value_info("Y", &[3])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let parsed = parse_bytes(&encode(&model)).expect("parse failed");
+
+        // Should see the subgraph's Add node, not the If node.
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.nodes[0].op_type, "Add");
+
+        // W should be merged as initializer from parent.
+        assert_eq!(parsed.initializers.len(), 1);
+        assert_eq!(parsed.initializers[0].0, "W");
+
+        // X should be merged as dynamic input from parent.
+        assert_eq!(parsed.dynamic_inputs.len(), 1);
+        assert_eq!(parsed.dynamic_inputs[0].name, "X");
+
+        assert_eq!(parsed.outputs, vec!["Y"]);
+    }
+
+    #[test]
+    fn non_if_graph_passes_through() {
+        let model = ModelProto {
+            ir_version: 8,
+            graph: Some(GraphProto {
+                node: vec![
+                    NodeProto {
+                        op_type: "Relu".into(),
+                        input: vec!["X".into()],
+                        output: vec!["Y".into()],
+                        ..Default::default()
+                    },
+                    NodeProto {
+                        op_type: "Relu".into(),
+                        input: vec!["Y".into()],
+                        output: vec!["Z".into()],
+                        ..Default::default()
+                    },
+                ],
+                input: vec![value_info("X", &[4])],
+                output: vec![value_info("Z", &[4])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let parsed = parse_bytes(&encode(&model)).expect("parse failed");
+        assert_eq!(parsed.nodes.len(), 2);
+        assert_eq!(parsed.nodes[0].op_type, "Relu");
+    }
 
     #[test]
     fn negative_dim_in_initializer_returns_error() {

@@ -647,6 +647,25 @@ impl ExecutionPlan {
                 })
                 .collect();
 
+            // Skip kernel if any input has a zero dimension — the output is
+            // trivially zero-filled.  This is the industry-standard approach
+            // (PyTorch, ONNX Runtime, TF all do this).
+            let has_zero_dim = step_inputs
+                .iter()
+                .any(|b| b.shape().0.iter().any(|&d| d == 0));
+            if has_zero_dim {
+                tracing::debug!(
+                    kernel = step.kernel_idx,
+                    "skipping kernel: input has zero dimension"
+                );
+                for &slot in &step.output_slots {
+                    let shape = &resolved_shapes[slot];
+                    let dtype = self.slot_descs[slot].dtype;
+                    pool[slot] = Some(PoolEntry::Owned(Buffer::new(&shape.0, dtype)));
+                }
+                continue;
+            }
+
             // Check if any output has dynamic dims — if so, resolve from slot_descs.
             let has_dynamic = kernel
                 .output_descs()
@@ -838,6 +857,49 @@ mod tests {
             result[0].as_slice::<f32>(),
             &[110.0, 440.0, 990.0, 1760.0]
         );
+    }
+
+    #[test]
+    fn execution_plan_zero_dim_skips_kernel() {
+        // When an input has a zero dimension, the kernel should be skipped
+        // and the output should be a zero-filled buffer with the resolved shape.
+        use crate::graph_builder::GraphContext;
+        use super::{ExecutionPlan, KernelStep, SlotDesc};
+        use crate::Shape;
+
+        // Compile a real kernel (add) — it won't actually be called.
+        let ctx = GraphContext::new();
+        let mut gb = ctx.builder();
+        let x = gb.input(&[Some(4)], DType::F32);
+        let y = gb.input(&[Some(4)], DType::F32);
+        let z = gb.emit_add(&x, &y);
+        let k = gb.compile(&[&z]).expect("compile");
+
+        let plan = ExecutionPlan {
+            kernels: vec![k],
+            steps: vec![KernelStep {
+                kernel_idx: 0,
+                input_slots: vec![0, 1],
+                output_slots: vec![2],
+            }],
+            num_slots: 3,
+            input_slots: vec![0, 1],
+            weight_slots: vec![],
+            output_slots: vec![2],
+            slot_descs: vec![
+                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
+                SlotDesc { shape: Shape(vec![0]), dtype: DType::F32, sym_shape: None },
+            ],
+        };
+
+        let a = Buffer::new(&[0], DType::F32);
+        let b = Buffer::new(&[0], DType::F32);
+
+        let result = plan.run(&[&a, &b], &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].shape().0, vec![0]);
+        assert_eq!(result[0].as_slice::<f32>(), &[] as &[f32]);
     }
 
     #[test]
