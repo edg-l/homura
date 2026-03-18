@@ -32,8 +32,12 @@ pub enum TransformMode {
     None,
     /// Full tiling + vectorize + OpenMP schedule.
     Full,
-    /// Vectorize only — no tiling, no OpenMP. For dynamic-M matmuls (M=1 decode).
+    /// Tile only — no MLIR vectorize, no OpenMP. LLVM auto-vectorizes.
     VectorizeOnly,
+    /// Tile + OpenMP parallel on N for large-N matmuls (e.g. LM head 768×50257).
+    /// Uses forall on N for multi-threaded memory bandwidth, inner for on N+K
+    /// for LLVM auto-vectorization. No MLIR vectorize/pad/outline.
+    TileParallel,
 }
 
 // ── Tensor wrapper ────────────────────────────────────────────────────────────
@@ -7351,7 +7355,8 @@ impl<'c> GraphBuilder<'c> {
 
         // Attach transform schedule based on mode.
         // - Full: tiling + vectorize + OpenMP (for static-M matmuls).
-        // - VectorizeOnly: vectorize without tiling/OpenMP (for dynamic-M matmuls).
+        // - VectorizeOnly: tile only, no OpenMP. LLVM auto-vectorizes.
+        // - TileParallel: forall on N (OpenMP) + for on N+K. LLVM auto-vectorizes.
         // - None: skip schedule entirely (elementwise / BatchNorm kernels).
         match transform_mode {
             TransformMode::Full => {
@@ -7369,6 +7374,14 @@ impl<'c> GraphBuilder<'c> {
                     .as_operation_mut()
                     .set_attribute("homura.vectorize_only", Attribute::unit(context));
                 crate::compiler::build_vectorize_only_schedule(context, &module, location);
+            }
+            TransformMode::TileParallel => {
+                // Uses the Full pipeline (with OpenMP) but a simpler schedule
+                // (forall + for, no pad/outline/vectorize).
+                module
+                    .as_operation_mut()
+                    .set_attribute("transform.with_named_sequence", Attribute::unit(context));
+                crate::compiler::build_tile_parallel_schedule(context, &module, location);
             }
             TransformMode::None => {}
         }

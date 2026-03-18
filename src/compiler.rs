@@ -1410,6 +1410,333 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
     module.body().append_operation(main_named_seq);
 }
 
+pub(crate) fn build_tile_parallel_schedule<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    location: Location<'c>,
+) {
+    let any_op_type =
+        melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
+    let param_i64_type = melior::ir::Type::parse(context, "!transform.param<i64>")
+        .expect("parse !transform.param<i64>");
+
+    // Match sequences are identical to build_vectorize_only_schedule.
+    let build_match_seq = |name: &str, rank: i64| {
+        let inner_block = Block::new(&[(any_op_type, location)]);
+        let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
+
+        let contraction_attr = ArrayAttribute::new(
+            context,
+            &[
+                StringAttribute::new(context, "arith.mulf").into(),
+                StringAttribute::new(context, "arith.addf").into(),
+            ],
+        );
+        let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
+            .add_operands(&[inner_arg])
+            .add_attributes(&[(
+                Identifier::new(context, "contraction"),
+                contraction_attr.into(),
+            )])
+            .build()
+            .expect("build transform.match.structured.body");
+        inner_block.append_operation(body_check_op);
+
+        let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
+            .add_operands(&[inner_arg])
+            .add_results(&[param_i64_type])
+            .build()
+            .expect("build transform.match.structured.rank");
+        let rank_ref = inner_block.append_operation(rank_op);
+        let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
+
+        let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
+            .add_operands(&[inner_arg, rank_param])
+            .build()
+            .expect("build transform.match.structured.yield");
+        inner_block.append_operation(inner_yield_op);
+
+        let inner_region = Region::new();
+        inner_region.append_block(inner_block);
+
+        let match_outer_block = Block::new(&[(any_op_type, location)]);
+        let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
+
+        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
+            .add_operands(&[candidate])
+            .add_attributes(&[(
+                Identifier::new(context, "op_names"),
+                ArrayAttribute::new(
+                    context,
+                    &[StringAttribute::new(context, "linalg.generic").into()],
+                )
+                .into(),
+            )])
+            .build()
+            .expect("build transform.match.operation_name");
+        match_outer_block.append_operation(op_name_filter);
+
+        let match_structured_op = OperationBuilder::new("transform.match.structured", location)
+            .add_operands(&[candidate])
+            .add_results(&[any_op_type, param_i64_type])
+            .add_regions([inner_region])
+            .build()
+            .expect("build transform.match.structured");
+        let match_structured_ref = match_outer_block.append_operation(match_structured_op);
+        let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
+        let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
+
+        let rank_const_attr =
+            Attribute::parse(context, &format!("{rank} : i64")).expect("parse rank constant attr");
+        let rank_const_op = OperationBuilder::new("transform.param.constant", location)
+            .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
+            .add_results(&[param_i64_type])
+            .build()
+            .expect("build transform.param.constant");
+        let rank_const_ref = match_outer_block.append_operation(rank_const_op);
+        let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
+
+        let predicate_attr = Attribute::parse(context, "0 : i32").expect("parse eq predicate");
+        let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
+            .add_operands(&[matched_rank, expected_rank])
+            .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
+            .build()
+            .expect("build transform.match.param.cmpi");
+        match_outer_block.append_operation(cmpi_op);
+
+        let match_outer_yield = OperationBuilder::new("transform.yield", location)
+            .add_operands(&[matched_op])
+            .build()
+            .expect("build transform.yield (match_contraction)");
+        match_outer_block.append_operation(match_outer_yield);
+
+        let match_outer_region = Region::new();
+        match_outer_region.append_block(match_outer_block);
+
+        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
+        let match_arg_attrs =
+            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
+
+        OperationBuilder::new("transform.named_sequence", location)
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "sym_name"),
+                    StringAttribute::new(context, name).into(),
+                ),
+                (
+                    Identifier::new(context, "function_type"),
+                    TypeAttribute::new(match_func_type.into()).into(),
+                ),
+                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
+                (
+                    Identifier::new(context, "sym_visibility"),
+                    StringAttribute::new(context, "private").into(),
+                ),
+            ])
+            .add_regions([match_outer_region])
+            .build()
+            .expect("build transform.named_sequence @match_contraction_Nd")
+    };
+
+    // Helper: build a @tile_parallel_contraction_Nd named_sequence.
+    //
+    // Tiles N with tile_using_forall (parallel cache-level tiling) and
+    // then tiles N+K with tile_using_for (sequential register-level tiling).
+    // No padding, outlining, or vectorization — the parallelism is exposed
+    // via scf.forall for downstream lowering to parallel loops.
+    let build_tile_parallel_seq = |name: &str,
+                                   forall_sizes: &str,
+                                   scalable_forall: &str,
+                                   for_sizes: &str,
+                                   scalable_for: &str,
+                                   n_for_loops: usize| {
+        let action_block = Block::new(&[(any_op_type, location)]);
+        let op_handle: melior::ir::Value = action_block.argument(0).unwrap().into();
+
+        // tile_using_forall on N — produces scf.forall (parallel) loop.
+        let static_tile_sizes_attr =
+            Attribute::parse(context, forall_sizes).expect("parse forall static_tile_sizes");
+        let static_num_threads_attr =
+            Attribute::parse(context, "array<i64>").expect("parse static_num_threads");
+        let scalable_forall_attr =
+            Attribute::parse(context, scalable_forall).expect("parse forall scalable_sizes");
+        let operand_segment_sizes = Attribute::parse(context, "array<i32: 1, 0, 0, 0, 0>")
+            .expect("parse operandSegmentSizes");
+
+        let forall_op =
+            OperationBuilder::new("transform.structured.tile_using_forall", location)
+                .add_operands(&[op_handle])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "static_num_threads"),
+                        static_num_threads_attr,
+                    ),
+                    (
+                        Identifier::new(context, "static_tile_sizes"),
+                        static_tile_sizes_attr,
+                    ),
+                    (
+                        Identifier::new(context, "scalable_sizes"),
+                        scalable_forall_attr,
+                    ),
+                    (
+                        Identifier::new(context, "operandSegmentSizes"),
+                        operand_segment_sizes,
+                    ),
+                ])
+                .add_results(&[any_op_type, any_op_type])
+                .build()
+                .expect("build structured.tile_using_forall (tile-parallel)");
+        let forall_ref = action_block.append_operation(forall_op);
+        let tiled_op: melior::ir::Value = forall_ref.result(0).unwrap().into();
+
+        // tile_using_for on N+K — produces scf.for (sequential) inner loops.
+        let for_static_sizes =
+            Attribute::parse(context, for_sizes).expect("parse for static_sizes");
+        let for_scalable_sizes =
+            Attribute::parse(context, scalable_for).expect("parse for scalable_sizes");
+
+        // tile_using_for returns: tiled_op + one loop handle per non-zero tile dim
+        let mut for_results: Vec<melior::ir::Type> = vec![any_op_type];
+        for _ in 0..n_for_loops {
+            for_results.push(any_op_type);
+        }
+        let for_tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+            .add_operands(&[tiled_op])
+            .add_attributes(&[
+                (Identifier::new(context, "static_sizes"), for_static_sizes),
+                (
+                    Identifier::new(context, "scalable_sizes"),
+                    for_scalable_sizes,
+                ),
+            ])
+            .add_results(&for_results)
+            .build()
+            .expect("build structured.tile_using_for (tile-parallel register)");
+        action_block.append_operation(for_tile_op);
+
+        let action_yield_op = OperationBuilder::new("transform.yield", location)
+            .build()
+            .expect("build transform.yield (tile_parallel)");
+        action_block.append_operation(action_yield_op);
+
+        let action_region = Region::new();
+        action_region.append_block(action_block);
+
+        let action_func_type = FunctionType::new(context, &[any_op_type], &[]);
+        let action_arg_attrs =
+            Attribute::parse(context, "[{transform.consumed}]").expect("parse action arg_attrs");
+
+        OperationBuilder::new("transform.named_sequence", location)
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "sym_name"),
+                    StringAttribute::new(context, name).into(),
+                ),
+                (
+                    Identifier::new(context, "function_type"),
+                    TypeAttribute::new(action_func_type.into()).into(),
+                ),
+                (Identifier::new(context, "arg_attrs"), action_arg_attrs),
+                (
+                    Identifier::new(context, "sym_visibility"),
+                    StringAttribute::new(context, "private").into(),
+                ),
+            ])
+            .add_regions([action_region])
+            .build()
+            .expect("build transform.named_sequence @tile_parallel_contraction_Nd")
+    };
+
+    // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
+    module
+        .body()
+        .append_operation(build_match_seq("match_contraction_3d", 3));
+    module
+        .body()
+        .append_operation(build_match_seq("match_contraction_4d", 4));
+
+    // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
+    // 3D matmul (M, N, K): forall N=1024 (parallel), for N=16 K=16 (register).
+    module.body().append_operation(build_tile_parallel_seq(
+        "tile_parallel_contraction_3d",
+        "array<i64: 0, 1024, 0>",        // forall: tile N=1024, skip M and K
+        "array<i1: false, false, false>",
+        "array<i64: 0, 16, 16>",         // for: tile N=16, K=16, skip M
+        "array<i1: false, false, false>",
+        2,                                // 2 non-zero for-tile dims (N, K)
+    ));
+    // ── @tile_parallel_contraction_4d ─────────────────────────────────────────
+    // 4D batched matmul (B, M, N, K): forall N=1024 (parallel), for N=16 K=16.
+    module.body().append_operation(build_tile_parallel_seq(
+        "tile_parallel_contraction_4d",
+        "array<i64: 0, 0, 1024, 0>",              // forall: tile N=1024, skip B, M, K
+        "array<i1: false, false, false, false>",
+        "array<i64: 0, 0, 16, 16>",               // for: tile N=16, K=16, skip B and M
+        "array<i1: false, false, false, false>",
+        2,                                          // 2 non-zero for-tile dims (N, K)
+    ));
+
+    // ── @__transform_main ─────────────────────────────────────────────────────
+    let main_block = Block::new(&[(any_op_type, location)]);
+    let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
+
+    let matchers_attr = Attribute::parse(
+        context,
+        "[@match_contraction_3d, @match_contraction_4d]",
+    )
+    .expect("parse matchers attr");
+    let actions_attr = Attribute::parse(
+        context,
+        "[@tile_parallel_contraction_3d, @tile_parallel_contraction_4d]",
+    )
+    .expect("parse actions attr");
+
+    let foreach_op = OperationBuilder::new("transform.foreach_match", location)
+        .add_operands(&[module_handle])
+        .add_attributes(&[
+            (Identifier::new(context, "matchers"), matchers_attr),
+            (Identifier::new(context, "actions"), actions_attr),
+        ])
+        .add_results(&[any_op_type])
+        .build()
+        .expect("build transform.foreach_match");
+    main_block.append_operation(foreach_op);
+
+    let main_yield_op = OperationBuilder::new("transform.yield", location)
+        .build()
+        .expect("build transform.yield (__transform_main)");
+    main_block.append_operation(main_yield_op);
+
+    let main_region = Region::new();
+    main_region.append_block(main_block);
+
+    let main_func_type = FunctionType::new(context, &[any_op_type], &[]);
+    let main_arg_attrs =
+        Attribute::parse(context, "[{transform.consumed}]").expect("parse main arg_attrs");
+
+    let main_named_seq = OperationBuilder::new("transform.named_sequence", location)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "sym_name"),
+                StringAttribute::new(context, "__transform_main").into(),
+            ),
+            (
+                Identifier::new(context, "function_type"),
+                TypeAttribute::new(main_func_type.into()).into(),
+            ),
+            (Identifier::new(context, "arg_attrs"), main_arg_attrs),
+            (
+                Identifier::new(context, "sym_visibility"),
+                StringAttribute::new(context, "private").into(),
+            ),
+        ])
+        .add_regions([main_region])
+        .build()
+        .expect("build transform.named_sequence @__transform_main (tile-parallel)");
+    module.body().append_operation(main_named_seq);
+}
+
 // ── Public wrappers for graph_builder ─────────────────────────────────────────
 
 /// Public wrapper so `graph_builder` can call the AOT object emitter.

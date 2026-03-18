@@ -2093,7 +2093,18 @@ pub fn emit_and_compile_plan(
                     })
                     .unwrap_or(false);
                 if has_dynamic_m {
-                    crate::graph_builder::TransformMode::VectorizeOnly
+                    // For large static N (e.g. LM head 768×50257), use OpenMP
+                    // parallelism on N to saturate memory bandwidth.
+                    let has_large_static_n = node.inputs.get(1).and_then(|inp| {
+                        shape_info.get(inp).and_then(|info| {
+                            info.shape.last().copied().flatten()
+                        })
+                    }).map_or(false, |n| n > 4096);
+                    if has_large_static_n {
+                        crate::graph_builder::TransformMode::TileParallel
+                    } else {
+                        crate::graph_builder::TransformMode::VectorizeOnly
+                    }
                 } else {
                     crate::graph_builder::TransformMode::Full
                 }
