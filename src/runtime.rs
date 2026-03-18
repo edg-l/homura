@@ -848,14 +848,10 @@ pub enum NativeOp {
     /// Concatenate inputs along `axis` into the output buffer.
     /// Inputs: [past, new], output: past ++ new along axis.
     Concat { axis: usize },
-    /// Append new K or V entry to the KV cache and produce a view.
-    /// Input: [new_k] or [new_v] (1 tensor, shape [1, heads, 1, head_dim]).
-    /// Output: [present_k] or [present_v] (view of [1, heads, seq_len+1, head_dim]).
-    KvAppend { layer: usize, is_value: bool },
 }
 
 /// Metadata for KV cache management within an ExecutionPlan.
-/// Present only when the model has KV Concat ops that were converted to KvAppend.
+/// Present only when the model has KV Concat ops that should use cache in run_kv().
 #[derive(Clone, Debug)]
 pub struct KvPlanInfo {
     /// Number of transformer layers with KV caching.
@@ -1156,9 +1152,6 @@ impl ExecutionPlan {
                         let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
                         (buf, out_slot)
                     }
-                    NativeOp::KvAppend { .. } => {
-                        panic!("KvAppend in run() — use run_kv() for KV-cached models");
-                    }
                 };
                 if let Some(t0) = t0 {
                     let shapes: Vec<Vec<u64>> =
@@ -1389,7 +1382,16 @@ impl ExecutionPlan {
 
         let mut free_list: Vec<Buffer> = Vec::new();
 
-        // Execute steps — same as run(), but with KvAppend handling.
+        // Build KV concat lookup: present_kv output slot → (layer, is_value).
+        let mut kv_output_meta: std::collections::HashMap<usize, (usize, bool)> =
+            std::collections::HashMap::new();
+        if let Some(ref info) = self.kv_info {
+            for (i, &slot) in info.present_kv_output_slots.iter().enumerate() {
+                kv_output_meta.insert(slot, (i / 2, (i % 2) == 1));
+            }
+        }
+
+        // Execute steps — same as run(), but KV Concat steps use cache.append+view.
         for (step_idx, step) in self.steps.iter().enumerate() {
             let step_inputs: Vec<&Buffer> = step
                 .input_slots
@@ -1426,27 +1428,33 @@ impl ExecutionPlan {
                 let (buf, out_slot) = match native_op {
                     NativeOp::Concat { axis } => {
                         let out_slot = step.output_slots[0];
-                        let out_shape = &resolved_shapes[out_slot];
-                        let dtype = self.slot_descs[out_slot].dtype;
-                        let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
-                        (buf, out_slot)
-                    }
-                    NativeOp::KvAppend { layer, is_value } => {
-                        let cache = self.kv_cache.as_mut().expect("KvAppend but no KvCache");
-                        // input_slots contains only the "new" slot (emitter guarantees this).
-                        let new_data = step_inputs[0];
-                        if *is_value {
-                            cache.append_value(*layer, new_data);
+                        // Check if this Concat is a KV concat.
+                        if let Some(&(layer, is_value)) = kv_output_meta.get(&out_slot) {
+                            let cache = self.kv_cache.as_mut().expect("KV concat but no KvCache");
+                            let new_data = step
+                                .input_slots
+                                .iter()
+                                .zip(step_inputs.iter())
+                                .find(|(slot, _)| !past_kv_set.contains(slot))
+                                .expect("KV concat has no non-past input")
+                                .1;
+                            if is_value {
+                                cache.append_value(layer, new_data);
+                            } else {
+                                cache.append_key(layer, new_data);
+                            }
+                            let view = if is_value {
+                                cache.view_value(layer)
+                            } else {
+                                cache.view_key(layer)
+                            };
+                            (view, out_slot)
                         } else {
-                            cache.append_key(*layer, new_data);
+                            let out_shape = &resolved_shapes[out_slot];
+                            let dtype = self.slot_descs[out_slot].dtype;
+                            let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
+                            (buf, out_slot)
                         }
-                        let out_slot = step.output_slots[0];
-                        let view = if *is_value {
-                            cache.view_value(*layer)
-                        } else {
-                            cache.view_key(*layer)
-                        };
-                        (view, out_slot)
                     }
                 };
                 if let Some(t0) = t0 {

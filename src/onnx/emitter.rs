@@ -2228,14 +2228,8 @@ pub fn emit_and_compile_plan(
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
         assign_buffer_slots(model, &groups);
 
-    // Build KV Concat metadata: map node_index → (layer, is_value).
-    // KV Concats come in pairs (K then V) per layer, in model order.
-    let mut kv_concat_meta: HashMap<usize, (usize, bool)> = HashMap::new();
-    for (i, &ni) in kv_concat_ordered.iter().enumerate() {
-        let layer = i / 2;
-        let is_value = (i % 2) == 1;
-        kv_concat_meta.insert(ni, (layer, is_value));
-    }
+    // KV Concat node indices (used to identify KV vs normal Concat steps).
+    let kv_concat_meta: HashSet<usize> = kv_concat_ordered.iter().copied().collect();
 
     // Build model input name set for identifying "past" KV inputs.
     let model_input_names: HashSet<&str> = model
@@ -2455,37 +2449,27 @@ pub fn emit_and_compile_plan(
             let all_input_slots: Vec<usize> = io.input_slots.iter().map(|(_, s)| *s).collect();
             let all_output_slots: Vec<usize> = io.output_slots.iter().map(|(_, s)| *s).collect();
 
-            if let Some(&(layer, is_value)) = kv_concat_meta.get(&ni) {
-                // Track which input is "past" (model input) and which is "new".
-                let mut new_slot = None;
+            if kv_concat_meta.contains(&ni) {
+                // Track which slots are past_kv inputs and present_kv outputs.
+                // run_kv() uses this metadata to route through the KvCache.
                 for (name, slot) in &io.input_slots {
                     if model_input_names.contains(name.as_str()) {
                         past_kv_input_slots.push(*slot);
-                    } else {
-                        new_slot = Some(*slot);
                     }
                 }
-                let new_slot = new_slot.expect("KvAppend Concat has no non-past (new) input slot");
                 for (_, slot) in &io.output_slots {
                     present_kv_output_slots.push(*slot);
                 }
-
-                // Only keep the "new" input slot — run_kv() uses step_inputs[0] directly.
-                // run() no longer falls back to Concat for KvAppend steps.
-                steps.push(KernelStep {
-                    kernel_idx: usize::MAX,
-                    input_slots: vec![new_slot],
-                    output_slots: all_output_slots,
-                    native_op: Some(crate::runtime::NativeOp::KvAppend { layer, is_value }),
-                });
-            } else {
-                steps.push(KernelStep {
-                    kernel_idx: usize::MAX,
-                    input_slots: all_input_slots,
-                    output_slots: all_output_slots,
-                    native_op: Some(crate::runtime::NativeOp::Concat { axis }),
-                });
             }
+
+            // All Concat steps (KV or not) use the same native op with both inputs.
+            // run_kv() identifies KV concats via present_kv_output_slots metadata.
+            steps.push(KernelStep {
+                kernel_idx: usize::MAX,
+                input_slots: all_input_slots,
+                output_slots: all_output_slots,
+                native_op: Some(crate::runtime::NativeOp::Concat { axis }),
+            });
             continue;
         }
 
