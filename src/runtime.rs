@@ -159,6 +159,44 @@ impl Buffer {
     }
 }
 
+/// Native concat: copy data from multiple input buffers into an output buffer
+/// along `axis`. All inputs must have the same shape except along `axis`.
+fn native_concat(inputs: &[&Buffer], axis: usize, out_shape: &[u64], dtype: DType) -> Buffer {
+    let elem_size = dtype.size_bytes();
+    let rank = out_shape.len();
+    let total_bytes = out_shape.iter().product::<u64>() as usize * elem_size;
+    let mut out_data = vec![0u8; total_bytes];
+
+    // Compute the size of one "slice" along the concat axis.
+    // outer_size = product of dims before axis
+    // inner_size = product of dims after axis (in bytes)
+    let outer_size: usize = out_shape[..axis].iter().product::<u64>() as usize;
+    let inner_size: usize = if axis + 1 < rank {
+        out_shape[axis + 1..].iter().product::<u64>() as usize * elem_size
+    } else {
+        elem_size
+    };
+
+    let mut write_offset = 0;
+    for outer in 0..outer_size {
+        for input in inputs {
+            let in_axis_len = input.shape().0[axis] as usize;
+            let chunk = in_axis_len * inner_size;
+            let read_offset = outer * in_axis_len * inner_size;
+            out_data[write_offset..write_offset + chunk]
+                .copy_from_slice(&input.data[read_offset..read_offset + chunk]);
+            write_offset += chunk;
+        }
+    }
+
+    Buffer {
+        data: out_data,
+        shape: Shape(out_shape.to_vec()),
+        strides: row_major_strides(out_shape),
+        dtype,
+    }
+}
+
 /// Compute row-major strides for `shape`. For a scalar (rank 0) returns `[]`.
 fn row_major_strides(shape: &[u64]) -> Vec<i64> {
     let n = shape.len();
@@ -572,6 +610,30 @@ pub struct KernelStep {
     /// Buffer pool slot indices where this kernel writes its outputs.
     /// Order matches the kernel's compiled output arguments.
     pub output_slots: Vec<usize>,
+    /// If set, execute this native operation instead of calling a compiled kernel.
+    #[allow(clippy::struct_field_names)]
+    pub native_op: Option<NativeOp>,
+}
+
+impl KernelStep {
+    /// Create a kernel step (compiled kernel).
+    pub fn kernel(kernel_idx: usize, input_slots: Vec<usize>, output_slots: Vec<usize>) -> Self {
+        Self {
+            kernel_idx,
+            input_slots,
+            output_slots,
+            native_op: None,
+        }
+    }
+}
+
+/// A native operation executed in Rust instead of a compiled kernel.
+/// Avoids kernel launch overhead for simple data-movement ops.
+#[derive(Clone, Debug)]
+pub enum NativeOp {
+    /// Concatenate inputs along `axis` into the output buffer.
+    /// Inputs: [past, new], output: past ++ new along axis.
+    Concat { axis: usize },
 }
 
 /// A compiled model consisting of multiple independently-compiled kernels
@@ -828,6 +890,43 @@ impl ExecutionPlan {
                 continue;
             }
 
+            // Native ops: execute in Rust instead of calling a compiled kernel.
+            if let Some(ref native_op) = step.native_op {
+                let t0 = if profile {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let (buf, out_slot) = match native_op {
+                    NativeOp::Concat { axis } => {
+                        assert_eq!(step.output_slots.len(), 1);
+                        let out_slot = step.output_slots[0];
+                        let out_shape = &resolved_shapes[out_slot];
+                        let dtype = self.slot_descs[out_slot].dtype;
+                        let buf = native_concat(&step_inputs, *axis, &out_shape.0, dtype);
+                        (buf, out_slot)
+                    }
+                };
+                if let Some(t0) = t0 {
+                    let shapes: Vec<Vec<u64>> =
+                        step_inputs.iter().map(|b| b.shape().0.clone()).collect();
+                    step_times.push((step.kernel_idx, t0.elapsed(), shapes));
+                }
+                drop(step_inputs); // Release pool borrows before mutating.
+                pool[out_slot] = Some(PoolEntry::Owned(buf));
+                // Recycle dead inputs.
+                for &slot in &step.input_slots {
+                    if let Some(last) = self.slot_last_read[slot] {
+                        if last == step_idx {
+                            if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                                free_list.push(buf);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Check if any output has dynamic dims — if so, resolve from slot_descs.
             let has_dynamic = kernel
                 .output_descs()
@@ -1062,11 +1161,13 @@ mod tests {
                     kernel_idx: 0,
                     input_slots: vec![0, 1], // a, b
                     output_slots: vec![2],   // c
+                    native_op: None,
                 },
                 KernelStep {
                     kernel_idx: 1,
                     input_slots: vec![2, 1], // c, b
                     output_slots: vec![3],   // d
+                    native_op: None,
                 },
             ],
             4,
@@ -1128,6 +1229,7 @@ mod tests {
                 kernel_idx: 0,
                 input_slots: vec![0, 1],
                 output_slots: vec![2],
+                native_op: None,
             }],
             3,
             vec![0, 1],
@@ -1182,6 +1284,7 @@ mod tests {
                 kernel_idx: 0,
                 input_slots: vec![0, 1],
                 output_slots: vec![2],
+                native_op: None,
             }],
             3,
             vec![0],

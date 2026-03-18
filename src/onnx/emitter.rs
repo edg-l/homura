@@ -2029,6 +2029,8 @@ pub fn emit_and_compile_plan(
             gemm_residual_fusions.len()
         );
     }
+    let kv_concat_node_indices: HashSet<usize> = HashSet::new();
+
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
         assign_buffer_slots(model, &groups);
 
@@ -2184,6 +2186,65 @@ pub fn emit_and_compile_plan(
     let mut steps: Vec<KernelStep> = Vec::new();
 
     for (gi, (group, io)) in groups.iter().zip(kernel_ios.iter()).enumerate() {
+        // Skip MLIR emission for native-op groups (KV Concat).
+        if group.node_indices.len() == 1 && kv_concat_node_indices.contains(&group.node_indices[0])
+        {
+            let node = &model.nodes[group.node_indices[0]];
+            let axis_raw = node
+                .attributes
+                .get("axis")
+                .and_then(|a| {
+                    if let OnnxAttribute::Int(v) = a {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let rank = 4usize;
+            let axis = if axis_raw < 0 {
+                (rank as i64 + axis_raw) as usize
+            } else {
+                axis_raw as usize
+            };
+            // Still need to propagate shape info for the Concat output.
+            // The output shape = input[0] shape with axis dim summed.
+            if let (Some(in0_info), Some(in1_info)) = (
+                shape_info.get(&node.inputs[0]),
+                shape_info.get(&node.inputs[1]),
+            ) {
+                let mut out_shape = in0_info.shape.clone();
+                match (in0_info.shape[axis], in1_info.shape[axis]) {
+                    (Some(a), Some(b)) => out_shape[axis] = Some(a + b),
+                    _ => out_shape[axis] = None, // dynamic
+                }
+                shape_info.insert(
+                    node.outputs[0].clone(),
+                    ValueShapeInfo {
+                        shape: out_shape,
+                        dtype: in0_info.dtype,
+                    },
+                );
+            }
+            // Propagate sym shapes.
+            if let Some(sym0) = sym_shape_info.get(&node.inputs[0]) {
+                if let Some(sym1) = sym_shape_info.get(&node.inputs[1]) {
+                    let mut out_sym = sym0.clone();
+                    if axis < out_sym.len() && axis < sym1.len() {
+                        out_sym[axis] = sym0[axis].clone().add(sym1[axis].clone());
+                    }
+                    sym_shape_info.insert(node.outputs[0].clone(), out_sym);
+                }
+            }
+            steps.push(KernelStep {
+                kernel_idx: usize::MAX, // sentinel — no compiled kernel
+                input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
+                output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
+                native_op: Some(crate::runtime::NativeOp::Concat { axis }),
+            });
+            continue;
+        }
+
         let ctx = GraphContext::new();
         let mut builder = ctx.builder();
         let mut local_value_map: HashMap<String, EmitValue> = HashMap::new();
@@ -2402,6 +2463,7 @@ pub fn emit_and_compile_plan(
             kernel_idx: gi,
             input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
             output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
+            native_op: None,
         });
     }
 
