@@ -473,6 +473,25 @@ pub struct SlotDesc {
     pub dtype: DType,
 }
 
+/// Resolution rule for a single dynamic dimension in a buffer slot.
+#[derive(Clone, Debug)]
+pub enum DimRule {
+    /// Copy from input_slots[input_idx] shape dim.
+    SameAsInput { input_idx: usize, dim: usize },
+    /// input_slots[input_idx] shape dim + offset.
+    InputDimPlusOffset { input_idx: usize, dim: usize, offset: i64 },
+    /// Always this fixed value (from probe pass).
+    Fixed(u64),
+}
+
+/// Specifies how to resolve one DIM_DYNAMIC entry at runtime.
+#[derive(Clone, Debug)]
+pub struct DimResolution {
+    pub slot: usize,
+    pub dim: usize,
+    pub rule: DimRule,
+}
+
 /// One step in the execution plan: invoke a kernel with specific buffer routing.
 #[derive(Clone, Debug)]
 pub struct KernelStep {
@@ -507,6 +526,8 @@ pub struct ExecutionPlan {
     pub(crate) output_slots: Vec<usize>,
     /// Shape + dtype for every slot (used to allocate intermediate buffers).
     pub(crate) slot_descs: Vec<SlotDesc>,
+    /// Rules for resolving DIM_DYNAMIC entries at runtime.
+    pub(crate) dim_resolutions: Vec<DimResolution>,
 }
 
 /// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
@@ -537,6 +558,24 @@ impl ExecutionPlan {
         self.output_slots.iter().map(|&s| &self.slot_descs[s]).collect()
     }
 
+    /// Build concrete shapes for all slots, resolving DIM_DYNAMIC via dim_resolutions.
+    fn resolve_slot_shapes(&self, inputs: &[&Buffer]) -> Vec<Shape> {
+        let mut shapes: Vec<Shape> = self.slot_descs.iter().map(|sd| sd.shape.clone()).collect();
+        for res in &self.dim_resolutions {
+            let concrete = match &res.rule {
+                DimRule::SameAsInput { input_idx, dim } => {
+                    inputs[*input_idx].shape().0[*dim]
+                }
+                DimRule::InputDimPlusOffset { input_idx, dim, offset } => {
+                    (inputs[*input_idx].shape().0[*dim] as i64 + offset) as u64
+                }
+                DimRule::Fixed(v) => *v,
+            };
+            shapes[res.slot].0[res.dim] = concrete;
+        }
+        shapes
+    }
+
     /// Execute the plan with the given model inputs and weight buffers.
     ///
     /// # Panics
@@ -557,6 +596,8 @@ impl ExecutionPlan {
             self.weight_slots.len(),
             weights.len()
         );
+
+        let resolved_shapes = self.resolve_slot_shapes(inputs);
 
         let mut pool: Vec<Option<PoolEntry>> = (0..self.num_slots).map(|_| None).collect();
 
@@ -596,7 +637,7 @@ impl ExecutionPlan {
                 let concrete_shapes: Vec<Shape> = step
                     .output_slots
                     .iter()
-                    .map(|&s| self.slot_descs[s].shape.clone())
+                    .map(|&s| resolved_shapes[s].clone())
                     .collect();
                 kernel.run_dynamic(&step_inputs, &concrete_shapes)
             } else {
@@ -765,6 +806,7 @@ mod tests {
                 SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
                 SlotDesc { shape: Shape(vec![4]), dtype: DType::F32 },
             ],
+            dim_resolutions: vec![],
         };
 
         let a = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[4], DType::F32);
@@ -810,6 +852,7 @@ mod tests {
                 SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
                 SlotDesc { shape: Shape(vec![3]), dtype: DType::F32 },
             ],
+            dim_resolutions: vec![],
         };
 
         let input = Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3], DType::F32);
