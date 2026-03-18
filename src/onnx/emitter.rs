@@ -2093,14 +2093,16 @@ pub fn emit_and_compile_plan(
                     })
                     .unwrap_or(false);
                 if has_dynamic_m {
-                    // For large static N (e.g. LM head 768×50257), use OpenMP
-                    // parallelism on N to saturate memory bandwidth.
+                    // Gemm kernels benefit from OpenMP parallelism on N.
+                    // Small attention MatMuls (dynamic N, tiny at runtime)
+                    // stay on VectorizeOnly to avoid fork/join overhead.
+                    let is_gemm = node.op_type.as_str() == "Gemm";
                     let has_large_static_n = node.inputs.get(1).and_then(|inp| {
                         shape_info.get(inp).and_then(|info| {
                             info.shape.last().copied().flatten()
                         })
-                    }).map_or(false, |n| n > 4096);
-                    if has_large_static_n {
+                    }).map_or(false, |n| n > 256);
+                    if is_gemm || has_large_static_n {
                         crate::graph_builder::TransformMode::TileParallel
                     } else {
                         crate::graph_builder::TransformMode::VectorizeOnly
