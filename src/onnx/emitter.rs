@@ -1708,12 +1708,23 @@ pub fn emit_and_compile_plan(
         CompilationCache::cache_key(b, &shape_refs)
     });
 
-    // Compile each kernel.
-    let mut kernels: Vec<crate::runtime::CompiledGraph> = Vec::new();
+    // Phase 1: Emit all kernels sequentially (shape propagation requires order).
+    // Each kernel produces an MLIR module text + metadata for deferred compilation.
+    struct KernelEmitResult {
+        mlir_text: String,
+        num_inputs: usize,
+        output_descs: Vec<crate::runtime::OutputDesc>,
+        cache_key: Option<String>,
+        group_idx: usize,
+        num_nodes: usize,
+        num_in: usize,
+        num_out: usize,
+    }
+
+    let mut emit_results: Vec<KernelEmitResult> = Vec::new();
     let mut steps: Vec<KernelStep> = Vec::new();
 
     for (gi, (group, io)) in groups.iter().zip(kernel_ios.iter()).enumerate() {
-        let t0 = std::time::Instant::now();
         let ctx = GraphContext::new();
         let mut builder = ctx.builder();
         let mut local_value_map: HashMap<String, EmitValue> = HashMap::new();
@@ -1743,7 +1754,7 @@ pub fn emit_and_compile_plan(
             }
         }
 
-        // Collect output tensors.
+        // Collect output tensors and finalize the module (without compiling).
         let output_tensors: Vec<crate::graph_builder::Tensor> = io
             .output_slots
             .iter()
@@ -1756,28 +1767,66 @@ pub fn emit_and_compile_plan(
             .collect();
         let output_refs: Vec<&crate::graph_builder::Tensor> = output_tensors.iter().collect();
 
-        // Compile with per-kernel cache key.
-        let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
-        let compiled = builder
-            .compile_with_cache(&output_refs, cache_key.as_deref())
+        // Finalize module to MLIR text for deferred parallel compilation.
+        let (mlir_text, num_inputs, output_descs) = builder
+            .finalize_to_mlir(&output_refs)
             .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
 
-        eprintln!(
-            "[plan] kernel {gi} ({} nodes, {} in / {} out): {}ms",
-            group.node_indices.len(),
-            io.input_slots.len(),
-            io.output_slots.len(),
-            t0.elapsed().as_millis()
-        );
+        let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
 
-        let kernel_idx = kernels.len();
-        kernels.push(compiled);
+        emit_results.push(KernelEmitResult {
+            mlir_text,
+            num_inputs,
+            output_descs,
+            cache_key,
+            group_idx: gi,
+            num_nodes: group.node_indices.len(),
+            num_in: io.input_slots.len(),
+            num_out: io.output_slots.len(),
+        });
+
         steps.push(KernelStep {
-            kernel_idx,
+            kernel_idx: gi,
             input_slots: io.input_slots.iter().map(|(_, s)| *s).collect(),
             output_slots: io.output_slots.iter().map(|(_, s)| *s).collect(),
         });
     }
+
+    // Phase 2: Compile all kernels in parallel.
+    eprintln!("[plan] compiling {} kernels in parallel...", emit_results.len());
+    let compile_start = std::time::Instant::now();
+
+    let kernels: Vec<crate::runtime::CompiledGraph> = {
+        use rayon::prelude::*;
+        let results: Vec<Result<crate::runtime::CompiledGraph, OnnxError>> = emit_results
+            .par_iter()
+            .map(|er| {
+                let t0 = std::time::Instant::now();
+                let compiled = crate::graph_builder::compile_from_mlir(
+                    &er.mlir_text,
+                    er.num_inputs,
+                    &er.output_descs,
+                    er.cache_key.as_deref(),
+                )
+                .map_err(|e| OnnxError::CompileError(
+                    format!("kernel {}: {e}", er.group_idx)
+                ))?;
+                eprintln!(
+                    "[plan] kernel {} ({} nodes, {} in / {} out): {}ms",
+                    er.group_idx, er.num_nodes, er.num_in, er.num_out,
+                    t0.elapsed().as_millis()
+                );
+                Ok(compiled)
+            })
+            .collect();
+        results.into_iter().collect::<Result<Vec<_>, _>>()?
+    };
+
+    eprintln!(
+        "[plan] all {} kernels compiled: {}ms total",
+        kernels.len(),
+        compile_start.elapsed().as_millis()
+    );
 
     // Build slot descriptors.
     let slot_descs: Vec<SlotDesc> = slot_names

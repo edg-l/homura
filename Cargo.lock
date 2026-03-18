@@ -671,6 +671,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protobuf-src",
+ "rayon",
  "serde_json",
  "tracing",
  "tracing-subscriber",

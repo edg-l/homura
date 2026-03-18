@@ -143,6 +143,125 @@ impl GraphContext {
     }
 }
 
+/// Compile an MLIR module from text with a fresh context.
+///
+/// This is the second half of the `finalize_to_mlir` + `compile_from_mlir`
+/// split, designed for parallel compilation: each call creates its own MLIR
+/// context, so multiple calls can run on different threads safely.
+pub fn compile_from_mlir(
+    mlir_text: &str,
+    num_inputs: usize,
+    output_descs: &[OutputDesc],
+    cache_key: Option<&str>,
+) -> Result<CompiledGraph, CompileError> {
+    use melior::ir::Module;
+    use melior::pass;
+
+    let context = create_context();
+    let location = Location::unknown(&context);
+
+    // Cache check.
+    if let Some(key) = cache_key {
+        let cache = crate::cache::CompilationCache::new();
+        if let Some((so_path, meta_path)) = cache.get(key) {
+            if let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
+                match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
+                    Ok(graph) => return Ok(graph),
+                    Err(e) => {
+                        tracing::warn!(path = %so_path.display(), "cache entry unloadable, recompiling: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse module from text.
+    let mut module = Module::parse(&context, mlir_text)
+        .ok_or_else(|| CompileError::Verification)?;
+
+    // Run pass pipeline.
+    register_all_passes();
+    let pass_manager = pass::PassManager::new(&context);
+    parse_pass_pipeline(
+        pass_manager.as_operation_pass_manager(),
+        "builtin.module(\
+            func.func(canonicalize,cse),\
+            transform-interpreter,\
+            func.func(canonicalize,cse),\
+            symbol-dce,\
+            func.func(lower-vector-multi-reduction,lower-vector-mask),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            scf-forall-to-parallel,\
+            fold-memref-alias-ops,\
+            convert-vector-to-scf,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-openmp,\
+            convert-openmp-to-llvm,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-vector-to-llvm,\
+            convert-ub-to-llvm,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            convert-openmp-to-llvm,\
+            reconcile-unrealized-casts\
+        )",
+    )
+    .map_err(CompileError::Pass)?;
+
+    pass_manager.run(&mut module).map_err(CompileError::Pass)?;
+
+    // AOT compile.
+    let tmp_dir = tempfile_dir().ok_or_else(|| {
+        CompileError::ObjectEmit("cannot determine temp directory".into())
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let suffix = format!("{}_{:08x}", std::process::id(), nanos);
+    let tmp_so = tmp_dir.join(format!("homura_pk_{suffix}.so"));
+
+    let obj_paths = crate::compiler::emit_object_files_pub(
+        &module, &tmp_dir, &format!("homura_pk_{suffix}"),
+    )?;
+    crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
+    for p in &obj_paths {
+        std::fs::remove_file(p).ok();
+    }
+
+    // Store in cache.
+    let descs_owned: Vec<OutputDesc> = output_descs.to_vec();
+    if let Some(key) = cache_key {
+        let cache = crate::cache::CompilationCache::new();
+        let meta = crate::cache::CacheMeta {
+            num_inputs,
+            outputs: descs_owned.iter()
+                .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
+                .collect(),
+        };
+        if let Err(e) = cache.store(key, &tmp_so, &meta) {
+            tracing::warn!("cache: failed to write cache entry: {e}");
+        }
+    }
+
+    let graph = CompiledGraph::load(&tmp_so, num_inputs, descs_owned)
+        .map_err(CompileError::ObjectEmit)?;
+    std::fs::remove_file(&tmp_so).ok();
+    Ok(graph)
+}
+
 // ── Reshape decomposition: collapse_shape / expand_shape ──────────────────────
 
 /// Result of analyzing how to decompose a reshape into collapse/expand ops.
@@ -6246,6 +6365,149 @@ impl<'c> GraphBuilder<'c> {
     /// Compile the graph. `outputs` are the tensor values to return.
     pub fn compile(self, outputs: &[&Tensor<'c>]) -> Result<CompiledGraph, CompileError> {
         self.compile_with_cache(outputs, None)
+    }
+
+    /// Finalize the builder into an MLIR module text + metadata without compiling.
+    ///
+    /// Returns `(mlir_text, num_inputs, output_descs)`. The MLIR text can be
+    /// compiled later (possibly on another thread) via `compile_from_mlir`.
+    pub fn finalize_to_mlir(
+        self,
+        outputs: &[&Tensor<'c>],
+    ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
+        if outputs.is_empty() {
+            return Err(CompileError::NoOutputs);
+        }
+
+        let context = self.context;
+        let location = self.location;
+        let num_args = self.args.len();
+
+        // Build output descriptors.
+        let output_descs: Vec<OutputDesc> = outputs
+            .iter()
+            .map(|t| {
+                let shape_vec: Vec<u64> = t.shape().iter().map(|d| match d {
+                    Some(n) => *n,
+                    None => crate::shape::DIM_DYNAMIC,
+                }).collect();
+                OutputDesc {
+                    shape: crate::Shape(shape_vec),
+                    dtype: t.dtype(),
+                }
+            })
+            .collect();
+
+        // Add output memref arguments + bufferization.to_buffer + memref.copy.
+        for (out_idx, &output_tensor) in outputs.iter().enumerate() {
+            let out_shape = output_tensor.shape();
+            let out_dtype = output_tensor.dtype();
+            let dims: Vec<i64> = out_shape.iter().map(|d| match d {
+                Some(n) => *n as i64,
+                None => i64::MIN,
+            }).collect();
+            let out_memref_type: melior::ir::Type<'c> =
+                MemRefType::new(out_dtype.to_mlir_type(context), &dims, None, None).into();
+
+            self.block.add_argument(out_memref_type, location);
+
+            let result_memref: melior::ir::Value = self.block
+                .append_operation(
+                    OperationBuilder::new("bufferization.to_buffer", location)
+                        .add_operands(&[output_tensor.value()])
+                        .add_results(&[out_memref_type])
+                        .build()
+                        .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+                )
+                .result(0)
+                .unwrap()
+                .into();
+
+            let out_arg_idx = num_args + out_idx;
+            let out_arg: melior::ir::Value = self.block.argument(out_arg_idx).unwrap().into();
+            self.block.append_operation(
+                OperationBuilder::new("memref.copy", location)
+                    .add_operands(&[result_memref, out_arg])
+                    .build()
+                    .map_err(|e| CompileError::AttributeParse(e.to_string()))?,
+            );
+        }
+
+        // func.return
+        self.block.append_operation(func::r#return(&[], location));
+
+        // Build function type.
+        let all_arg_types: Vec<melior::ir::Type> = (0..self.block.argument_count())
+            .map(|i| self.block.argument(i).unwrap().r#type())
+            .collect();
+        let function_type = FunctionType::new(context, &all_arg_types, &[]);
+
+        // Build module.
+        let mut module = Module::new(location);
+
+        let dl_attr = Attribute::parse(context,
+            "#dlti.dl_spec<\
+                index = 64 : i64, \
+                i32 = dense<32> : vector<2xi64>, \
+                i64 = dense<64> : vector<2xi64>, \
+                f32 = dense<32> : vector<2xi64>, \
+                f64 = dense<64> : vector<2xi64>, \
+                !llvm.ptr = dense<64> : vector<4xi64>\
+            >"
+        ).expect("failed to parse dlti.dl_spec");
+        module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
+
+        // Emit sub-functions.
+        for sub in self.completed_subfunctions {
+            let sub_func_type = FunctionType::new(context, &sub.arg_types, &sub.return_types);
+            let sub_region = Region::new();
+            sub_region.append_block(sub.block);
+            let sub_func = func::func(
+                context,
+                StringAttribute::new(context, &sub.name),
+                TypeAttribute::new(sub_func_type.into()),
+                sub_region,
+                &[(
+                    Identifier::new(context, "llvm.emit_c_interface"),
+                    Attribute::unit(context),
+                )],
+                location,
+            );
+            module.body().append_operation(sub_func);
+        }
+
+        // Build @compute.
+        let func_region = Region::new();
+        func_region.append_block(self.block);
+        let function = func::func(
+            context,
+            StringAttribute::new(context, "compute"),
+            TypeAttribute::new(function_type.into()),
+            func_region,
+            &[(
+                Identifier::new(context, "llvm.emit_c_interface"),
+                Attribute::unit(context),
+            )],
+            location,
+        );
+        module.body().append_operation(function);
+
+        // Attach transform schedule.
+        module.as_operation_mut().set_attribute(
+            "transform.with_named_sequence",
+            Attribute::unit(context),
+        );
+        crate::compiler::build_transform_schedule(context, &module, location);
+
+        // Verify.
+        if !module.as_operation().verify() {
+            let ir = module.as_operation().to_string();
+            let _ = std::fs::write("/tmp/homura_gb_failed.mlir", &ir);
+            return Err(CompileError::Verification);
+        }
+
+        let mlir_text = module.as_operation().to_string();
+        Ok((mlir_text, num_args, output_descs))
     }
 
     /// Compile with optional cache key.
