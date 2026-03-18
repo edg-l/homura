@@ -269,6 +269,16 @@ impl CompiledGraph {
         num_inputs: usize,
         outputs: Vec<OutputDesc>,
     ) -> Result<Self, String> {
+        Self::load_named(so_path, num_inputs, outputs, "compute")
+    }
+
+    /// Load a compiled graph from a .so, resolving a specific function name.
+    pub(crate) fn load_named(
+        so_path: &Path,
+        num_inputs: usize,
+        outputs: Vec<OutputDesc>,
+        func_name: &str,
+    ) -> Result<Self, String> {
         use std::ffi::CString;
 
         let path_str = so_path
@@ -289,24 +299,47 @@ impl CompiledGraph {
             return Err(format!("dlopen({}) failed: {err}", so_path.display()));
         }
 
-        // `_mlir__mlir_ciface_compute` is the packed-convention wrapper:
-        // takes void** where each void* points to a MemRefDescriptor.
-        let sym_name = CString::new("_mlir__mlir_ciface_compute").expect("static name has no NUL");
+        let sym_str = format!("_mlir__mlir_ciface_{func_name}");
+        let sym_name = CString::new(sym_str.clone()).expect("symbol name has no NUL");
         let sym = unsafe { libc::dlsym(lib, sym_name.as_ptr()) };
         if sym.is_null() {
             unsafe {
                 libc::dlclose(lib);
             }
-            return Err(format!(
-                "_mlir__mlir_ciface_compute not found in {}",
-                so_path.display()
-            ));
+            return Err(format!("{sym_str} not found in {}", so_path.display()));
         }
 
         let func: unsafe extern "C" fn(*mut *mut ()) = unsafe { std::mem::transmute(sym) };
 
         Ok(Self {
             _lib: lib,
+            func,
+            num_inputs,
+            outputs,
+        })
+    }
+
+    /// Load a kernel function from an already-opened shared library handle.
+    ///
+    /// The handle is NOT owned — the caller must ensure it outlives this
+    /// `CompiledGraph`. We store a null `_lib` to skip dlclose on drop.
+    pub(crate) fn load_from_handle(
+        lib: *mut std::ffi::c_void,
+        num_inputs: usize,
+        outputs: Vec<OutputDesc>,
+        func_name: &str,
+    ) -> Result<Self, String> {
+        use std::ffi::CString;
+
+        let sym_str = format!("_mlir__mlir_ciface_{func_name}");
+        let sym_name = CString::new(sym_str.clone()).expect("symbol name has no NUL");
+        let sym = unsafe { libc::dlsym(lib, sym_name.as_ptr()) };
+        if sym.is_null() {
+            return Err(format!("{sym_str} not found in shared library"));
+        }
+        let func: unsafe extern "C" fn(*mut *mut ()) = unsafe { std::mem::transmute(sym) };
+        Ok(Self {
+            _lib: std::ptr::null_mut(), // not owned — caller manages lifetime
             func,
             num_inputs,
             outputs,
@@ -548,6 +581,9 @@ pub struct KernelStep {
 /// specifies the order of kernel invocations and how buffer slots map to
 /// each kernel's inputs and outputs.
 pub struct ExecutionPlan {
+    /// Unified shared library handle (if all kernels are in one .so).
+    /// When set, individual `CompiledGraph._lib` entries are null (non-owning).
+    _shared_lib: *mut std::ffi::c_void,
     /// Compiled kernels, indexed by `KernelStep::kernel_idx`.
     pub(crate) kernels: Vec<CompiledGraph>,
     /// Execution steps in order.
@@ -590,6 +626,20 @@ impl<'a> PoolEntry<'a> {
     }
 }
 
+// SAFETY: the dlopen handle and function pointers are safe to send across threads.
+unsafe impl Send for ExecutionPlan {}
+unsafe impl Sync for ExecutionPlan {}
+
+impl Drop for ExecutionPlan {
+    fn drop(&mut self) {
+        if !self._shared_lib.is_null() {
+            unsafe {
+                libc::dlclose(self._shared_lib);
+            }
+        }
+    }
+}
+
 impl ExecutionPlan {
     /// Build an execution plan, precomputing buffer lifetime metadata.
     pub fn new(
@@ -617,6 +667,7 @@ impl ExecutionPlan {
             last_read[slot] = None;
         }
         Self {
+            _shared_lib: std::ptr::null_mut(),
             kernels,
             steps,
             num_slots,
@@ -626,6 +677,11 @@ impl ExecutionPlan {
             slot_descs,
             slot_last_read: last_read,
         }
+    }
+
+    /// Set the unified shared library handle (transfers ownership).
+    pub(crate) fn set_shared_lib(&mut self, lib: *mut std::ffi::c_void) {
+        self._shared_lib = lib;
     }
 
     /// Return the `SlotDesc` for each model output slot.

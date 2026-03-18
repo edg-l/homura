@@ -2355,8 +2355,11 @@ pub fn emit_and_compile_plan(
         };
 
         // Finalize module to MLIR text for deferred parallel compilation.
+        // Use a unique function name per kernel so all .o files can be linked
+        // into a single .so without symbol collisions.
+        let func_name = format!("k{gi}");
         let (mlir_text, num_inputs, output_descs) = builder
-            .finalize_to_mlir(&output_refs, transform_mode)
+            .finalize_to_mlir_named(&output_refs, transform_mode, &func_name)
             .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
 
         let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
@@ -2410,19 +2413,23 @@ pub fn emit_and_compile_plan(
     );
     let compile_start = std::time::Instant::now();
 
-    let kernels: Vec<crate::runtime::CompiledGraph> = {
+    // Phase 2a: Compile each kernel to .o files in parallel (no linking yet).
+    let tmp_dir = crate::graph_builder::tempfile_dir()
+        .ok_or_else(|| OnnxError::CompileError("cannot determine temp directory".into()))?;
+
+    let all_obj_paths: Vec<(usize, Vec<std::path::PathBuf>)> = {
         use rayon::prelude::*;
-        let results: Vec<Result<crate::runtime::CompiledGraph, OnnxError>> = emit_results
+        let results: Vec<Result<(usize, Vec<std::path::PathBuf>), OnnxError>> = emit_results
             .par_iter()
             .map(|er| {
                 let t0 = std::time::Instant::now();
+                let func_name = format!("k{}", er.group_idx);
                 let label = format!("k{}:{}", er.group_idx, er.ops_label);
-                let compiled = crate::graph_builder::compile_from_mlir(
+                let obj_paths = crate::graph_builder::compile_to_objects(
                     &er.mlir_text,
-                    er.num_inputs,
-                    &er.output_descs,
-                    er.cache_key.as_deref(),
                     &label,
+                    &func_name,
+                    &tmp_dir,
                 )
                 .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
                 eprintln!(
@@ -2434,14 +2441,81 @@ pub fn emit_and_compile_plan(
                     er.num_out,
                     t0.elapsed().as_millis()
                 );
-                Ok(compiled)
+                Ok((er.group_idx, obj_paths))
             })
             .collect();
         results.into_iter().collect::<Result<Vec<_>, _>>()?
     };
 
+    // Phase 2b: Link all .o files into a single .so.
+    let link_start = std::time::Instant::now();
+    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let unified_so = tmp_dir.join(format!(
+        "homura_unified_{}_{:08x}.so",
+        std::process::id(),
+        nanos
+    ));
+    crate::compiler::link_shared_lib_pub(&all_objs, &unified_so)
+        .map_err(|e| OnnxError::CompileError(format!("unified link: {e}")))?;
     eprintln!(
-        "[{:>8.2}s] [plan] all {} kernels compiled: {}ms total",
+        "[{:>8.2}s] [plan] unified link ({} .o files): {}ms",
+        crate::log_ts(),
+        all_objs.len(),
+        link_start.elapsed().as_millis()
+    );
+
+    // Clean up .o files.
+    for p in &all_objs {
+        std::fs::remove_file(p).ok();
+    }
+
+    // Phase 2c: dlopen once, dlsym each kernel.
+    let lib = {
+        use std::ffi::CString;
+        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
+        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
+        if lib.is_null() {
+            let err = unsafe {
+                let msg = libc::dlerror();
+                if msg.is_null() {
+                    "unknown dlopen error".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+                }
+            };
+            return Err(OnnxError::CompileError(format!(
+                "dlopen unified .so failed: {err}"
+            )));
+        }
+        lib
+    };
+
+    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
+        .iter()
+        .map(|er| {
+            let func_name = format!("k{}", er.group_idx);
+            crate::runtime::CompiledGraph::load_from_handle(
+                lib,
+                er.num_inputs,
+                er.output_descs.clone(),
+                &func_name,
+            )
+            .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Clean up the .so file (it's already dlopen'd).
+    std::fs::remove_file(&unified_so).ok();
+
+    eprintln!(
+        "[{:>8.2}s] [plan] all {} kernels compiled + linked: {}ms total",
         crate::log_ts(),
         kernels.len(),
         compile_start.elapsed().as_millis()
@@ -2469,7 +2543,7 @@ pub fn emit_and_compile_plan(
         })
         .collect();
 
-    let plan = ExecutionPlan::new(
+    let mut plan = ExecutionPlan::new(
         kernels,
         steps,
         num_slots,
@@ -2478,6 +2552,7 @@ pub fn emit_and_compile_plan(
         output_slots,
         slot_descs,
     );
+    plan.set_shared_lib(lib);
 
     Ok((plan, weights))
 }

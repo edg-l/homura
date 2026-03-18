@@ -194,6 +194,28 @@ fn emit_object_files(
     output_dir: &std::path::Path,
     base_name: &str,
     label: &str,
+    func_name: &str,
+) -> Result<Vec<std::path::PathBuf>, CompileError> {
+    emit_object_files_impl(module, output_dir, base_name, label, func_name, false)
+}
+
+fn emit_object_files_monolithic(
+    module: &melior::ir::Module,
+    output_dir: &std::path::Path,
+    base_name: &str,
+    label: &str,
+    func_name: &str,
+) -> Result<Vec<std::path::PathBuf>, CompileError> {
+    emit_object_files_impl(module, output_dir, base_name, label, func_name, true)
+}
+
+fn emit_object_files_impl(
+    module: &melior::ir::Module,
+    output_dir: &std::path::Path,
+    base_name: &str,
+    label: &str,
+    func_name: &str,
+    force_monolithic: bool,
 ) -> Result<Vec<std::path::PathBuf>, CompileError> {
     use crate::llvm_ffi::{LLVMSplitModule, mlirTranslateModuleToLLVMIR};
     use llvm_sys::bit_reader::LLVMParseBitcodeInContext2;
@@ -237,13 +259,19 @@ fn emit_object_files(
             ));
         }
 
-        if let Err(e) = emit_packed_wrapper(llvm_module, llvm_ctx) {
+        if let Err(e) = emit_packed_wrapper(llvm_module, llvm_ctx, func_name) {
             LLVMDisposeModule(llvm_module);
             LLVMContextDispose(llvm_ctx);
             return Err(CompileError::ObjectEmit(format!(
                 "emit_packed_wrapper: {e}"
             )));
         }
+
+        // Internalize all defined symbols except the entry-point chain BEFORE
+        // LLVMSplitModule, so the optimizer can inline internalized functions
+        // into callers within the same module. This prevents symbol collisions
+        // when multiple kernels' .o files are linked into a single .so.
+        internalize_module(llvm_module, func_name);
 
         // Determine thread count: env override or available parallelism.
         let n_threads: usize = std::env::var("HOMURA_CODEGEN_THREADS")
@@ -268,7 +296,7 @@ fn emit_object_files(
         // Monolithic path: few functions or parallelism disabled.
         // Per-kernel modules typically have 1 real function + 2 dead transform
         // schedule stubs — splitting those is counterproductive.
-        if n_threads <= 1 || n_funcs <= 4 {
+        if force_monolithic || n_threads <= 1 || n_funcs <= 4 {
             let bc_size = {
                 let mb = LLVMWriteBitcodeToMemoryBuffer(llvm_module);
                 let sz = LLVMGetBufferSize(mb);
@@ -281,6 +309,7 @@ fn emit_object_files(
                 bc_size / 1024
             );
             let obj_path = output_dir.join(format!("{base_name}.o"));
+            internalize_module(llvm_module, func_name);
             optimise_and_emit(llvm_module, llvm_ctx, &obj_path, "O2")?;
             return Ok(vec![obj_path]);
         }
@@ -431,19 +460,61 @@ fn emit_object_files(
 ///     _mlir_ciface_compute(args[0], args[1], ..., args[N-1]);
 /// }
 /// ```
+/// Set internal linkage on all defined symbols (functions + globals) in
+/// the LLVM module, except the packed wrapper for `func_name`.
+///
+/// This prevents symbol collisions when multiple kernels' .o files are
+/// linked into a single .so.
+unsafe fn internalize_module(llvm_module: llvm_sys::prelude::LLVMModuleRef, func_name: &str) {
+    use llvm_sys::core::*;
+    // Keep these symbols external (they form the call chain):
+    //   _mlir__mlir_ciface_{name} → _mlir_ciface_{name} → {name}
+    let keep_syms: Vec<std::ffi::CString> = vec![
+        std::ffi::CString::new(format!("_mlir__mlir_ciface_{func_name}")).unwrap(),
+        std::ffi::CString::new(format!("_mlir_ciface_{func_name}")).unwrap(),
+        std::ffi::CString::new(func_name).unwrap(),
+    ];
+    unsafe {
+        let mut f = LLVMGetFirstFunction(llvm_module);
+        while !f.is_null() {
+            let next = LLVMGetNextFunction(f);
+            if LLVMIsDeclaration(f) == 0 {
+                let mut name_len: usize = 0;
+                let name_ptr = LLVMGetValueName2(f, &mut name_len as *mut usize);
+                let name = std::slice::from_raw_parts(name_ptr as *const u8, name_len);
+                let keep = keep_syms.iter().any(|s| name == s.as_bytes());
+                if !keep {
+                    LLVMSetLinkage(f, llvm_sys::LLVMLinkage::LLVMInternalLinkage);
+                }
+            }
+            f = next;
+        }
+        let mut g = LLVMGetFirstGlobal(llvm_module);
+        while !g.is_null() {
+            let next = LLVMGetNextGlobal(g);
+            if LLVMIsDeclaration(g) == 0 {
+                LLVMSetLinkage(g, llvm_sys::LLVMLinkage::LLVMInternalLinkage);
+            }
+            g = next;
+        }
+    }
+}
+
 unsafe fn emit_packed_wrapper(
     llvm_module: llvm_sys::prelude::LLVMModuleRef,
     llvm_ctx: llvm_sys::prelude::LLVMContextRef,
+    func_name: &str,
 ) -> Result<(), String> {
     use llvm_sys::core::*;
     use std::ffi::CString;
 
     unsafe {
         // Look up the direct C interface function.
-        let ciface_name = CString::new("_mlir_ciface_compute").unwrap();
+        // MLIR's convert-func-to-llvm emits `_mlir_ciface_{func_name}`.
+        let ciface_name = CString::new(format!("_mlir_ciface_{func_name}")).unwrap();
         let ciface_fn = LLVMGetNamedFunction(llvm_module, ciface_name.as_ptr());
         if ciface_fn.is_null() {
-            return Err("_mlir_ciface_compute not found in LLVM module".into());
+            return Err(format!("_mlir_ciface_{func_name} not found in LLVM module"));
         }
 
         // Determine how many arguments it takes.
@@ -460,7 +531,7 @@ unsafe fn emit_packed_wrapper(
         let mut wrapper_param_types = [ptr_ty];
         let wrapper_fn_ty = LLVMFunctionType(void_ty, wrapper_param_types.as_mut_ptr(), 1, 0);
 
-        let packed_name = CString::new("_mlir__mlir_ciface_compute").unwrap();
+        let packed_name = CString::new(format!("_mlir__mlir_ciface_{func_name}")).unwrap();
         let wrapper_fn = LLVMAddFunction(llvm_module, packed_name.as_ptr(), wrapper_fn_ty);
 
         // Set internal linkage so the optimiser can inline it.
@@ -1263,66 +1334,64 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
     //      (e.g. vector<50257xf32> for LM head) which hangs LLVM.
     //   2. Outlining + padding for isolation introduces memrefCopy
     //      allocas that crash at runtime.
-    let build_vectorize_seq = |name: &str,
-                                tile_sizes: &str,
-                                scalable: &str,
-                                n_tile_loops: usize| {
-        let vec_block = Block::new(&[(any_op_type, location)]);
-        let op_handle: melior::ir::Value = vec_block.argument(0).unwrap().into();
+    let build_vectorize_seq =
+        |name: &str, tile_sizes: &str, scalable: &str, n_tile_loops: usize| {
+            let vec_block = Block::new(&[(any_op_type, location)]);
+            let op_handle: melior::ir::Value = vec_block.argument(0).unwrap().into();
 
-        // tile_using_for on N and K dimensions — produces scf.for loops.
-        // LLVM's Loop Vectorizer + SLP Vectorizer handle the inner loops.
-        let static_sizes =
-            Attribute::parse(context, tile_sizes).expect("parse tile static_sizes");
-        let scalable_sizes =
-            Attribute::parse(context, scalable).expect("parse tile scalable_sizes");
-        let mut tile_results: Vec<melior::ir::Type> = vec![any_op_type];
-        for _ in 0..n_tile_loops {
-            tile_results.push(any_op_type);
-        }
-        let tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
-            .add_operands(&[op_handle])
-            .add_attributes(&[
-                (Identifier::new(context, "static_sizes"), static_sizes),
-                (Identifier::new(context, "scalable_sizes"), scalable_sizes),
-            ])
-            .add_results(&tile_results)
-            .build()
-            .expect("build structured.tile_using_for (vectorize-only)");
-        vec_block.append_operation(tile_op);
+            // tile_using_for on N and K dimensions — produces scf.for loops.
+            // LLVM's Loop Vectorizer + SLP Vectorizer handle the inner loops.
+            let static_sizes =
+                Attribute::parse(context, tile_sizes).expect("parse tile static_sizes");
+            let scalable_sizes =
+                Attribute::parse(context, scalable).expect("parse tile scalable_sizes");
+            let mut tile_results: Vec<melior::ir::Type> = vec![any_op_type];
+            for _ in 0..n_tile_loops {
+                tile_results.push(any_op_type);
+            }
+            let tile_op = OperationBuilder::new("transform.structured.tile_using_for", location)
+                .add_operands(&[op_handle])
+                .add_attributes(&[
+                    (Identifier::new(context, "static_sizes"), static_sizes),
+                    (Identifier::new(context, "scalable_sizes"), scalable_sizes),
+                ])
+                .add_results(&tile_results)
+                .build()
+                .expect("build structured.tile_using_for (vectorize-only)");
+            vec_block.append_operation(tile_op);
 
-        let vec_yield_op = OperationBuilder::new("transform.yield", location)
-            .build()
-            .expect("build transform.yield (vectorize)");
-        vec_block.append_operation(vec_yield_op);
+            let vec_yield_op = OperationBuilder::new("transform.yield", location)
+                .build()
+                .expect("build transform.yield (vectorize)");
+            vec_block.append_operation(vec_yield_op);
 
-        let vec_region = Region::new();
-        vec_region.append_block(vec_block);
+            let vec_region = Region::new();
+            vec_region.append_block(vec_block);
 
-        let vec_func_type = FunctionType::new(context, &[any_op_type], &[]);
-        let vec_arg_attrs =
-            Attribute::parse(context, "[{transform.consumed}]").expect("parse vec arg_attrs");
+            let vec_func_type = FunctionType::new(context, &[any_op_type], &[]);
+            let vec_arg_attrs =
+                Attribute::parse(context, "[{transform.consumed}]").expect("parse vec arg_attrs");
 
-        OperationBuilder::new("transform.named_sequence", location)
-            .add_attributes(&[
-                (
-                    Identifier::new(context, "sym_name"),
-                    StringAttribute::new(context, name).into(),
-                ),
-                (
-                    Identifier::new(context, "function_type"),
-                    TypeAttribute::new(vec_func_type.into()).into(),
-                ),
-                (Identifier::new(context, "arg_attrs"), vec_arg_attrs),
-                (
-                    Identifier::new(context, "sym_visibility"),
-                    StringAttribute::new(context, "private").into(),
-                ),
-            ])
-            .add_regions([vec_region])
-            .build()
-            .expect("build transform.named_sequence @vectorize_contraction_Nd")
-    };
+            OperationBuilder::new("transform.named_sequence", location)
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "sym_name"),
+                        StringAttribute::new(context, name).into(),
+                    ),
+                    (
+                        Identifier::new(context, "function_type"),
+                        TypeAttribute::new(vec_func_type.into()).into(),
+                    ),
+                    (Identifier::new(context, "arg_attrs"), vec_arg_attrs),
+                    (
+                        Identifier::new(context, "sym_visibility"),
+                        StringAttribute::new(context, "private").into(),
+                    ),
+                ])
+                .add_regions([vec_region])
+                .build()
+                .expect("build transform.named_sequence @vectorize_contraction_Nd")
+        };
 
     // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
     module
@@ -1337,28 +1406,25 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
     // tiled inner loops to AVX-512 FMA (vfmadd132ps + vbroadcastss).
     module.body().append_operation(build_vectorize_seq(
         "vectorize_contraction_3d",
-        "array<i64: 0, 16, 16>",         // tile N=16, K=16, skip M
+        "array<i64: 0, 16, 16>", // tile N=16, K=16, skip M
         "array<i1: false, false, false>",
-        2,                                // 2 non-zero tile dims (N, K)
+        2, // 2 non-zero tile dims (N, K)
     ));
     // ── @vectorize_contraction_4d ──────────────────────────────────────────────
     // 4D batched matmul (B, M, N, K): tile N=16, K=16.
     module.body().append_operation(build_vectorize_seq(
         "vectorize_contraction_4d",
-        "array<i64: 0, 0, 16, 16>",             // tile N=16, K=16, skip B and M
+        "array<i64: 0, 0, 16, 16>", // tile N=16, K=16, skip B and M
         "array<i1: false, false, false, false>",
-        2,                                        // 2 non-zero tile dims (N, K)
+        2, // 2 non-zero tile dims (N, K)
     ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
     let main_block = Block::new(&[(any_op_type, location)]);
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
 
-    let matchers_attr = Attribute::parse(
-        context,
-        "[@match_contraction_3d, @match_contraction_4d]",
-    )
-    .expect("parse matchers attr");
+    let matchers_attr = Attribute::parse(context, "[@match_contraction_3d, @match_contraction_4d]")
+        .expect("parse matchers attr");
     let actions_attr = Attribute::parse(
         context,
         "[@vectorize_contraction_3d, @vectorize_contraction_4d]",
@@ -1563,30 +1629,29 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         let operand_segment_sizes = Attribute::parse(context, "array<i32: 1, 0, 0, 0, 0>")
             .expect("parse operandSegmentSizes");
 
-        let forall_op =
-            OperationBuilder::new("transform.structured.tile_using_forall", location)
-                .add_operands(&[op_handle])
-                .add_attributes(&[
-                    (
-                        Identifier::new(context, "static_num_threads"),
-                        static_num_threads_attr,
-                    ),
-                    (
-                        Identifier::new(context, "static_tile_sizes"),
-                        static_tile_sizes_attr,
-                    ),
-                    (
-                        Identifier::new(context, "scalable_sizes"),
-                        scalable_forall_attr,
-                    ),
-                    (
-                        Identifier::new(context, "operandSegmentSizes"),
-                        operand_segment_sizes,
-                    ),
-                ])
-                .add_results(&[any_op_type, any_op_type])
-                .build()
-                .expect("build structured.tile_using_forall (tile-parallel)");
+        let forall_op = OperationBuilder::new("transform.structured.tile_using_forall", location)
+            .add_operands(&[op_handle])
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "static_num_threads"),
+                    static_num_threads_attr,
+                ),
+                (
+                    Identifier::new(context, "static_tile_sizes"),
+                    static_tile_sizes_attr,
+                ),
+                (
+                    Identifier::new(context, "scalable_sizes"),
+                    scalable_forall_attr,
+                ),
+                (
+                    Identifier::new(context, "operandSegmentSizes"),
+                    operand_segment_sizes,
+                ),
+            ])
+            .add_results(&[any_op_type, any_op_type])
+            .build()
+            .expect("build structured.tile_using_forall (tile-parallel)");
         let forall_ref = action_block.append_operation(forall_op);
         let tiled_op: melior::ir::Value = forall_ref.result(0).unwrap().into();
 
@@ -1663,32 +1728,29 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
     // within each forall chunk for optimal M=1 vector-matrix multiply.
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_3d",
-        "array<i64: 0, 256, 0>",         // forall: tile N=256, skip M and K
+        "array<i64: 0, 256, 0>", // forall: tile N=256, skip M and K
         "array<i1: false, false, false>",
-        "array<i64: 0, 0, 16>",          // for: tile K=16 only, N streams freely
+        "array<i64: 0, 0, 16>", // for: tile K=16 only, N streams freely
         "array<i1: false, false, false>",
-        1,                                // 1 non-zero for-tile dim (K)
+        1, // 1 non-zero for-tile dim (K)
     ));
     // ── @tile_parallel_contraction_4d ─────────────────────────────────────────
     // 4D batched matmul (B, M, N, K): forall N=256 (parallel), for K=16.
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_4d",
-        "array<i64: 0, 0, 256, 0>",               // forall: tile N=256, skip B, M, K
+        "array<i64: 0, 0, 256, 0>", // forall: tile N=256, skip B, M, K
         "array<i1: false, false, false, false>",
-        "array<i64: 0, 0, 0, 16>",                // for: tile K=16 only
+        "array<i64: 0, 0, 0, 16>", // for: tile K=16 only
         "array<i1: false, false, false, false>",
-        1,                                          // 1 non-zero for-tile dim (K)
+        1, // 1 non-zero for-tile dim (K)
     ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
     let main_block = Block::new(&[(any_op_type, location)]);
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
 
-    let matchers_attr = Attribute::parse(
-        context,
-        "[@match_contraction_3d, @match_contraction_4d]",
-    )
-    .expect("parse matchers attr");
+    let matchers_attr = Attribute::parse(context, "[@match_contraction_3d, @match_contraction_4d]")
+        .expect("parse matchers attr");
     let actions_attr = Attribute::parse(
         context,
         "[@tile_parallel_contraction_3d, @tile_parallel_contraction_4d]",
@@ -1748,8 +1810,21 @@ pub(crate) fn emit_object_files_pub(
     output_dir: &std::path::Path,
     base_name: &str,
     label: &str,
+    func_name: &str,
 ) -> Result<Vec<std::path::PathBuf>, CompileError> {
-    emit_object_files(module, output_dir, base_name, label)
+    emit_object_files(module, output_dir, base_name, label, func_name)
+}
+
+/// Like `emit_object_files_pub` but forces monolithic codegen (single .o file).
+/// Used for unified linking where multiple kernels share a single .so.
+pub(crate) fn emit_object_files_monolithic_pub(
+    module: &melior::ir::Module,
+    output_dir: &std::path::Path,
+    base_name: &str,
+    label: &str,
+    func_name: &str,
+) -> Result<Vec<std::path::PathBuf>, CompileError> {
+    emit_object_files_monolithic(module, output_dir, base_name, label, func_name)
 }
 
 /// Public wrapper so `graph_builder` can call the shared lib linker.

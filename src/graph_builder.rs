@@ -166,6 +166,150 @@ impl GraphContext {
 /// This is the second half of the `finalize_to_mlir` + `compile_from_mlir`
 /// split, designed for parallel compilation: each call creates its own MLIR
 /// context, so multiple calls can run on different threads safely.
+/// Compile MLIR text to object files only (no linking).
+///
+/// Returns the .o file paths. The caller is responsible for linking them
+/// into a shared library. Used by the unified compilation path where
+/// multiple kernels are linked into a single .so.
+pub fn compile_to_objects(
+    mlir_text: &str,
+    label: &str,
+    func_name: &str,
+    output_dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, CompileError> {
+    use melior::ir::Module;
+    use melior::pass;
+
+    let context = create_context();
+
+    // Dump pre-pass IR for specific kernels.
+    if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
+        let _ = std::fs::write("/tmp/homura_kernel_pre.mlir", mlir_text);
+        eprintln!("[dump] {label} pre-pass IR → /tmp/homura_kernel_pre.mlir");
+    }
+
+    let mut module =
+        Module::parse(&context, mlir_text).ok_or_else(|| CompileError::Verification)?;
+
+    let has_schedule = mlir_text.contains("transform.with_named_sequence");
+    let vectorize_only = mlir_text.contains("homura.vectorize_only");
+    register_all_passes();
+    let pass_manager = pass::PassManager::new(&context);
+
+    let pipeline = if has_schedule && !vectorize_only {
+        "builtin.module(\
+            func.func(canonicalize,cse),\
+            transform-interpreter,\
+            func.func(canonicalize,cse),\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
+            symbol-dce,\
+            func.func(lower-vector-multi-reduction,lower-vector-mask),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            scf-forall-to-parallel,\
+            fold-memref-alias-ops,\
+            convert-vector-to-scf,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-openmp,\
+            convert-openmp-to-llvm,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
+            convert-ub-to-llvm,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            convert-openmp-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
+    } else if has_schedule {
+        "builtin.module(\
+            func.func(canonicalize,cse),\
+            transform-interpreter,\
+            func.func(canonicalize,cse),\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
+            symbol-dce,\
+            func.func(lower-vector-multi-reduction,lower-vector-mask),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            fold-memref-alias-ops,\
+            convert-vector-to-scf,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
+            convert-ub-to-llvm,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
+    } else {
+        "builtin.module(\
+            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
+            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
+            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            fold-memref-alias-ops,\
+            convert-linalg-to-loops,\
+            fold-memref-alias-ops,\
+            lower-affine,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
+    };
+
+    parse_pass_pipeline(pass_manager.as_operation_pass_manager(), pipeline)
+        .map_err(CompileError::Pass)?;
+    pass_manager.run(&mut module).map_err(CompileError::Pass)?;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let tid = std::thread::current().id();
+    let base_name = format!(
+        "homura_{func_name}_{}_{}_{:08x}",
+        std::process::id(),
+        format!("{:?}", tid)
+            .replace("ThreadId(", "")
+            .replace(")", ""),
+        nanos
+    );
+
+    crate::compiler::emit_object_files_monolithic_pub(
+        &module, output_dir, &base_name, label, func_name,
+    )
+}
+
 pub fn compile_from_mlir(
     mlir_text: &str,
     num_inputs: usize,
@@ -353,6 +497,7 @@ pub fn compile_from_mlir(
         &tmp_dir,
         &format!("homura_pk_{suffix}"),
         label,
+        "compute",
     )?;
     let link_start = std::time::Instant::now();
     crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
@@ -7643,6 +7788,15 @@ impl<'c> GraphBuilder<'c> {
         outputs: &[&Tensor<'c>],
         transform_mode: TransformMode,
     ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
+        self.finalize_to_mlir_named(outputs, transform_mode, "compute")
+    }
+
+    pub fn finalize_to_mlir_named(
+        self,
+        outputs: &[&Tensor<'c>],
+        transform_mode: TransformMode,
+        func_name: &str,
+    ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
         if outputs.is_empty() {
             return Err(CompileError::NoOutputs);
         }
@@ -7756,12 +7910,12 @@ impl<'c> GraphBuilder<'c> {
             module.body().append_operation(sub_func);
         }
 
-        // Build @compute.
+        // Build @{func_name}.
         let func_region = Region::new();
         func_region.append_block(self.block);
         let function = func::func(
             context,
-            StringAttribute::new(context, "compute"),
+            StringAttribute::new(context, func_name),
             TypeAttribute::new(function_type.into()),
             func_region,
             &[(
@@ -8072,6 +8226,7 @@ impl<'c> GraphBuilder<'c> {
             &tmp_dir,
             &format!("homura_gb_{suffix}"),
             "gb",
+            "compute",
         )?;
         crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
         for p in &obj_paths {
@@ -8638,7 +8793,7 @@ fn identity_map_str(rank: usize) -> String {
     format!("affine_map<({dim_list}) -> ({dim_list})>")
 }
 
-fn tempfile_dir() -> Option<std::path::PathBuf> {
+pub fn tempfile_dir() -> Option<std::path::PathBuf> {
     std::env::var("TMPDIR")
         .ok()
         .map(std::path::PathBuf::from)
