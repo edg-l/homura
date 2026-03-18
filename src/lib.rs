@@ -9,9 +9,7 @@ pub mod onnx;
 pub mod op;
 pub(crate) mod runtime;
 pub mod shape;
-pub mod tensor;
 pub mod tokenizer;
-pub mod trace;
 
 /// Timestamp prefix for compile-time logging. Returns seconds since process start.
 pub(crate) fn log_ts() -> f64 {
@@ -21,12 +19,9 @@ pub(crate) fn log_ts() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
-pub use compiler::Compiler;
 pub use dtype::DType;
 pub use graph_builder::{GraphBuilder, GraphContext};
 pub use onnx::Model;
 pub use op::NodeId;
 pub use runtime::{Buffer, CompiledGraph, ExecutionPlan, KernelStep, SlotDesc};
 pub use shape::Shape;
-pub use tensor::Tensor;
-pub use trace::{begin_trace, take_trace};

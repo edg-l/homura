@@ -13,7 +13,7 @@ use crate::{DType, Shape, runtime::OutputDesc};
 /// - `{key}.so`  — the native compiled shared library
 /// - `{key}.meta` — JSON sidecar with `num_inputs` and output shapes/dtypes
 ///
-/// On a cache hit, `Compiler::compile` skips compilation entirely and loads
+/// On a cache hit, the compiler skips compilation entirely and loads
 /// the .so directly via dlopen, which is near-instant.
 pub struct CompilationCache {
     cache_dir: PathBuf,

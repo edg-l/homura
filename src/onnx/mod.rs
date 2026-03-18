@@ -8,8 +8,7 @@ use std::sync::Mutex;
 
 use crate::{
     Shape,
-    cache::CompilationCache,
-    runtime::{Buffer, CompiledGraph, ExecutionPlan, OutputDesc},
+    runtime::{Buffer, ExecutionPlan, OutputDesc},
     shape::DIM_DYNAMIC,
 };
 use parser::{Dim, OnnxError, OnnxModel};

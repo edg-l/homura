@@ -29,11 +29,3 @@ opt-level = 2
 [patch.crates-io]
 mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
 
-[[example]]
-name = "add"
-
-[[example]]
-name = "ops"
-
-[[example]]
-name = "mlp"
