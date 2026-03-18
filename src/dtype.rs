@@ -9,12 +9,16 @@ pub enum DType {
     F64,
     I32,
     I64,
+    /// BFloat16 — used for loading weights from safetensors.
+    /// Compute stays in f32; bf16 buffers are converted on load.
+    BF16,
 }
 
 impl DType {
     /// Size in bytes of one element.
     pub fn size_bytes(self) -> usize {
         match self {
+            DType::BF16 => 2,
             DType::F32 | DType::I32 => 4,
             DType::F64 | DType::I64 => 8,
         }
@@ -23,6 +27,7 @@ impl DType {
     /// Convert to an MLIR Type.
     pub(crate) fn to_mlir_type<'c>(self, context: &'c Context) -> Type<'c> {
         match self {
+            DType::BF16 => Type::bfloat16(context),
             DType::F32 => Type::float32(context),
             DType::F64 => Type::float64(context),
             DType::I32 => IntegerType::new(context, 32).into(),

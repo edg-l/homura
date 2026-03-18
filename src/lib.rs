@@ -1,10 +1,11 @@
 pub mod cache;
 pub(crate) mod compiler;
-pub mod graph_builder;
-mod llvm_ffi;
 pub mod dtype;
 pub mod generate;
+pub mod graph_builder;
+pub mod hf;
 pub mod kv_generate;
+mod llvm_ffi;
 pub mod onnx;
 pub mod op;
 pub(crate) mod runtime;

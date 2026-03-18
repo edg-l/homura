@@ -54,24 +54,30 @@ fn pack_dims_to_i64_tensor<'c>(
     let loc = builder.location();
     let i64_type = melior::ir::Type::parse(ctx, "i64").expect("i64 type");
 
-    let i64_vals: Vec<Value<'c, 'c>> = dims.iter().map(|&idx| {
-        builder.block()
-            .append_operation(
-                OperationBuilder::new("arith.index_cast", loc)
-                    .add_operands(&[idx])
-                    .add_results(&[i64_type])
-                    .build()
-                    .expect("arith.index_cast"),
-            )
-            .result(0).unwrap().into()
-    }).collect();
+    let i64_vals: Vec<Value<'c, 'c>> = dims
+        .iter()
+        .map(|&idx| {
+            builder
+                .block()
+                .append_operation(
+                    OperationBuilder::new("arith.index_cast", loc)
+                        .add_operands(&[idx])
+                        .add_results(&[i64_type])
+                        .build()
+                        .expect("arith.index_cast"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        })
+        .collect();
 
     let n = dims.len() as u64;
-    let tensor_type: melior::ir::Type = melior::ir::r#type::RankedTensorType::new(
-        &[n], i64_type, None,
-    ).into();
+    let tensor_type: melior::ir::Type =
+        melior::ir::r#type::RankedTensorType::new(&[n], i64_type, None).into();
 
-    let result: Value<'c, 'c> = builder.block()
+    let result: Value<'c, 'c> = builder
+        .block()
         .append_operation(
             OperationBuilder::new("tensor.from_elements", loc)
                 .add_operands(&i64_vals)
@@ -79,7 +85,9 @@ fn pack_dims_to_i64_tensor<'c>(
                 .build()
                 .expect("tensor.from_elements"),
         )
-        .result(0).unwrap().into();
+        .result(0)
+        .unwrap()
+        .into();
     Tensor::from_value(result)
 }
 
@@ -93,45 +101,60 @@ fn extract_dims_from_i64_tensor<'c>(
     let loc = builder.location();
     let index_type = melior::ir::Type::parse(ctx, "index").expect("index type");
     let shape = tensor.shape();
-    assert_eq!(shape.len(), 1, "extract_dims_from_i64_tensor: expected 1-D tensor");
+    assert_eq!(
+        shape.len(),
+        1,
+        "extract_dims_from_i64_tensor: expected 1-D tensor"
+    );
     let n = match shape[0] {
         Some(n) => n as usize,
         None => panic!("extract_dims_from_i64_tensor: dynamic-length shape tensor not supported"),
     };
     let elem_type = tensor.dtype().to_mlir_type(ctx);
 
-    (0..n).map(|i| {
-        let idx_attr = Attribute::parse(ctx, &format!("{i} : index")).expect("idx attr");
-        let idx_val: Value<'c, 'c> = builder.block()
-            .append_operation(
-                OperationBuilder::new("arith.constant", loc)
-                    .add_results(&[index_type])
-                    .add_attributes(&[(Identifier::new(ctx, "value"), idx_attr)])
-                    .build()
-                    .expect("arith.constant idx"),
-            )
-            .result(0).unwrap().into();
+    (0..n)
+        .map(|i| {
+            let idx_attr = Attribute::parse(ctx, &format!("{i} : index")).expect("idx attr");
+            let idx_val: Value<'c, 'c> = builder
+                .block()
+                .append_operation(
+                    OperationBuilder::new("arith.constant", loc)
+                        .add_results(&[index_type])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), idx_attr)])
+                        .build()
+                        .expect("arith.constant idx"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
 
-        let elem: Value<'c, 'c> = builder.block()
-            .append_operation(
-                OperationBuilder::new("tensor.extract", loc)
-                    .add_operands(&[tensor.value(), idx_val])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect("tensor.extract"),
-            )
-            .result(0).unwrap().into();
+            let elem: Value<'c, 'c> = builder
+                .block()
+                .append_operation(
+                    OperationBuilder::new("tensor.extract", loc)
+                        .add_operands(&[tensor.value(), idx_val])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("tensor.extract"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
 
-        builder.block()
-            .append_operation(
-                OperationBuilder::new("arith.index_cast", loc)
-                    .add_operands(&[elem])
-                    .add_results(&[index_type])
-                    .build()
-                    .expect("arith.index_cast"),
-            )
-            .result(0).unwrap().into()
-    }).collect()
+            builder
+                .block()
+                .append_operation(
+                    OperationBuilder::new("arith.index_cast", loc)
+                        .add_operands(&[elem])
+                        .add_results(&[index_type])
+                        .build()
+                        .expect("arith.index_cast"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        })
+        .collect()
 }
 
 /// Extract a single `index` value from a scalar (rank-0) or 1-element (rank-1) tensor.
@@ -145,7 +168,8 @@ fn extract_scalar_as_index<'c>(
     let elem_type = tensor.dtype().to_mlir_type(ctx);
 
     let scalar: Value<'c, 'c> = if tensor.rank() == 0 {
-        builder.block()
+        builder
+            .block()
             .append_operation(
                 OperationBuilder::new("tensor.extract", loc)
                     .add_operands(&[tensor.value()])
@@ -153,10 +177,13 @@ fn extract_scalar_as_index<'c>(
                     .build()
                     .expect("tensor.extract scalar"),
             )
-            .result(0).unwrap().into()
+            .result(0)
+            .unwrap()
+            .into()
     } else {
         let c0_attr = Attribute::parse(ctx, "0 : index").expect("0 index");
-        let c0: Value<'c, 'c> = builder.block()
+        let c0: Value<'c, 'c> = builder
+            .block()
             .append_operation(
                 OperationBuilder::new("arith.constant", loc)
                     .add_results(&[index_type])
@@ -164,8 +191,11 @@ fn extract_scalar_as_index<'c>(
                     .build()
                     .expect("arith.constant 0"),
             )
-            .result(0).unwrap().into();
-        builder.block()
+            .result(0)
+            .unwrap()
+            .into();
+        builder
+            .block()
             .append_operation(
                 OperationBuilder::new("tensor.extract", loc)
                     .add_operands(&[tensor.value(), c0])
@@ -173,10 +203,13 @@ fn extract_scalar_as_index<'c>(
                     .build()
                     .expect("tensor.extract [0]"),
             )
-            .result(0).unwrap().into()
+            .result(0)
+            .unwrap()
+            .into()
     };
 
-    builder.block()
+    builder
+        .block()
         .append_operation(
             OperationBuilder::new("arith.index_cast", loc)
                 .add_operands(&[scalar])
@@ -184,7 +217,9 @@ fn extract_scalar_as_index<'c>(
                 .build()
                 .expect("arith.index_cast scalar"),
         )
-        .result(0).unwrap().into()
+        .result(0)
+        .unwrap()
+        .into()
 }
 
 // ── Static integer constant map ────────────────────────────────────────────────
@@ -258,12 +293,16 @@ pub fn emit_graph_with_split<'c>(
 
     // ── 1. Dynamic inputs ───────────────────────────────────────────────────────
     for input in &model.dynamic_inputs {
-        let shape: Vec<Option<u64>> = input.dims.iter().map(|d| match d {
-            Dim::Fixed(v) if *v == crate::shape::DIM_DYNAMIC => None,
-            Dim::Fixed(v) => Some(*v),
-            Dim::Symbolic(name) if keep_dynamic.contains(name) => None,
-            Dim::Symbolic(_) => None, // unresolved — treat as dynamic
-        }).collect();
+        let shape: Vec<Option<u64>> = input
+            .dims
+            .iter()
+            .map(|d| match d {
+                Dim::Fixed(v) if *v == crate::shape::DIM_DYNAMIC => None,
+                Dim::Fixed(v) => Some(*v),
+                Dim::Symbolic(name) if keep_dynamic.contains(name) => None,
+                Dim::Symbolic(_) => None, // unresolved — treat as dynamic
+            })
+            .collect();
         let t = builder.input(&shape, input.dtype);
         value_map.insert(input.name.clone(), EmitValue::Tensor(t));
     }
@@ -301,9 +340,7 @@ pub fn emit_graph_with_split<'c>(
 
     // Start the first sub-function immediately so @compute only has glue code.
     if splitting_enabled {
-        let live = collect_live_values(
-            &mut value_map, &weight_names, &last_use, 0, builder,
-        );
+        let live = collect_live_values(&mut value_map, &weight_names, &last_use, 0, builder);
         begin_chunk(builder, &mut value_map, &live, chunk_index);
         chunk_index += 1;
         weight_remap.clear();
@@ -319,13 +356,11 @@ pub fn emit_graph_with_split<'c>(
         let op_count = builder.block_op_count();
         let is_heavy = HEAVY_OPS.contains(&node.op_type.as_str());
         if splitting_enabled && (op_count >= split_threshold || (is_heavy && op_count > 0)) {
-            let live = collect_live_values(
-                &mut value_map, &weight_names, &last_use, node_idx, builder,
-            );
+            let live =
+                collect_live_values(&mut value_map, &weight_names, &last_use, node_idx, builder);
             end_chunk(builder, &mut value_map, &live);
-            let live = collect_live_values(
-                &mut value_map, &weight_names, &last_use, node_idx, builder,
-            );
+            let live =
+                collect_live_values(&mut value_map, &weight_names, &last_use, node_idx, builder);
             begin_chunk(builder, &mut value_map, &live, chunk_index);
             chunk_index += 1;
             weight_remap.clear();
@@ -334,8 +369,12 @@ pub fn emit_graph_with_split<'c>(
         // Route weights into the current sub-function on demand.
         if builder.in_subfunction() {
             remap_node_weights(
-                node, &weight_names, &weight_compute_tensors,
-                &mut weight_remap, &mut value_map, builder,
+                node,
+                &weight_names,
+                &weight_compute_tensors,
+                &mut weight_remap,
+                &mut value_map,
+                builder,
             );
         }
 
@@ -347,7 +386,8 @@ pub fn emit_graph_with_split<'c>(
         // Collect model output values as the final sub-function's returns.
         let mut final_live: Vec<(String, Tensor<'c>)> = Vec::new();
         for name in &model.outputs {
-            let ev = value_map.get(name)
+            let ev = value_map
+                .get(name)
                 .ok_or_else(|| OnnxError::MissingEdge(name.clone()))?;
             final_live.push((name.clone(), ev.as_tensor(builder)));
         }
@@ -357,7 +397,8 @@ pub fn emit_graph_with_split<'c>(
     // ── 4. Collect outputs ───────────────────────────────────────────────────────
     let mut outputs: Vec<Tensor<'c>> = Vec::with_capacity(model.outputs.len());
     for name in &model.outputs {
-        let ev = value_map.get(name)
+        let ev = value_map
+            .get(name)
             .ok_or_else(|| OnnxError::MissingEdge(name.clone()))?;
         outputs.push(ev.as_tensor(builder));
     }
@@ -404,12 +445,18 @@ fn collect_live_values<'c>(
     let names_to_materialize: Vec<String> = value_map
         .iter()
         .filter(|(name, ev)| {
-            if weight_names.contains(*name) { return false; }
+            if weight_names.contains(*name) {
+                return false;
+            }
             if let Some(&lu) = last_use.get(*name) {
                 if lu >= current_node_idx {
                     matches!(ev, EmitValue::ShapeDims(_))
-                } else { false }
-            } else { false }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -423,7 +470,9 @@ fn collect_live_values<'c>(
     // Second pass: collect all live tensors.
     let mut live = Vec::new();
     for (name, ev) in value_map.iter() {
-        if weight_names.contains(name) { continue; }
+        if weight_names.contains(name) {
+            continue;
+        }
         if let Some(&lu) = last_use.get(name) {
             if lu >= current_node_idx {
                 match ev {
@@ -712,8 +761,15 @@ fn emit_node<'c>(
             };
 
             let out = builder.emit_conv2d(
-                &x, &w, bias.as_ref(),
-                [pads[0] as u64, pads[1] as u64, pads[2] as u64, pads[3] as u64],
+                &x,
+                &w,
+                bias.as_ref(),
+                [
+                    pads[0] as u64,
+                    pads[1] as u64,
+                    pads[2] as u64,
+                    pads[3] as u64,
+                ],
                 [strides[0] as u64, strides[1] as u64],
                 [dilations[0] as u64, dilations[1] as u64],
             );
@@ -733,7 +789,12 @@ fn emit_node<'c>(
             let out = builder.emit_max_pool2d(
                 &x,
                 [kernel_shape[0] as u64, kernel_shape[1] as u64],
-                [pads[0] as u64, pads[1] as u64, pads[2] as u64, pads[3] as u64],
+                [
+                    pads[0] as u64,
+                    pads[1] as u64,
+                    pads[2] as u64,
+                    pads[3] as u64,
+                ],
                 [strides[0] as u64, strides[1] as u64],
                 [dilations[0] as u64, dilations[1] as u64],
             );
@@ -788,15 +849,20 @@ fn emit_node<'c>(
                 //    0 = "copy from input dim i" (when allowzero=0, the default)
                 //
                 // tensor.reshape does NOT handle these — we must resolve them first.
-                let shape_val = value_map.get(shape_name)
+                let shape_val = value_map
+                    .get(shape_name)
                     .ok_or_else(|| OnnxError::MissingEdge(shape_name.clone()))?;
                 let shape_tensor = shape_val.as_tensor(builder);
 
                 let shape_tensor_shape = shape_tensor.shape();
-                let out_rank = shape_tensor_shape.first()
+                let out_rank = shape_tensor_shape
+                    .first()
                     .and_then(|d| *d)
                     .unwrap_or_else(|| {
-                        panic!("Reshape: shape tensor '{}' must have static rank-1 size", shape_name)
+                        panic!(
+                            "Reshape: shape tensor '{}' must have static rank-1 size",
+                            shape_name
+                        )
                     }) as usize;
 
                 // Extract individual dim values as index values.
@@ -804,9 +870,7 @@ fn emit_node<'c>(
                 let allowzero = get_int_attr(&node.attributes, "allowzero", 0);
 
                 // Resolve -1 and 0 entries, producing corrected index values.
-                let corrected = builder.emit_resolve_reshape_dims(
-                    &x, &dim_indices, allowzero != 0,
-                );
+                let corrected = builder.emit_resolve_reshape_dims(&x, &dim_indices, allowzero != 0);
 
                 // Compute static output shape where possible.
                 // If const_i64 propagation (e.g. through Concat) made the shape
@@ -816,39 +880,48 @@ fn emit_node<'c>(
                 let in_shape = x.shape();
                 let allowzero_flag = allowzero != 0;
 
-                let out_shape: Vec<Option<u64>> = (0..out_rank).map(|i| {
-                    let raw_val: Option<i64> = shape_static.as_ref()
-                        .and_then(|v| v.get(i).copied())
-                        .filter(|&v| v != CONST_I64_UNKNOWN);
+                let out_shape: Vec<Option<u64>> = (0..out_rank)
+                    .map(|i| {
+                        let raw_val: Option<i64> = shape_static
+                            .as_ref()
+                            .and_then(|v| v.get(i).copied())
+                            .filter(|&v| v != CONST_I64_UNKNOWN);
 
-                    match raw_val {
-                        Some(d) if d > 0 => Some(d as u64),
-                        Some(0) if !allowzero_flag => {
-                            // Copy from input dim i.
-                            in_shape.get(i).and_then(|opt| *opt)
-                        }
-                        Some(-1) => {
-                            // Infer: total_input / product_of_known_target.
-                            let total_static: Option<u64> = in_shape.iter()
-                                .try_fold(1u64, |acc, d| d.map(|n| acc * n));
-                            let known_product: Option<u64> = shape_static.as_ref().and_then(|sv| {
-                                sv.iter().enumerate().try_fold(1u64, |acc, (j, &d)| {
-                                    if j == i { Some(acc) } // skip the -1 dim
-                                    else if d > 0 && d != CONST_I64_UNKNOWN { Some(acc * d as u64) }
-                                    else if d == 0 && !allowzero_flag {
-                                        in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
-                                    }
-                                    else { None }
-                                })
-                            });
-                            match (total_static, known_product) {
-                                (Some(t), Some(k)) if k > 0 => Some(t / k),
-                                _ => None,
+                        match raw_val {
+                            Some(d) if d > 0 => Some(d as u64),
+                            Some(0) if !allowzero_flag => {
+                                // Copy from input dim i.
+                                in_shape.get(i).and_then(|opt| *opt)
                             }
+                            Some(-1) => {
+                                // Infer: total_input / product_of_known_target.
+                                let total_static: Option<u64> =
+                                    in_shape.iter().try_fold(1u64, |acc, d| d.map(|n| acc * n));
+                                let known_product: Option<u64> =
+                                    shape_static.as_ref().and_then(|sv| {
+                                        sv.iter().enumerate().try_fold(1u64, |acc, (j, &d)| {
+                                            if j == i {
+                                                Some(acc)
+                                            }
+                                            // skip the -1 dim
+                                            else if d > 0 && d != CONST_I64_UNKNOWN {
+                                                Some(acc * d as u64)
+                                            } else if d == 0 && !allowzero_flag {
+                                                in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    });
+                                match (total_static, known_product) {
+                                    (Some(t), Some(k)) if k > 0 => Some(t / k),
+                                    _ => None,
+                                }
+                            }
+                            _ => None, // truly dynamic (or CONST_I64_UNKNOWN)
                         }
-                        _ => None, // truly dynamic (or CONST_I64_UNKNOWN)
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 builder.emit_reshape_from_index_dims(&x, &corrected, &out_shape)
             };
@@ -877,11 +950,21 @@ fn emit_node<'c>(
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "Concat" => {
-            let axis = node.attributes.get("axis")
-                .and_then(|a| if let OnnxAttribute::Int(v) = a { Some(*v) } else { None })
-                .ok_or_else(|| OnnxError::UnsupportedOp(
-                    "Concat: missing required `axis` attribute".to_string(),
-                ))?;
+            let axis = node
+                .attributes
+                .get("axis")
+                .and_then(|a| {
+                    if let OnnxAttribute::Int(v) = a {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    OnnxError::UnsupportedOp(
+                        "Concat: missing required `axis` attribute".to_string(),
+                    )
+                })?;
             let first = get_tensor(value_map, builder, &node.inputs[0])?;
             let axis_usize = normalize_axis(axis, first.rank());
             let mut inputs: Vec<Tensor<'c>> = vec![first];
@@ -908,8 +991,11 @@ fn emit_node<'c>(
                         let n = match value_map.get(name) {
                             Some(EmitValue::Tensor(t)) => {
                                 let s = t.shape();
-                                if s.len() == 1 { s[0].unwrap_or(1) as usize }
-                                else { 1 }
+                                if s.len() == 1 {
+                                    s[0].unwrap_or(1) as usize
+                                } else {
+                                    1
+                                }
                             }
                             Some(EmitValue::ShapeDims(dims)) => dims.len(),
                             None => 1,
@@ -926,14 +1012,16 @@ fn emit_node<'c>(
             let data = get_tensor(value_map, builder, &node.inputs[0])?;
 
             let starts_static = lookup_const_i64(const_i64, &node.inputs[1]);
-            let ends_static   = lookup_const_i64(const_i64, &node.inputs[2]);
+            let ends_static = lookup_const_i64(const_i64, &node.inputs[2]);
 
             // axes and steps are always from initializers or attributes in ONNX.
             let axes: Vec<i64> = if node.inputs.len() > 3 && !node.inputs[3].is_empty() {
-                lookup_const_i64(const_i64, &node.inputs[3])
-                    .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                        "Slice: axes input '{}' must be a static initializer", node.inputs[3]
-                    )))?
+                lookup_const_i64(const_i64, &node.inputs[3]).ok_or_else(|| {
+                    OnnxError::UnsupportedOp(format!(
+                        "Slice: axes input '{}' must be a static initializer",
+                        node.inputs[3]
+                    ))
+                })?
             } else {
                 Vec::new() // placeholder; filled in below
             };
@@ -946,10 +1034,12 @@ fn emit_node<'c>(
                     axes
                 };
                 let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
-                    lookup_const_i64(const_i64, &node.inputs[4])
-                        .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                            "Slice: steps input '{}' must be a static initializer", node.inputs[4]
-                        )))?
+                    lookup_const_i64(const_i64, &node.inputs[4]).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice: steps input '{}' must be a static initializer",
+                            node.inputs[4]
+                        ))
+                    })?
                 } else {
                     vec![1i64; starts.len()]
                 };
@@ -960,8 +1050,16 @@ fn emit_node<'c>(
                 if let Some(data_vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
                     if axes.len() == 1 && axes[0] == 0 && steps.iter().all(|&s| s == 1) {
                         let n = data_vals.len() as i64;
-                        let s = if starts[0] < 0 { (n + starts[0]).max(0) } else { starts[0].min(n) } as usize;
-                        let e = if ends[0] < 0 { (n + ends[0]).max(0) } else { ends[0].min(n) } as usize;
+                        let s = if starts[0] < 0 {
+                            (n + starts[0]).max(0)
+                        } else {
+                            starts[0].min(n)
+                        } as usize;
+                        let e = if ends[0] < 0 {
+                            (n + ends[0]).max(0)
+                        } else {
+                            ends[0].min(n)
+                        } as usize;
                         if s <= e && e <= data_vals.len() {
                             const_i64.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
                         }
@@ -971,15 +1069,17 @@ fn emit_node<'c>(
                 // ── Dynamic path ─────────────────────────────────────────────
                 // starts/ends are runtime 1-D I64 tensors in value_map.
                 let starts_t = get_tensor(value_map, builder, &node.inputs[1])?;
-                let ends_t   = get_tensor(value_map, builder, &node.inputs[2])?;
+                let ends_t = get_tensor(value_map, builder, &node.inputs[2])?;
 
                 // Number of sliced axes = length of the starts tensor.
                 let n_axes = match starts_t.shape().first() {
                     Some(Some(n)) => *n as usize,
-                    _ => return Err(OnnxError::UnsupportedOp(format!(
-                        "Slice: dynamic starts tensor '{}' must have a static length",
-                        node.inputs[1]
-                    ))),
+                    _ => {
+                        return Err(OnnxError::UnsupportedOp(format!(
+                            "Slice: dynamic starts tensor '{}' must have a static length",
+                            node.inputs[1]
+                        )));
+                    }
                 };
 
                 let axes = if axes.is_empty() {
@@ -988,10 +1088,12 @@ fn emit_node<'c>(
                     axes
                 };
                 let steps: Vec<i64> = if node.inputs.len() > 4 && !node.inputs[4].is_empty() {
-                    lookup_const_i64(const_i64, &node.inputs[4])
-                        .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                            "Slice: steps input '{}' must be a static initializer", node.inputs[4]
-                        )))?
+                    lookup_const_i64(const_i64, &node.inputs[4]).ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Slice: steps input '{}' must be a static initializer",
+                            node.inputs[4]
+                        ))
+                    })?
                 } else {
                     vec![1i64; n_axes]
                 };
@@ -1023,10 +1125,17 @@ fn emit_node<'c>(
                 lookup_const_i64(const_i64, &node.inputs[1]),
             ) {
                 if axis_usize == 0 && data.rank() == 1 {
-                    let gathered: Vec<i64> = idx_vals.iter().map(|&idx| {
-                        let i = if idx < 0 { (data_vals.len() as i64 + idx) as usize } else { idx as usize };
-                        data_vals[i]
-                    }).collect();
+                    let gathered: Vec<i64> = idx_vals
+                        .iter()
+                        .map(|&idx| {
+                            let i = if idx < 0 {
+                                (data_vals.len() as i64 + idx) as usize
+                            } else {
+                                idx as usize
+                            };
+                            data_vals[i]
+                        })
+                        .collect();
                     const_i64.insert(node.outputs[0].clone(), gathered);
                 }
             }
@@ -1046,8 +1155,9 @@ fn emit_node<'c>(
         "Cast" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
             let to = get_int_attr(&node.attributes, "to", 0);
-            let target = onnx_dtype_to_internal(to)
-                .ok_or_else(|| OnnxError::UnsupportedOp(format!("Cast: unsupported ONNX dtype {to}")))?;
+            let target = onnx_dtype_to_internal(to).ok_or_else(|| {
+                OnnxError::UnsupportedOp(format!("Cast: unsupported ONNX dtype {to}"))
+            })?;
             let out = builder.emit_cast(&a, target);
             insert_tensor(value_map, &node.outputs[0], out);
 
@@ -1070,10 +1180,12 @@ fn emit_node<'c>(
         "Squeeze" => {
             let x = get_tensor(value_map, builder, &node.inputs[0])?;
             let axes = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
-                lookup_const_i64(const_i64, &node.inputs[1])
-                    .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                        "Squeeze: axes input '{}' must be a static initializer", node.inputs[1]
-                    )))?
+                lookup_const_i64(const_i64, &node.inputs[1]).ok_or_else(|| {
+                    OnnxError::UnsupportedOp(format!(
+                        "Squeeze: axes input '{}' must be a static initializer",
+                        node.inputs[1]
+                    ))
+                })?
             } else if let Some(OnnxAttribute::Ints(v)) = node.attributes.get("axes") {
                 v.clone()
             } else {
@@ -1095,17 +1207,21 @@ fn emit_node<'c>(
 
             let split_sizes: Vec<u64> = if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
                 lookup_const_i64(const_i64, &node.inputs[1])
-                    .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                        "Split: split input '{}' must be a static initializer", node.inputs[1]
-                    )))?
-                    .iter().map(|&v| v as u64).collect()
+                    .ok_or_else(|| {
+                        OnnxError::UnsupportedOp(format!(
+                            "Split: split input '{}' must be a static initializer",
+                            node.inputs[1]
+                        ))
+                    })?
+                    .iter()
+                    .map(|&v| v as u64)
+                    .collect()
             } else if let Some(OnnxAttribute::Ints(v)) = node.attributes.get("split") {
                 v.iter().map(|&v| v as u64).collect()
             } else {
-                let ax_dim = input.shape()[axis_usize]
-                    .ok_or_else(|| OnnxError::UnsupportedOp(
-                        "Split: split axis dimension is dynamic".to_string(),
-                    ))?;
+                let ax_dim = input.shape()[axis_usize].ok_or_else(|| {
+                    OnnxError::UnsupportedOp("Split: split axis dimension is dynamic".to_string())
+                })?;
                 let each = ax_dim / num_outputs as u64;
                 vec![each; num_outputs]
             };
@@ -1124,9 +1240,8 @@ fn emit_node<'c>(
             // Seed const_i64 with static shape values so downstream Gather/Concat/
             // Reshape chains can resolve dims at compile time.
             let in_shape = input.shape();
-            let static_vals: Option<Vec<i64>> = in_shape.iter()
-                .map(|d| d.map(|n| n as i64))
-                .collect();
+            let static_vals: Option<Vec<i64>> =
+                in_shape.iter().map(|d| d.map(|n| n as i64)).collect();
             if let Some(vals) = static_vals {
                 const_i64.insert(node.outputs[0].clone(), vals);
             }
@@ -1137,37 +1252,40 @@ fn emit_node<'c>(
         }
         "ConstantOfShape" => {
             let shape_name = &node.inputs[0];
-            let (shape_vals, static_shape): (Vec<Value<'c, 'c>>, Vec<Option<u64>>) =
-                match value_map.get(shape_name)
-                    .ok_or_else(|| OnnxError::MissingEdge(shape_name.clone()))?
-                {
-                    EmitValue::ShapeDims(dims) => {
-                        // Each dim is a runtime index value; we don't know statics.
-                        let statics: Vec<Option<u64>> = dims.iter().map(|_| None).collect();
-                        (dims.clone(), statics)
-                    }
-                    EmitValue::Tensor(t) => {
-                        let t = *t;
-                        let n = t.shape()[0].unwrap_or(0) as usize;
-                        let statics: Vec<Option<u64>> = vec![None; n];
-                        let shape_idx_vals = extract_dims_from_i64_tensor(builder, &t);
-                        (shape_idx_vals, statics)
-                    }
-                };
-
-            let (fill_value, fill_dtype) = if let Some(OnnxAttribute::Tensor(val_buf)) = node.attributes.get("value") {
-                let fv = match val_buf.dtype() {
-                    DType::F32 => val_buf.as_slice::<f32>()[0] as f64,
-                    DType::F64 => val_buf.as_slice::<f64>()[0],
-                    DType::I32 => val_buf.as_slice::<i32>()[0] as f64,
-                    DType::I64 => val_buf.as_slice::<i64>()[0] as f64,
-                };
-                (fv, val_buf.dtype())
-            } else {
-                (0.0, DType::F32)
+            let (shape_vals, static_shape): (Vec<Value<'c, 'c>>, Vec<Option<u64>>) = match value_map
+                .get(shape_name)
+                .ok_or_else(|| OnnxError::MissingEdge(shape_name.clone()))?
+            {
+                EmitValue::ShapeDims(dims) => {
+                    // Each dim is a runtime index value; we don't know statics.
+                    let statics: Vec<Option<u64>> = dims.iter().map(|_| None).collect();
+                    (dims.clone(), statics)
+                }
+                EmitValue::Tensor(t) => {
+                    let t = *t;
+                    let n = t.shape()[0].unwrap_or(0) as usize;
+                    let statics: Vec<Option<u64>> = vec![None; n];
+                    let shape_idx_vals = extract_dims_from_i64_tensor(builder, &t);
+                    (shape_idx_vals, statics)
+                }
             };
 
-            let out = builder.emit_constant_of_shape(&shape_vals, &static_shape, fill_value, fill_dtype);
+            let (fill_value, fill_dtype) =
+                if let Some(OnnxAttribute::Tensor(val_buf)) = node.attributes.get("value") {
+                    let fv = match val_buf.dtype() {
+                        DType::F32 => val_buf.as_slice::<f32>()[0] as f64,
+                        DType::F64 => val_buf.as_slice::<f64>()[0],
+                        DType::BF16 => val_buf.as_slice::<u16>()[0] as f64,
+                        DType::I32 => val_buf.as_slice::<i32>()[0] as f64,
+                        DType::I64 => val_buf.as_slice::<i64>()[0] as f64,
+                    };
+                    (fv, val_buf.dtype())
+                } else {
+                    (0.0, DType::F32)
+                };
+
+            let out =
+                builder.emit_constant_of_shape(&shape_vals, &static_shape, fill_value, fill_dtype);
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "Range" => {
@@ -1202,11 +1320,21 @@ fn emit_node<'c>(
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "Constant" => {
-            let buf = node.attributes.get("value")
-                .and_then(|attr| if let OnnxAttribute::Tensor(b) = attr { Some(b) } else { None })
-                .ok_or_else(|| OnnxError::UnsupportedOp(
-                    "Constant: missing or non-tensor `value` attribute".to_string(),
-                ))?;
+            let buf = node
+                .attributes
+                .get("value")
+                .and_then(|attr| {
+                    if let OnnxAttribute::Tensor(b) = attr {
+                        Some(b)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    OnnxError::UnsupportedOp(
+                        "Constant: missing or non-tensor `value` attribute".to_string(),
+                    )
+                })?;
             // Seed const_i64 for small integer constants (axes, split sizes, shape inputs).
             if buf.shape().num_elements() <= 64 {
                 if let Ok(vals) = read_i64_buffer(buf) {
@@ -1244,6 +1372,12 @@ fn buffer_to_dense_str(buf: &Buffer) -> String {
         DType::F64 => {
             let vals = buf.as_slice::<f64>();
             format_dense_nd(vals.iter().map(|&v| format!("{v:.15e}")), shape)
+        }
+        DType::BF16 => {
+            // BF16 is stored as raw u16 bytes; emit as hex integers so MLIR can
+            // parse the dense attribute as bf16 without floating-point conversion.
+            let vals = buf.as_slice::<u16>();
+            format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
         }
         DType::I32 => {
             let vals = buf.as_slice::<i32>();
@@ -1290,7 +1424,10 @@ fn read_i64_buffer(buf: &Buffer) -> Result<Vec<i64>, OnnxError> {
 
 // ── Multi-axis reduce helper ──────────────────────────────────────────────────
 
-enum ReduceOp { Sum, Max }
+enum ReduceOp {
+    Sum,
+    Max,
+}
 
 fn emit_multi_axis_reduce<'c>(
     builder: &mut GraphBuilder<'c>,
@@ -1311,7 +1448,8 @@ fn emit_multi_axis_reduce<'c>(
     }
     // Sort descending to avoid index shift as dims are removed.
     let rank = input.rank() as i64;
-    let mut norm: Vec<i64> = axes.iter()
+    let mut norm: Vec<i64> = axes
+        .iter()
         .map(|&a| if a < 0 { a + rank } else { a })
         .collect();
     norm.sort_unstable();
@@ -1330,39 +1468,85 @@ fn emit_multi_axis_reduce<'c>(
 // ── Attribute extraction helpers ──────────────────────────────────────────────
 
 fn get_int_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str, default: i64) -> i64 {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v) } else { None }
-    }).unwrap_or(default)
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 fn get_float_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str, default: f64) -> f64 {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Float(v) = a { Some(*v as f64) } else { None }
-    }).unwrap_or(default)
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Float(v) = a {
+                Some(*v as f64)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 fn get_bool_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str) -> bool {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v != 0) } else { None }
-    }).unwrap_or(false)
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v != 0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
 }
 
 fn get_keepdims_attr(attrs: &HashMap<String, OnnxAttribute>, default: bool) -> bool {
-    attrs.get("keepdims").and_then(|a| {
-        if let OnnxAttribute::Int(v) = a { Some(*v != 0) } else { None }
-    }).unwrap_or(default)
+    attrs
+        .get("keepdims")
+        .and_then(|a| {
+            if let OnnxAttribute::Int(v) = a {
+                Some(*v != 0)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
-fn get_str_attr<'a>(attrs: &'a HashMap<String, OnnxAttribute>, name: &str, default: &'a str) -> &'a str {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::String(v) = a { Some(v.as_str()) } else { None }
-    }).unwrap_or(default)
+fn get_str_attr<'a>(
+    attrs: &'a HashMap<String, OnnxAttribute>,
+    name: &str,
+    default: &'a str,
+) -> &'a str {
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::String(v) = a {
+                Some(v.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
 }
 
 fn get_ints_attr(attrs: &HashMap<String, OnnxAttribute>, name: &str, default: &[i64]) -> Vec<i64> {
-    attrs.get(name).and_then(|a| {
-        if let OnnxAttribute::Ints(v) = a { Some(v.clone()) } else { None }
-    }).unwrap_or_else(|| default.to_vec())
+    attrs
+        .get(name)
+        .and_then(|a| {
+            if let OnnxAttribute::Ints(v) = a {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| default.to_vec())
 }
 
 fn onnx_dtype_to_internal(onnx_dtype: i64) -> Option<DType> {
@@ -1388,14 +1572,18 @@ fn get_axes_from_input_or_attr(
     op_name: &str,
 ) -> Result<Vec<i64>, OnnxError> {
     if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
-        lookup_const_i64(const_i64, &node.inputs[1])
-            .ok_or_else(|| OnnxError::UnsupportedOp(format!(
-                "{op_name}: axes input '{}' must be a static initializer or Constant node", node.inputs[1]
-            )))
+        lookup_const_i64(const_i64, &node.inputs[1]).ok_or_else(|| {
+            OnnxError::UnsupportedOp(format!(
+                "{op_name}: axes input '{}' must be a static initializer or Constant node",
+                node.inputs[1]
+            ))
+        })
     } else if let Some(OnnxAttribute::Ints(v)) = node.attributes.get("axes") {
         Ok(v.clone())
     } else {
-        Err(OnnxError::UnsupportedOp(format!("{op_name}: no axes specified")))
+        Err(OnnxError::UnsupportedOp(format!(
+            "{op_name}: no axes specified"
+        )))
     }
 }
 
@@ -1405,11 +1593,12 @@ fn get_reduce_axes(
     rank: usize,
 ) -> Result<Vec<i64>, OnnxError> {
     if node.inputs.len() > 1 && !node.inputs[1].is_empty() {
-        lookup_const_i64(const_i64, &node.inputs[1])
-            .ok_or_else(|| OnnxError::UnsupportedOp(format!(
+        lookup_const_i64(const_i64, &node.inputs[1]).ok_or_else(|| {
+            OnnxError::UnsupportedOp(format!(
                 "{}: axes input '{}' must be a static initializer or Constant node",
                 node.op_type, node.inputs[1]
-            )))
+            ))
+        })
     } else if let Some(OnnxAttribute::Ints(v)) = node.attributes.get("axes") {
         Ok(v.clone())
     } else {
@@ -1424,16 +1613,13 @@ fn get_tensor<'c>(
     builder: &mut GraphBuilder<'c>,
     name: &str,
 ) -> Result<Tensor<'c>, OnnxError> {
-    let ev = value_map.get(name)
+    let ev = value_map
+        .get(name)
         .ok_or_else(|| OnnxError::MissingEdge(name.to_string()))?;
     Ok(ev.as_tensor(builder))
 }
 
-fn insert_tensor<'c>(
-    value_map: &mut HashMap<String, EmitValue<'c>>,
-    name: &str,
-    t: Tensor<'c>,
-) {
+fn insert_tensor<'c>(value_map: &mut HashMap<String, EmitValue<'c>>, name: &str, t: Tensor<'c>) {
     value_map.insert(name.to_string(), EmitValue::Tensor(t));
 }
 
@@ -1496,13 +1682,23 @@ struct KernelIO {
 fn assign_buffer_slots(
     model: &OnnxModel,
     groups: &[KernelGroup],
-) -> (Vec<KernelIO>, usize, Vec<usize>, Vec<usize>, Vec<usize>, Vec<String>) {
+) -> (
+    Vec<KernelIO>,
+    usize,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<String>,
+) {
     let mut name_to_slot: HashMap<String, usize> = HashMap::new();
     let mut slot_names: Vec<String> = Vec::new();
     let mut next_slot = 0usize;
 
-    let alloc_slot = |name: &str, name_to_slot: &mut HashMap<String, usize>,
-                          slot_names: &mut Vec<String>, next: &mut usize| -> usize {
+    let alloc_slot = |name: &str,
+                      name_to_slot: &mut HashMap<String, usize>,
+                      slot_names: &mut Vec<String>,
+                      next: &mut usize|
+     -> usize {
         if let Some(&s) = name_to_slot.get(name) {
             s
         } else {
@@ -1517,7 +1713,12 @@ fn assign_buffer_slots(
     // Assign slots for model inputs (in order).
     let mut input_slots: Vec<usize> = Vec::new();
     for input in &model.dynamic_inputs {
-        let s = alloc_slot(&input.name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+        let s = alloc_slot(
+            &input.name,
+            &mut name_to_slot,
+            &mut slot_names,
+            &mut next_slot,
+        );
         input_slots.push(s);
     }
 
@@ -1577,15 +1778,21 @@ fn assign_buffer_slots(
                     continue;
                 }
                 // Is this value used outside this group or is a model output?
-                let used_outside = model.nodes.iter().enumerate().any(|(other_ni, other_node)| {
-                    if group.node_indices.contains(&other_ni) {
-                        return false;
-                    }
-                    other_node.inputs.contains(out_name)
-                }) || model_output_set.contains(out_name.as_str());
+                let used_outside = model
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .any(|(other_ni, other_node)| {
+                        if group.node_indices.contains(&other_ni) {
+                            return false;
+                        }
+                        other_node.inputs.contains(out_name)
+                    })
+                    || model_output_set.contains(out_name.as_str());
 
                 if used_outside {
-                    let s = alloc_slot(out_name, &mut name_to_slot, &mut slot_names, &mut next_slot);
+                    let s =
+                        alloc_slot(out_name, &mut name_to_slot, &mut slot_names, &mut next_slot);
                     io_output_slots.push((out_name.clone(), s));
                 }
             }
@@ -1601,10 +1808,21 @@ fn assign_buffer_slots(
     let output_slots: Vec<usize> = model
         .outputs
         .iter()
-        .map(|name| *name_to_slot.get(name).expect("model output not in slot map"))
+        .map(|name| {
+            *name_to_slot
+                .get(name)
+                .expect("model output not in slot map")
+        })
         .collect();
 
-    (kernel_ios, next_slot, input_slots, weight_slots, output_slots, slot_names)
+    (
+        kernel_ios,
+        next_slot,
+        input_slots,
+        weight_slots,
+        output_slots,
+        slot_names,
+    )
 }
 
 /// Shape + dtype info for a value, recorded after emission for use by downstream kernels.
@@ -1624,11 +1842,11 @@ pub fn emit_and_compile_plan(
     model_bytes: Option<&[u8]>,
     keep_dynamic: &HashSet<String>,
 ) -> Result<(crate::runtime::ExecutionPlan, Vec<Buffer>), OnnxError> {
+    use crate::Shape;
     use crate::cache::CompilationCache;
     use crate::graph_builder::GraphContext;
     use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
     use crate::shape::DIM_DYNAMIC;
-    use crate::Shape;
 
     let groups = partition_nodes(&model.nodes);
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
@@ -1636,7 +1854,10 @@ pub fn emit_and_compile_plan(
 
     eprintln!(
         "[{:>8.2}s] [plan] {} nodes → {} kernels, {} buffer slots",
-        crate::log_ts(), model.nodes.len(), groups.len(), num_slots
+        crate::log_ts(),
+        model.nodes.len(),
+        groups.len(),
+        num_slots
     );
 
     // Seed shape info from model inputs.
@@ -1653,18 +1874,24 @@ pub fn emit_and_compile_plan(
                 Dim::Symbolic(_) => Some(buf.shape().0[i]),
             })
             .collect();
-        shape_info.insert(spec.name.clone(), ValueShapeInfo {
-            shape,
-            dtype: spec.dtype,
-        });
+        shape_info.insert(
+            spec.name.clone(),
+            ValueShapeInfo {
+                shape,
+                dtype: spec.dtype,
+            },
+        );
     }
 
     // Seed shape info from weights.
     for (name, buf) in &model.initializers {
-        shape_info.insert(name.clone(), ValueShapeInfo {
-            shape: buf.shape().0.iter().map(|&d| Some(d)).collect(),
-            dtype: buf.dtype(),
-        });
+        shape_info.insert(
+            name.clone(),
+            ValueShapeInfo {
+                shape: buf.shape().0.iter().map(|&d| Some(d)).collect(),
+                dtype: buf.dtype(),
+            },
+        );
     }
 
     // Seed const_i64 from small integer initializers.
@@ -1693,7 +1920,9 @@ pub fn emit_and_compile_plan(
                     crate::shape::SymDim::Var(format!("__dyn_{i}"))
                 }
                 Dim::Fixed(v) => crate::shape::SymDim::Concrete(*v),
-                Dim::Symbolic(name) if keep_dynamic.contains(name) => crate::shape::SymDim::Var(name.clone()),
+                Dim::Symbolic(name) if keep_dynamic.contains(name) => {
+                    crate::shape::SymDim::Var(name.clone())
+                }
                 Dim::Symbolic(_) => crate::shape::SymDim::Concrete(buf.shape().0[i]),
             })
             .collect();
@@ -1703,7 +1932,9 @@ pub fn emit_and_compile_plan(
     // Seed symbolic shape info from initializers (all concrete).
     for (name, buf) in &model.initializers {
         let sym_shape: crate::shape::SymShape = buf
-            .shape().0.iter()
+            .shape()
+            .0
+            .iter()
             .map(|&d| crate::shape::SymDim::Concrete(d))
             .collect();
         sym_shape_info.insert(name.clone(), sym_shape);
@@ -1719,7 +1950,9 @@ pub fn emit_and_compile_plan(
                 if vals.iter().all(|&v| v >= 0) {
                     sym_const_i64.insert(
                         name.clone(),
-                        vals.iter().map(|&v| crate::shape::SymDim::Concrete(v as u64)).collect(),
+                        vals.iter()
+                            .map(|&v| crate::shape::SymDim::Concrete(v as u64))
+                            .collect(),
                     );
                 }
             }
@@ -1777,9 +2010,9 @@ pub fn emit_and_compile_plan(
 
         // Add inputs to this kernel's builder.
         for (name, _slot) in &io.input_slots {
-            let info = shape_info.get(name).unwrap_or_else(|| {
-                panic!("kernel {gi}: no shape info for input '{name}'")
-            });
+            let info = shape_info
+                .get(name)
+                .unwrap_or_else(|| panic!("kernel {gi}: no shape info for input '{name}'"));
             let t = builder.input(&info.shape, info.dtype);
             local_value_map.insert(name.clone(), EmitValue::Tensor(t));
         }
@@ -1793,15 +2026,13 @@ pub fn emit_and_compile_plan(
             // Use a default empty shape for inputs not in sym_shape_info to preserve
             // positional alignment (e.g., Gemm needs input[0]=data, input[1]=weight).
             let empty_sym: crate::shape::SymShape = vec![];
-            let input_sym_refs: Vec<&crate::shape::SymShape> = node.inputs.iter()
+            let input_sym_refs: Vec<&crate::shape::SymShape> = node
+                .inputs
+                .iter()
                 .map(|name| sym_shape_info.get(name.as_str()).unwrap_or(&empty_sym))
                 .collect();
-            let (out_sym_shapes, sym_updates) = sym_shapes::propagate_sym_shapes(
-                node,
-                &input_sym_refs,
-                &sym_const_i64,
-                &const_i64,
-            );
+            let (out_sym_shapes, sym_updates) =
+                sym_shapes::propagate_sym_shapes(node, &input_sym_refs, &sym_const_i64, &const_i64);
             for (name, val) in sym_updates {
                 sym_const_i64.insert(name, val);
             }
@@ -1816,10 +2047,13 @@ pub fn emit_and_compile_plan(
         for (name, _slot) in &io.output_slots {
             if let Some(ev) = local_value_map.get(name) {
                 let t = ev.as_tensor(&mut builder);
-                shape_info.insert(name.clone(), ValueShapeInfo {
-                    shape: t.shape(),
-                    dtype: t.dtype(),
-                });
+                shape_info.insert(
+                    name.clone(),
+                    ValueShapeInfo {
+                        shape: t.shape(),
+                        dtype: t.dtype(),
+                    },
+                );
             }
         }
 
@@ -1849,13 +2083,17 @@ pub fn emit_and_compile_plan(
         let ops_label = if group.node_indices.len() == 1 {
             model.nodes[group.node_indices[0]].op_type.clone()
         } else {
-            let types: Vec<&str> = group.node_indices.iter()
+            let types: Vec<&str> = group
+                .node_indices
+                .iter()
                 .map(|&ni| model.nodes[ni].op_type.as_str())
                 .collect();
             // Deduplicate for compact display.
             let mut unique: Vec<&str> = Vec::new();
             for t in &types {
-                if !unique.contains(t) { unique.push(t); }
+                if !unique.contains(t) {
+                    unique.push(t);
+                }
             }
             if unique.len() <= 3 {
                 unique.join("+")
@@ -1883,7 +2121,11 @@ pub fn emit_and_compile_plan(
     }
 
     // Phase 2: Compile all kernels in parallel.
-    eprintln!("[{:>8.2}s] [plan] compiling {} kernels in parallel...", crate::log_ts(), emit_results.len());
+    eprintln!(
+        "[{:>8.2}s] [plan] compiling {} kernels in parallel...",
+        crate::log_ts(),
+        emit_results.len()
+    );
     let compile_start = std::time::Instant::now();
 
     let kernels: Vec<crate::runtime::CompiledGraph> = {
@@ -1900,12 +2142,14 @@ pub fn emit_and_compile_plan(
                     er.cache_key.as_deref(),
                     &label,
                 )
-                .map_err(|e| OnnxError::CompileError(
-                    format!("kernel {}: {e}", er.group_idx)
-                ))?;
+                .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
                 eprintln!(
                     "[{:>8.2}s] [plan] k{} [{}] ({} in / {} out): {}ms",
-                    crate::log_ts(), er.group_idx, er.ops_label, er.num_in, er.num_out,
+                    crate::log_ts(),
+                    er.group_idx,
+                    er.ops_label,
+                    er.num_in,
+                    er.num_out,
                     t0.elapsed().as_millis()
                 );
                 Ok(compiled)
@@ -1916,18 +2160,23 @@ pub fn emit_and_compile_plan(
 
     eprintln!(
         "[{:>8.2}s] [plan] all {} kernels compiled: {}ms total",
-        crate::log_ts(), kernels.len(), compile_start.elapsed().as_millis()
+        crate::log_ts(),
+        kernels.len(),
+        compile_start.elapsed().as_millis()
     );
 
     // Build slot descriptors.
     let slot_descs: Vec<SlotDesc> = slot_names
         .iter()
         .map(|name| {
-            let info = shape_info.get(name).unwrap_or_else(|| {
-                panic!("no shape info for slot '{name}'")
-            });
+            let info = shape_info
+                .get(name)
+                .unwrap_or_else(|| panic!("no shape info for slot '{name}'"));
             let shape = Shape(
-                info.shape.iter().map(|d| d.unwrap_or(DIM_DYNAMIC)).collect(),
+                info.shape
+                    .iter()
+                    .map(|d| d.unwrap_or(DIM_DYNAMIC))
+                    .collect(),
             );
             let sym_shape = sym_shape_info.get(name).cloned();
             SlotDesc {

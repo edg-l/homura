@@ -113,6 +113,7 @@ fn dtype_to_str(d: DType) -> &'static str {
         DType::F64 => "f64",
         DType::I32 => "i32",
         DType::I64 => "i64",
+        DType::BF16 => panic!("BF16 not supported in computation; convert to F32 first"),
     }
 }
 
@@ -187,7 +188,10 @@ fn decode_meta(s: &str) -> Option<CacheMeta> {
 
     let outputs = parse_output_array(array_content)?;
 
-    Some(CacheMeta { num_inputs, outputs })
+    Some(CacheMeta {
+        num_inputs,
+        outputs,
+    })
 }
 
 /// Parse the JSON array of output descriptors.
@@ -355,8 +359,14 @@ mod tests {
         let meta = CacheMeta {
             num_inputs: 2,
             outputs: vec![
-                OutputDesc { shape: Shape(vec![1, 3, 224, 224]), dtype: DType::F32 },
-                OutputDesc { shape: Shape(vec![1000]), dtype: DType::F32 },
+                OutputDesc {
+                    shape: Shape(vec![1, 3, 224, 224]),
+                    dtype: DType::F32,
+                },
+                OutputDesc {
+                    shape: Shape(vec![1000]),
+                    dtype: DType::F32,
+                },
             ],
         };
         let json = encode_meta(&meta);
@@ -372,7 +382,10 @@ mod tests {
     fn meta_roundtrip_scalar_output() {
         let meta = CacheMeta {
             num_inputs: 1,
-            outputs: vec![OutputDesc { shape: Shape(vec![]), dtype: DType::I64 }],
+            outputs: vec![OutputDesc {
+                shape: Shape(vec![]),
+                dtype: DType::I64,
+            }],
         };
         let json = encode_meta(&meta);
         let decoded = decode_meta(&json).expect("decode failed");
@@ -386,8 +399,14 @@ mod tests {
         let meta = CacheMeta {
             num_inputs: 3,
             outputs: vec![
-                OutputDesc { shape: Shape(vec![4, 4]), dtype: DType::F64 },
-                OutputDesc { shape: Shape(vec![2]), dtype: DType::I32 },
+                OutputDesc {
+                    shape: Shape(vec![4, 4]),
+                    dtype: DType::F64,
+                },
+                OutputDesc {
+                    shape: Shape(vec![2]),
+                    dtype: DType::I32,
+                },
             ],
         };
         let json = encode_meta(&meta);

@@ -3,8 +3,8 @@ use melior::{
     Context,
     dialect::func,
     ir::{
-        Attribute, Block, Identifier, Location, Module, Region, RegionLike,
-        ShapedTypeLike, ValueLike,
+        Attribute, Block, Identifier, Location, Module, Region, RegionLike, ShapedTypeLike,
+        ValueLike,
         attribute::{StringAttribute, TypeAttribute},
         block::BlockLike,
         operation::{OperationBuilder, OperationLike, OperationMutLike},
@@ -72,8 +72,7 @@ impl<'c> Tensor<'c> {
 
     fn ranked_tensor_type(&self) -> RankedTensorType<'c> {
         let ty = self.value.r#type();
-        RankedTensorType::try_from(ty)
-            .expect("Tensor value must have RankedTensorType")
+        RankedTensorType::try_from(ty).expect("Tensor value must have RankedTensorType")
     }
 }
 
@@ -135,7 +134,9 @@ pub struct GraphContext {
 
 impl GraphContext {
     pub fn new() -> Self {
-        Self { context: create_context() }
+        Self {
+            context: create_context(),
+        }
     }
 
     pub fn builder(&self) -> GraphBuilder<'_> {
@@ -176,8 +177,8 @@ pub fn compile_from_mlir(
     }
 
     // Parse module from text.
-    let mut module = Module::parse(&context, mlir_text)
-        .ok_or_else(|| CompileError::Verification)?;
+    let mut module =
+        Module::parse(&context, mlir_text).ok_or_else(|| CompileError::Verification)?;
 
     // Run pass pipeline. Use the full pipeline (with transform-interpreter +
     // vector lowering) only for modules with a transform schedule. Lightweight
@@ -251,26 +252,43 @@ pub fn compile_from_mlir(
         .map_err(CompileError::Pass)?;
 
     pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-    eprintln!("[{:>8.2}s] [{label}] passes: {}ms", crate::log_ts(), passes_start.elapsed().as_millis());
+    eprintln!(
+        "[{:>8.2}s] [{label}] passes: {}ms",
+        crate::log_ts(),
+        passes_start.elapsed().as_millis()
+    );
 
     // AOT compile.
-    let tmp_dir = tempfile_dir().ok_or_else(|| {
-        CompileError::ObjectEmit("cannot determine temp directory".into())
-    })?;
+    let tmp_dir = tempfile_dir()
+        .ok_or_else(|| CompileError::ObjectEmit("cannot determine temp directory".into()))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
     let tid = std::thread::current().id();
-    let suffix = format!("{}_{}_{:08x}", std::process::id(), format!("{:?}", tid).replace("ThreadId(", "").replace(")", ""), nanos);
+    let suffix = format!(
+        "{}_{}_{:08x}",
+        std::process::id(),
+        format!("{:?}", tid)
+            .replace("ThreadId(", "")
+            .replace(")", ""),
+        nanos
+    );
     let tmp_so = tmp_dir.join(format!("homura_pk_{suffix}.so"));
 
     let obj_paths = crate::compiler::emit_object_files_pub(
-        &module, &tmp_dir, &format!("homura_pk_{suffix}"), label,
+        &module,
+        &tmp_dir,
+        &format!("homura_pk_{suffix}"),
+        label,
     )?;
     let link_start = std::time::Instant::now();
     crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
-    eprintln!("[{:>8.2}s] [{label}] link: {}ms", crate::log_ts(), link_start.elapsed().as_millis());
+    eprintln!(
+        "[{:>8.2}s] [{label}] link: {}ms",
+        crate::log_ts(),
+        link_start.elapsed().as_millis()
+    );
     for p in &obj_paths {
         std::fs::remove_file(p).ok();
     }
@@ -281,8 +299,12 @@ pub fn compile_from_mlir(
         let cache = crate::cache::CompilationCache::new();
         let meta = crate::cache::CacheMeta {
             num_inputs,
-            outputs: descs_owned.iter()
-                .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
+            outputs: descs_owned
+                .iter()
+                .map(|d| OutputDesc {
+                    shape: d.shape.clone(),
+                    dtype: d.dtype,
+                })
                 .collect(),
         };
         if let Err(e) = cache.store(key, &tmp_so, &meta) {
@@ -290,8 +312,8 @@ pub fn compile_from_mlir(
         }
     }
 
-    let graph = CompiledGraph::load(&tmp_so, num_inputs, descs_owned)
-        .map_err(CompileError::ObjectEmit)?;
+    let graph =
+        CompiledGraph::load(&tmp_so, num_inputs, descs_owned).map_err(CompileError::ObjectEmit)?;
     std::fs::remove_file(&tmp_so).ok();
     Ok(graph)
 }
@@ -306,7 +328,10 @@ enum ReassocResult {
     /// Rank decreases: groups of input dims collapse into output dims.
     /// `inferred_shape` is the result shape computed from input + reassociation
     /// (may be more precise than the caller's out_shape).
-    Collapse { reassoc: Vec<Vec<usize>>, inferred_shape: Vec<Option<u64>> },
+    Collapse {
+        reassoc: Vec<Vec<usize>>,
+        inferred_shape: Vec<Option<u64>>,
+    },
     /// Rank increases: each input dim expands into a group of output dims.
     Expand { reassoc: Vec<Vec<usize>> },
     /// General: collapse to intermediate shape, then expand to target.
@@ -321,7 +346,15 @@ enum ReassocResult {
 fn reassoc_to_string(reassoc: &[Vec<usize>]) -> String {
     let groups: Vec<String> = reassoc
         .iter()
-        .map(|g| format!("[{}]", g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")))
+        .map(|g| {
+            format!(
+                "[{}]",
+                g.iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
         .collect();
     format!("[{}]", groups.join(", "))
 }
@@ -365,10 +398,7 @@ fn compute_reassociation(
 ///
 /// Strategy: match static dims from the END first (they anchor the grouping),
 /// then assign remaining input dims to the first dynamic output dim.
-fn try_collapse(
-    in_shape: &[Option<u64>],
-    out_shape: &[Option<u64>],
-) -> Option<ReassocResult> {
+fn try_collapse(in_shape: &[Option<u64>], out_shape: &[Option<u64>]) -> Option<ReassocResult> {
     let in_rank = in_shape.len();
     let out_rank = out_shape.len();
 
@@ -461,7 +491,9 @@ fn try_collapse(
                 }
             }
         }
-        if in_fwd != in_end { return None; }
+        if in_fwd != in_end {
+            return None;
+        }
     } else if in_end > 0 && out_end == 0 {
         // All output groups matched from the end, but extra input dims remain.
         // Prepend them to the first matched group (smallest output index with a group).
@@ -508,19 +540,28 @@ fn try_collapse(
     // For collapse_shape, each output dim is:
     //   - product of static input dims if ALL dims in the group are static
     //   - dynamic (None) if ANY dim in the group is dynamic
-    let inferred_shape: Vec<Option<u64>> = reassoc.iter().map(|group| {
-        let mut product = 1u64;
-        let mut all_static = true;
-        for &i in group {
-            match in_shape[i] {
-                Some(d) => product *= d,
-                None => { all_static = false; break; }
+    let inferred_shape: Vec<Option<u64>> = reassoc
+        .iter()
+        .map(|group| {
+            let mut product = 1u64;
+            let mut all_static = true;
+            for &i in group {
+                match in_shape[i] {
+                    Some(d) => product *= d,
+                    None => {
+                        all_static = false;
+                        break;
+                    }
+                }
             }
-        }
-        if all_static { Some(product) } else { None }
-    }).collect();
+            if all_static { Some(product) } else { None }
+        })
+        .collect();
 
-    Some(ReassocResult::Collapse { reassoc, inferred_shape })
+    Some(ReassocResult::Collapse {
+        reassoc,
+        inferred_shape,
+    })
 }
 
 /// Try to build an expand reassociation: groups of contiguous output dims
@@ -528,10 +569,7 @@ fn try_collapse(
 ///
 /// Strategy: match static dims from the END first (they anchor the grouping),
 /// then assign remaining output dims to the first group.
-fn try_expand(
-    in_shape: &[Option<u64>],
-    out_shape: &[Option<u64>],
-) -> Option<ReassocResult> {
+fn try_expand(in_shape: &[Option<u64>], out_shape: &[Option<u64>]) -> Option<ReassocResult> {
     let in_rank = in_shape.len();
     let out_rank = out_shape.len();
 
@@ -629,13 +667,17 @@ fn try_expand(
                                     }
                                     break;
                                 }
-                                if !has_dynamic && product > source_val { return None; }
+                                if !has_dynamic && product > source_val {
+                                    return None;
+                                }
                             }
                             None => {
                                 reassoc[in_i].push(out_fwd);
                                 out_fwd += 1;
                                 #[allow(unused_assignments)]
-                                { has_dynamic = true; }
+                                {
+                                    has_dynamic = true;
+                                }
                                 // If last input group, consume all remaining.
                                 if in_i == in_end - 1 {
                                     while out_fwd < out_end {
@@ -666,7 +708,9 @@ fn try_expand(
                 }
             }
         }
-        if out_fwd != out_end { return None; }
+        if out_fwd != out_end {
+            return None;
+        }
     } else if out_end > 0 {
         return None;
     }
@@ -769,7 +813,9 @@ impl<'c> GraphBuilder<'c> {
         let location = Location::unknown(context);
         let block = Block::new(&[]);
         Self {
-            context, block, location,
+            context,
+            block,
+            location,
             args: Vec::new(),
             completed_subfunctions: Vec::new(),
             subfunction_build_state: None,
@@ -843,9 +889,7 @@ impl<'c> GraphBuilder<'c> {
             let tensor_type = arg.value().r#type();
             new_block.add_argument(tensor_type, self.location);
             let idx = new_block.argument_count() - 1;
-            sub_arg_tensors.push(Tensor::from_value(
-                new_block.argument(idx).unwrap().into(),
-            ));
+            sub_arg_tensors.push(Tensor::from_value(new_block.argument(idx).unwrap().into()));
         }
 
         // Stash caller state.
@@ -870,9 +914,10 @@ impl<'c> GraphBuilder<'c> {
     /// Use this to route weights directly to sub-functions without threading
     /// them through intermediate sub-functions.
     pub fn add_subfunction_arg(&mut self, caller_value: &Tensor<'c>) -> Tensor<'c> {
-        let state = self.subfunction_build_state.as_mut().expect(
-            "add_subfunction_arg called outside of a sub-function"
-        );
+        let state = self
+            .subfunction_build_state
+            .as_mut()
+            .expect("add_subfunction_arg called outside of a sub-function");
         let tensor_type = caller_value.value().r#type();
         self.block.add_argument(tensor_type, self.location);
         let idx = self.block.argument_count() - 1;
@@ -905,13 +950,13 @@ impl<'c> GraphBuilder<'c> {
         _handle: SubFunctionHandle,
         returns: &[&Tensor<'c>],
     ) -> Vec<Tensor<'c>> {
-        let state = self.subfunction_build_state.take().expect(
-            "end_subfunction called without matching begin_subfunction",
-        );
+        let state = self
+            .subfunction_build_state
+            .take()
+            .expect("end_subfunction called without matching begin_subfunction");
 
         // func.return in the sub-function.
-        let return_values: Vec<melior::ir::Value> =
-            returns.iter().map(|t| t.value()).collect();
+        let return_values: Vec<melior::ir::Value> = returns.iter().map(|t| t.value()).collect();
         self.block
             .append_operation(func::r#return(&return_values, self.location));
 
@@ -935,19 +980,13 @@ impl<'c> GraphBuilder<'c> {
         });
 
         // Emit func.call in the caller block.
-        let callee_attr = Attribute::parse(
-            self.context,
-            &format!("@{func_name}"),
-        )
-        .expect("callee attr");
+        let callee_attr =
+            Attribute::parse(self.context, &format!("@{func_name}")).expect("callee attr");
 
         let call_op = OperationBuilder::new("func.call", self.location)
             .add_operands(&state.caller_arg_values)
             .add_results(&return_types)
-            .add_attributes(&[(
-                Identifier::new(self.context, "callee"),
-                callee_attr,
-            )])
+            .add_attributes(&[(Identifier::new(self.context, "callee"), callee_attr)])
             .build()
             .expect("func.call");
 
@@ -963,7 +1002,7 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise addition (F32/F64: arith.addf; I32/I64: arith.addi).
     pub fn emit_add(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 => "arith.addf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
             DType::I32 | DType::I64 => "arith.addi",
         };
         self.emit_linalg_binary(op, lhs, rhs)
@@ -972,7 +1011,7 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise subtraction (F32/F64: arith.subf; I32/I64: arith.subi).
     pub fn emit_sub(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 => "arith.subf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.subf",
             DType::I32 | DType::I64 => "arith.subi",
         };
         self.emit_linalg_binary(op, lhs, rhs)
@@ -981,7 +1020,7 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise multiplication (F32/F64: arith.mulf; I32/I64: arith.muli).
     pub fn emit_mul(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 => "arith.mulf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.mulf",
             DType::I32 | DType::I64 => "arith.muli",
         };
         self.emit_linalg_binary(op, lhs, rhs)
@@ -990,7 +1029,7 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise division (F32/F64: arith.divf; I32/I64: arith.divsi).
     pub fn emit_div(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 => "arith.divf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.divf",
             DType::I32 | DType::I64 => "arith.divsi",
         };
         self.emit_linalg_binary(op, lhs, rhs)
@@ -1007,7 +1046,7 @@ impl<'c> GraphBuilder<'c> {
     /// use arith.subi(0, x) for integers via a special path).
     pub fn emit_neg(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
         match input.dtype() {
-            DType::F32 | DType::F64 => self.emit_linalg_unary("arith.negf", input),
+            DType::F32 | DType::F64 | DType::BF16 => self.emit_linalg_unary("arith.negf", input),
             DType::I32 | DType::I64 => {
                 // Emit 0 - x via linalg.generic with arith.subi where lhs is a zero constant.
                 self.emit_linalg_unary_int_neg(input)
@@ -1076,9 +1115,7 @@ impl<'c> GraphBuilder<'c> {
                 (Some(1), other) | (other, Some(1)) => *other,
                 (Some(a), Some(b)) if a == b => Some(*a),
                 (None, _) | (_, None) => None,
-                (Some(a), Some(b)) => panic!(
-                    "broadcast shape mismatch: {a} vs {b}"
-                ),
+                (Some(a), Some(b)) => panic!("broadcast shape mismatch: {a} vs {b}"),
             })
             .collect()
     }
@@ -1102,10 +1139,8 @@ impl<'c> GraphBuilder<'c> {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        let dims_attr = Attribute::parse(
-            self.context,
-            &format!("array<i64: {dims_str}>"),
-        ).expect("broadcast dimensions attr");
+        let dims_attr = Attribute::parse(self.context, &format!("array<i64: {dims_str}>"))
+            .expect("broadcast dimensions attr");
 
         let dims_u64: Vec<u64> = out_shape
             .iter()
@@ -1119,10 +1154,7 @@ impl<'c> GraphBuilder<'c> {
             RankedTensorType::new(&dims_u64, elem_type, None).into();
 
         // linalg.broadcast requires a region with a linalg.yield body.
-        let body_block = Block::new(&[
-            (elem_type, self.location),
-            (elem_type, self.location),
-        ]);
+        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let in_val: melior::ir::Value = body_block.argument(0).unwrap().into();
         body_block.append_operation(
             OperationBuilder::new("linalg.yield", self.location)
@@ -1138,9 +1170,7 @@ impl<'c> GraphBuilder<'c> {
                 OperationBuilder::new("linalg.broadcast", self.location)
                     .add_operands(&[input, init])
                     .add_results(&[tensor_type])
-                    .add_attributes(&[
-                        (Identifier::new(self.context, "dimensions"), dims_attr),
-                    ])
+                    .add_attributes(&[(Identifier::new(self.context, "dimensions"), dims_attr)])
                     .add_regions([body_region])
                     .build()
                     .expect("linalg.broadcast"),
@@ -1155,11 +1185,7 @@ impl<'c> GraphBuilder<'c> {
     /// for same-rank size-1 broadcast dims.
     ///
     /// Returns a new `Tensor` with `target_shape`.
-    fn broadcast_to(
-        &mut self,
-        input: &Tensor<'c>,
-        target_shape: &[Option<u64>],
-    ) -> Tensor<'c> {
+    fn broadcast_to(&mut self, input: &Tensor<'c>, target_shape: &[Option<u64>]) -> Tensor<'c> {
         let src_shape = input.shape();
         if src_shape == target_shape {
             return *input;
@@ -1177,12 +1203,8 @@ impl<'c> GraphBuilder<'c> {
                 .take(extra)
                 .chain(src_shape.iter().copied())
                 .collect();
-            let val = self.emit_linalg_broadcast(
-                input.value(),
-                &promoted_shape,
-                dtype,
-                &broadcast_dims,
-            );
+            let val =
+                self.emit_linalg_broadcast(input.value(), &promoted_shape, dtype, &broadcast_dims);
             (val, promoted_shape)
         } else {
             (input.value(), src_shape.clone())
@@ -1216,10 +1238,8 @@ impl<'c> GraphBuilder<'c> {
         let dim_list = dim_vars.join(", ");
         let in_map = format!("affine_map<({dim_list}) -> ({})>", input_exprs.join(", "));
         let out_map = format!("affine_map<({dim_list}) -> ({})>", output_exprs.join(", "));
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{in_map}, {out_map}]"),
-        ).expect("broadcast projected maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{in_map}, {out_map}]"))
+            .expect("broadcast projected maps");
 
         let iterator_types = self.make_iterator_types(out_rank);
         let elem_type = dtype.to_mlir_type(self.context);
@@ -1251,16 +1271,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[rank_promoted_val, init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1301,10 +1330,9 @@ impl<'c> GraphBuilder<'c> {
         let rhs_map = Self::make_broadcast_map(out_rank, &rhs_padded, &out_shape);
         let out_map = identity_map_str(out_rank);
 
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
-        ).expect("broadcast indexing_maps");
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{lhs_map}, {rhs_map}, {out_map}]"))
+                .expect("broadcast indexing_maps");
         let iterator_types = self.make_iterator_types(out_rank);
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
@@ -1318,7 +1346,14 @@ impl<'c> GraphBuilder<'c> {
         } else {
             // Neither operand matches fully — need to build dynamic dims from
             // whichever operand provides each dim.
-            Some(self.emit_tensor_empty_for_broadcast(&out_shape, &lhs_padded, lhs_val, &rhs_padded, rhs_val, dtype))
+            Some(self.emit_tensor_empty_for_broadcast(
+                &out_shape,
+                &lhs_padded,
+                lhs_val,
+                &rhs_padded,
+                rhs_val,
+                dtype,
+            ))
         };
         let init = if let Some(src) = dyn_source {
             // If src is already a tensor.empty Value, use it directly.
@@ -1349,7 +1384,8 @@ impl<'c> GraphBuilder<'c> {
         }
         let op_result = body_block
             .append_operation(
-                builder.build()
+                builder
+                    .build()
                     .unwrap_or_else(|e| panic!("{body_op} in linalg body: {e}")),
             )
             .result(0)
@@ -1364,16 +1400,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 2, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 2, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1486,16 +1531,11 @@ impl<'c> GraphBuilder<'c> {
 
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
-        let body_block = Block::new(&[
-            (elem_type, self.location),
-            (elem_type, self.location),
-        ]);
+        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let a: melior::ir::Value = body_block.argument(0).unwrap().into();
         let op_result = body_block
             .append_operation(
@@ -1517,16 +1557,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1557,16 +1606,11 @@ impl<'c> GraphBuilder<'c> {
 
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
-        let body_block = Block::new(&[
-            (elem_type, self.location),
-            (elem_type, self.location),
-        ]);
+        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let x: melior::ir::Value = body_block.argument(0).unwrap().into();
 
         // Emit zero constant of matching integer type.
@@ -1574,7 +1618,8 @@ impl<'c> GraphBuilder<'c> {
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
             _ => unreachable!(),
-        }.expect("zero constant");
+        }
+        .expect("zero constant");
         let zero = body_block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
@@ -1607,16 +1652,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1647,24 +1701,21 @@ impl<'c> GraphBuilder<'c> {
 
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
-        let body_block = Block::new(&[
-            (elem_type, self.location),
-            (elem_type, self.location),
-        ]);
+        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let x: melior::ir::Value = body_block.argument(0).unwrap().into();
 
         let zero_attr = match dtype {
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+            DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
-        }.expect("zero for relu");
+        }
+        .expect("zero for relu");
         let zero = body_block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
@@ -1678,7 +1729,7 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         let relu_op = match dtype {
-            DType::F32 | DType::F64 => "arith.maximumf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
             DType::I32 | DType::I64 => "arith.maxsi",
         };
         let relu_val = body_block
@@ -1701,16 +1752,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1741,23 +1801,19 @@ impl<'c> GraphBuilder<'c> {
 
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
-        let body_block = Block::new(&[
-            (elem_type, self.location),
-            (elem_type, self.location),
-        ]);
+        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let x: melior::ir::Value = body_block.argument(0).unwrap().into();
 
         let one_attr = match dtype {
             DType::F32 => Attribute::parse(self.context, "1.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "1.0 : f64"),
             _ => panic!("reciprocal is float-only"),
-        }.expect("one for reciprocal");
+        }
+        .expect("one for reciprocal");
         let one = body_block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
@@ -1790,16 +1846,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -1820,7 +1885,7 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_reduce_sum(&mut self, input: &Tensor<'c>, axis: i64, keepdim: bool) -> Tensor<'c> {
         let dtype = input.dtype();
         let combiner_op = match dtype {
-            DType::F32 | DType::F64 => "arith.addf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
             DType::I32 | DType::I64 => "arith.addi",
         };
         let init_val = self.make_zero_scalar_attr(dtype);
@@ -1833,7 +1898,7 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_reduce_max(&mut self, input: &Tensor<'c>, axis: i64, keepdim: bool) -> Tensor<'c> {
         let dtype = input.dtype();
         let combiner_op = match dtype {
-            DType::F32 | DType::F64 => "arith.maximumf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
             DType::I32 | DType::I64 => "arith.maxsi",
         };
         let init_val = self.make_min_scalar_attr(dtype);
@@ -1880,14 +1945,22 @@ impl<'c> GraphBuilder<'c> {
         let non_reduced_indices: Vec<usize> = (0..input_shape.len())
             .filter(|i| !norm_axes.contains(i))
             .collect();
-        let filled = self.emit_filled_tensor_for_reduce(input.value(), &reduce_shape, &non_reduced_indices, dtype, 0.0_f64);
+        let filled = self.emit_filled_tensor_for_reduce(
+            input.value(),
+            &reduce_shape,
+            &non_reduced_indices,
+            dtype,
+            0.0_f64,
+        );
 
         // Emit linalg.reduce with all axes at once.
-        let dims_str = norm_axes.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
-        let dimensions_attr = Attribute::parse(
-            self.context,
-            &format!("array<i64: {dims_str}>"),
-        ).expect("reduce dimensions attr");
+        let dims_str = norm_axes
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dimensions_attr = Attribute::parse(self.context, &format!("array<i64: {dims_str}>"))
+            .expect("reduce dimensions attr");
 
         let reduced_type = self.make_tensor_type(&reduce_shape, dtype);
         let elem_type = dtype.to_mlir_type(self.context);
@@ -1899,7 +1972,7 @@ impl<'c> GraphBuilder<'c> {
         let in_e: melior::ir::Value = body_block.argument(0).unwrap().into();
         let acc_e: melior::ir::Value = body_block.argument(1).unwrap().into();
         let add_op = match dtype {
-            DType::F32 | DType::F64 => "arith.addf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
             DType::I32 | DType::I64 => "arith.addi",
         };
         let sum_val: melior::ir::Value = body_block
@@ -1922,7 +1995,8 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let sum_val: melior::ir::Value = self.block
+        let sum_val: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.reduce", self.location)
                     .add_operands(&[input.value(), filled])
@@ -1968,7 +2042,10 @@ impl<'c> GraphBuilder<'c> {
         let shape = input.shape();
         let rank = shape.len() as i64;
         let axis = if axis < 0 { axis + rank } else { axis };
-        assert!(axis >= 0 && axis < rank, "softmax axis {axis} out of bounds for rank {rank}");
+        assert!(
+            axis >= 0 && axis < rank,
+            "softmax axis {axis} out of bounds for rank {rank}"
+        );
 
         // Step 1: max along axis with keepdim.
         let max_val = self.emit_reduce_max(input, axis, true);
@@ -1997,7 +2074,10 @@ impl<'c> GraphBuilder<'c> {
         let input_shape = input.shape();
         let rank = input_shape.len() as i64;
         let axis = if axis < 0 { axis + rank } else { axis };
-        assert!(axis >= 0 && axis < rank, "axis {axis} out of bounds for rank {rank}");
+        assert!(
+            axis >= 0 && axis < rank,
+            "axis {axis} out of bounds for rank {rank}"
+        );
         let axis = axis as usize;
 
         let dtype = input.dtype();
@@ -2012,13 +2092,18 @@ impl<'c> GraphBuilder<'c> {
             .collect();
 
         // Emit init tensor filled with the identity value.
-        let filled = self.emit_scalar_filled_tensor(&reduce_shape, dtype, init_scalar_attr, input.value(), &input_shape, axis);
+        let filled = self.emit_scalar_filled_tensor(
+            &reduce_shape,
+            dtype,
+            init_scalar_attr,
+            input.value(),
+            &input_shape,
+            axis,
+        );
 
         let reduced_type = self.make_tensor_type(&reduce_shape, dtype);
-        let dimensions_attr = Attribute::parse(
-            self.context,
-            &format!("array<i64: {axis}>"),
-        ).expect("reduce dimensions attr");
+        let dimensions_attr = Attribute::parse(self.context, &format!("array<i64: {axis}>"))
+            .expect("reduce dimensions attr");
 
         // Body: (%in_elem, %acc_elem) -> combiner(%acc, %in) -> yield
         let body_block = Block::new(&[
@@ -2047,7 +2132,8 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let reduced: melior::ir::Value = self.block
+        let reduced: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.reduce", self.location)
                     .add_operands(&[input.value(), filled])
@@ -2103,7 +2189,8 @@ impl<'c> GraphBuilder<'c> {
                 let orig_i = orig_indices[out_i];
                 let idx_attr = Attribute::parse(self.context, &format!("{orig_i} : index"))
                     .expect("dim index attr");
-                let idx_val: melior::ir::Value = self.block
+                let idx_val: melior::ir::Value = self
+                    .block
                     .append_operation(
                         OperationBuilder::new("arith.constant", self.location)
                             .add_results(&[index_type])
@@ -2114,7 +2201,8 @@ impl<'c> GraphBuilder<'c> {
                     .result(0)
                     .unwrap()
                     .into();
-                let dim_val: melior::ir::Value = self.block
+                let dim_val: melior::ir::Value = self
+                    .block
                     .append_operation(
                         OperationBuilder::new("tensor.dim", self.location)
                             .add_operands(&[dyn_src, idx_val])
@@ -2131,7 +2219,8 @@ impl<'c> GraphBuilder<'c> {
 
         let tensor_type = self.make_tensor_type(shape, dtype);
 
-        let init: melior::ir::Value = self.block
+        let init: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -2143,7 +2232,8 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
 
-        let scalar: melior::ir::Value = self.block
+        let scalar: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -2207,7 +2297,8 @@ impl<'c> GraphBuilder<'c> {
         }
 
         let tensor_type = self.make_tensor_type(reduce_shape, dtype);
-        let init: melior::ir::Value = self.block
+        let init: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -2223,11 +2314,14 @@ impl<'c> GraphBuilder<'c> {
         let fill_attr = match dtype {
             DType::F32 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : f32")),
             DType::F64 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : f64")),
+            DType::BF16 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : bf16")),
             DType::I32 => Attribute::parse(self.context, &format!("{} : i32", fill_f64 as i64)),
             DType::I64 => Attribute::parse(self.context, &format!("{} : i64", fill_f64 as i64)),
-        }.expect("fill attr");
+        }
+        .expect("fill attr");
 
-        let scalar: melior::ir::Value = self.block
+        let scalar: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -2300,11 +2394,15 @@ impl<'c> GraphBuilder<'c> {
                 None => {
                     let ax_attr = Attribute::parse(self.context, &format!("{ax} : index"))
                         .expect("axis index attr");
-                    let ax_val: melior::ir::Value = self.block
+                    let ax_val: melior::ir::Value = self
+                        .block
                         .append_operation(
                             OperationBuilder::new("arith.constant", self.location)
                                 .add_results(&[index_type])
-                                .add_attributes(&[(Identifier::new(self.context, "value"), ax_attr)])
+                                .add_attributes(&[(
+                                    Identifier::new(self.context, "value"),
+                                    ax_attr,
+                                )])
                                 .build()
                                 .expect("arith.constant ax index"),
                         )
@@ -2327,7 +2425,8 @@ impl<'c> GraphBuilder<'c> {
 
             count = Some(match count {
                 None => dim_size_val,
-                Some(prev) => self.block
+                Some(prev) => self
+                    .block
                     .append_operation(
                         OperationBuilder::new("arith.muli", self.location)
                             .add_operands(&[prev, dim_size_val])
@@ -2359,7 +2458,8 @@ impl<'c> GraphBuilder<'c> {
         // Convert index -> i64 via arith.index_cast, then i64 -> f32/f64 via arith.sitofp.
         // arith.uitofp/sitofp does not accept 'index' type directly.
         let i64_type = melior::ir::Type::parse(self.context, "i64").expect("i64 type");
-        let count_i64: melior::ir::Value = self.block
+        let count_i64: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.index_cast", self.location)
                     .add_operands(&[count_idx])
@@ -2372,10 +2472,11 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         let float_convert_op = match dtype {
-            DType::F32 | DType::F64 => "arith.sitofp",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.sitofp",
             DType::I32 | DType::I64 => panic!("emit_div_by_index_scalar: float types only"),
         };
-        let count_f: melior::ir::Value = self.block
+        let count_f: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new(float_convert_op, self.location)
                     .add_operands(&[count_i64])
@@ -2407,7 +2508,8 @@ impl<'c> GraphBuilder<'c> {
             let rtt: melior::ir::Type = RankedTensorType::new(&[], elem_type, None).into();
             rtt
         };
-        let scalar_tensor: melior::ir::Value = self.block
+        let scalar_tensor: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.from_elements", self.location)
                     .add_operands(&[count_f])
@@ -2430,7 +2532,8 @@ impl<'c> GraphBuilder<'c> {
         let indexing_maps = Attribute::parse(
             self.context,
             &format!("[{identity_map}, {scalar_map}, {identity_map}]"),
-        ).expect("div mean indexing_maps");
+        )
+        .expect("div mean indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
         let body_block = Block::new(&[
@@ -2460,16 +2563,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), scalar_tensor, init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 2, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 2, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -2498,7 +2610,11 @@ impl<'c> GraphBuilder<'c> {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                if reduced_axes.contains(&i) { Some(1) } else { *d }
+                if reduced_axes.contains(&i) {
+                    Some(1)
+                } else {
+                    *d
+                }
             })
             .collect();
 
@@ -2575,7 +2691,11 @@ impl<'c> GraphBuilder<'c> {
         let groups: Vec<String> = src_to_tgt
             .iter()
             .map(|g| {
-                let inner = g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+                let inner = g
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("[{inner}]")
             })
             .collect();
@@ -2589,9 +2709,11 @@ impl<'c> GraphBuilder<'c> {
         match dtype {
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+            DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
-        }.expect("zero scalar attr")
+        }
+        .expect("zero scalar attr")
     }
 
     /// Build a minimum-value scalar `Attribute` for the given dtype.
@@ -2601,9 +2723,12 @@ impl<'c> GraphBuilder<'c> {
             // 0xFF800000 is -inf for f32; 0xFFF0000000000000 is -inf for f64.
             DType::F32 => Attribute::parse(self.context, "0xFF800000 : f32"),
             DType::F64 => Attribute::parse(self.context, "0xFFF0000000000000 : f64"),
+            // 0xFF80 is -inf for bf16.
+            DType::BF16 => Attribute::parse(self.context, "0xFF80 : bf16"),
             DType::I32 => Attribute::parse(self.context, "-2147483648 : i32"),
             DType::I64 => Attribute::parse(self.context, "-9223372036854775808 : i64"),
-        }.expect("min scalar attr")
+        }
+        .expect("min scalar attr")
     }
 
     // ── Matmul and Gemm ───────────────────────────────────────────────────────
@@ -2626,19 +2751,13 @@ impl<'c> GraphBuilder<'c> {
 
         match (lhs_rank, rhs_rank) {
             (2, 2) => self.emit_matmul_2d(lhs.value(), &lhs_shape, rhs.value(), &rhs_shape),
-            (3, 3) => {
-                self.emit_batch_matmul_3d(lhs.value(), &lhs_shape, rhs.value(), &rhs_shape)
-            }
+            (3, 3) => self.emit_batch_matmul_3d(lhs.value(), &lhs_shape, rhs.value(), &rhs_shape),
             (1, 2) => {
                 // [K] -> [1, K] via expand_shape, matmul [1,K]x[K,N]->[1,N], collapse to [N]
                 let exp_shape = vec![Some(1), lhs_shape[0]];
                 let expanded = self.emit_expand_shape_1d_to_2d(lhs.value(), &lhs_shape, &exp_shape);
-                let result_2d = self.emit_matmul_2d(
-                    expanded.value(),
-                    &exp_shape,
-                    rhs.value(),
-                    &rhs_shape,
-                );
+                let result_2d =
+                    self.emit_matmul_2d(expanded.value(), &exp_shape, rhs.value(), &rhs_shape);
                 // result is [1, N] -> collapse to [N]
                 let n = rhs_shape[1];
                 self.emit_collapse_shape_2d_to_1d(result_2d.value(), &[Some(1), n], &[n])
@@ -2648,12 +2767,8 @@ impl<'c> GraphBuilder<'c> {
                 let k = rhs_shape[0];
                 let exp_shape = vec![k, Some(1)];
                 let expanded = self.emit_expand_shape_1d_to_2d(rhs.value(), &rhs_shape, &exp_shape);
-                let result_2d = self.emit_matmul_2d(
-                    lhs.value(),
-                    &lhs_shape,
-                    expanded.value(),
-                    &exp_shape,
-                );
+                let result_2d =
+                    self.emit_matmul_2d(lhs.value(), &lhs_shape, expanded.value(), &exp_shape);
                 let m = lhs_shape[0];
                 self.emit_collapse_shape_2d_to_1d(result_2d.value(), &[m, Some(1)], &[m])
             }
@@ -2668,22 +2783,20 @@ impl<'c> GraphBuilder<'c> {
 
                 // Compute flat batch size per tensor (use each tensor's own batch dims).
                 let lhs_batch_dims = &lhs_shape[..lhs_rank - 2];
-                let flat_b: Option<u64> = lhs_batch_dims.iter().try_fold(1u64, |acc, d| {
-                    d.map(|v| acc * v)
-                });
+                let flat_b: Option<u64> = lhs_batch_dims
+                    .iter()
+                    .try_fold(1u64, |acc, d| d.map(|v| acc * v));
                 let rhs_batch_dims = &rhs_shape[..rhs_rank - 2];
-                let rhs_flat_b: Option<u64> = rhs_batch_dims.iter().try_fold(1u64, |acc, d| {
-                    d.map(|v| acc * v)
-                });
+                let rhs_flat_b: Option<u64> = rhs_batch_dims
+                    .iter()
+                    .try_fold(1u64, |acc, d| d.map(|v| acc * v));
 
                 let lhs_3d_shape = vec![flat_b, m, lhs_k];
                 let rhs_3d_shape = vec![rhs_flat_b, rhs_k, n];
-                let lhs_collapsed = self.emit_collapse_shape_nd_to_3d(
-                    lhs.value(), &lhs_shape, &lhs_3d_shape,
-                );
-                let rhs_collapsed = self.emit_collapse_shape_nd_to_3d(
-                    rhs.value(), &rhs_shape, &rhs_3d_shape,
-                );
+                let lhs_collapsed =
+                    self.emit_collapse_shape_nd_to_3d(lhs.value(), &lhs_shape, &lhs_3d_shape);
+                let rhs_collapsed =
+                    self.emit_collapse_shape_nd_to_3d(rhs.value(), &rhs_shape, &rhs_3d_shape);
 
                 let result_3d = self.emit_batch_matmul_3d(
                     lhs_collapsed.value(),
@@ -2698,7 +2811,9 @@ impl<'c> GraphBuilder<'c> {
                 out_shape.push(n);
                 let result_3d_shape = vec![flat_b, m, n];
                 self.emit_expand_shape_3d_to_nd(
-                    result_3d.value(), &result_3d_shape, &out_shape,
+                    result_3d.value(),
+                    &result_3d_shape,
+                    &out_shape,
                     Some((lhs.value(), &lhs_shape)),
                 )
             }
@@ -2782,47 +2897,60 @@ impl<'c> GraphBuilder<'c> {
     fn emit_matmul_2d(
         &mut self,
         lhs_val: melior::ir::Value<'c, 'c>,
-        lhs_shape: &[Option<u64>],  // [M, K]
+        lhs_shape: &[Option<u64>], // [M, K]
         rhs_val: melior::ir::Value<'c, 'c>,
-        rhs_shape: &[Option<u64>],  // [K, N]
+        rhs_shape: &[Option<u64>], // [K, N]
     ) -> Tensor<'c> {
         let m = lhs_shape[0];
         let n = rhs_shape[1];
         let out_shape = vec![m, n];
         let dtype = self.value_dtype(lhs_val);
 
-        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &[
-            (lhs_val, 0), // M from lhs dim 0
-            (rhs_val, 1), // N from rhs dim 1
-        ]);
+        let filled = self.emit_zero_filled_tensor(
+            &out_shape,
+            dtype,
+            &[
+                (lhs_val, 0), // M from lhs dim 0
+                (rhs_val, 1), // N from rhs dim 1
+            ],
+        );
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
-        let segment = Attribute::parse(self.context, "array<i32: 2, 1>")
-            .expect("matmul segment sizes");
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
         let matmul_region = self.make_matmul_region(dtype);
 
         // 3 iteration dims: d0=M, d1=N, d2=K
         let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
         let rhs_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
         let out_map = "affine_map<(d0, d1, d2) -> (d0, d1)>";
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
-        ).expect("matmul 2d indexing maps");
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{lhs_map}, {rhs_map}, {out_map}]"))
+                .expect("matmul 2d indexing maps");
         let iterator_types = Attribute::parse(
             self.context,
             "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
         ).expect("matmul 2d iterator types");
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, filled])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"), segment),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
                     ])
                     .add_regions([matmul_region])
                     .build()
@@ -2838,9 +2966,9 @@ impl<'c> GraphBuilder<'c> {
     fn emit_batch_matmul_3d(
         &mut self,
         lhs_val: melior::ir::Value<'c, 'c>,
-        lhs_shape: &[Option<u64>],  // [B, M, K]
+        lhs_shape: &[Option<u64>], // [B, M, K]
         rhs_val: melior::ir::Value<'c, 'c>,
-        rhs_shape: &[Option<u64>],  // [B, K, N]
+        rhs_shape: &[Option<u64>], // [B, K, N]
     ) -> Tensor<'c> {
         let b = lhs_shape[0];
         let m = lhs_shape[1];
@@ -2848,39 +2976,52 @@ impl<'c> GraphBuilder<'c> {
         let out_shape = vec![b, m, n];
         let dtype = self.value_dtype(lhs_val);
 
-        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &[
-            (lhs_val, 0), // B from lhs dim 0
-            (lhs_val, 1), // M from lhs dim 1
-            (rhs_val, 2), // N from rhs dim 2
-        ]);
+        let filled = self.emit_zero_filled_tensor(
+            &out_shape,
+            dtype,
+            &[
+                (lhs_val, 0), // B from lhs dim 0
+                (lhs_val, 1), // M from lhs dim 1
+                (rhs_val, 2), // N from rhs dim 2
+            ],
+        );
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
-        let segment = Attribute::parse(self.context, "array<i32: 2, 1>")
-            .expect("batch_matmul segment sizes");
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("batch_matmul segment sizes");
         let matmul_region = self.make_matmul_region(dtype);
 
         // 4 iteration dims: d0=B, d1=M, d2=N, d3=K
         let lhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>";
         let rhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>";
         let out_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>";
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{lhs_map}, {rhs_map}, {out_map}]"),
-        ).expect("batch matmul 3d indexing maps");
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{lhs_map}, {rhs_map}, {out_map}]"))
+                .expect("batch matmul 3d indexing maps");
         let iterator_types = Attribute::parse(
             self.context,
             "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]",
         ).expect("batch matmul 3d iterator types");
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[lhs_val, rhs_val, filled])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"), segment),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
                     ])
                     .add_regions([matmul_region])
                     .build()
@@ -2907,34 +3048,31 @@ impl<'c> GraphBuilder<'c> {
         let tensor_type = self.make_tensor_type(shape, dtype);
 
         // Collect tensor.dim values for dynamic dims in shape order.
-        let index_type = melior::ir::Type::parse(self.context, "index")
-            .expect("index type");
+        let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let mut dyn_iter = dyn_sources.iter();
         let mut dyn_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
         for dim in shape.iter() {
             if dim.is_none() {
-                let &(src, idx) = dyn_iter.next()
+                let &(src, idx) = dyn_iter
+                    .next()
                     .expect("dyn_sources must have an entry for each None dim");
                 // Emit arith.constant for the dim index.
-                let idx_attr = Attribute::parse(
-                    self.context,
-                    &format!("{idx} : index"),
-                ).expect("dim index attr");
-                let idx_val: melior::ir::Value = self.block
+                let idx_attr = Attribute::parse(self.context, &format!("{idx} : index"))
+                    .expect("dim index attr");
+                let idx_val: melior::ir::Value = self
+                    .block
                     .append_operation(
                         OperationBuilder::new("arith.constant", self.location)
                             .add_results(&[index_type])
-                            .add_attributes(&[(
-                                Identifier::new(self.context, "value"),
-                                idx_attr,
-                            )])
+                            .add_attributes(&[(Identifier::new(self.context, "value"), idx_attr)])
                             .build()
                             .expect("arith.constant index"),
                     )
                     .result(0)
                     .unwrap()
                     .into();
-                let dim_val: melior::ir::Value = self.block
+                let dim_val: melior::ir::Value = self
+                    .block
                     .append_operation(
                         OperationBuilder::new("tensor.dim", self.location)
                             .add_operands(&[src, idx_val])
@@ -2950,7 +3088,8 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // tensor.empty(%dyn0, %dyn1, ...) : tensor<...>
-        let init: melior::ir::Value = self.block
+        let init: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -2966,10 +3105,13 @@ impl<'c> GraphBuilder<'c> {
         let zero_attr = match dtype {
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+            DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
-        }.expect("zero constant attr");
-        let zero: melior::ir::Value = self.block
+        }
+        .expect("zero constant attr");
+        let zero: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -2993,8 +3135,8 @@ impl<'c> GraphBuilder<'c> {
         let fill_region = Region::new();
         fill_region.append_block(fill_block);
 
-        let segment_fill = Attribute::parse(self.context, "array<i32: 1, 1>")
-            .expect("fill segment sizes");
+        let segment_fill =
+            Attribute::parse(self.context, "array<i32: 1, 1>").expect("fill segment sizes");
 
         self.block
             .append_operation(
@@ -3029,7 +3171,7 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let mul: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => {
+            DType::F32 | DType::F64 | DType::BF16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -3057,7 +3199,7 @@ impl<'c> GraphBuilder<'c> {
                 .into(),
         };
         let add: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => {
+            DType::F32 | DType::F64 | DType::BF16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -3098,18 +3240,20 @@ impl<'c> GraphBuilder<'c> {
     /// Transpose a 2D tensor `[M, N] -> [N, M]` via `linalg.transpose`.
     fn emit_linalg_transpose_2d(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
         let in_shape = input.shape();
-        assert_eq!(in_shape.len(), 2, "emit_linalg_transpose_2d requires rank-2 tensor");
+        assert_eq!(
+            in_shape.len(),
+            2,
+            "emit_linalg_transpose_2d requires rank-2 tensor"
+        );
         let out_shape = vec![in_shape[1], in_shape[0]];
         let dtype = input.dtype();
 
-        let init = self.emit_tensor_empty_with_dim_map(
-            &out_shape, dtype, input.value(), &[1, 0],
-        );
+        let init = self.emit_tensor_empty_with_dim_map(&out_shape, dtype, input.value(), &[1, 0]);
         let out_type = self.make_tensor_type(&out_shape, dtype);
 
         // permutation = [1, 0]
-        let perm_attr = Attribute::parse(self.context, "array<i64: 1, 0>")
-            .expect("transpose permutation");
+        let perm_attr =
+            Attribute::parse(self.context, "array<i64: 1, 0>").expect("transpose permutation");
 
         // linalg.transpose region: single-block with 2 args (input_elem, output_elem).
         // Body yields the input element (arg 0).
@@ -3125,15 +3269,13 @@ impl<'c> GraphBuilder<'c> {
         let trans_region = Region::new();
         trans_region.append_block(trans_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.transpose", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[out_type])
-                    .add_attributes(&[(
-                        Identifier::new(self.context, "permutation"),
-                        perm_attr,
-                    )])
+                    .add_attributes(&[(Identifier::new(self.context, "permutation"), perm_attr)])
                     .add_regions([trans_region])
                     .build()
                     .expect("linalg.transpose"),
@@ -3170,17 +3312,26 @@ impl<'c> GraphBuilder<'c> {
                     in_shape.get(i).and_then(|opt| *opt)
                 } else {
                     // d == -1: try to infer statically.
-                    let total_static: Option<u64> = in_shape.iter()
+                    let total_static: Option<u64> = in_shape
+                        .iter()
                         .try_fold(1u64, |acc, dim| dim.map(|n| acc * n));
-                    let known_product: Option<u64> = target_shape.iter().enumerate()
-                        .try_fold(1u64, |acc, (j, &td)| {
-                            if j == i { Some(acc) } // skip the -1 dim
-                            else if td > 0 { Some(acc * td as u64) }
-                            else if td == 0 {
-                                in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
-                            }
-                            else { None }
-                        });
+                    let known_product: Option<u64> =
+                        target_shape
+                            .iter()
+                            .enumerate()
+                            .try_fold(1u64, |acc, (j, &td)| {
+                                if j == i {
+                                    Some(acc)
+                                }
+                                // skip the -1 dim
+                                else if td > 0 {
+                                    Some(acc * td as u64)
+                                } else if td == 0 {
+                                    in_shape.get(j).and_then(|opt| opt.map(|n| acc * n))
+                                } else {
+                                    None
+                                }
+                            });
                     match (total_static, known_product) {
                         (Some(t), Some(k)) if k > 0 => Some(t / k),
                         _ => None,
@@ -3195,16 +3346,23 @@ impl<'c> GraphBuilder<'c> {
                 ReassocResult::Identity => {
                     return Tensor::from_value(input.value());
                 }
-                ReassocResult::Collapse { reassoc, inferred_shape } => {
+                ReassocResult::Collapse {
+                    reassoc,
+                    inferred_shape,
+                } => {
                     let reassoc_str = reassoc_to_string(&reassoc);
                     return self.emit_collapse_shape_with_reassoc(
-                        input.value(), &inferred_shape, &reassoc_str,
+                        input.value(),
+                        &inferred_shape,
+                        &reassoc_str,
                     );
                 }
                 ReassocResult::Expand { reassoc } => {
                     let reassoc_str = reassoc_to_string(&reassoc);
                     return self.emit_expand_shape_with_reassoc(
-                        input.value(), &out_shape, &reassoc_str,
+                        input.value(),
+                        &out_shape,
+                        &reassoc_str,
                     );
                 }
                 ReassocResult::CollapseExpand {
@@ -3214,11 +3372,15 @@ impl<'c> GraphBuilder<'c> {
                 } => {
                     let c_str = reassoc_to_string(&collapse_reassoc);
                     let collapsed = self.emit_collapse_shape_with_reassoc(
-                        input.value(), &intermediate_shape, &c_str,
+                        input.value(),
+                        &intermediate_shape,
+                        &c_str,
                     );
                     let e_str = reassoc_to_string(&expand_reassoc);
                     return self.emit_expand_shape_with_reassoc(
-                        collapsed.value(), &out_shape, &e_str,
+                        collapsed.value(),
+                        &out_shape,
+                        &e_str,
                     );
                 }
             }
@@ -3246,20 +3408,22 @@ impl<'c> GraphBuilder<'c> {
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let target_rank = out_shape.len();
 
-        let emit_index_const = |block: &Block<'c>, ctx: &'c Context, n: u64| -> melior::ir::Value<'c, 'c> {
-            let attr = Attribute::parse(ctx, &format!("{n} : index")).expect("index const attr");
-            block
-                .append_operation(
-                    OperationBuilder::new("arith.constant", Location::unknown(ctx))
-                        .add_results(&[melior::ir::Type::parse(ctx, "index").unwrap()])
-                        .add_attributes(&[(Identifier::new(ctx, "value"), attr)])
-                        .build()
-                        .expect("arith.constant index"),
-                )
-                .result(0)
-                .unwrap()
-                .into()
-        };
+        let emit_index_const =
+            |block: &Block<'c>, ctx: &'c Context, n: u64| -> melior::ir::Value<'c, 'c> {
+                let attr =
+                    Attribute::parse(ctx, &format!("{n} : index")).expect("index const attr");
+                block
+                    .append_operation(
+                        OperationBuilder::new("arith.constant", Location::unknown(ctx))
+                            .add_results(&[melior::ir::Type::parse(ctx, "index").unwrap()])
+                            .add_attributes(&[(Identifier::new(ctx, "value"), attr)])
+                            .build()
+                            .expect("arith.constant index"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            };
 
         // Build dim values — for dynamic dims, compute from input.
         let mut dim_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::with_capacity(target_rank);
@@ -3275,7 +3439,8 @@ impl<'c> GraphBuilder<'c> {
                 };
                 prod = Some(match prod {
                     None => dim_val,
-                    Some(prev) => self.block
+                    Some(prev) => self
+                        .block
                         .append_operation(
                             OperationBuilder::new("arith.muli", self.location)
                                 .add_operands(&[prev, dim_val])
@@ -3301,10 +3466,13 @@ impl<'c> GraphBuilder<'c> {
                     if let Some(total) = total_elems {
                         let mut known = emit_index_const(&self.block, self.context, 1);
                         for (j, d) in out_shape.iter().enumerate() {
-                            if j == i { continue; }
+                            if j == i {
+                                continue;
+                            }
                             if let Some(n) = d {
                                 let c = emit_index_const(&self.block, self.context, *n);
-                                known = self.block
+                                known = self
+                                    .block
                                     .append_operation(
                                         OperationBuilder::new("arith.muli", self.location)
                                             .add_operands(&[known, c])
@@ -3312,7 +3480,9 @@ impl<'c> GraphBuilder<'c> {
                                             .build()
                                             .expect("arith.muli known"),
                                     )
-                                    .result(0).unwrap().into();
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
                             }
                         }
                         self.block
@@ -3323,7 +3493,9 @@ impl<'c> GraphBuilder<'c> {
                                     .build()
                                     .expect("arith.divui infer"),
                             )
-                            .result(0).unwrap().into()
+                            .result(0)
+                            .unwrap()
+                            .into()
                     } else if i < rank {
                         self.emit_tensor_dim(input.value(), i)
                     } else {
@@ -3339,7 +3511,8 @@ impl<'c> GraphBuilder<'c> {
             let dims_u64 = vec![target_rank as u64];
             RankedTensorType::new(&dims_u64, index_type, None).into()
         };
-        let shape_tensor: melior::ir::Value<'c, 'c> = self.block
+        let shape_tensor: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.from_elements", self.location)
                     .add_operands(&dim_vals)
@@ -3352,7 +3525,8 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         let out_type = self.make_tensor_type(out_shape, dtype);
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.reshape", self.location)
                     .add_operands(&[input.value(), shape_tensor])
@@ -3379,7 +3553,8 @@ impl<'c> GraphBuilder<'c> {
         let dtype = input.dtype();
         let out_type = self.make_tensor_type(out_shape, dtype);
 
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.reshape", self.location)
                     .add_operands(&[input.value(), shape_tensor])
@@ -3420,7 +3595,8 @@ impl<'c> GraphBuilder<'c> {
             // so cast from i64.
             let i64_type = melior::ir::Type::parse(ctx, "i64").expect("i64");
             let neg1_attr = Attribute::parse(ctx, "-1 : i64").expect("-1 i64 attr");
-            let neg1_i64: melior::ir::Value = self.block
+            let neg1_i64: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.constant", loc)
                         .add_results(&[i64_type])
@@ -3428,7 +3604,9 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.constant -1"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
             self.block
                 .append_operation(
                     OperationBuilder::new("arith.index_cast", loc)
@@ -3437,7 +3615,9 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.index_cast -1"),
                 )
-                .result(0).unwrap().into()
+                .result(0)
+                .unwrap()
+                .into()
         };
 
         // Compute total input elements.
@@ -3447,7 +3627,8 @@ impl<'c> GraphBuilder<'c> {
                 Some(n) => self.emit_arith_constant_index(n),
                 None => self.emit_tensor_dim(input.value(), i),
             };
-            total = self.block
+            total = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.muli", loc)
                         .add_operands(&[total, dim_val])
@@ -3455,55 +3636,67 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.muli total"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
         }
 
         // First pass: resolve 0 entries (copy from input), leave -1 as-is.
-        let resolved_zeros: Vec<melior::ir::Value<'c, 'c>> = dim_indices.iter().enumerate().map(|(i, &dim_val)| {
-            if allowzero {
-                return dim_val;
-            }
-            // Check if dim == 0 using arith.cmpi eq.
-            let is_zero: melior::ir::Value = self.block
-                .append_operation(
-                    OperationBuilder::new("arith.cmpi", loc)
-                        .add_operands(&[dim_val, c0])
-                        .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
-                        .add_attributes(&[(
-                            Identifier::new(ctx, "predicate"),
-                            Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
-                        )])
-                        .build()
-                        .expect("arith.cmpi eq zero"),
-                )
-                .result(0).unwrap().into();
-
-            // If zero, use input dim i; else use dim_val.
-            let input_dim = if i < in_rank {
-                match in_shape[i] {
-                    Some(n) => self.emit_arith_constant_index(n),
-                    None => self.emit_tensor_dim(input.value(), i),
+        let resolved_zeros: Vec<melior::ir::Value<'c, 'c>> = dim_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &dim_val)| {
+                if allowzero {
+                    return dim_val;
                 }
-            } else {
-                c0 // out of range, shouldn't happen in valid ONNX
-            };
+                // Check if dim == 0 using arith.cmpi eq.
+                let is_zero: melior::ir::Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("arith.cmpi", loc)
+                            .add_operands(&[dim_val, c0])
+                            .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
+                            .add_attributes(&[(
+                                Identifier::new(ctx, "predicate"),
+                                Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
+                            )])
+                            .build()
+                            .expect("arith.cmpi eq zero"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
 
-            self.block
-                .append_operation(
-                    OperationBuilder::new("arith.select", loc)
-                        .add_operands(&[is_zero, input_dim, dim_val])
-                        .add_results(&[index_type])
-                        .build()
-                        .expect("arith.select zero"),
-                )
-                .result(0).unwrap().into()
-        }).collect();
+                // If zero, use input dim i; else use dim_val.
+                let input_dim = if i < in_rank {
+                    match in_shape[i] {
+                        Some(n) => self.emit_arith_constant_index(n),
+                        None => self.emit_tensor_dim(input.value(), i),
+                    }
+                } else {
+                    c0 // out of range, shouldn't happen in valid ONNX
+                };
+
+                self.block
+                    .append_operation(
+                        OperationBuilder::new("arith.select", loc)
+                            .add_operands(&[is_zero, input_dim, dim_val])
+                            .add_results(&[index_type])
+                            .build()
+                            .expect("arith.select zero"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            })
+            .collect();
 
         // Compute product of known dims (non -1).
         let mut known_product: melior::ir::Value<'c, 'c> = c1;
         for &dim_val in &resolved_zeros {
             // Check if dim == -1.
-            let is_neg1: melior::ir::Value = self.block
+            let is_neg1: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.cmpi", loc)
                         .add_operands(&[dim_val, c_neg1])
@@ -3515,10 +3708,13 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.cmpi eq neg1"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
 
             // If -1, contribute 1 to the product; else contribute dim_val.
-            let contrib: melior::ir::Value = self.block
+            let contrib: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.select", loc)
                         .add_operands(&[is_neg1, c1, dim_val])
@@ -3526,9 +3722,12 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.select neg1 contrib"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
 
-            known_product = self.block
+            known_product = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.muli", loc)
                         .add_operands(&[known_product, contrib])
@@ -3536,11 +3735,14 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.muli known_product"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
         }
 
         // Inferred dim value = total / known_product.
-        let inferred: melior::ir::Value<'c, 'c> = self.block
+        let inferred: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.divui", loc)
                     .add_operands(&[total, known_product])
@@ -3548,34 +3750,44 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.divui inferred"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         // Second pass: replace -1 with inferred.
-        resolved_zeros.iter().map(|&dim_val| {
-            let is_neg1: melior::ir::Value = self.block
-                .append_operation(
-                    OperationBuilder::new("arith.cmpi", loc)
-                        .add_operands(&[dim_val, c_neg1])
-                        .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
-                        .add_attributes(&[(
-                            Identifier::new(ctx, "predicate"),
-                            Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
-                        )])
-                        .build()
-                        .expect("arith.cmpi eq neg1 final"),
-                )
-                .result(0).unwrap().into();
+        resolved_zeros
+            .iter()
+            .map(|&dim_val| {
+                let is_neg1: melior::ir::Value = self
+                    .block
+                    .append_operation(
+                        OperationBuilder::new("arith.cmpi", loc)
+                            .add_operands(&[dim_val, c_neg1])
+                            .add_results(&[melior::ir::Type::parse(ctx, "i1").unwrap()])
+                            .add_attributes(&[(
+                                Identifier::new(ctx, "predicate"),
+                                Attribute::parse(ctx, "0 : i64").unwrap(), // eq predicate
+                            )])
+                            .build()
+                            .expect("arith.cmpi eq neg1 final"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
 
-            self.block
-                .append_operation(
-                    OperationBuilder::new("arith.select", loc)
-                        .add_operands(&[is_neg1, inferred, dim_val])
-                        .add_results(&[index_type])
-                        .build()
-                        .expect("arith.select replace neg1"),
-                )
-                .result(0).unwrap().into()
-        }).collect()
+                self.block
+                    .append_operation(
+                        OperationBuilder::new("arith.select", loc)
+                            .add_operands(&[is_neg1, inferred, dim_val])
+                            .add_results(&[index_type])
+                            .build()
+                            .expect("arith.select replace neg1"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into()
+            })
+            .collect()
     }
 
     /// Reshape `input` using corrected runtime index dim values.
@@ -3596,10 +3808,15 @@ impl<'c> GraphBuilder<'c> {
                 ReassocResult::Identity => {
                     return Tensor::from_value(input.value());
                 }
-                ReassocResult::Collapse { reassoc, inferred_shape } => {
+                ReassocResult::Collapse {
+                    reassoc,
+                    inferred_shape,
+                } => {
                     let reassoc_str = reassoc_to_string(&reassoc);
                     return self.emit_collapse_shape_with_reassoc(
-                        input.value(), &inferred_shape, &reassoc_str,
+                        input.value(),
+                        &inferred_shape,
+                        &reassoc_str,
                     );
                 }
                 ReassocResult::Expand { reassoc } => {
@@ -3613,7 +3830,11 @@ impl<'c> GraphBuilder<'c> {
                         .map(|(i, _)| dim_vals[i])
                         .collect();
                     return self.emit_expand_shape_impl_with_dyn_vals(
-                        input.value(), out_shape, input.dtype(), &reassoc_str, &dyn_vals,
+                        input.value(),
+                        out_shape,
+                        input.dtype(),
+                        &reassoc_str,
+                        &dyn_vals,
                     );
                 }
                 ReassocResult::CollapseExpand {
@@ -3623,7 +3844,9 @@ impl<'c> GraphBuilder<'c> {
                 } => {
                     let c_str = reassoc_to_string(&collapse_reassoc);
                     let collapsed = self.emit_collapse_shape_with_reassoc(
-                        input.value(), &intermediate_shape, &c_str,
+                        input.value(),
+                        &intermediate_shape,
+                        &c_str,
                     );
                     let e_str = reassoc_to_string(&expand_reassoc);
                     let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
@@ -3633,7 +3856,11 @@ impl<'c> GraphBuilder<'c> {
                         .map(|(i, _)| dim_vals[i])
                         .collect();
                     return self.emit_expand_shape_impl_with_dyn_vals(
-                        collapsed.value(), out_shape, input.dtype(), &e_str, &dyn_vals,
+                        collapsed.value(),
+                        out_shape,
+                        input.dtype(),
+                        &e_str,
+                        &dyn_vals,
                     );
                 }
             }
@@ -3656,20 +3883,29 @@ impl<'c> GraphBuilder<'c> {
                         .map(|(i, _)| dim_vals[i])
                         .collect();
                     return self.emit_expand_shape_impl_with_dyn_vals(
-                        cast_val.value(), out_shape, input.dtype(), &reassoc_str, &dyn_vals,
+                        cast_val.value(),
+                        out_shape,
+                        input.dtype(),
+                        &reassoc_str,
+                        &dyn_vals,
                     );
                 }
             }
         }
 
         // Final fallback: tensor.reshape via shape tensor.
-        tracing::debug!(?in_shape, ?out_shape, "emit_reshape_from_index_dims: falling back to tensor.reshape");
+        tracing::debug!(
+            ?in_shape,
+            ?out_shape,
+            "emit_reshape_from_index_dims: falling back to tensor.reshape"
+        );
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let n = dim_vals.len() as u64;
         let shape_tensor_type: melior::ir::Type =
             melior::ir::r#type::RankedTensorType::new(&[n], index_type, None).into();
 
-        let shape_tensor: melior::ir::Value<'c, 'c> = self.block
+        let shape_tensor: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.from_elements", self.location)
                     .add_operands(dim_vals)
@@ -3677,7 +3913,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("tensor.from_elements reshape dims"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         self.emit_reshape_with_tensor(input, shape_tensor, out_shape)
     }
@@ -3685,8 +3923,8 @@ impl<'c> GraphBuilder<'c> {
     /// Emit `arith.constant <n> : index`.
     fn emit_arith_constant_index(&mut self, n: u64) -> melior::ir::Value<'c, 'c> {
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
-        let attr = Attribute::parse(self.context, &format!("{n} : index"))
-            .expect("index const attr");
+        let attr =
+            Attribute::parse(self.context, &format!("{n} : index")).expect("index const attr");
         self.block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
@@ -3695,7 +3933,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.constant index"),
             )
-            .result(0).unwrap().into()
+            .result(0)
+            .unwrap()
+            .into()
     }
 
     /// Transpose `input` according to `perms` (ONNX-style signed permutation).
@@ -3706,13 +3946,23 @@ impl<'c> GraphBuilder<'c> {
         let in_shape = input.shape();
         let rank = in_shape.len();
         let dtype = input.dtype();
-        assert_eq!(perms.len(), rank, "emit_transpose: perms len must match rank");
+        assert_eq!(
+            perms.len(),
+            rank,
+            "emit_transpose: perms len must match rank"
+        );
 
-        let norm_perms: Vec<usize> = perms.iter().map(|&p| {
-            let p = if p < 0 { p + rank as i64 } else { p };
-            assert!(p >= 0 && (p as usize) < rank, "perm {p} out of bounds for rank {rank}");
-            p as usize
-        }).collect();
+        let norm_perms: Vec<usize> = perms
+            .iter()
+            .map(|&p| {
+                let p = if p < 0 { p + rank as i64 } else { p };
+                assert!(
+                    p >= 0 && (p as usize) < rank,
+                    "perm {p} out of bounds for rank {rank}"
+                );
+                p as usize
+            })
+            .collect();
         {
             let mut seen = vec![false; rank];
             for &p in &norm_perms {
@@ -3733,7 +3983,8 @@ impl<'c> GraphBuilder<'c> {
         let perm_attr = Attribute::parse(
             self.context,
             &format!("array<i64: {}>", perm_vals.join(", ")),
-        ).expect("transpose permutation attr");
+        )
+        .expect("transpose permutation attr");
 
         let elem_type = dtype.to_mlir_type(self.context);
         let trans_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
@@ -3747,7 +3998,8 @@ impl<'c> GraphBuilder<'c> {
         let trans_region = Region::new();
         trans_region.append_block(trans_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.transpose", self.location)
                     .add_operands(&[input.value(), init])
@@ -3771,7 +4023,10 @@ impl<'c> GraphBuilder<'c> {
         assert!(!inputs.is_empty(), "emit_concat: inputs must not be empty");
         let rank = inputs[0].rank();
         let dtype = inputs[0].dtype();
-        assert!(axis < rank, "emit_concat: axis {axis} out of bounds for rank {rank}");
+        assert!(
+            axis < rank,
+            "emit_concat: axis {axis} out of bounds for rank {rank}"
+        );
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
 
         let first_shape = inputs[0].shape();
@@ -3812,7 +4067,10 @@ impl<'c> GraphBuilder<'c> {
                             .append_operation(
                                 OperationBuilder::new("arith.constant", self.location)
                                     .add_results(&[index_type])
-                                    .add_attributes(&[(Identifier::new(self.context, "value"), attr)])
+                                    .add_attributes(&[(
+                                        Identifier::new(self.context, "value"),
+                                        attr,
+                                    )])
                                     .build()
                                     .expect("arith.constant"),
                             )
@@ -3824,7 +4082,8 @@ impl<'c> GraphBuilder<'c> {
                 };
                 acc = Some(match acc {
                     None => dim_val,
-                    Some(prev) => self.block
+                    Some(prev) => self
+                        .block
                         .append_operation(
                             OperationBuilder::new("arith.addi", self.location)
                                 .add_operands(&[prev, dim_val])
@@ -3887,16 +4146,25 @@ impl<'c> GraphBuilder<'c> {
             // For the axis: static if offset_static is known and axis dim static, else dynamic.
             let axis_offset_is_static = total_axis_static.is_some();
             let static_offsets: Vec<i64> = (0..rank)
-                .map(|i| if i == axis {
-                    if axis_offset_is_static { offset_static } else { K_DYNAMIC }
-                } else {
-                    0
+                .map(|i| {
+                    if i == axis {
+                        if axis_offset_is_static {
+                            offset_static
+                        } else {
+                            K_DYNAMIC
+                        }
+                    } else {
+                        0
+                    }
                 })
                 .collect();
 
             // Build static_sizes: size of each input dim.
             let static_sizes: Vec<i64> = (0..rank)
-                .map(|i| match inp_shape[i] { Some(n) => n as i64, None => K_DYNAMIC })
+                .map(|i| match inp_shape[i] {
+                    Some(n) => n as i64,
+                    None => K_DYNAMIC,
+                })
                 .collect();
 
             // Strides = all 1.
@@ -3913,7 +4181,10 @@ impl<'c> GraphBuilder<'c> {
                             .append_operation(
                                 OperationBuilder::new("arith.constant", self.location)
                                     .add_results(&[index_type])
-                                    .add_attributes(&[(Identifier::new(self.context, "value"), attr)])
+                                    .add_attributes(&[(
+                                        Identifier::new(self.context, "value"),
+                                        attr,
+                                    )])
                                     .build()
                                     .expect("arith.constant 0"),
                             )
@@ -3933,17 +4204,29 @@ impl<'c> GraphBuilder<'c> {
                 .collect();
 
             let static_offsets_attr = {
-                let s = static_offsets.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+                let s = static_offsets
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Attribute::parse(self.context, &format!("array<i64: {s}>"))
                     .expect("static_offsets attr")
             };
             let static_sizes_attr = {
-                let s = static_sizes.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+                let s = static_sizes
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Attribute::parse(self.context, &format!("array<i64: {s}>"))
                     .expect("static_sizes attr")
             };
             let static_strides_attr = {
-                let s = static_strides.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+                let s = static_strides
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Attribute::parse(self.context, &format!("array<i64: {s}>"))
                     .expect("static_strides attr")
             };
@@ -3958,18 +4241,32 @@ impl<'c> GraphBuilder<'c> {
             let seg_attr = Attribute::parse(
                 self.context,
                 &format!("array<i32: 1, 1, {dyn_offsets_len}, {dyn_sizes_len}, 0>"),
-            ).expect("insert_slice operandSegmentSizes");
+            )
+            .expect("insert_slice operandSegmentSizes");
 
-            current = self.block
+            current = self
+                .block
                 .append_operation(
                     OperationBuilder::new("tensor.insert_slice", self.location)
                         .add_operands(&operands)
                         .add_results(&[out_type])
                         .add_attributes(&[
-                            (Identifier::new(self.context, "static_offsets"), static_offsets_attr),
-                            (Identifier::new(self.context, "static_sizes"), static_sizes_attr),
-                            (Identifier::new(self.context, "static_strides"), static_strides_attr),
-                            (Identifier::new(self.context, "operandSegmentSizes"), seg_attr),
+                            (
+                                Identifier::new(self.context, "static_offsets"),
+                                static_offsets_attr,
+                            ),
+                            (
+                                Identifier::new(self.context, "static_sizes"),
+                                static_sizes_attr,
+                            ),
+                            (
+                                Identifier::new(self.context, "static_strides"),
+                                static_strides_attr,
+                            ),
+                            (
+                                Identifier::new(self.context, "operandSegmentSizes"),
+                                seg_attr,
+                            ),
                         ])
                         .build()
                         .expect("tensor.insert_slice"),
@@ -3990,7 +4287,10 @@ impl<'c> GraphBuilder<'c> {
                             .append_operation(
                                 OperationBuilder::new("arith.constant", self.location)
                                     .add_results(&[index_type])
-                                    .add_attributes(&[(Identifier::new(self.context, "value"), attr)])
+                                    .add_attributes(&[(
+                                        Identifier::new(self.context, "value"),
+                                        attr,
+                                    )])
                                     .build()
                                     .expect("arith.constant step"),
                             )
@@ -4008,7 +4308,10 @@ impl<'c> GraphBuilder<'c> {
                             .append_operation(
                                 OperationBuilder::new("arith.constant", self.location)
                                     .add_results(&[index_type])
-                                    .add_attributes(&[(Identifier::new(self.context, "value"), attr)])
+                                    .add_attributes(&[(
+                                        Identifier::new(self.context, "value"),
+                                        attr,
+                                    )])
                                     .build()
                                     .expect("arith.constant 0 prev"),
                             )
@@ -4028,7 +4331,7 @@ impl<'c> GraphBuilder<'c> {
                         )
                         .result(0)
                         .unwrap()
-                        .into()
+                        .into(),
                 );
             }
         }
@@ -4059,15 +4362,22 @@ impl<'c> GraphBuilder<'c> {
         const K_DYNAMIC: i64 = i64::MIN;
 
         // Normalize axes to usize.
-        let norm_axes: Vec<usize> = axes.iter().map(|&a| {
-            let a = if a < 0 { a + rank as i64 } else { a };
-            a as usize
-        }).collect();
+        let norm_axes: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                let a = if a < 0 { a + rank as i64 } else { a };
+                a as usize
+            })
+            .collect();
 
         // Build per-dim (offset, size, stride) — defaulting to full dim for un-mentioned axes.
         let mut static_offsets = vec![0i64; rank];
-        let mut static_sizes: Vec<i64> = in_shape.iter()
-            .map(|d| match d { Some(n) => *n as i64, None => K_DYNAMIC })
+        let mut static_sizes: Vec<i64> = in_shape
+            .iter()
+            .map(|d| match d {
+                Some(n) => *n as i64,
+                None => K_DYNAMIC,
+            })
             .collect();
         let mut static_strides = vec![1i64; rank];
 
@@ -4090,7 +4400,11 @@ impl<'c> GraphBuilder<'c> {
                 }
             };
             let s = if start < 0 { start + ax_size } else { start }.max(0);
-            let e = if end < 0 { end + ax_size } else { end.min(ax_size) };
+            let e = if end < 0 {
+                end + ax_size
+            } else {
+                end.min(ax_size)
+            };
             let size = ((e - s + step - 1) / step).max(0);
 
             static_offsets[ax] = s;
@@ -4099,17 +4413,24 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Output shape.
-        let out_shape: Vec<Option<u64>> = static_sizes.iter()
+        let out_shape: Vec<Option<u64>> = static_sizes
+            .iter()
             .map(|&s| if s == K_DYNAMIC { None } else { Some(s as u64) })
             .collect();
         let out_type = self.make_tensor_type(&out_shape, dtype);
 
         let make_attr = |ctx: &'c Context, vals: &[i64]| -> Attribute<'c> {
-            let s = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            let s = vals
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             Attribute::parse(ctx, &format!("array<i64: {s}>")).expect("slice attr")
         };
 
-        let dyn_sizes: Vec<melior::ir::Value<'c, 'c>> = static_sizes.iter().enumerate()
+        let dyn_sizes: Vec<melior::ir::Value<'c, 'c>> = static_sizes
+            .iter()
+            .enumerate()
             .filter(|&(_, s)| *s == K_DYNAMIC)
             .map(|(i, _)| self.emit_tensor_dim(input.value(), i))
             .collect();
@@ -4123,21 +4444,32 @@ impl<'c> GraphBuilder<'c> {
         let seg_attr = Attribute::parse(
             self.context,
             &format!("array<i32: 1, 0, {dyn_sizes_len}, 0>"),
-        ).expect("operandSegmentSizes");
+        )
+        .expect("operandSegmentSizes");
 
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.extract_slice", self.location)
                     .add_operands(&operands)
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "static_offsets"),
-                         make_attr(self.context, &static_offsets)),
-                        (Identifier::new(self.context, "static_sizes"),
-                         make_attr(self.context, &static_sizes)),
-                        (Identifier::new(self.context, "static_strides"),
-                         make_attr(self.context, &static_strides)),
-                        (Identifier::new(self.context, "operandSegmentSizes"), seg_attr),
+                        (
+                            Identifier::new(self.context, "static_offsets"),
+                            make_attr(self.context, &static_offsets),
+                        ),
+                        (
+                            Identifier::new(self.context, "static_sizes"),
+                            make_attr(self.context, &static_sizes),
+                        ),
+                        (
+                            Identifier::new(self.context, "static_strides"),
+                            make_attr(self.context, &static_strides),
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            seg_attr,
+                        ),
                     ])
                     .build()
                     .expect("tensor.extract_slice"),
@@ -4173,15 +4505,22 @@ impl<'c> GraphBuilder<'c> {
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
 
         // Normalize axes to usize.
-        let norm_axes: Vec<usize> = axes.iter().map(|&a| {
-            let a = if a < 0 { a + rank as i64 } else { a };
-            a as usize
-        }).collect();
+        let norm_axes: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                let a = if a < 0 { a + rank as i64 } else { a };
+                a as usize
+            })
+            .collect();
 
         // Per-dim static placeholders; sliced axes will be K_DYNAMIC.
         let mut static_offsets = vec![0i64; rank];
-        let mut static_sizes: Vec<i64> = in_shape.iter()
-            .map(|d| match d { Some(n) => *n as i64, None => K_DYNAMIC })
+        let mut static_sizes: Vec<i64> = in_shape
+            .iter()
+            .map(|d| match d {
+                Some(n) => *n as i64,
+                None => K_DYNAMIC,
+            })
             .collect();
         let mut static_strides = vec![1i64; rank];
 
@@ -4193,13 +4532,15 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Output shape: dynamic for sliced axes, static (or dynamic) for the rest.
-        let out_shape: Vec<Option<u64>> = (0..rank).map(|i| {
-            if norm_axes.contains(&i) {
-                None
-            } else {
-                in_shape[i]
-            }
-        }).collect();
+        let out_shape: Vec<Option<u64>> = (0..rank)
+            .map(|i| {
+                if norm_axes.contains(&i) {
+                    None
+                } else {
+                    in_shape[i]
+                }
+            })
+            .collect();
         let out_type = self.make_tensor_type(&out_shape, dtype);
 
         // Build dynamic offsets and sizes for the sliced axes.
@@ -4241,7 +4582,8 @@ impl<'c> GraphBuilder<'c> {
             dyn_offsets.push(start_idx);
 
             // size = (end - start) / step
-            let diff: melior::ir::Value<'c, 'c> = self.block
+            let diff: melior::ir::Value<'c, 'c> = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.subi", self.location)
                         .add_operands(&[end_idx, start_idx])
@@ -4256,11 +4598,10 @@ impl<'c> GraphBuilder<'c> {
             let size = if steps[j] == 1 {
                 diff
             } else {
-                let step_attr = Attribute::parse(
-                    self.context,
-                    &format!("{} : index", steps[j]),
-                ).expect("step attr");
-                let step_val: melior::ir::Value<'c, 'c> = self.block
+                let step_attr = Attribute::parse(self.context, &format!("{} : index", steps[j]))
+                    .expect("step attr");
+                let step_val: melior::ir::Value<'c, 'c> = self
+                    .block
                     .append_operation(
                         OperationBuilder::new("arith.constant", self.location)
                             .add_results(&[index_type])
@@ -4305,32 +4646,44 @@ impl<'c> GraphBuilder<'c> {
         let n_dyn_sizes = all_dyn_sizes.len() as i32;
 
         let make_i64_array = |ctx: &'c Context, vals: &[i64]| -> Attribute<'c> {
-            let s = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+            let s = vals
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             Attribute::parse(ctx, &format!("array<i64: {s}>")).expect("i64 array attr")
         };
 
         let seg_attr = Attribute::parse(
             self.context,
             &format!("array<i32: 1, {n_dyn_offsets}, {n_dyn_sizes}, 0>"),
-        ).expect("operandSegmentSizes");
+        )
+        .expect("operandSegmentSizes");
 
         let mut operands = vec![input.value()];
         operands.extend(dyn_offsets);
         operands.extend(all_dyn_sizes);
 
         let ctx = self.context;
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.extract_slice", self.location)
                     .add_operands(&operands)
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(ctx, "static_offsets"),
-                         make_i64_array(ctx, &static_offsets)),
-                        (Identifier::new(ctx, "static_sizes"),
-                         make_i64_array(ctx, &static_sizes)),
-                        (Identifier::new(ctx, "static_strides"),
-                         make_i64_array(ctx, &static_strides)),
+                        (
+                            Identifier::new(ctx, "static_offsets"),
+                            make_i64_array(ctx, &static_offsets),
+                        ),
+                        (
+                            Identifier::new(ctx, "static_sizes"),
+                            make_i64_array(ctx, &static_sizes),
+                        ),
+                        (
+                            Identifier::new(ctx, "static_strides"),
+                            make_i64_array(ctx, &static_strides),
+                        ),
                         (Identifier::new(ctx, "operandSegmentSizes"), seg_attr),
                     ])
                     .build()
@@ -4353,7 +4706,12 @@ impl<'c> GraphBuilder<'c> {
     /// to read from `data`.
     ///
     /// Restrictions: `indices` dtype must be I32 or I64.
-    pub fn emit_gather(&mut self, data: &Tensor<'c>, indices: &Tensor<'c>, axis: usize) -> Tensor<'c> {
+    pub fn emit_gather(
+        &mut self,
+        data: &Tensor<'c>,
+        indices: &Tensor<'c>,
+        axis: usize,
+    ) -> Tensor<'c> {
         let data_shape = data.shape();
         let idx_shape = indices.shape();
         let dtype = data.dtype();
@@ -4364,7 +4722,7 @@ impl<'c> GraphBuilder<'c> {
         let mut out_shape: Vec<Option<u64>> = Vec::new();
         out_shape.extend_from_slice(&data_shape[..axis]);
         out_shape.extend_from_slice(&idx_shape);
-        out_shape.extend_from_slice(&data_shape[axis+1..]);
+        out_shape.extend_from_slice(&data_shape[axis + 1..]);
         let out_rank = out_shape.len();
 
         let elem_type = dtype.to_mlir_type(self.context);
@@ -4385,7 +4743,8 @@ impl<'c> GraphBuilder<'c> {
                 }
             }
         }
-        let init_proper: melior::ir::Value<'c, 'c> = self.block
+        let init_proper: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -4430,21 +4789,19 @@ impl<'c> GraphBuilder<'c> {
         let dim_list = dim_vars.join(", ");
 
         // indices map: maps output dims [axis..axis+idx_rank] to indices dims [0..idx_rank].
-        let idx_dims: Vec<String> = (axis..axis+idx_rank).map(|i| format!("d{i}")).collect();
+        let idx_dims: Vec<String> = (axis..axis + idx_rank).map(|i| format!("d{i}")).collect();
         let idx_map = format!("affine_map<({dim_list}) -> ({})>", idx_dims.join(", "));
 
         // out map: identity.
         let out_map = format!("affine_map<({dim_list}) -> ({dim_list})>");
 
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{idx_map}, {out_map}]"),
-        ).expect("gather indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{idx_map}, {out_map}]"))
+            .expect("gather indexing_maps");
 
         // Body block: (indices_elem, out_elem)
         let body_block = Block::new(&[
-            (idx_elem_type, self.location),  // indices element
-            (elem_type, self.location),      // out element (unused, destination style)
+            (idx_elem_type, self.location), // indices element
+            (elem_type, self.location),     // out element (unused, destination style)
         ]);
 
         let idx_elem: melior::ir::Value = body_block.argument(0).unwrap().into();
@@ -4490,7 +4847,7 @@ impl<'c> GraphBuilder<'c> {
         // axis dim: gather_idx
         data_indices.push(gather_idx);
         // post-axis dims: iter_indices[axis+idx_rank..out_rank]
-        data_indices.extend_from_slice(&iter_indices[axis+idx_rank..out_rank]);
+        data_indices.extend_from_slice(&iter_indices[axis + idx_rank..out_rank]);
 
         // tensor.extract %data[data_indices] : tensor<...>
         let mut extract_operands = vec![data.value()];
@@ -4516,16 +4873,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[indices.value(), init_proper])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -4567,7 +4933,8 @@ impl<'c> GraphBuilder<'c> {
         let indexing_maps = Attribute::parse(
             self.context,
             &format!("[{cond_map}, {x_map}, {y_map}, {out_map}]"),
-        ).expect("where indexing_maps");
+        )
+        .expect("where indexing_maps");
         let iterator_types = self.make_iterator_types(out_rank);
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
@@ -4576,10 +4943,13 @@ impl<'c> GraphBuilder<'c> {
         let find_dyn_source = |padded: &[Option<u64>], _val: melior::ir::Value<'c, 'c>| -> bool {
             // The source must have the same rank and its dynamic positions must
             // cover all dynamic positions of out_shape.
-            if padded.len() != out_shape.len() { return false; }
-            out_shape.iter().enumerate().all(|(i, d)| {
-                d.is_some() || padded[i].is_none()
-            })
+            if padded.len() != out_shape.len() {
+                return false;
+            }
+            out_shape
+                .iter()
+                .enumerate()
+                .all(|(i, d)| d.is_some() || padded[i].is_none())
         };
         let init_source = if find_dyn_source(&x_padded, x_val) {
             Some(x_val)
@@ -4597,10 +4967,10 @@ impl<'c> GraphBuilder<'c> {
         let i1_type = melior::ir::Type::parse(self.context, "i1").expect("i1 type");
 
         let body_block = Block::new(&[
-            (cond_elem_type, self.location),  // cond element
-            (elem_type, self.location),       // x element
-            (elem_type, self.location),       // y element
-            (elem_type, self.location),       // out element (unused)
+            (cond_elem_type, self.location), // cond element
+            (elem_type, self.location),      // x element
+            (elem_type, self.location),      // y element
+            (elem_type, self.location),      // out element (unused)
         ]);
         let cond_e: melior::ir::Value = body_block.argument(0).unwrap().into();
         let x_e: melior::ir::Value = body_block.argument(1).unwrap().into();
@@ -4613,7 +4983,8 @@ impl<'c> GraphBuilder<'c> {
                     DType::I32 => Attribute::parse(self.context, "0 : i32"),
                     DType::I64 => Attribute::parse(self.context, "0 : i64"),
                     _ => unreachable!(),
-                }.expect("zero for cond");
+                }
+                .expect("zero for cond");
                 let zero: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("arith.constant", self.location)
@@ -4632,7 +5003,10 @@ impl<'c> GraphBuilder<'c> {
                         OperationBuilder::new("arith.cmpi", self.location)
                             .add_operands(&[cond_e, zero])
                             .add_results(&[i1_type])
-                            .add_attributes(&[(Identifier::new(self.context, "predicate"), ne_attr)])
+                            .add_attributes(&[(
+                                Identifier::new(self.context, "predicate"),
+                                ne_attr,
+                            )])
                             .build()
                             .expect("arith.cmpi ne"),
                     )
@@ -4640,13 +5014,15 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::F32 | DType::F64 => {
+            DType::F32 | DType::F64 | DType::BF16 => {
                 // Compare float != 0.0.
                 let zero_attr = match cond_dtype {
                     DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
                     DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+                    DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
                     _ => unreachable!(),
-                }.expect("zero float cond");
+                }
+                .expect("zero float cond");
                 let zero: melior::ir::Value = body_block
                     .append_operation(
                         OperationBuilder::new("arith.constant", self.location)
@@ -4665,7 +5041,10 @@ impl<'c> GraphBuilder<'c> {
                         OperationBuilder::new("arith.cmpf", self.location)
                             .add_operands(&[cond_e, zero])
                             .add_results(&[i1_type])
-                            .add_attributes(&[(Identifier::new(self.context, "predicate"), une_attr)])
+                            .add_attributes(&[(
+                                Identifier::new(self.context, "predicate"),
+                                une_attr,
+                            )])
                             .build()
                             .expect("arith.cmpf une"),
                     )
@@ -4695,16 +5074,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[cond_val, x_val, y_val, init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 3, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 3, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -4734,10 +5122,14 @@ impl<'c> GraphBuilder<'c> {
             (DType::F64, DType::F32) => "arith.truncf",
             (DType::I32, DType::I64) => "arith.extsi",
             (DType::I64, DType::I32) => "arith.trunci",
-            (DType::I32, DType::F32) | (DType::I32, DType::F64)
-            | (DType::I64, DType::F32) | (DType::I64, DType::F64) => "arith.sitofp",
-            (DType::F32, DType::I32) | (DType::F32, DType::I64)
-            | (DType::F64, DType::I32) | (DType::F64, DType::I64) => "arith.fptosi",
+            (DType::I32, DType::F32)
+            | (DType::I32, DType::F64)
+            | (DType::I64, DType::F32)
+            | (DType::I64, DType::F64) => "arith.sitofp",
+            (DType::F32, DType::I32)
+            | (DType::F32, DType::I64)
+            | (DType::F64, DType::I32)
+            | (DType::F64, DType::I64) => "arith.fptosi",
             _ => panic!("emit_cast: unsupported cast {src_dtype:?} -> {target_dtype:?}"),
         };
 
@@ -4749,10 +5141,8 @@ impl<'c> GraphBuilder<'c> {
 
         let init = self.emit_tensor_empty_dyn(&shape, target_dtype, Some(input.value()));
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("cast indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("cast indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
         let body_block = Block::new(&[
@@ -4780,16 +5170,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result: melior::ir::Value<'c, 'c> = self.block
+        let result: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -4810,10 +5209,13 @@ impl<'c> GraphBuilder<'c> {
         let tgt_rank = src_rank + axes.len();
 
         // Normalize axes to output positions.
-        let mut norm_axes: Vec<usize> = axes.iter().map(|&a| {
-            let a = if a < 0 { a + tgt_rank as i64 } else { a };
-            a as usize
-        }).collect();
+        let mut norm_axes: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                let a = if a < 0 { a + tgt_rank as i64 } else { a };
+                a as usize
+            })
+            .collect();
         norm_axes.sort_unstable();
 
         // Build target shape: insert Some(1) at each axis position.
@@ -4840,7 +5242,9 @@ impl<'c> GraphBuilder<'c> {
                 pending.push(tgt_i);
             } else {
                 for p in pending.drain(..) {
-                    if src_rank == 0 { break; }
+                    if src_rank == 0 {
+                        break;
+                    }
                     src_to_tgt[src_idx].push(p);
                 }
                 if src_rank > 0 {
@@ -4864,9 +5268,14 @@ impl<'c> GraphBuilder<'c> {
             return self.emit_expand_shape_impl(input.value(), &out_shape, dtype, reassoc_str);
         }
 
-        let groups: Vec<String> = src_to_tgt.iter()
+        let groups: Vec<String> = src_to_tgt
+            .iter()
             .map(|g| {
-                let inner = g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+                let inner = g
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("[{inner}]")
             })
             .collect();
@@ -4883,14 +5292,19 @@ impl<'c> GraphBuilder<'c> {
         let src_rank = in_shape.len();
 
         // Normalize axes.
-        let mut norm_axes: Vec<usize> = axes.iter().map(|&a| {
-            let a = if a < 0 { a + src_rank as i64 } else { a };
-            a as usize
-        }).collect();
+        let mut norm_axes: Vec<usize> = axes
+            .iter()
+            .map(|&a| {
+                let a = if a < 0 { a + src_rank as i64 } else { a };
+                a as usize
+            })
+            .collect();
         norm_axes.sort_unstable();
 
         // Build output shape: remove the squeezed dims.
-        let out_shape: Vec<Option<u64>> = in_shape.iter().enumerate()
+        let out_shape: Vec<Option<u64>> = in_shape
+            .iter()
+            .enumerate()
             .filter(|(i, _)| !norm_axes.contains(i))
             .map(|(_, d)| *d)
             .collect();
@@ -4933,9 +5347,14 @@ impl<'c> GraphBuilder<'c> {
             return self.emit_collapse_shape_with_reassoc(input.value(), &out_shape, reassoc_str);
         }
 
-        let groups: Vec<String> = tgt_to_src.iter()
+        let groups: Vec<String> = tgt_to_src
+            .iter()
             .map(|g| {
-                let inner = g.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+                let inner = g
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("[{inner}]")
             })
             .collect();
@@ -4952,18 +5371,25 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_flatten(&mut self, input: &Tensor<'c>, axis: usize) -> Tensor<'c> {
         let in_shape = input.shape();
         let rank = in_shape.len();
-        assert!(axis <= rank, "emit_flatten: axis {axis} out of bounds for rank {rank}");
+        assert!(
+            axis <= rank,
+            "emit_flatten: axis {axis} out of bounds for rank {rank}"
+        );
 
         // Compute static dims for the two groups if possible.
         let head_size: Option<u64> = if axis == 0 {
             Some(1)
         } else {
-            in_shape[..axis].iter().try_fold(1u64, |acc, d| d.map(|v| acc * v))
+            in_shape[..axis]
+                .iter()
+                .try_fold(1u64, |acc, d| d.map(|v| acc * v))
         };
         let tail_size: Option<u64> = if axis == rank {
             Some(1)
         } else {
-            in_shape[axis..].iter().try_fold(1u64, |acc, d| d.map(|v| acc * v))
+            in_shape[axis..]
+                .iter()
+                .try_fold(1u64, |acc, d| d.map(|v| acc * v))
         };
         let out_shape = vec![head_size, tail_size];
 
@@ -4974,18 +5400,18 @@ impl<'c> GraphBuilder<'c> {
         // Easier: emit reshape instead.
         if axis == 0 || axis == rank {
             // One group covers the entire input; use tensor.reshape.
-            let target: Vec<i64> = if axis == 0 {
-                vec![1, -1]
-            } else {
-                vec![-1, 1]
-            };
+            let target: Vec<i64> = if axis == 0 { vec![1, -1] } else { vec![-1, 1] };
             return self.emit_reshape(input, &target);
         }
 
         // General case: two non-empty groups.
         let head_indices: Vec<String> = (0..axis).map(|i| i.to_string()).collect();
         let tail_indices: Vec<String> = (axis..rank).map(|i| i.to_string()).collect();
-        let reassoc_str = format!("[[{}], [{}]]", head_indices.join(", "), tail_indices.join(", "));
+        let reassoc_str = format!(
+            "[[{}], [{}]]",
+            head_indices.join(", "),
+            tail_indices.join(", ")
+        );
 
         self.emit_collapse_shape_with_reassoc(input.value(), &out_shape, &reassoc_str)
     }
@@ -4994,12 +5420,23 @@ impl<'c> GraphBuilder<'c> {
     ///
     /// `split_sizes` must sum to the axis dimension of `input`.
     /// Returns one `Tensor` per entry in `split_sizes`.
-    pub fn emit_split(&mut self, input: &Tensor<'c>, axis: usize, split_sizes: &[u64]) -> Vec<Tensor<'c>> {
+    pub fn emit_split(
+        &mut self,
+        input: &Tensor<'c>,
+        axis: usize,
+        split_sizes: &[u64],
+    ) -> Vec<Tensor<'c>> {
         let in_shape = input.shape();
         let rank = in_shape.len();
         let dtype = input.dtype();
-        assert!(axis < rank, "emit_split: axis {axis} out of bounds for rank {rank}");
-        assert!(!split_sizes.is_empty(), "emit_split: split_sizes must not be empty");
+        assert!(
+            axis < rank,
+            "emit_split: axis {axis} out of bounds for rank {rank}"
+        );
+        assert!(
+            !split_sizes.is_empty(),
+            "emit_split: split_sizes must not be empty"
+        );
         const K_DYNAMIC: i64 = i64::MIN;
 
         let mut results: Vec<Tensor<'c>> = Vec::with_capacity(split_sizes.len());
@@ -5007,7 +5444,9 @@ impl<'c> GraphBuilder<'c> {
 
         for &size in split_sizes {
             // Out shape: same as input except axis dim = size.
-            let out_shape: Vec<Option<u64>> = in_shape.iter().enumerate()
+            let out_shape: Vec<Option<u64>> = in_shape
+                .iter()
+                .enumerate()
                 .map(|(i, d)| if i == axis { Some(size) } else { *d })
                 .collect();
             let out_type = self.make_tensor_type(&out_shape, dtype);
@@ -5019,22 +5458,33 @@ impl<'c> GraphBuilder<'c> {
 
             // static_sizes: the split size for axis, input dims for others.
             let static_sizes: Vec<i64> = (0..rank)
-                .map(|i| if i == axis {
-                    size as i64
-                } else {
-                    match in_shape[i] { Some(n) => n as i64, None => K_DYNAMIC }
+                .map(|i| {
+                    if i == axis {
+                        size as i64
+                    } else {
+                        match in_shape[i] {
+                            Some(n) => n as i64,
+                            None => K_DYNAMIC,
+                        }
+                    }
                 })
                 .collect();
 
             let static_strides: Vec<i64> = vec![1; rank];
 
-            let dyn_sizes: Vec<melior::ir::Value<'c, 'c>> = static_sizes.iter().enumerate()
+            let dyn_sizes: Vec<melior::ir::Value<'c, 'c>> = static_sizes
+                .iter()
+                .enumerate()
                 .filter(|&(_, s)| *s == K_DYNAMIC)
                 .map(|(i, _)| self.emit_tensor_dim(input.value(), i))
                 .collect();
 
             let make_attr = |ctx: &'c Context, vals: &[i64]| -> Attribute<'c> {
-                let s = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
+                let s = vals
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 Attribute::parse(ctx, &format!("array<i64: {s}>")).expect("split slice attr")
             };
 
@@ -5045,21 +5495,32 @@ impl<'c> GraphBuilder<'c> {
             let seg_attr = Attribute::parse(
                 self.context,
                 &format!("array<i32: 1, 0, {dyn_sizes_len}, 0>"),
-            ).expect("operandSegmentSizes split");
+            )
+            .expect("operandSegmentSizes split");
 
-            let slice: melior::ir::Value<'c, 'c> = self.block
+            let slice: melior::ir::Value<'c, 'c> = self
+                .block
                 .append_operation(
                     OperationBuilder::new("tensor.extract_slice", self.location)
                         .add_operands(&operands)
                         .add_results(&[out_type])
                         .add_attributes(&[
-                            (Identifier::new(self.context, "static_offsets"),
-                             make_attr(self.context, &static_offsets)),
-                            (Identifier::new(self.context, "static_sizes"),
-                             make_attr(self.context, &static_sizes)),
-                            (Identifier::new(self.context, "static_strides"),
-                             make_attr(self.context, &static_strides)),
-                            (Identifier::new(self.context, "operandSegmentSizes"), seg_attr),
+                            (
+                                Identifier::new(self.context, "static_offsets"),
+                                make_attr(self.context, &static_offsets),
+                            ),
+                            (
+                                Identifier::new(self.context, "static_sizes"),
+                                make_attr(self.context, &static_sizes),
+                            ),
+                            (
+                                Identifier::new(self.context, "static_strides"),
+                                make_attr(self.context, &static_strides),
+                            ),
+                            (
+                                Identifier::new(self.context, "operandSegmentSizes"),
+                                seg_attr,
+                            ),
                         ])
                         .build()
                         .expect("tensor.extract_slice split"),
@@ -5085,10 +5546,8 @@ impl<'c> GraphBuilder<'c> {
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
         let out_type = self.make_tensor_type(&shape, dtype);
         let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{0}, {0}]", identity),
-        ).expect("scale indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
+            .expect("scale indexing_maps");
         let iterator_types = self.make_iterator_types(rank);
 
         // MLIR requires a decimal point for float literals.
@@ -5097,7 +5556,8 @@ impl<'c> GraphBuilder<'c> {
             DType::F32 => Attribute::parse(self.context, &format!("{scale_f64:.6e} : f32")),
             DType::F64 => Attribute::parse(self.context, &format!("{scale_f64:.6e} : f64")),
             _ => panic!("emit_linalg_scale_f32: float-only"),
-        }.expect("scale constant attr");
+        }
+        .expect("scale constant attr");
 
         let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
         let x: melior::ir::Value = body_block.argument(0).unwrap().into();
@@ -5133,16 +5593,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[input.value(), init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -5189,7 +5658,8 @@ impl<'c> GraphBuilder<'c> {
         let dtype = mlir_element_type_to_dtype(elem_type);
         let out_type = self.make_tensor_type(tgt_shape, dtype);
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.cast", self.location)
                     .add_operands(&[input])
@@ -5222,7 +5692,7 @@ impl<'c> GraphBuilder<'c> {
         &mut self,
         input: melior::ir::Value<'c, 'c>,
         src_shape: &[Option<u64>],
-        tgt_shape: &[Option<u64>],   // [B_flat, M, K]
+        tgt_shape: &[Option<u64>], // [B_flat, M, K]
     ) -> Tensor<'c> {
         let src_rank = src_shape.len();
         debug_assert!(src_rank >= 3);
@@ -5249,8 +5719,8 @@ impl<'c> GraphBuilder<'c> {
     fn emit_expand_shape_3d_to_nd(
         &mut self,
         input: melior::ir::Value<'c, 'c>,
-        src_shape: &[Option<u64>],   // [B_flat, M, N]
-        tgt_shape: &[Option<u64>],   // [..., M, N]
+        src_shape: &[Option<u64>], // [B_flat, M, N]
+        tgt_shape: &[Option<u64>], // [..., M, N]
         batch_ref: Option<(melior::ir::Value<'c, 'c>, &[Option<u64>])>,
     ) -> Tensor<'c> {
         let tgt_rank = tgt_shape.len();
@@ -5291,9 +5761,7 @@ impl<'c> GraphBuilder<'c> {
             rtt.element()
         };
         let dtype = mlir_element_type_to_dtype(elem_type);
-        self.emit_expand_shape_impl_with_dyn_vals(
-            input, tgt_shape, dtype, &reassoc_str, &dyn_vals,
-        )
+        self.emit_expand_shape_impl_with_dyn_vals(input, tgt_shape, dtype, &reassoc_str, &dyn_vals)
     }
 
     fn emit_collapse_shape_with_reassoc(
@@ -5310,10 +5778,11 @@ impl<'c> GraphBuilder<'c> {
         let dtype = mlir_element_type_to_dtype(elem_type);
         let out_type = self.make_tensor_type(tgt_shape, dtype);
 
-        let reassoc_attr = Attribute::parse(self.context, reassoc_str)
-            .expect("collapse_shape reassociation");
+        let reassoc_attr =
+            Attribute::parse(self.context, reassoc_str).expect("collapse_shape reassociation");
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.collapse_shape", self.location)
                     .add_operands(&[input])
@@ -5356,19 +5825,25 @@ impl<'c> GraphBuilder<'c> {
     ) -> Tensor<'c> {
         let out_type = self.make_tensor_type(tgt_shape, dtype);
 
-        let reassoc_attr = Attribute::parse(self.context, reassoc_str)
-            .expect("expand_shape reassociation");
+        let reassoc_attr =
+            Attribute::parse(self.context, reassoc_str).expect("expand_shape reassociation");
 
         // static_output_shape: kDynamic sentinel = i64::MIN for dynamic dims.
-        let static_shape_vals: Vec<i64> = tgt_shape.iter().map(|d| match d {
-            Some(n) => *n as i64,
-            None => i64::MIN,
-        }).collect();
-        let static_shape_str = static_shape_vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-        let static_output_shape_attr = Attribute::parse(
-            self.context,
-            &format!("array<i64: {static_shape_str}>"),
-        ).expect("static_output_shape attr");
+        let static_shape_vals: Vec<i64> = tgt_shape
+            .iter()
+            .map(|d| match d {
+                Some(n) => *n as i64,
+                None => i64::MIN,
+            })
+            .collect();
+        let static_shape_str = static_shape_vals
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let static_output_shape_attr =
+            Attribute::parse(self.context, &format!("array<i64: {static_shape_str}>"))
+                .expect("static_output_shape attr");
 
         // For each dynamic dim in tgt_shape, emit tensor.dim on the input
         // to get the runtime size. For expand_shape, a dynamic output dim
@@ -5394,14 +5869,18 @@ impl<'c> GraphBuilder<'c> {
         let mut operands = vec![input];
         operands.extend(dyn_output_shape_vals);
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.expand_shape", self.location)
                     .add_operands(&operands)
                     .add_results(&[out_type])
                     .add_attributes(&[
                         (Identifier::new(self.context, "reassociation"), reassoc_attr),
-                        (Identifier::new(self.context, "static_output_shape"), static_output_shape_attr),
+                        (
+                            Identifier::new(self.context, "static_output_shape"),
+                            static_output_shape_attr,
+                        ),
                     ])
                     .build()
                     .expect("tensor.expand_shape"),
@@ -5426,30 +5905,40 @@ impl<'c> GraphBuilder<'c> {
     ) -> Tensor<'c> {
         let out_type = self.make_tensor_type(tgt_shape, dtype);
 
-        let reassoc_attr = Attribute::parse(self.context, reassoc_str)
-            .expect("expand_shape reassociation");
+        let reassoc_attr =
+            Attribute::parse(self.context, reassoc_str).expect("expand_shape reassociation");
 
-        let static_shape_vals: Vec<i64> = tgt_shape.iter().map(|d| match d {
-            Some(n) => *n as i64,
-            None => i64::MIN,
-        }).collect();
-        let static_shape_str = static_shape_vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-        let static_output_shape_attr = Attribute::parse(
-            self.context,
-            &format!("array<i64: {static_shape_str}>"),
-        ).expect("static_output_shape attr");
+        let static_shape_vals: Vec<i64> = tgt_shape
+            .iter()
+            .map(|d| match d {
+                Some(n) => *n as i64,
+                None => i64::MIN,
+            })
+            .collect();
+        let static_shape_str = static_shape_vals
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let static_output_shape_attr =
+            Attribute::parse(self.context, &format!("array<i64: {static_shape_str}>"))
+                .expect("static_output_shape attr");
 
         let mut operands = vec![input];
         operands.extend_from_slice(dyn_vals);
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.expand_shape", self.location)
                     .add_operands(&operands)
                     .add_results(&[out_type])
                     .add_attributes(&[
                         (Identifier::new(self.context, "reassociation"), reassoc_attr),
-                        (Identifier::new(self.context, "static_output_shape"), static_output_shape_attr),
+                        (
+                            Identifier::new(self.context, "static_output_shape"),
+                            static_output_shape_attr,
+                        ),
                     ])
                     .build()
                     .expect("tensor.expand_shape"),
@@ -5467,7 +5956,7 @@ impl<'c> GraphBuilder<'c> {
         // The group index IS the input dim index.
         // E.g. "[[0, 1], [2]]" means group 0 → output dims {0,1}, group 1 → output dim {2}.
         let trimmed = reassoc_str.trim();
-        let inner = &trimmed[1..trimmed.len()-1]; // strip outer []
+        let inner = &trimmed[1..trimmed.len() - 1]; // strip outer []
         let mut depth = 0;
         let mut group_start = None;
         let mut group_idx = 0;
@@ -5475,7 +5964,9 @@ impl<'c> GraphBuilder<'c> {
             match ch {
                 '[' => {
                     depth += 1;
-                    if depth == 1 { group_start = Some(i + 1); }
+                    if depth == 1 {
+                        group_start = Some(i + 1);
+                    }
                 }
                 ']' => {
                     depth -= 1;
@@ -5607,9 +6098,10 @@ impl<'c> GraphBuilder<'c> {
         dim_idx: usize,
     ) -> melior::ir::Value<'c, 'c> {
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
-        let idx_attr = Attribute::parse(self.context, &format!("{dim_idx} : index"))
-            .expect("dim index attr");
-        let idx_val: melior::ir::Value = self.block
+        let idx_attr =
+            Attribute::parse(self.context, &format!("{dim_idx} : index")).expect("dim index attr");
+        let idx_val: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[index_type])
@@ -5646,9 +6138,10 @@ impl<'c> GraphBuilder<'c> {
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
 
         // Build arith.constant for the position index.
-        let idx_attr = Attribute::parse(self.context, &format!("{pos} : index"))
-            .expect("index attr");
-        let idx_val: melior::ir::Value<'c, 'c> = self.block
+        let idx_attr =
+            Attribute::parse(self.context, &format!("{pos} : index")).expect("index attr");
+        let idx_val: melior::ir::Value<'c, 'c> = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[index_type])
@@ -5717,14 +6210,20 @@ impl<'c> GraphBuilder<'c> {
         let out_type = self.make_tensor_type(&out_shape, dtype);
 
         // static_low and static_high as DenseI64ArrayAttr.
-        let low_str = pad_low.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-        let high_str = pad_high.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-        let static_low_attr = Attribute::parse(
-            self.context, &format!("array<i64: {low_str}>"),
-        ).expect("static_low attr");
-        let static_high_attr = Attribute::parse(
-            self.context, &format!("array<i64: {high_str}>"),
-        ).expect("static_high attr");
+        let low_str = pad_low
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let high_str = pad_high
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let static_low_attr = Attribute::parse(self.context, &format!("array<i64: {low_str}>"))
+            .expect("static_low attr");
+        let static_high_attr = Attribute::parse(self.context, &format!("array<i64: {high_str}>"))
+            .expect("static_high attr");
 
         // Padding region: block args are indices (one per rank dim), yields the pad value.
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
@@ -5760,10 +6259,15 @@ impl<'c> GraphBuilder<'c> {
                     .add_results(&[out_type])
                     .add_attributes(&[
                         (Identifier::new(self.context, "static_low"), static_low_attr),
-                        (Identifier::new(self.context, "static_high"), static_high_attr),
+                        (
+                            Identifier::new(self.context, "static_high"),
+                            static_high_attr,
+                        ),
                         // AttrSizedOperandSegments: source(1), low_dynamic(0), high_dynamic(0).
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 1, 0, 0>").unwrap()),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 1, 0, 0>").unwrap(),
+                        ),
                     ])
                     .add_regions([pad_region])
                     .build()
@@ -5789,8 +6293,8 @@ impl<'c> GraphBuilder<'c> {
         strides: [u64; 2],
         dilations: [u64; 2],
     ) -> Tensor<'c> {
-        let in_shape = input.shape();   // [N, CI, H, W]
-        let wt_shape = weight.shape();  // [CO, CI, KH, KW]
+        let in_shape = input.shape(); // [N, CI, H, W]
+        let wt_shape = weight.shape(); // [CO, CI, KH, KW]
         assert_eq!(in_shape.len(), 4, "conv2d: input must be rank-4 (NCHW)");
         assert_eq!(wt_shape.len(), 4, "conv2d: weight must be rank-4 (FCHW)");
 
@@ -5806,9 +6310,11 @@ impl<'c> GraphBuilder<'c> {
             let zero_attr = match dtype {
                 DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
                 DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+                DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
                 DType::I32 => Attribute::parse(self.context, "0 : i32"),
                 DType::I64 => Attribute::parse(self.context, "0 : i64"),
-            }.expect("conv2d pad zero");
+            }
+            .expect("conv2d pad zero");
             self.emit_tensor_pad(input.value(), &pad_low, &pad_high, zero_attr)
         } else {
             input.value()
@@ -5838,12 +6344,12 @@ impl<'c> GraphBuilder<'c> {
 
         // Step 2: compute output spatial dims.
         // OH = (H_padded - dilation_h * (KH - 1) - 1) / stride_h + 1
-        let oh = h_padded.zip(kh).map(|(h, k)| {
-            (h - dilation_h * (k - 1) - 1) / stride_h + 1
-        });
-        let ow = w_padded.zip(kw).map(|(w, k)| {
-            (w - dilation_w * (k - 1) - 1) / stride_w + 1
-        });
+        let oh = h_padded
+            .zip(kh)
+            .map(|(h, k)| (h - dilation_h * (k - 1) - 1) / stride_h + 1);
+        let ow = w_padded
+            .zip(kw)
+            .map(|(w, k)| (w - dilation_w * (k - 1) - 1) / stride_w + 1);
         let out_shape = vec![n, co, oh, ow];
 
         // Step 3: zero-filled output tensor [N, CO, OH, OW].
@@ -5853,10 +6359,13 @@ impl<'c> GraphBuilder<'c> {
         let zero_attr = match dtype {
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
+            DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
-        }.expect("conv2d output zero");
-        let zero_scalar: melior::ir::Value = self.block
+        }
+        .expect("conv2d output zero");
+        let zero_scalar: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -5879,10 +6388,13 @@ impl<'c> GraphBuilder<'c> {
             dyn_vals.push(self.emit_tensor_dim(weight.value(), 0));
         }
         // dim 2 (OH) and dim 3 (OW) — must be static for now.
-        assert!(oh.is_some() && ow.is_some(),
-            "conv2d: dynamic output spatial dims not yet supported");
+        assert!(
+            oh.is_some() && ow.is_some(),
+            "conv2d: dynamic output spatial dims not yet supported"
+        );
 
-        let init_empty: melior::ir::Value = self.block
+        let init_empty: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -5905,7 +6417,8 @@ impl<'c> GraphBuilder<'c> {
         let fill_region = Region::new();
         fill_region.append_block(fill_block);
 
-        let init_filled: melior::ir::Value = self.block
+        let init_filled: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.fill", self.location)
                     .add_operands(&[zero_scalar, init_empty])
@@ -5928,11 +6441,13 @@ impl<'c> GraphBuilder<'c> {
         let strides_attr = Attribute::parse(
             self.context,
             &format!("dense<[{stride_h}, {stride_w}]> : tensor<2xi64>"),
-        ).expect("conv2d strides attr");
+        )
+        .expect("conv2d strides attr");
         let dilations_attr = Attribute::parse(
             self.context,
             &format!("dense<[{dilation_h}, {dilation_w}]> : tensor<2xi64>"),
-        ).expect("conv2d dilations attr");
+        )
+        .expect("conv2d dilations attr");
 
         // linalg.conv_2d_nchw_fchw requires an explicit region with body:
         //   ^bb0(%in: f32, %filter: f32, %acc: f32):
@@ -5941,7 +6456,8 @@ impl<'c> GraphBuilder<'c> {
         //     linalg.yield %sum : f32
         let conv_region = self.make_conv2d_region(dtype);
 
-        let conv_result: melior::ir::Value = self.block
+        let conv_result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.conv_2d_nchw_fchw", self.location)
                     .add_operands(&[input_val, weight.value(), init_filled])
@@ -5949,8 +6465,10 @@ impl<'c> GraphBuilder<'c> {
                     .add_attributes(&[
                         (Identifier::new(self.context, "strides"), strides_attr),
                         (Identifier::new(self.context, "dilations"), dilations_attr),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 2, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 2, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([conv_region])
                     .build()
@@ -5986,8 +6504,16 @@ impl<'c> GraphBuilder<'c> {
     ) -> Tensor<'c> {
         let in_shape = input.shape();
         let wt_shape = weight.shape();
-        assert_eq!(in_shape.len(), 4, "conv2d_same_upper: input must be NCHW rank-4");
-        assert_eq!(wt_shape.len(), 4, "conv2d_same_upper: weight must be FCHW rank-4");
+        assert_eq!(
+            in_shape.len(),
+            4,
+            "conv2d_same_upper: input must be NCHW rank-4"
+        );
+        assert_eq!(
+            wt_shape.len(),
+            4,
+            "conv2d_same_upper: weight must be FCHW rank-4"
+        );
 
         let h = in_shape[2].expect("conv2d_same_upper: H must be static");
         let w = in_shape[3].expect("conv2d_same_upper: W must be static");
@@ -6007,7 +6533,14 @@ impl<'c> GraphBuilder<'c> {
         let pad_left = pad_total_w / 2;
         let pad_right = pad_total_w - pad_left;
 
-        self.emit_conv2d(input, weight, bias, [pad_top, pad_left, pad_bottom, pad_right], strides, dilations)
+        self.emit_conv2d(
+            input,
+            weight,
+            bias,
+            [pad_top, pad_left, pad_bottom, pad_right],
+            strides,
+            dilations,
+        )
     }
 
     /// Build the region body for `linalg.conv_2d_nchw_fchw`:
@@ -6024,7 +6557,7 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let prod: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => {
+            DType::F32 | DType::F64 | DType::BF16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -6035,7 +6568,9 @@ impl<'c> GraphBuilder<'c> {
                             .build()
                             .expect("arith.mulf conv2d"),
                     )
-                    .result(0).unwrap().into()
+                    .result(0)
+                    .unwrap()
+                    .into()
             }
             DType::I32 | DType::I64 => block
                 .append_operation(
@@ -6045,10 +6580,12 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.muli conv2d"),
                 )
-                .result(0).unwrap().into(),
+                .result(0)
+                .unwrap()
+                .into(),
         };
         let sum: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 => {
+            DType::F32 | DType::F64 | DType::BF16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -6059,7 +6596,9 @@ impl<'c> GraphBuilder<'c> {
                             .build()
                             .expect("arith.addf conv2d"),
                     )
-                    .result(0).unwrap().into()
+                    .result(0)
+                    .unwrap()
+                    .into()
             }
             DType::I32 | DType::I64 => block
                 .append_operation(
@@ -6069,7 +6608,9 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.addi conv2d"),
                 )
-                .result(0).unwrap().into(),
+                .result(0)
+                .unwrap()
+                .into(),
         };
         block.append_operation(
             OperationBuilder::new("linalg.yield", self.location)
@@ -6096,7 +6637,7 @@ impl<'c> GraphBuilder<'c> {
         strides: [u64; 2],
         dilations: [u64; 2],
     ) -> Tensor<'c> {
-        let in_shape = input.shape();   // [N, C, H, W]
+        let in_shape = input.shape(); // [N, C, H, W]
         assert_eq!(in_shape.len(), 4, "max_pool2d: input must be rank-4 (NCHW)");
 
         let dtype = input.dtype();
@@ -6113,15 +6654,16 @@ impl<'c> GraphBuilder<'c> {
                 DType::F32 => Attribute::parse(self.context, "0xFF800000 : f32"),
                 DType::F64 => Attribute::parse(self.context, "0xFFF0000000000000 : f64"),
                 _ => panic!("max_pool2d: integer pooling not supported"),
-            }.expect("max_pool2d -inf pad value");
+            }
+            .expect("max_pool2d -inf pad value");
             self.emit_tensor_pad(input.value(), &pad_low, &pad_high, neg_inf_attr)
         } else {
             input.value()
         };
 
         // Get padded input shape.
-        let padded_rtt = RankedTensorType::try_from(input_val.r#type())
-            .expect("padded input RankedTensorType");
+        let padded_rtt =
+            RankedTensorType::try_from(input_val.r#type()).expect("padded input RankedTensorType");
         let padded_shape: Vec<Option<u64>> = (0..4)
             .map(|i| {
                 let raw = unsafe {
@@ -6150,9 +6692,11 @@ impl<'c> GraphBuilder<'c> {
             DType::F32 => Attribute::parse(self.context, "0xFF800000 : f32"),
             DType::F64 => Attribute::parse(self.context, "0xFFF0000000000000 : f64"),
             _ => panic!("max_pool2d: integer pooling not supported"),
-        }.expect("max_pool2d output -inf");
+        }
+        .expect("max_pool2d output -inf");
 
-        let neg_inf_scalar: melior::ir::Value = self.block
+        let neg_inf_scalar: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -6166,11 +6710,19 @@ impl<'c> GraphBuilder<'c> {
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
         let mut dyn_vals: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
-        if n.is_none() { dyn_vals.push(self.emit_tensor_dim(input_val, 0)); }
-        if c.is_none() { dyn_vals.push(self.emit_tensor_dim(input_val, 1)); }
-        assert!(oh.is_some() && ow.is_some(), "max_pool2d: dynamic output spatial dims not yet supported");
+        if n.is_none() {
+            dyn_vals.push(self.emit_tensor_dim(input_val, 0));
+        }
+        if c.is_none() {
+            dyn_vals.push(self.emit_tensor_dim(input_val, 1));
+        }
+        assert!(
+            oh.is_some() && ow.is_some(),
+            "max_pool2d: dynamic output spatial dims not yet supported"
+        );
 
-        let init_empty: melior::ir::Value = self.block
+        let init_empty: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -6193,7 +6745,8 @@ impl<'c> GraphBuilder<'c> {
         let fill_region = Region::new();
         fill_region.append_block(fill_block);
 
-        let init_filled: melior::ir::Value = self.block
+        let init_filled: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.fill", self.location)
                     .add_operands(&[neg_inf_scalar, init_empty])
@@ -6213,7 +6766,8 @@ impl<'c> GraphBuilder<'c> {
         // Step 4: create empty window tensor [KH, KW].
         let window_shape = vec![Some(kh), Some(kw)];
         let window_type = self.make_tensor_type(&window_shape, dtype);
-        let window_empty: melior::ir::Value = self.block
+        let window_empty: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&[])
@@ -6229,16 +6783,19 @@ impl<'c> GraphBuilder<'c> {
         let strides_attr = Attribute::parse(
             self.context,
             &format!("dense<[{stride_h}, {stride_w}]> : tensor<2xi64>"),
-        ).expect("max_pool2d strides attr");
+        )
+        .expect("max_pool2d strides attr");
         let dilations_attr = Attribute::parse(
             self.context,
             &format!("dense<[{dilation_h}, {dilation_w}]> : tensor<2xi64>"),
-        ).expect("max_pool2d dilations attr");
+        )
+        .expect("max_pool2d dilations attr");
 
         // Region body: max(in, acc).
         let pool_region = self.make_pool_max_region(dtype);
 
-        let pool_result: melior::ir::Value = self.block
+        let pool_result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.pooling_nchw_max", self.location)
                     .add_operands(&[input_val, window_empty, init_filled])
@@ -6246,8 +6803,10 @@ impl<'c> GraphBuilder<'c> {
                     .add_attributes(&[
                         (Identifier::new(self.context, "strides"), strides_attr),
                         (Identifier::new(self.context, "dilations"), dilations_attr),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 2, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 2, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([pool_region])
                     .build()
@@ -6273,7 +6832,7 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let max_op = match dtype {
-            DType::F32 | DType::F64 => "arith.maximumf",
+            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
             DType::I32 | DType::I64 => "arith.maxsi",
         };
         let max_val: melior::ir::Value = block
@@ -6303,12 +6862,16 @@ impl<'c> GraphBuilder<'c> {
     /// Output shape: `[N, C, 1, 1]`.
     /// Implemented as: reduce_sum over axes [2, 3] with keepdim, then divide by H*W.
     pub fn emit_global_avg_pool(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
-        let in_shape = input.shape();  // [N, C, H, W]
-        assert_eq!(in_shape.len(), 4, "global_avg_pool: input must be rank-4 NCHW");
+        let in_shape = input.shape(); // [N, C, H, W]
+        assert_eq!(
+            in_shape.len(),
+            4,
+            "global_avg_pool: input must be rank-4 NCHW"
+        );
 
         // Sum over H then W (keepdim=true to preserve rank).
-        let sum_h = self.emit_reduce_sum(input, 2, true);    // [N, C, 1, W]
-        let sum_hw = self.emit_reduce_sum(&sum_h, 3, true);  // [N, C, 1, 1]
+        let sum_h = self.emit_reduce_sum(input, 2, true); // [N, C, 1, W]
+        let sum_hw = self.emit_reduce_sum(&sum_h, 3, true); // [N, C, 1, 1]
 
         // Divide by H*W.
         let h = in_shape[2].expect("global_avg_pool: H must be static");
@@ -6368,17 +6931,16 @@ impl<'c> GraphBuilder<'c> {
             DType::F32 => Attribute::parse(self.context, &format!("{value_f64:.6e} : f32")),
             DType::F64 => Attribute::parse(self.context, &format!("{value_f64:.6e} : f64")),
             _ => panic!("emit_scalar_broadcast: float only"),
-        }.expect("scalar broadcast attr");
+        }
+        .expect("scalar broadcast attr");
 
         let out_type = self.make_tensor_type(&shape, dtype);
         let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(like.value()));
 
         // linalg.generic with empty inputs: body just yields the constant.
         let identity = identity_map_str(shape.len());
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{identity}]"),
-        ).expect("scalar broadcast indexing_maps");
+        let indexing_maps = Attribute::parse(self.context, &format!("[{identity}]"))
+            .expect("scalar broadcast indexing_maps");
         let iterator_types = self.make_iterator_types(shape.len());
 
         let body_block = Block::new(&[(elem_type, self.location)]);
@@ -6402,16 +6964,25 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result = self.block
+        let result = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[init])
                     .add_results(&[out_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 0, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 0, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
@@ -6455,10 +7026,14 @@ impl<'c> GraphBuilder<'c> {
         let output_descs: Vec<OutputDesc> = outputs
             .iter()
             .map(|t| {
-                let shape_vec: Vec<u64> = t.shape().iter().map(|d| match d {
-                    Some(n) => *n,
-                    None => crate::shape::DIM_DYNAMIC,
-                }).collect();
+                let shape_vec: Vec<u64> = t
+                    .shape()
+                    .iter()
+                    .map(|d| match d {
+                        Some(n) => *n,
+                        None => crate::shape::DIM_DYNAMIC,
+                    })
+                    .collect();
                 OutputDesc {
                     shape: crate::Shape(shape_vec),
                     dtype: t.dtype(),
@@ -6470,16 +7045,20 @@ impl<'c> GraphBuilder<'c> {
         for (out_idx, &output_tensor) in outputs.iter().enumerate() {
             let out_shape = output_tensor.shape();
             let out_dtype = output_tensor.dtype();
-            let dims: Vec<i64> = out_shape.iter().map(|d| match d {
-                Some(n) => *n as i64,
-                None => i64::MIN,
-            }).collect();
+            let dims: Vec<i64> = out_shape
+                .iter()
+                .map(|d| match d {
+                    Some(n) => *n as i64,
+                    None => i64::MIN,
+                })
+                .collect();
             let out_memref_type: melior::ir::Type<'c> =
                 MemRefType::new(out_dtype.to_mlir_type(context), &dims, None, None).into();
 
             self.block.add_argument(out_memref_type, location);
 
-            let result_memref: melior::ir::Value = self.block
+            let result_memref: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("bufferization.to_buffer", location)
                         .add_operands(&[output_tensor.value()])
@@ -6513,7 +7092,8 @@ impl<'c> GraphBuilder<'c> {
         // Build module.
         let mut module = Module::new(location);
 
-        let dl_attr = Attribute::parse(context,
+        let dl_attr = Attribute::parse(
+            context,
             "#dlti.dl_spec<\
                 index = 64 : i64, \
                 i32 = dense<32> : vector<2xi64>, \
@@ -6521,9 +7101,12 @@ impl<'c> GraphBuilder<'c> {
                 f32 = dense<32> : vector<2xi64>, \
                 f64 = dense<64> : vector<2xi64>, \
                 !llvm.ptr = dense<64> : vector<4xi64>\
-            >"
-        ).expect("failed to parse dlti.dl_spec");
-        module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
+            >",
+        )
+        .expect("failed to parse dlti.dl_spec");
+        module
+            .as_operation_mut()
+            .set_attribute("dlti.dl_spec", dl_attr);
 
         // Emit sub-functions.
         for sub in self.completed_subfunctions {
@@ -6564,10 +7147,9 @@ impl<'c> GraphBuilder<'c> {
         // Kernels with only elementwise/BatchNorm ops skip the schedule,
         // so transform-interpreter is a no-op and no vectorization occurs.
         if attach_transform_schedule {
-            module.as_operation_mut().set_attribute(
-                "transform.with_named_sequence",
-                Attribute::unit(context),
-            );
+            module
+                .as_operation_mut()
+                .set_attribute("transform.with_named_sequence", Attribute::unit(context));
             crate::compiler::build_transform_schedule(context, &module, location);
         }
 
@@ -6600,10 +7182,14 @@ impl<'c> GraphBuilder<'c> {
         let output_descs: Vec<OutputDesc> = outputs
             .iter()
             .map(|t| {
-                let shape_vec: Vec<u64> = t.shape().iter().map(|d| match d {
-                    Some(n) => *n,
-                    None => crate::shape::DIM_DYNAMIC,
-                }).collect();
+                let shape_vec: Vec<u64> = t
+                    .shape()
+                    .iter()
+                    .map(|d| match d {
+                        Some(n) => *n,
+                        None => crate::shape::DIM_DYNAMIC,
+                    })
+                    .collect();
                 OutputDesc {
                     shape: crate::Shape(shape_vec),
                     dtype: t.dtype(),
@@ -6615,16 +7201,20 @@ impl<'c> GraphBuilder<'c> {
         for (out_idx, &output_tensor) in outputs.iter().enumerate() {
             let out_shape = output_tensor.shape();
             let out_dtype = output_tensor.dtype();
-            let dims: Vec<i64> = out_shape.iter().map(|d| match d {
-                Some(n) => *n as i64,
-                None => i64::MIN,
-            }).collect();
+            let dims: Vec<i64> = out_shape
+                .iter()
+                .map(|d| match d {
+                    Some(n) => *n as i64,
+                    None => i64::MIN,
+                })
+                .collect();
             let out_memref_type: melior::ir::Type<'c> =
                 MemRefType::new(out_dtype.to_mlir_type(context), &dims, None, None).into();
 
             self.block.add_argument(out_memref_type, location);
 
-            let result_memref: melior::ir::Value = self.block
+            let result_memref: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("bufferization.to_buffer", location)
                         .add_operands(&[output_tensor.value()])
@@ -6659,7 +7249,8 @@ impl<'c> GraphBuilder<'c> {
         let mut module = Module::new(location);
 
         // Set data layout.
-        let dl_attr = Attribute::parse(context,
+        let dl_attr = Attribute::parse(
+            context,
             "#dlti.dl_spec<\
                 index = 64 : i64, \
                 i32 = dense<32> : vector<2xi64>, \
@@ -6667,14 +7258,16 @@ impl<'c> GraphBuilder<'c> {
                 f32 = dense<32> : vector<2xi64>, \
                 f64 = dense<64> : vector<2xi64>, \
                 !llvm.ptr = dense<64> : vector<4xi64>\
-            >"
-        ).expect("failed to parse dlti.dl_spec");
-        module.as_operation_mut().set_attribute("dlti.dl_spec", dl_attr);
+            >",
+        )
+        .expect("failed to parse dlti.dl_spec");
+        module
+            .as_operation_mut()
+            .set_attribute("dlti.dl_spec", dl_attr);
 
         // Emit sub-functions before @compute.
         for sub in self.completed_subfunctions {
-            let sub_func_type =
-                FunctionType::new(context, &sub.arg_types, &sub.return_types);
+            let sub_func_type = FunctionType::new(context, &sub.arg_types, &sub.return_types);
             let sub_region = Region::new();
             sub_region.append_block(sub.block);
 
@@ -6712,15 +7305,17 @@ impl<'c> GraphBuilder<'c> {
 
         // Attach the transform schedule so transform-interpreter can tile
         // and vectorize linalg.generic contraction ops.
-        module.as_operation_mut().set_attribute(
-            "transform.with_named_sequence",
-            Attribute::unit(context),
-        );
+        module
+            .as_operation_mut()
+            .set_attribute("transform.with_named_sequence", Attribute::unit(context));
         crate::compiler::build_transform_schedule(context, &module, location);
 
         // Dump pre-pass IR if requested.
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
-            let _ = std::fs::write("/tmp/homura_gb_pre_passes.mlir", module.as_operation().to_string());
+            let _ = std::fs::write(
+                "/tmp/homura_gb_pre_passes.mlir",
+                module.as_operation().to_string(),
+            );
             tracing::debug!("GraphBuilder pre-pass IR dumped to /tmp/homura_gb_pre_passes.mlir");
         }
 
@@ -6728,7 +7323,9 @@ impl<'c> GraphBuilder<'c> {
         if !module.as_operation().verify() {
             let ir = module.as_operation().to_string();
             let _ = std::fs::write("/tmp/homura_gb_failed.mlir", &ir);
-            tracing::warn!("GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir");
+            tracing::warn!(
+                "GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir"
+            );
             return Err(CompileError::Verification);
         }
 
@@ -6749,7 +7346,10 @@ impl<'c> GraphBuilder<'c> {
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
         let pipeline_start = std::time::Instant::now();
-        eprintln!("[{:>8.2}s] [pipeline] starting MLIR passes...", crate::log_ts());
+        eprintln!(
+            "[{:>8.2}s] [pipeline] starting MLIR passes...",
+            crate::log_ts()
+        );
         register_all_passes();
         let pass_manager = pass::PassManager::new(context);
         parse_pass_pipeline(
@@ -6791,17 +7391,23 @@ impl<'c> GraphBuilder<'c> {
         .map_err(CompileError::Pass)?;
 
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-        eprintln!("[{:>8.2}s] [pipeline] MLIR passes done: {}ms", crate::log_ts(), pipeline_start.elapsed().as_millis());
+        eprintln!(
+            "[{:>8.2}s] [pipeline] MLIR passes done: {}ms",
+            crate::log_ts(),
+            pipeline_start.elapsed().as_millis()
+        );
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
-            let _ = std::fs::write("/tmp/homura_gb_post_passes.mlir", module.as_operation().to_string());
+            let _ = std::fs::write(
+                "/tmp/homura_gb_post_passes.mlir",
+                module.as_operation().to_string(),
+            );
             tracing::debug!("GraphBuilder post-pass IR dumped to /tmp/homura_gb_post_passes.mlir");
         }
 
         // AOT compile.
-        let tmp_dir = tempfile_dir().ok_or_else(|| {
-            CompileError::ObjectEmit("cannot determine temp directory".into())
-        })?;
+        let tmp_dir = tempfile_dir()
+            .ok_or_else(|| CompileError::ObjectEmit("cannot determine temp directory".into()))?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -6809,7 +7415,12 @@ impl<'c> GraphBuilder<'c> {
         let suffix = format!("{}_{:08x}", std::process::id(), nanos);
         let tmp_so = tmp_dir.join(format!("homura_gb_{suffix}.so"));
 
-        let obj_paths = crate::compiler::emit_object_files_pub(&module, &tmp_dir, &format!("homura_gb_{suffix}"), "gb")?;
+        let obj_paths = crate::compiler::emit_object_files_pub(
+            &module,
+            &tmp_dir,
+            &format!("homura_gb_{suffix}"),
+            "gb",
+        )?;
         crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
         for p in &obj_paths {
             std::fs::remove_file(p).ok();
@@ -6822,7 +7433,10 @@ impl<'c> GraphBuilder<'c> {
                 num_inputs: num_args,
                 outputs: output_descs
                     .iter()
-                    .map(|d| OutputDesc { shape: d.shape.clone(), dtype: d.dtype })
+                    .map(|d| OutputDesc {
+                        shape: d.shape.clone(),
+                        dtype: d.dtype,
+                    })
                     .collect(),
             };
             if let Err(e) = cache.store(key, &tmp_so, &meta) {
@@ -6840,25 +7454,28 @@ impl<'c> GraphBuilder<'c> {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn add_arg(&mut self, shape: &[Option<u64>], dtype: DType, is_input: bool) -> Tensor<'c> {
-        let dims: Vec<i64> = shape.iter().map(|d| match d {
-            Some(n) => *n as i64,
-            None => i64::MIN,
-        }).collect();
+        let dims: Vec<i64> = shape
+            .iter()
+            .map(|d| match d {
+                Some(n) => *n as i64,
+                None => i64::MIN,
+            })
+            .collect();
         let elem_type = dtype.to_mlir_type(self.context);
 
         // RankedTensorType uses u64 dims where kDynamic = i64::MIN as u64.
         let dims_u64: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
         let tensor_type: melior::ir::Type =
             RankedTensorType::new(&dims_u64, elem_type, None).into();
-        let memref_type: melior::ir::Type =
-            MemRefType::new(elem_type, &dims, None, None).into();
+        let memref_type: melior::ir::Type = MemRefType::new(elem_type, &dims, None, None).into();
 
         let arg_idx = self.block.argument_count();
         self.block.add_argument(memref_type, self.location);
         let memref_arg = self.block.argument(arg_idx).unwrap();
 
         // bufferization.to_tensor %memref {restrict}
-        let tensor_val = self.block
+        let tensor_val = self
+            .block
             .append_operation(
                 OperationBuilder::new("bufferization.to_tensor", self.location)
                     .add_operands(&[memref_arg.into()])
@@ -6874,7 +7491,11 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
 
-        self.args.push(ArgInfo { _shape: shape.to_vec(), _dtype: dtype, _is_input: is_input });
+        self.args.push(ArgInfo {
+            _shape: shape.to_vec(),
+            _dtype: dtype,
+            _is_input: is_input,
+        });
 
         Tensor::from_value(tensor_val)
     }
@@ -6887,8 +7508,10 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_shape_of(&mut self, input: &Tensor<'c>) -> Vec<melior::ir::Value<'c, 'c>> {
         let shape = input.shape();
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
-        shape.iter().enumerate().map(|(i, dim)| {
-            match dim {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| match dim {
                 Some(n) => {
                     let attr = Attribute::parse(self.context, &format!("{n} : index"))
                         .expect("index constant attr");
@@ -6905,8 +7528,8 @@ impl<'c> GraphBuilder<'c> {
                         .into()
                 }
                 None => self.emit_tensor_dim(input.value(), i),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Create a tensor filled with `fill_value`, with shape given by runtime
@@ -6932,7 +7555,8 @@ impl<'c> GraphBuilder<'c> {
             .map(|(i, _)| shape_vals[i])
             .collect();
 
-        let init: melior::ir::Value = self.block
+        let init: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -6946,7 +7570,8 @@ impl<'c> GraphBuilder<'c> {
 
         // Scalar fill value.
         let scalar_attr = self.make_scalar_attr(fill_value, dtype);
-        let scalar: melior::ir::Value = self.block
+        let scalar: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[elem_type])
@@ -6970,7 +7595,8 @@ impl<'c> GraphBuilder<'c> {
         let fill_region = Region::new();
         fill_region.append_block(fill_block);
 
-        let filled: melior::ir::Value = self.block
+        let filled: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.fill", self.location)
                     .add_operands(&[scalar, init])
@@ -7013,7 +7639,8 @@ impl<'c> GraphBuilder<'c> {
         let mut dyn_vals = Vec::new();
         if output_size.is_none() {
             // Compute runtime size: ceildiv(limit - start, delta)
-            let diff: melior::ir::Value = self.block
+            let diff: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.subi", self.location)
                         .add_operands(&[limit, start])
@@ -7021,8 +7648,11 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.subi range"),
                 )
-                .result(0).unwrap().into();
-            let size: melior::ir::Value = self.block
+                .result(0)
+                .unwrap()
+                .into();
+            let size: melior::ir::Value = self
+                .block
                 .append_operation(
                     OperationBuilder::new("arith.ceildivui", self.location)
                         .add_operands(&[diff, delta])
@@ -7030,11 +7660,14 @@ impl<'c> GraphBuilder<'c> {
                         .build()
                         .expect("arith.ceildivui range"),
                 )
-                .result(0).unwrap().into();
+                .result(0)
+                .unwrap()
+                .into();
             dyn_vals.push(size);
         }
 
-        let init: melior::ir::Value = self.block
+        let init: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("tensor.empty", self.location)
                     .add_operands(&dyn_vals)
@@ -7042,7 +7675,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("tensor.empty range"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         // Cast start and delta from index to element type (they may come from
         // extract_scalar_as_index which returns index values).
@@ -7051,10 +7686,8 @@ impl<'c> GraphBuilder<'c> {
 
         // linalg.generic: body computes start + index * delta
         let identity = identity_map_str(1);
-        let indexing_maps = Attribute::parse(
-            self.context,
-            &format!("[{identity}]"),
-        ).expect("range indexing_maps");
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{identity}]")).expect("range indexing_maps");
         let iterator_types = self.make_iterator_types(1);
 
         let body_block = Block::new(&[(elem_type, self.location)]);
@@ -7071,7 +7704,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("linalg.index"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         // Cast index to element type, then compute start + idx * delta.
         let idx_cast = self.emit_index_to_elem_in_block(&body_block, idx, dtype);
@@ -7080,22 +7715,30 @@ impl<'c> GraphBuilder<'c> {
             if is_float { "arith.mulf" } else { "arith.muli" },
             self.location,
         )
-            .add_operands(&[idx_cast, delta_elem])
-            .add_results(&[elem_type]);
-        if is_float { mul_builder = mul_builder.add_attributes(&[self.fastmath_contract_attr()]); }
+        .add_operands(&[idx_cast, delta_elem])
+        .add_results(&[elem_type]);
+        if is_float {
+            mul_builder = mul_builder.add_attributes(&[self.fastmath_contract_attr()]);
+        }
         let prod: melior::ir::Value = body_block
             .append_operation(mul_builder.build().expect("range mul"))
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
         let mut add_builder = OperationBuilder::new(
             if is_float { "arith.addf" } else { "arith.addi" },
             self.location,
         )
-            .add_operands(&[start_elem, prod])
-            .add_results(&[elem_type]);
-        if is_float { add_builder = add_builder.add_attributes(&[self.fastmath_contract_attr()]); }
+        .add_operands(&[start_elem, prod])
+        .add_results(&[elem_type]);
+        if is_float {
+            add_builder = add_builder.add_attributes(&[self.fastmath_contract_attr()]);
+        }
         let val: melior::ir::Value = body_block
             .append_operation(add_builder.build().expect("range add"))
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         body_block.append_operation(
             OperationBuilder::new("linalg.yield", self.location)
@@ -7106,22 +7749,33 @@ impl<'c> GraphBuilder<'c> {
         let body_region = Region::new();
         body_region.append_block(body_block);
 
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("linalg.generic", self.location)
                     .add_operands(&[init])
                     .add_results(&[tensor_type])
                     .add_attributes(&[
-                        (Identifier::new(self.context, "indexing_maps"), indexing_maps),
-                        (Identifier::new(self.context, "iterator_types"), iterator_types),
-                        (Identifier::new(self.context, "operandSegmentSizes"),
-                         Attribute::parse(self.context, "array<i32: 0, 1>").unwrap()),
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            Attribute::parse(self.context, "array<i32: 0, 1>").unwrap(),
+                        ),
                     ])
                     .add_regions([body_region])
                     .build()
                     .expect("linalg.generic range"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
 
         Tensor::from_value(result)
     }
@@ -7135,7 +7789,8 @@ impl<'c> GraphBuilder<'c> {
     ) -> melior::ir::Value<'c, 'c> {
         let elem_type = dtype.to_mlir_type(self.context);
         let i64_type = melior::ir::Type::parse(self.context, "i64").expect("i64 type");
-        let as_i64: melior::ir::Value = self.block
+        let as_i64: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.index_cast", self.location)
                     .add_operands(&[idx])
@@ -7143,31 +7798,35 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.index_cast"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
         match dtype {
             DType::I64 => as_i64,
-            DType::I32 => {
-                self.block
-                    .append_operation(
-                        OperationBuilder::new("arith.trunci", self.location)
-                            .add_operands(&[as_i64])
-                            .add_results(&[elem_type])
-                            .build()
-                            .expect("arith.trunci"),
-                    )
-                    .result(0).unwrap().into()
-            }
-            DType::F32 | DType::F64 => {
-                self.block
-                    .append_operation(
-                        OperationBuilder::new("arith.sitofp", self.location)
-                            .add_operands(&[as_i64])
-                            .add_results(&[elem_type])
-                            .build()
-                            .expect("arith.sitofp"),
-                    )
-                    .result(0).unwrap().into()
-            }
+            DType::I32 => self
+                .block
+                .append_operation(
+                    OperationBuilder::new("arith.trunci", self.location)
+                        .add_operands(&[as_i64])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.trunci"),
+                )
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::F32 | DType::F64 | DType::BF16 => self
+                .block
+                .append_operation(
+                    OperationBuilder::new("arith.sitofp", self.location)
+                        .add_operands(&[as_i64])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.sitofp"),
+                )
+                .result(0)
+                .unwrap()
+                .into(),
         }
     }
 
@@ -7188,31 +7847,33 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.index_cast"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
         match dtype {
             DType::I64 => as_i64,
-            DType::I32 => {
-                block
-                    .append_operation(
-                        OperationBuilder::new("arith.trunci", self.location)
-                            .add_operands(&[as_i64])
-                            .add_results(&[elem_type])
-                            .build()
-                            .expect("arith.trunci"),
-                    )
-                    .result(0).unwrap().into()
-            }
-            DType::F32 | DType::F64 => {
-                block
-                    .append_operation(
-                        OperationBuilder::new("arith.sitofp", self.location)
-                            .add_operands(&[as_i64])
-                            .add_results(&[elem_type])
-                            .build()
-                            .expect("arith.sitofp"),
-                    )
-                    .result(0).unwrap().into()
-            }
+            DType::I32 => block
+                .append_operation(
+                    OperationBuilder::new("arith.trunci", self.location)
+                        .add_operands(&[as_i64])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.trunci"),
+                )
+                .result(0)
+                .unwrap()
+                .into(),
+            DType::F32 | DType::F64 | DType::BF16 => block
+                .append_operation(
+                    OperationBuilder::new("arith.sitofp", self.location)
+                        .add_operands(&[as_i64])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.sitofp"),
+                )
+                .result(0)
+                .unwrap()
+                .into(),
         }
     }
 
@@ -7221,13 +7882,14 @@ impl<'c> GraphBuilder<'c> {
         let dense_str = match dtype {
             DType::F32 => format!("dense<{:.6e}> : tensor<f32>", value),
             DType::F64 => format!("dense<{:.15e}> : tensor<f64>", value),
+            DType::BF16 => format!("dense<{:.6e}> : tensor<bf16>", value),
             DType::I32 => format!("dense<{}> : tensor<i32>", value as i32),
             DType::I64 => format!("dense<{}> : tensor<i64>", value as i64),
         };
-        let dense_attr = Attribute::parse(self.context, &dense_str)
-            .expect("dense constant attr");
+        let dense_attr = Attribute::parse(self.context, &dense_str).expect("dense constant attr");
         let tensor_type = self.make_tensor_type(&[], dtype);
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[tensor_type])
@@ -7235,7 +7897,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.constant dense"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
         Tensor::from_value(result)
     }
 
@@ -7255,7 +7919,8 @@ impl<'c> GraphBuilder<'c> {
         let dense_str = format!("dense<{data_str}> : {type_str}");
         let dense_attr = Attribute::parse(self.context, &dense_str)
             .unwrap_or_else(|| panic!("failed to parse dense attr: {dense_str}"));
-        let result: melior::ir::Value = self.block
+        let result: melior::ir::Value = self
+            .block
             .append_operation(
                 OperationBuilder::new("arith.constant", self.location)
                     .add_results(&[tensor_type])
@@ -7263,7 +7928,9 @@ impl<'c> GraphBuilder<'c> {
                     .build()
                     .expect("arith.constant dense tensor"),
             )
-            .result(0).unwrap().into();
+            .result(0)
+            .unwrap()
+            .into();
         Tensor::from_value(result)
     }
 
@@ -7272,6 +7939,7 @@ impl<'c> GraphBuilder<'c> {
         let s = match dtype {
             DType::F32 => format!("{:.6e} : f32", value),
             DType::F64 => format!("{:.15e} : f64", value),
+            DType::BF16 => format!("{:.6e} : bf16", value),
             DType::I32 => format!("{} : i32", value as i32),
             DType::I64 => format!("{} : i64", value as i64),
         };
@@ -7290,7 +7958,9 @@ pub(crate) fn register_force_exit() {
         extern "C" fn force_exit() {
             unsafe { libc::_exit(0) }
         }
-        unsafe { libc::atexit(force_exit); }
+        unsafe {
+            libc::atexit(force_exit);
+        }
     });
 }
 
@@ -7419,7 +8089,9 @@ mod tests {
         let neg_a = gb.emit_neg(&a);
         let exp_a = gb.emit_exp(&a);
         let tanh_a = gb.emit_tanh(&a);
-        let graph = gb.compile(&[&neg_a, &exp_a, &tanh_a]).expect("compile unary ops");
+        let graph = gb
+            .compile(&[&neg_a, &exp_a, &tanh_a])
+            .expect("compile unary ops");
 
         let a_buf = Buffer::from_slice(&[1.0f32, 0.0], &[2], DType::F32);
         let out = graph.run(&[&a_buf]);
@@ -7462,10 +8134,10 @@ mod tests {
         assert!((sqrt_vals[1] - 3.0).abs() < 1e-5);
         let rec_vals = out[1].as_slice::<f32>();
         assert!((rec_vals[0] - 0.25).abs() < 1e-5);
-        assert!((rec_vals[1] - 1.0/9.0).abs() < 1e-5);
+        assert!((rec_vals[1] - 1.0 / 9.0).abs() < 1e-5);
         let rsq_vals = out[2].as_slice::<f32>();
         assert!((rsq_vals[0] - 0.5).abs() < 1e-5);
-        assert!((rsq_vals[1] - 1.0/3.0).abs() < 1e-5);
+        assert!((rsq_vals[1] - 1.0 / 3.0).abs() < 1e-5);
     }
 
     #[test]
@@ -7481,9 +8153,9 @@ mod tests {
         let exp_buf = Buffer::from_slice(&[3.0f32, 2.0, 0.5], &[3], DType::F32);
         let out = graph.run(&[&base_buf, &exp_buf]);
         let vals = out[0].as_slice::<f32>();
-        assert!((vals[0] - 8.0).abs() < 1e-5);  // 2^3
-        assert!((vals[1] - 9.0).abs() < 1e-5);  // 3^2
-        assert!((vals[2] - 2.0).abs() < 1e-5);  // 4^0.5
+        assert!((vals[0] - 8.0).abs() < 1e-5); // 2^3
+        assert!((vals[1] - 9.0).abs() < 1e-5); // 3^2
+        assert!((vals[2] - 2.0).abs() < 1e-5); // 4^0.5
     }
 
     #[test]
@@ -7509,8 +8181,8 @@ mod tests {
         // Task 2.10: binary op with [3] + [4,3] => [4,3].
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
-        let a = gb.input(&[Some(3)], DType::F32);            // [3]
-        let b = gb.input(&[Some(4), Some(3)], DType::F32);   // [4, 3]
+        let a = gb.input(&[Some(3)], DType::F32); // [3]
+        let b = gb.input(&[Some(4), Some(3)], DType::F32); // [4, 3]
         let c = gb.emit_add(&a, &b);
         assert_eq!(c.shape(), vec![Some(4), Some(3)]);
 
@@ -7519,14 +8191,18 @@ mod tests {
         // a = [1, 2, 3], b = [[10,20,30],[40,50,60],[70,80,90],[100,110,120]]
         let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0], &[3], DType::F32);
         let b_buf = Buffer::from_slice(
-            &[10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0],
+            &[
+                10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0,
+            ],
             &[4, 3],
             DType::F32,
         );
         let out = graph.run(&[&a_buf, &b_buf]);
         assert_eq!(
             out[0].as_slice::<f32>(),
-            &[11.0, 22.0, 33.0, 41.0, 52.0, 63.0, 71.0, 82.0, 93.0, 101.0, 112.0, 123.0]
+            &[
+                11.0, 22.0, 33.0, 41.0, 52.0, 63.0, 71.0, 82.0, 93.0, 101.0, 112.0, 123.0
+            ]
         );
     }
 
@@ -7545,22 +8221,20 @@ mod tests {
         assert_eq!(c.shape(), vec![Some(2), Some(4)]);
         let graph = gb.compile(&[&c]).expect("compile matmul 2d");
 
-        let a_buf = Buffer::from_slice(
-            &[1.0f32, 2.0, 3.0,
-              4.0, 5.0, 6.0],
-            &[2, 3],
-            DType::F32,
-        );
+        let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         // B is identity-ish: [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
         let b_buf = Buffer::from_slice(
-            &[1.0f32, 0.0, 0.0, 0.0,
-              0.0, 1.0, 0.0, 0.0,
-              0.0, 0.0, 1.0, 0.0],
+            &[
+                1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            ],
             &[3, 4],
             DType::F32,
         );
         let out = graph.run(&[&a_buf, &b_buf]);
-        assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0]);
+        assert_eq!(
+            out[0].as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0]
+        );
     }
 
     #[test]
@@ -7604,17 +8278,11 @@ mod tests {
         let a0 = vec![1.0f32; 12];
         // batch 0: B0 = partial identity (4x5, first 4 rows = I4 with 5th col=0)
         let b0: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 1.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
         ];
         // batch 1: A1 = eye-ish (3x4, first 3 rows partial identity)
-        let a1: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-        ];
+        let a1: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         // batch 1: B1 = all ones (4x5)
         let b1 = vec![1.0f32; 20];
 
@@ -7627,22 +8295,32 @@ mod tests {
         let vals = out[0].as_slice::<f32>();
 
         // batch 0 result (3x5): ones @ partial_identity = [[1,1,1,1,0],[1,1,1,1,0],[1,1,1,1,0]]
-        let expected_b0 = [1.0f32, 1.0, 1.0, 1.0, 0.0,
-                            1.0,   1.0, 1.0, 1.0, 0.0,
-                            1.0,   1.0, 1.0, 1.0, 0.0];
+        let expected_b0 = [
+            1.0f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+        ];
         for (i, &exp) in expected_b0.iter().enumerate() {
-            assert!((vals[i] - exp).abs() < 1e-4, "batch0[{i}]: got {}, expected {}", vals[i], exp);
+            assert!(
+                (vals[i] - exp).abs() < 1e-4,
+                "batch0[{i}]: got {}, expected {}",
+                vals[i],
+                exp
+            );
         }
         // batch 1 result (3x5): eye-ish @ all_ones
         // row0 = [1,0,0,0] @ all_ones = sum of col0 = [1,1,1,1,1]
         // row1 = [0,1,0,0] @ all_ones = [1,1,1,1,1]
         // row2 = [0,0,1,0] @ all_ones = [1,1,1,1,1]
-        let expected_b1 = [1.0f32, 1.0, 1.0, 1.0, 1.0,
-                            1.0,   1.0, 1.0, 1.0, 1.0,
-                            1.0,   1.0, 1.0, 1.0, 1.0];
+        let expected_b1 = [
+            1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
         for (i, &exp) in expected_b1.iter().enumerate() {
             let idx = 15 + i;
-            assert!((vals[idx] - exp).abs() < 1e-4, "batch1[{i}]: got {}, expected {}", vals[idx], exp);
+            assert!(
+                (vals[idx] - exp).abs() < 1e-4,
+                "batch1[{i}]: got {}, expected {}",
+                vals[idx],
+                exp
+            );
         }
     }
 
@@ -7663,10 +8341,8 @@ mod tests {
         // batch=1: A = ones(1,3,4), B = partial identity (1,4,5)
         let a_data = vec![1.0f32; 12];
         let b_data: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 1.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
         ];
         let a_buf = Buffer::from_slice(&a_data, &[1, 3, 4], DType::F32);
         let b_buf = Buffer::from_slice(&b_data, &[1, 4, 5], DType::F32);
@@ -7674,11 +8350,16 @@ mod tests {
         let out = graph.run_dynamic(&[&a_buf, &b_buf], &[crate::Shape(vec![1, 3, 5])]);
         // ones @ partial_identity = [[1,1,1,1,0], ...]
         let vals = out[0].as_slice::<f32>();
-        let expected = [1.0f32, 1.0, 1.0, 1.0, 0.0,
-                         1.0,   1.0, 1.0, 1.0, 0.0,
-                         1.0,   1.0, 1.0, 1.0, 0.0];
+        let expected = [
+            1.0f32, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+        ];
         for (i, &exp) in expected.iter().enumerate() {
-            assert!((vals[i] - exp).abs() < 1e-4, "[{i}]: got {}, expected {}", vals[i], exp);
+            assert!(
+                (vals[i] - exp).abs() < 1e-4,
+                "[{i}]: got {}, expected {}",
+                vals[i],
+                exp
+            );
         }
     }
 
@@ -7745,8 +8426,8 @@ mod tests {
         // [4,1] + [4,3] => [4,3] — same rank, size-1 broadcast.
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
-        let a = gb.input(&[Some(4), Some(1)], DType::F32);   // [4, 1]
-        let b = gb.input(&[Some(4), Some(3)], DType::F32);   // [4, 3]
+        let a = gb.input(&[Some(4), Some(1)], DType::F32); // [4, 1]
+        let b = gb.input(&[Some(4), Some(3)], DType::F32); // [4, 3]
         let c = gb.emit_add(&a, &b);
         assert_eq!(c.shape(), vec![Some(4), Some(3)]);
 
@@ -7754,14 +8435,18 @@ mod tests {
 
         let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4, 1], DType::F32);
         let b_buf = Buffer::from_slice(
-            &[10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0],
+            &[
+                10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0,
+            ],
             &[4, 3],
             DType::F32,
         );
         let out = graph.run(&[&a_buf, &b_buf]);
         assert_eq!(
             out[0].as_slice::<f32>(),
-            &[11.0, 21.0, 31.0, 42.0, 52.0, 62.0, 73.0, 83.0, 93.0, 104.0, 114.0, 124.0]
+            &[
+                11.0, 21.0, 31.0, 42.0, 52.0, 62.0, 73.0, 83.0, 93.0, 104.0, 114.0, 124.0
+            ]
         );
     }
 
@@ -7971,8 +8656,16 @@ mod tests {
         let sigma = 1.0f32 / (1.0 + std::f32::consts::E);
         assert!((vals[0] - sigma).abs() < 1e-5, "vals[0]={}", vals[0]);
         assert!((vals[1] - sigma).abs() < 1e-5, "vals[1]={}", vals[1]);
-        assert!((vals[2] - (1.0 - sigma)).abs() < 1e-5, "vals[2]={}", vals[2]);
-        assert!((vals[3] - (1.0 - sigma)).abs() < 1e-5, "vals[3]={}", vals[3]);
+        assert!(
+            (vals[2] - (1.0 - sigma)).abs() < 1e-5,
+            "vals[2]={}",
+            vals[2]
+        );
+        assert!(
+            (vals[3] - (1.0 - sigma)).abs() < 1e-5,
+            "vals[3]={}",
+            vals[3]
+        );
     }
 
     #[test]
@@ -8085,9 +8778,9 @@ mod tests {
         // output[k, i, j] = input[i, j, k]
         // out[0,0,0]=input[0,0,0]=0, out[0,0,1]=input[0,1,0]=4, out[1,0,0]=input[0,0,1]=1
         let vals = out[0].as_slice::<f32>();
-        assert!((vals[0] - 0.0).abs() < 1e-5);  // out[0,0,0] = input[0,0,0]
-        assert!((vals[1] - 4.0).abs() < 1e-5);  // out[0,0,1] = input[0,1,0]
-        assert!((vals[2] - 8.0).abs() < 1e-5);  // out[0,0,2] = input[0,2,0]
+        assert!((vals[0] - 0.0).abs() < 1e-5); // out[0,0,0] = input[0,0,0]
+        assert!((vals[1] - 4.0).abs() < 1e-5); // out[0,0,1] = input[0,1,0]
+        assert!((vals[2] - 8.0).abs() < 1e-5); // out[0,0,2] = input[0,2,0]
     }
 
     #[test]
@@ -8121,7 +8814,10 @@ mod tests {
         let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2], DType::F32);
         let b_buf = Buffer::from_slice(&[5.0f32, 6.0, 7.0, 8.0], &[2, 2], DType::F32);
         let out = graph.run(&[&a_buf, &b_buf]);
-        assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+        assert_eq!(
+            out[0].as_slice::<f32>(),
+            &[1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]
+        );
     }
 
     #[test]
@@ -8171,7 +8867,10 @@ mod tests {
         let a_buf = Buffer::from_slice(&data, &[3, 5], DType::F32);
         let out = graph.run(&[&a_buf]);
         // rows: [1,2,3], [6,7,8], [11,12,13]
-        assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 3.0, 6.0, 7.0, 8.0, 11.0, 12.0, 13.0]);
+        assert_eq!(
+            out[0].as_slice::<f32>(),
+            &[1.0, 2.0, 3.0, 6.0, 7.0, 8.0, 11.0, 12.0, 13.0]
+        );
     }
 
     #[test]
@@ -8187,11 +8886,7 @@ mod tests {
         assert_eq!(r.shape(), vec![Some(3), Some(2)]);
         let graph = gb.compile(&[&r]).expect("compile gather axis0");
 
-        let data_buf = Buffer::from_slice(
-            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[3, 2],
-            DType::F32,
-        );
+        let data_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2], DType::F32);
         let idx_buf = Buffer::from_slice(&[2i64, 0, 1], &[3], DType::I64);
         let out = graph.run(&[&data_buf, &idx_buf]);
         assert_eq!(out[0].as_slice::<f32>(), &[5.0, 6.0, 1.0, 2.0, 3.0, 4.0]);
@@ -8322,9 +9017,12 @@ mod tests {
         let a = gb.input(&[Some(6)], DType::F32);
         let parts = gb.emit_split(&a, 0, &[2, 2, 2]);
         assert_eq!(parts.len(), 3);
-        for p in &parts { assert_eq!(p.shape(), vec![Some(2)]); }
+        for p in &parts {
+            assert_eq!(p.shape(), vec![Some(2)]);
+        }
 
-        let graph = gb.compile(&parts.iter().collect::<Vec<_>>())
+        let graph = gb
+            .compile(&parts.iter().collect::<Vec<_>>())
             .expect("compile split");
 
         let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -8345,14 +9043,18 @@ mod tests {
         assert_eq!(parts[0].shape(), vec![Some(1), Some(3)]);
         assert_eq!(parts[1].shape(), vec![Some(3), Some(3)]);
 
-        let graph = gb.compile(&parts.iter().collect::<Vec<_>>())
+        let graph = gb
+            .compile(&parts.iter().collect::<Vec<_>>())
             .expect("compile split 2d");
 
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
         let a_buf = Buffer::from_slice(&data, &[4, 3], DType::F32);
         let out = graph.run(&[&a_buf]);
         assert_eq!(out[0].as_slice::<f32>(), &[1.0, 2.0, 3.0]);
-        assert_eq!(out[1].as_slice::<f32>(), &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(
+            out[1].as_slice::<f32>(),
+            &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
     }
 
     // ── Spatial ops (task 6) ──────────────────────────────────────────────────
@@ -8461,7 +9163,11 @@ mod tests {
         let out_data = graph.run(&[&in_buf]);
         let vals = out_data[0].as_slice::<f32>();
         assert_eq!(vals.len(), 1);
-        assert!((vals[0] - 2.5).abs() < 1e-5, "expected 2.5, got {}", vals[0]);
+        assert!(
+            (vals[0] - 2.5).abs() < 1e-5,
+            "expected 2.5, got {}",
+            vals[0]
+        );
     }
 
     /// batch_norm with identity parameters: scale=1, bias=0, mean=0, var=1, eps=0.
@@ -8498,7 +9204,10 @@ mod tests {
         let vals = out_data[0].as_slice::<f32>();
         // With scale=1, bias=0, mean=0, var=1, eps≈0: out ≈ x / sqrt(1) = x.
         for (i, (&got, &expected)) in vals.iter().zip(input_data.iter()).enumerate() {
-            assert!((got - expected).abs() < 1e-4, "vals[{i}]: got {got}, expected {expected}");
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "vals[{i}]: got {got}, expected {expected}"
+            );
         }
     }
 
@@ -8565,7 +9274,12 @@ mod tests {
         let a_buf = Buffer::from_slice(&[1.0f32; 24], &[2, 3, 4], DType::F32);
         let s_buf = Buffer::from_slice(&[10.0f32], &[1, 1, 1], DType::F32);
         let out = graph.run(&[&a_buf, &s_buf]);
-        assert!(out[0].as_slice::<f32>().iter().all(|&v| (v - 11.0).abs() < 1e-5));
+        assert!(
+            out[0]
+                .as_slice::<f32>()
+                .iter()
+                .all(|&v| (v - 11.0).abs() < 1e-5)
+        );
     }
 
     #[test]
@@ -8603,7 +9317,7 @@ mod tests {
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
         let a = gb.input(&[Some(2), Some(3), Some(4)], DType::F32); // [B=2, M=3, K=4]
-        let b = gb.input(&[Some(4), Some(5)], DType::F32);          // [K=4, N=5]
+        let b = gb.input(&[Some(4), Some(5)], DType::F32); // [K=4, N=5]
         let c = gb.emit_matmul(&a, &b);
         assert_eq!(c.shape(), vec![Some(2), Some(3), Some(5)]);
 
@@ -8622,7 +9336,7 @@ mod tests {
         // Same fix needed for the (2,3) case.
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
-        let a = gb.input(&[Some(3), Some(4)], DType::F32);          // [M=3, K=4]
+        let a = gb.input(&[Some(3), Some(4)], DType::F32); // [M=3, K=4]
         let b = gb.input(&[Some(2), Some(4), Some(5)], DType::F32); // [B=2, K=4, N=5]
         let c = gb.emit_matmul(&a, &b);
         assert_eq!(c.shape(), vec![Some(2), Some(3), Some(5)]);
@@ -8654,16 +9368,16 @@ mod tests {
         let results = gb.end_subfunction(handle, &[&product]);
 
         // results[0] is the matmul result in @compute's scope.
-        let graph = gb.compile(&[&results[0]]).expect("compile with subfunction");
+        let graph = gb
+            .compile(&[&results[0]])
+            .expect("compile with subfunction");
 
         // a: [[1,2,3],[4,5,6]], b: [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
-        let a_buf = Buffer::from_slice(
-            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[2, 3],
-            DType::F32,
-        );
+        let a_buf = Buffer::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], DType::F32);
         let b_buf = Buffer::from_slice(
-            &[1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            &[
+                1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            ],
             &[3, 4],
             DType::F32,
         );
