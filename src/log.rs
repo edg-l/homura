@@ -107,7 +107,12 @@ macro_rules! log_warn {
 macro_rules! log_info {
     ($($arg:tt)*) => {
         if $crate::log::enabled($crate::log::Level::Info) {
-            eprintln!("{}", format_args!($($arg)*));
+            eprintln!(
+                "{}{}{}",
+                $crate::log::DIM,
+                format_args!($($arg)*),
+                $crate::log::RESET,
+            );
         }
     };
 }
