@@ -24,9 +24,16 @@ pub enum Level {
     Debug = 3,
 }
 
+/// Override the log level at runtime (e.g. from a `--verbose` CLI flag).
+/// Must be called before any log macro is used.
+pub fn set_level(level: Level) {
+    LEVEL.set(level).ok();
+}
+
+static LEVEL: OnceLock<Level> = OnceLock::new();
+
 /// Global log level, parsed once from `HOMURA_LOG` env var.
 pub fn max_level() -> Level {
-    static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(|| {
         match std::env::var("HOMURA_LOG")
             .unwrap_or_default()
@@ -120,10 +127,12 @@ macro_rules! log_debug {
 }
 
 /// Compile-progress with automatic timestamp: `[   1.23s] [label] msg`
+///
+/// Hidden by default. Shown with `--verbose` or `HOMURA_LOG=debug`.
 #[macro_export]
 macro_rules! log_compile {
     ($label:expr, $($arg:tt)*) => {
-        if $crate::log::enabled($crate::log::Level::Info) {
+        if $crate::log::enabled($crate::log::Level::Debug) {
             eprintln!(
                 "[{:>8.2}s] [{}] {}",
                 $crate::log::ts(),

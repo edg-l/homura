@@ -34,6 +34,10 @@ const SUPPORTED_OPS: &[&str] = &[
 #[derive(Parser)]
 #[command(name = "homura", about = "ONNX inference with homura")]
 struct Cli {
+    /// Show compilation progress (MLIR passes, kernel timing)
+    #[arg(long, short, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -98,6 +102,9 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    if cli.verbose {
+        log::set_level(log::Level::Debug);
+    }
     let code = match run(cli) {
         Ok(()) => 0,
         Err(e) => {
