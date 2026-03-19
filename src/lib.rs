@@ -11,6 +11,7 @@ pub mod kv_generate;
 mod llvm_ffi;
 pub mod onnx;
 pub mod op;
+pub mod progress;
 pub(crate) mod runtime;
 pub mod shape;
 pub mod tokenizer;

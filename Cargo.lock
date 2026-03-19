@@ -1152,9 +1152,11 @@ version = "0.1.0"
 dependencies = [
  "atty",
  "clap",
+ "console",
  "fancy-regex",
  "hf-hub",
  "image",
+ "indicatif",
  "libc",
  "llvm-sys",
  "melior",

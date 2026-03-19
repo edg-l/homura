@@ -478,9 +478,14 @@ fn cmd_generate_hf(
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
 
+    let sp = homura::progress::spinner("Loading model...");
     let model = homura::hf::model::HfModel::load(model_dir)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+    homura::progress::finish_spinner(
+        &sp,
+        &format!("Model loaded in {:.2}s", t_load.elapsed().as_secs_f64()),
+    );
 
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
@@ -515,10 +520,15 @@ fn cmd_chat(
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
 
+    let sp = homura::progress::spinner("Loading model...");
     let model = homura::hf::model::HfModel::load(model_dir)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let chat_template = ChatTemplate::load(model_dir)?;
+    homura::progress::finish_spinner(
+        &sp,
+        &format!("Model loaded in {:.2}s", t_load.elapsed().as_secs_f64()),
+    );
 
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 

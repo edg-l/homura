@@ -20,6 +20,8 @@ atty = "0.2.14"
 hf-hub = "0.5.0"
 minijinja = { version = "2.18.0", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2.18.0", features = ["pycompat"] }
+console = "0.16.3"
+indicatif = "0.18.4"
 
 [dev-dependencies]
 image = "0.25"

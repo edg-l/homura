@@ -1634,6 +1634,8 @@ pub(crate) fn compile_and_link_kernels(
     );
     let compile_start = std::time::Instant::now();
 
+    let pb = crate::progress::compile_progress(emit_results.len());
+
     let tmp_dir = crate::graph_builder::tempfile_dir()
         .ok_or_else(|| CompileError::Link("cannot determine temp directory".into()))?;
 
@@ -1661,11 +1663,14 @@ pub(crate) fn compile_and_link_kernels(
                     er.num_out,
                     t0.elapsed().as_millis()
                 );
+                pb.inc(1);
                 Ok((er.group_idx, obj_paths))
             })
             .collect();
         results.into_iter().collect::<Result<Vec<_>, _>>()?
     };
+
+    crate::progress::finish_compile(&pb, compile_start.elapsed().as_millis() as u64);
 
     // Link all .o files into a single .so.
     let link_start = std::time::Instant::now();

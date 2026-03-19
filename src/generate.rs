@@ -101,7 +101,7 @@ fn generate_streaming_core(
     show_prompt: bool,
     think: ThinkConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
+    use crate::log::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
     use std::io::Write;
 
     if token_ids.is_empty() || max_new_tokens == 0 {
@@ -130,6 +130,12 @@ fn generate_streaming_core(
     let mut generated_text = String::new();
     let verbose = crate::log::enabled(crate::log::Level::Debug);
     let use_stdout = atty::is(atty::Stream::Stdout);
+    let decode_pb = if !verbose {
+        let pb = crate::progress::decode_progress(max_new_tokens);
+        Some(pb)
+    } else {
+        None
+    };
     let mut in_think_block = false;
     let mut skip_ws_after_think = false;
     let think_tokens = think.token_ids;
@@ -164,6 +170,8 @@ fn generate_streaming_core(
             "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
              {DIM}(prefill){RESET}"
         );
+    } else if let Some(ref pb) = decode_pb {
+        crate::progress::update_decode(pb, 1, 0.0, 0.0);
     }
 
     // Decode loop
@@ -205,6 +213,10 @@ fn generate_streaming_core(
                 step + 1,
                 step_elapsed.as_secs_f64() * 1000.0,
             );
+        } else if let Some(ref pb) = decode_pb {
+            let tok_s = 1.0 / step_elapsed.as_secs_f64();
+            let ms = step_elapsed.as_secs_f64() * 1000.0;
+            crate::progress::update_decode(pb, step + 1, tok_s, ms);
         }
 
         if current_token == model.eos_token_id() {
@@ -243,6 +255,10 @@ fn generate_streaming_core(
         println!();
     }
 
+    if let Some(ref pb) = decode_pb {
+        crate::progress::finish_decode(pb);
+    }
+
     let stats = GenerationStats {
         prompt_tokens: prompt_len,
         generated_tokens: generated_ids.len(),
@@ -250,10 +266,7 @@ fn generate_streaming_core(
         decode_times,
         seed: sampling.seed,
     };
-    eprintln!(
-        "\n  {BOLD_MAGENTA}── done ──{RESET} {}",
-        stats.format_summary()
-    );
+    crate::progress::print_stats(&stats);
 
     Ok(model.decode_tokens(&generated_ids))
 }
