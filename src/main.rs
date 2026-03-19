@@ -4,9 +4,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use homura::generate::Generator;
-use homura::kv_generate::{
-    KvGenerator, UnifiedKvGenerator, has_unified_model, has_with_past_model,
-};
+use homura::kv_generate::{UnifiedKvGenerator, has_unified_model};
 use homura::log;
 use homura::onnx::parser;
 use homura::{Buffer, DType, Model};
@@ -219,9 +217,9 @@ fn cmd_generate(
     log::info!("loading generator from {}", model_dir.display());
     let t_load = Instant::now();
 
-    // Prefer unified single-model, then two-model KV cache, then full-recompute.
+    // Prefer unified single-model KV cache, fall back to full-recompute.
     let generated = if has_unified_model(&model_dir) {
-        log::info!("using unified KV cache generator — single-model approach");
+        log::info!("using unified KV cache generator");
         let generator = UnifiedKvGenerator::load(model_dir_str, 1024, 50256)?;
         log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
@@ -230,18 +228,8 @@ fn cmd_generate(
         let text = generator.generate(prompt, max_tokens);
         log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
         text
-    } else if has_with_past_model(&model_dir) {
-        log::info!("using KV cache generator — two-model approach");
-        let generator = KvGenerator::load(model_dir_str, 1024, 50256)?;
-        log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
-
-        log::info!("generating (max_tokens={max_tokens})");
-        let t_gen = Instant::now();
-        let text = generator.generate(prompt, max_tokens);
-        log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
-        text
     } else {
-        log::info!("using full-recompute generator — no with-past model found");
+        log::info!("using full-recompute generator — no unified model found");
         let generator = Generator::load(model_dir_str)?;
         log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
