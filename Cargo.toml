@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-melior = { git = "https://github.com/mlir-rs/melior.git", branch = "main", features = ["ods-dialects"] }
-mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
+melior = { version = "0.26", features = ["ods-dialects"] }
+mlir-sys = "210.0"
 prost = "0.13"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
@@ -28,6 +28,4 @@ protobuf-src = "2"
 [profile.dev]
 opt-level = 2
 
-[patch.crates-io]
-mlir-sys = { git = "https://github.com/mlir-rs/mlir-sys.git", branch = "support-shared-libs" }
 

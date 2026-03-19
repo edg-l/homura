@@ -167,15 +167,10 @@ impl GraphContext {
     }
 }
 
-/// Compile an MLIR module from text with a fresh context.
-///
-/// This is the second half of the `finalize_to_mlir` + `compile_from_mlir`
-/// split, designed for parallel compilation: each call creates its own MLIR
-/// context, so multiple calls can run on different threads safely.
 /// Compile MLIR text to object files only (no linking).
 ///
 /// Returns the .o file paths. The caller is responsible for linking them
-/// into a shared library. Used by the unified compilation path where
+/// into a shared library. Used by the per-kernel compilation path where
 /// multiple kernels are linked into a single .so.
 pub fn compile_to_objects(
     mlir_text: &str,
@@ -314,222 +309,6 @@ pub fn compile_to_objects(
     crate::compiler::emit_object_files_monolithic_pub(
         &module, output_dir, &base_name, label, func_name,
     )
-}
-
-pub fn compile_from_mlir(
-    mlir_text: &str,
-    num_inputs: usize,
-    output_descs: &[OutputDesc],
-    cache_key: Option<&str>,
-    label: &str,
-) -> Result<CompiledGraph, CompileError> {
-    use melior::ir::Module;
-    use melior::pass;
-
-    let context = create_context();
-
-    // Cache check.
-    if let Some(key) = cache_key {
-        let cache = crate::cache::CompilationCache::new();
-        if let Some((so_path, meta_path)) = cache.get(key)
-            && let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
-                match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
-                    Ok(graph) => return Ok(graph),
-                    Err(e) => {
-                        log_warn!("cache entry unloadable, recompiling {}: {e}", so_path.display());
-                    }
-                }
-            }
-    }
-
-    // Parse module from text.
-    let mut module =
-        Module::parse(&context, mlir_text).ok_or(CompileError::Verification)?;
-
-    // Dump pre-pass IR for specific kernels.
-    if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
-        let _ = std::fs::write(
-            "/tmp/homura_kernel_pre.mlir",
-            module.as_operation().to_string(),
-        );
-        eprintln!("[dump] {label} pre-pass IR → /tmp/homura_kernel_pre.mlir");
-    }
-
-    // Run pass pipeline. Use the full pipeline (with transform-interpreter +
-    // vector lowering) only for modules with a transform schedule. Lightweight
-    // kernels (BatchNorm, elementwise) skip tiling/vectorization entirely.
-    let passes_start = std::time::Instant::now();
-    let has_schedule = mlir_text.contains("transform.with_named_sequence");
-    let vectorize_only = mlir_text.contains("homura.vectorize_only");
-    register_all_passes();
-    let pass_manager = pass::PassManager::new(&context);
-
-    let pipeline = if has_schedule && !vectorize_only {
-        // Full pipeline: tiling + vectorize + OpenMP (for static-M matmuls).
-        "builtin.module(\
-            func.func(canonicalize,cse),\
-            transform-interpreter,\
-            func.func(canonicalize,cse),\
-            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
-            symbol-dce,\
-            func.func(lower-vector-multi-reduction,lower-vector-mask),\
-            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
-            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
-            scf-forall-to-parallel,\
-            fold-memref-alias-ops,\
-            convert-vector-to-scf,\
-            convert-linalg-to-loops,\
-            fold-memref-alias-ops,\
-            lower-affine,\
-            convert-scf-to-openmp,\
-            convert-openmp-to-llvm,\
-            convert-scf-to-cf,\
-            canonicalize,\
-            cse,\
-            sccp,\
-            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
-            convert-ub-to-llvm,\
-            convert-math-to-llvm,\
-            expand-strided-metadata,\
-            lower-affine,\
-            finalize-memref-to-llvm,\
-            convert-arith-to-llvm,\
-            convert-index-to-llvm,\
-            convert-cf-to-llvm,\
-            convert-func-to-llvm,\
-            convert-openmp-to-llvm,\
-            reconcile-unrealized-casts\
-        )"
-    } else if has_schedule {
-        // Vectorize-only pipeline: vectorize without tiling or OpenMP.
-        // No scf-forall-to-parallel, no convert-scf-to-openmp, no convert-openmp-to-llvm.
-        // Suitable for dynamic-M matmuls (M=1 decode) where OpenMP overhead dominates.
-        "builtin.module(\
-            func.func(canonicalize,cse),\
-            transform-interpreter,\
-            func.func(canonicalize,cse),\
-            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
-            symbol-dce,\
-            func.func(lower-vector-multi-reduction,lower-vector-mask),\
-            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
-            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
-            fold-memref-alias-ops,\
-            convert-vector-to-scf,\
-            convert-linalg-to-loops,\
-            fold-memref-alias-ops,\
-            lower-affine,\
-            convert-scf-to-cf,\
-            canonicalize,\
-            cse,\
-            sccp,\
-            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
-            convert-ub-to-llvm,\
-            convert-math-to-llvm,\
-            expand-strided-metadata,\
-            lower-affine,\
-            finalize-memref-to-llvm,\
-            convert-arith-to-llvm,\
-            convert-index-to-llvm,\
-            convert-cf-to-llvm,\
-            convert-func-to-llvm,\
-            reconcile-unrealized-casts\
-        )"
-    } else {
-        // Lightweight pipeline: no tiling, no vectorization, just
-        // bufferize + lower to LLVM (for elementwise / BatchNorm kernels).
-        "builtin.module(\
-            func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
-            one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
-            func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
-            fold-memref-alias-ops,\
-            convert-linalg-to-loops,\
-            fold-memref-alias-ops,\
-            lower-affine,\
-            convert-scf-to-cf,\
-            canonicalize,\
-            cse,\
-            sccp,\
-            convert-math-to-llvm,\
-            expand-strided-metadata,\
-            lower-affine,\
-            finalize-memref-to-llvm,\
-            convert-arith-to-llvm,\
-            convert-index-to-llvm,\
-            convert-cf-to-llvm,\
-            convert-func-to-llvm,\
-            reconcile-unrealized-casts\
-        )"
-    };
-    parse_pass_pipeline(pass_manager.as_operation_pass_manager(), pipeline)
-        .map_err(CompileError::Pass)?;
-
-    pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-    log_compile!(label, "passes: {}ms", passes_start.elapsed().as_millis());
-
-    // Dump post-pass IR for specific kernels.
-    if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
-        let _ = std::fs::write(
-            "/tmp/homura_kernel_post.mlir",
-            module.as_operation().to_string(),
-        );
-        eprintln!("[dump] {label} post-pass IR → /tmp/homura_kernel_post.mlir");
-    }
-
-    // AOT compile.
-    let tmp_dir = tempfile_dir()
-        .ok_or_else(|| CompileError::ObjectEmit("cannot determine temp directory".into()))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let tid = std::thread::current().id();
-    let suffix = format!(
-        "{}_{}_{:08x}",
-        std::process::id(),
-        format!("{:?}", tid)
-            .replace("ThreadId(", "")
-            .replace(")", ""),
-        nanos
-    );
-    let tmp_so = tmp_dir.join(format!("homura_pk_{suffix}.so"));
-
-    let obj_paths = crate::compiler::emit_object_files_pub(
-        &module,
-        &tmp_dir,
-        &format!("homura_pk_{suffix}"),
-        label,
-        "compute",
-    )?;
-    let link_start = std::time::Instant::now();
-    crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
-    log_compile!(label, "link: {}ms", link_start.elapsed().as_millis());
-    for p in &obj_paths {
-        std::fs::remove_file(p).ok();
-    }
-
-    // Store in cache.
-    let descs_owned: Vec<OutputDesc> = output_descs.to_vec();
-    if let Some(key) = cache_key {
-        let cache = crate::cache::CompilationCache::new();
-        let meta = crate::cache::CacheMeta {
-            num_inputs,
-            outputs: descs_owned
-                .iter()
-                .map(|d| OutputDesc {
-                    shape: d.shape.clone(),
-                    dtype: d.dtype,
-                })
-                .collect(),
-        };
-        if let Err(e) = cache.store(key, &tmp_so, &meta) {
-            log_warn!("cache: failed to write cache entry: {e}");
-        }
-    }
-
-    let graph =
-        CompiledGraph::load(&tmp_so, num_inputs, descs_owned).map_err(CompileError::ObjectEmit)?;
-    std::fs::remove_file(&tmp_so).ok();
-    Ok(graph)
 }
 
 // ── Reshape decomposition: collapse_shape / expand_shape ──────────────────────
@@ -7772,18 +7551,6 @@ impl<'c> GraphBuilder<'c> {
         self.compile_with_cache(outputs, None)
     }
 
-    /// Finalize the builder into an MLIR module text + metadata without compiling.
-    ///
-    /// Returns `(mlir_text, num_inputs, output_descs)`. The MLIR text can be
-    /// compiled later (possibly on another thread) via `compile_from_mlir`.
-    pub fn finalize_to_mlir(
-        self,
-        outputs: &[&Tensor<'c>],
-        transform_mode: TransformMode,
-    ) -> Result<(String, usize, Vec<OutputDesc>), CompileError> {
-        self.finalize_to_mlir_named(outputs, transform_mode, "compute")
-    }
-
     pub fn finalize_to_mlir_named(
         self,
         outputs: &[&Tensor<'c>],
@@ -7935,7 +7702,7 @@ impl<'c> GraphBuilder<'c> {
                 module
                     .as_operation_mut()
                     .set_attribute("transform.with_named_sequence", Attribute::unit(context));
-                // Mark the module so compile_from_mlir can select the vectorize-only pipeline.
+                // Mark the module so compile_to_objects can select the vectorize-only pipeline.
                 module
                     .as_operation_mut()
                     .set_attribute("homura.vectorize_only", Attribute::unit(context));

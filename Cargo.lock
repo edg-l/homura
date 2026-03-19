@@ -1038,8 +1038,9 @@ dependencies = [
 
 [[package]]
 name = "melior"
-version = "0.26.7"
-source = "git+https://github.com/mlir-rs/melior.git?branch=main#409761a8b38fdbfabbea487d2497cfe961c41e97"
+version = "0.26.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfa2d923611bdf60b4fcac10af0db8a4ace33afacc512c272fa10ebff84d8dc1"
 dependencies = [
  "melior-macro",
  "mlir-sys",
@@ -1047,8 +1048,9 @@ dependencies = [
 
 [[package]]
 name = "melior-macro"
-version = "0.19.3"
-source = "git+https://github.com/mlir-rs/melior.git?branch=main#409761a8b38fdbfabbea487d2497cfe961c41e97"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df38ba6d58c44b27752de0e6e0b999e24972231f153669cd052b110e39b55f5c"
 dependencies = [
  "comrak",
  "convert_case",
@@ -1093,8 +1095,9 @@ dependencies = [
 
 [[package]]
 name = "mlir-sys"
-version = "210.0.3"
-source = "git+https://github.com/mlir-rs/mlir-sys.git?branch=support-shared-libs#1f3292b47253b95e88bfd15771879f9e5d775902"
+version = "210.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f376ddc92bf2bad0eba47e20f75923f76306e429273379cedb70eb7e664aab90"
 dependencies = [
  "bindgen",
 ]
@@ -1848,9 +1851,9 @@ dependencies = [
 
 [[package]]
 name = "tinyvec"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa5fdc3bce6191a1dbc8c02d5c8bffcf557bafa17c124c5264a458f1b0613fa"
+checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
 dependencies = [
  "tinyvec_macros",
 ]
