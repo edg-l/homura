@@ -4,6 +4,179 @@ use crate::{DType, onnx::Model, runtime::Buffer, tokenizer::Tokenizer};
 
 const EOS_TOKEN_ID: u32 = 50256;
 
+// ── GenerativeModel trait ─────────────────────────────────────────────────────
+
+/// Output from the prefill phase.
+pub struct PrefillOutput {
+    pub first_token: u32,
+    pub prompt_len: usize,
+    /// Position counter after prefill (= prompt_len).
+    pub real_pos: usize,
+    pub prefill_time: std::time::Duration,
+}
+
+/// Backend-agnostic interface for KV-cached causal language model generation.
+pub trait GenerativeModel {
+    fn encode(&self, prompt: &str) -> Vec<i64>;
+    fn decode_tokens(&self, ids: &[u32]) -> String;
+    fn prefill(&mut self, token_ids: &[i64]) -> Result<PrefillOutput, Box<dyn std::error::Error>>;
+    fn decode_step(
+        &mut self,
+        token: u32,
+        real_pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>>;
+    fn eos_token_id(&self) -> u32;
+    fn max_seq_len(&self) -> usize;
+}
+
+/// Shared streaming generation loop for any `GenerativeModel`.
+///
+/// Handles prefill, decode loop, streaming to stdout, verbose token logging,
+/// stop sequences, and the stats summary line.
+pub fn generate_streaming(
+    model: &mut impl GenerativeModel,
+    prompt: &str,
+    max_new_tokens: usize,
+    sampling: &SamplingConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
+    use std::io::Write;
+
+    let token_ids = model.encode(prompt);
+
+    if token_ids.is_empty() || max_new_tokens == 0 {
+        return Ok(String::new());
+    }
+
+    log_info!(
+        "starting generation: {} prompt tokens, max_new_tokens={}",
+        token_ids.len(),
+        max_new_tokens,
+    );
+
+    let prefill_out = model.prefill(&token_ids)?;
+    log_info!(
+        "prefill complete in {:.2}s",
+        prefill_out.prefill_time.as_secs_f64()
+    );
+
+    let prompt_len = prefill_out.prompt_len;
+    let mut real_pos = prefill_out.real_pos;
+    let first_token = prefill_out.first_token;
+
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
+    let mut rng = Rng::from_optional_seed(sampling.seed);
+    let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
+    let verbose = crate::log::enabled(crate::log::Level::Debug);
+    let use_stdout = atty::is(atty::Stream::Stdout);
+
+    // Print prompt to stdout after all log lines, before tokens stream.
+    if use_stdout {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+    }
+
+    if first_token == model.eos_token_id() {
+        log_info!("EOS after prefill");
+        return Ok(String::new());
+    }
+    generated_ids.push(first_token);
+    let token_text = model.decode_tokens(&[first_token]);
+    if use_stdout {
+        print!("{token_text}");
+        let _ = std::io::stdout().flush();
+    }
+    if verbose {
+        let token_display = escape_token_text(&token_text);
+        eprintln!(
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
+             {DIM}(prefill){RESET}"
+        );
+    }
+
+    // Decode loop
+    let mut current_token = first_token;
+    for step in 1..max_new_tokens {
+        if real_pos >= model.max_seq_len() {
+            log_warn!(
+                "context limit reached (max_seq_len={})",
+                model.max_seq_len()
+            );
+            break;
+        }
+
+        let step_start = std::time::Instant::now();
+        let logits = model.decode_step(current_token, real_pos)?;
+        current_token = sample_token(&logits, sampling, &generated_ids, &mut rng);
+        real_pos += 1;
+
+        let step_elapsed = step_start.elapsed();
+        decode_times.push(step_elapsed);
+
+        let token_text = model.decode_tokens(&[current_token]);
+        if use_stdout {
+            print!("{token_text}");
+            let _ = std::io::stdout().flush();
+        }
+        if verbose {
+            let tok_s = 1.0 / step_elapsed.as_secs_f64();
+            let token_display = escape_token_text(&token_text);
+            eprintln!(
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
+                 {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
+                step + 1,
+                step_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
+        if current_token == model.eos_token_id() {
+            break;
+        }
+        generated_ids.push(current_token);
+
+        // Check stop sequences against the generated text so far.
+        if !sampling.stop_sequences.is_empty() {
+            let text_so_far = model.decode_tokens(&generated_ids);
+            if let Some(seq) = sampling
+                .stop_sequences
+                .iter()
+                .find(|s| text_so_far.contains(s.as_str()))
+            {
+                log_info!("stop sequence {:?} reached", seq);
+                // Trim the generated text at the stop sequence and re-encode.
+                if let Some(pos) = text_so_far.find(seq.as_str()) {
+                    let trimmed_text = &text_so_far[..pos];
+                    let trimmed_ids: Vec<u32> = model
+                        .encode(trimmed_text)
+                        .into_iter()
+                        .map(|id| id as u32)
+                        .collect();
+                    generated_ids = trimmed_ids;
+                }
+                break;
+            }
+        }
+    }
+
+    if use_stdout {
+        println!();
+    }
+
+    let stats = GenerationStats {
+        prompt_tokens: prompt_len,
+        generated_tokens: generated_ids.len(),
+        prefill_time: prefill_out.prefill_time,
+        decode_times,
+        seed: sampling.seed,
+    };
+    eprintln!(
+        "\n  {BOLD_MAGENTA}── done ──{RESET} {}",
+        stats.format_summary()
+    );
+
+    Ok(model.decode_tokens(&generated_ids))
+}
+
 /// GPT-2 text generator using a single decoder ONNX model (full-recompute per step).
 ///
 /// Each generation step runs the full sequence through the model, which

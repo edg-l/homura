@@ -1,11 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::{
     DType,
-    generate::{
-        GenerationStats, Rng, SamplingConfig, argmax_at_position, escape_token_text, sample_token,
-    },
+    generate::{PrefillOutput, SamplingConfig, argmax_at_position},
     onnx::parser::Dim,
     onnx::{Model, parser},
     runtime::Buffer,
@@ -185,182 +182,29 @@ impl UnifiedKvGenerator {
     /// Generate text using the unified model for both prefill and decode.
     ///
     /// Returns only the generated text (prompt excluded).
-    pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> String {
+    pub fn generate(&mut self, prompt: &str, max_new_tokens: usize) -> String {
         self.generate_with_sampling(prompt, max_new_tokens, &SamplingConfig::default())
     }
 
     /// Generate text with explicit sampling configuration.
     pub fn generate_with_sampling(
-        &self,
+        &mut self,
         prompt: &str,
         max_new_tokens: usize,
         sampling: &SamplingConfig,
     ) -> String {
-        let mut token_ids: Vec<i64> = self
-            .tokenizer
-            .encode(prompt)
-            .into_iter()
-            .map(|id| id as i64)
-            .collect();
-
-        if token_ids.is_empty() || max_new_tokens == 0 {
-            return String::new();
-        }
-
-        let max_prompt = self.config.max_seq_len - 1;
-        if token_ids.len() > max_prompt {
-            log_warn!(
-                "truncating prompt from {} to {} tokens",
-                token_ids.len(),
-                max_prompt
-            );
-            token_ids.truncate(max_prompt);
-        }
-
-        log_info!(
-            "starting unified generation: {} prompt tokens, max_new_tokens={}",
-            token_ids.len(),
-            max_new_tokens,
-        );
-
-        // Prefill
-        let step_start = std::time::Instant::now();
-        let (mut next_token, kv_cache, mut real_pos) = match self.prefill(&token_ids) {
-            Ok(r) => r,
-            Err(e) => {
-                log_error!("prefill failed: {e}");
-                return String::new();
-            }
-        };
-        let prefill_s = step_start.elapsed().as_secs_f64();
-        log_info!("prefill complete in {prefill_s:.2}s");
-
-        // Initialize persistent KV cache from prefill outputs.
-        if let Err(e) = self.model.init_kv_cache(&kv_cache, self.config.max_seq_len) {
-            log_error!("init_kv_cache failed: {e}");
-            return String::new();
-        }
-        log_info!("KV cache initialized from prefill ({real_pos} positions)");
-
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut rng = Rng::from_optional_seed(sampling.seed);
-        let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
-        let verbose = crate::log::enabled(crate::log::Level::Debug);
-        let use_stdout = atty::is(atty::Stream::Stdout);
-
-        // Print prompt to stdout after all log lines, before tokens stream.
-        if use_stdout {
-            print!("{}", prompt);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-
-        if next_token == self.config.eos_token_id {
-            log_info!("EOS after prefill");
-            return String::new();
-        }
-        generated_ids.push(next_token);
-        let token_text = self.tokenizer.decode(&[next_token]);
-        if use_stdout {
-            print!("{token_text}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        if verbose {
-            let token_display = escape_token_text(&token_text);
-            eprintln!(
-                "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
-                 {DIM}(prefill){RESET}"
-            );
-        }
-
-        // Decode loop
-        for step in 1..max_new_tokens {
-            if real_pos >= self.config.max_seq_len {
-                log_warn!(
-                    "context limit reached (max_seq_len={})",
-                    self.config.max_seq_len
-                );
-                break;
-            }
-
-            let step_start = std::time::Instant::now();
-            let logits = match self.decode_step_logits(next_token, real_pos) {
-                Ok(l) => l,
-                Err(e) => {
-                    log_error!("decode step failed: {e}");
-                    break;
-                }
-            };
-            next_token = sample_token(&logits, sampling, &generated_ids, &mut rng);
-            real_pos += 1;
-
-            let step_elapsed = step_start.elapsed();
-            decode_times.push(step_elapsed);
-
-            let token_text = self.tokenizer.decode(&[next_token]);
-            if use_stdout {
-                print!("{token_text}");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            if verbose {
-                let tok_s = 1.0 / step_elapsed.as_secs_f64();
-                let token_display = escape_token_text(&token_text);
-                eprintln!(
-                    "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
-                     {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
-                    step + 1,
-                    step_elapsed.as_secs_f64() * 1000.0,
-                );
-            }
-
-            if next_token == self.config.eos_token_id {
-                break;
-            }
-            generated_ids.push(next_token);
-
-            // Check stop sequences against the generated text so far.
-            if !sampling.stop_sequences.is_empty() {
-                let text_so_far = self.tokenizer.decode(&generated_ids);
-                if let Some(seq) = sampling
-                    .stop_sequences
-                    .iter()
-                    .find(|s| text_so_far.contains(s.as_str()))
-                {
-                    log_info!("stop sequence {:?} reached", seq);
-                    // Trim the generated text at the stop sequence.
-                    if let Some(pos) = text_so_far.find(seq.as_str()) {
-                        let trimmed_text = &text_so_far[..pos];
-                        // Re-encode to get the right token count for the trimmed output.
-                        let trimmed_ids: Vec<u32> = self.tokenizer.encode(trimmed_text);
-                        generated_ids = trimmed_ids;
-                    }
-                    break;
-                }
-            }
-        }
-
-        if use_stdout {
-            println!();
-        }
-        let prefill_time = std::time::Duration::from_secs_f64(prefill_s);
-        let stats = GenerationStats {
-            prompt_tokens: token_ids.len(),
-            generated_tokens: generated_ids.len(),
-            prefill_time,
-            decode_times,
-            seed: sampling.seed,
-        };
-        eprintln!(
-            "\n  {BOLD_MAGENTA}── done ──{RESET} {}",
-            stats.format_summary()
-        );
-
-        self.tokenizer.decode(&generated_ids)
+        crate::generate::generate_streaming(self, prompt, max_new_tokens, sampling).unwrap_or_else(
+            |e| {
+                log_error!("generation failed: {e}");
+                String::new()
+            },
+        )
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Run the unified model in prefill mode: full prompt, empty KV cache.
-    fn prefill(
+    fn run_prefill(
         &self,
         token_ids: &[i64],
     ) -> Result<(u32, Vec<Buffer>, usize), Box<dyn std::error::Error>> {
@@ -439,6 +283,66 @@ impl UnifiedKvGenerator {
     }
 }
 
+// ── GenerativeModel impl ──────────────────────────────────────────────────────
+
+impl crate::generate::GenerativeModel for UnifiedKvGenerator {
+    fn encode(&self, prompt: &str) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .tokenizer
+            .encode(prompt)
+            .into_iter()
+            .map(|id| id as i64)
+            .collect();
+        let max_prompt = self.config.max_seq_len - 1;
+        if ids.len() > max_prompt {
+            log_warn!(
+                "truncating prompt from {} to {} tokens",
+                ids.len(),
+                max_prompt
+            );
+            ids.truncate(max_prompt);
+        }
+        ids
+    }
+
+    fn decode_tokens(&self, ids: &[u32]) -> String {
+        self.tokenizer.decode(ids)
+    }
+
+    fn prefill(&mut self, token_ids: &[i64]) -> Result<PrefillOutput, Box<dyn std::error::Error>> {
+        let step_start = std::time::Instant::now();
+        let (first_token, kv_cache, real_pos) = self.run_prefill(token_ids)?;
+        let prefill_time = step_start.elapsed();
+
+        self.model
+            .init_kv_cache(&kv_cache, self.config.max_seq_len)?;
+        log_info!("KV cache initialized from prefill ({real_pos} positions)");
+
+        Ok(PrefillOutput {
+            first_token,
+            prompt_len: token_ids.len(),
+            real_pos,
+            prefill_time,
+        })
+    }
+
+    fn decode_step(
+        &mut self,
+        token: u32,
+        real_pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.decode_step_logits(token, real_pos)
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.config.eos_token_id
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.config.max_seq_len
+    }
+}
+
 // ── Free functions ────────────────────────────────────────────────────────────
 
 /// Return the first existing path from `candidates` under `dir`.
@@ -508,7 +412,7 @@ mod tests {
     #[test]
     #[ignore]
     fn unified_kv_generate_produces_tokens() {
-        let generator = UnifiedKvGenerator::load("tests/fixtures", 1024, 50256)
+        let mut generator = UnifiedKvGenerator::load("tests/fixtures", 1024, 50256)
             .expect("failed to load UnifiedKvGenerator from tests/fixtures");
         let text = generator.generate("Hello", 3);
         assert!(!text.is_empty(), "should generate at least one token");

@@ -5,13 +5,12 @@ use std::sync::Mutex;
 
 use crate::DType;
 use crate::generate::{
-    GenerationStats, Rng, SamplingConfig, argmax_at_position, escape_token_text, sample_token,
+    GenerativeModel, PrefillOutput, SamplingConfig, argmax_at_position, generate_streaming,
 };
 use crate::hf::config::TransformerConfig;
 use crate::hf::precompute::{build_causal_mask, precompute_rope_cos_sin, slice_rope_for_positions};
 use crate::hf::tokenizer::HfTokenizer;
 use crate::hf::weights::{TransformerWeights, load_transformer_weights};
-use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::runtime::{Buffer, ExecutionPlan};
 
 /// A compiled HuggingFace transformer model.
@@ -171,142 +170,81 @@ impl HfModel {
         max_seq_len: usize,
         sampling: &SamplingConfig,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let token_ids: Vec<i64> = tokenizer
+        let mut ctx = HfGenerationContext {
+            model: self,
+            tokenizer,
+            max_seq_len,
+        };
+        generate_streaming(&mut ctx, prompt, max_new_tokens, sampling)
+    }
+}
+
+// ── HfGenerationContext ───────────────────────────────────────────────────────
+
+/// Wraps HfModel + HfTokenizer for use with the shared `generate_streaming` loop.
+pub struct HfGenerationContext<'a> {
+    model: &'a HfModel,
+    tokenizer: &'a HfTokenizer,
+    max_seq_len: usize,
+}
+
+impl<'a> GenerativeModel for HfGenerationContext<'a> {
+    fn encode(&self, prompt: &str) -> Vec<i64> {
+        self.tokenizer
             .encode(prompt)
             .iter()
             .map(|&id| id as i64)
-            .collect();
+            .collect()
+    }
 
-        if token_ids.is_empty() || max_new_tokens == 0 {
-            return Ok(String::new());
-        }
+    fn decode_tokens(&self, ids: &[u32]) -> String {
+        self.tokenizer.decode(ids)
+    }
 
-        let eos_token_id = self.config.eos_token_id.unwrap_or(u32::MAX);
-        let vocab_size = self.config.vocab_size;
-        let num_kv = self.config.num_hidden_layers * 2;
-
-        log_info!(
-            "starting generation: {} prompt tokens, max_new_tokens={}",
-            token_ids.len(),
-            max_new_tokens,
-        );
-
-        // Prefill
-        let step_start = std::time::Instant::now();
+    fn prefill(&mut self, token_ids: &[i64]) -> Result<PrefillOutput, Box<dyn std::error::Error>> {
         let seq_len = token_ids.len();
-        let input_ids = Buffer::from_slice::<i64>(&token_ids, &[1, seq_len as u64], DType::I64);
-        let outputs = self.run(&input_ids)?;
+        let vocab_size = self.model.config.vocab_size;
+        let num_kv = self.model.config.num_hidden_layers * 2;
+
+        let step_start = std::time::Instant::now();
+        let input_ids = Buffer::from_slice::<i64>(token_ids, &[1, seq_len as u64], DType::I64);
+        let outputs = self.model.run(&input_ids)?;
 
         let logits = &outputs[0];
-        let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
+        let first_token = argmax_at_position(logits, seq_len - 1, vocab_size);
 
-        // Extract KV cache from prefill outputs (outputs[1..1+num_kv])
         let kv_cache: Vec<Buffer> = outputs[1..1 + num_kv].to_vec();
-        self.init_kv_cache(&kv_cache, max_seq_len)?;
+        self.model.init_kv_cache(&kv_cache, self.max_seq_len)?;
 
-        let prefill_s = step_start.elapsed().as_secs_f64();
-        log_info!("prefill complete in {prefill_s:.2}s ({seq_len} tokens)");
+        let prefill_time = step_start.elapsed();
 
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut rng = Rng::from_optional_seed(sampling.seed);
-        let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
-        let verbose = crate::log::enabled(crate::log::Level::Debug);
-        let use_stdout = atty::is(atty::Stream::Stdout);
-
-        // Print prompt to stdout after all log lines, before tokens stream.
-        if use_stdout {
-            print!("{}", prompt);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-
-        if next_token == eos_token_id {
-            log_info!("EOS after prefill");
-            return Ok(String::new());
-        }
-        generated_ids.push(next_token);
-        let token_text = tokenizer.decode(&[next_token]);
-        // Stream to stdout
-        if use_stdout {
-            print!("{token_text}");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        if verbose {
-            let token_display = escape_token_text(&token_text);
-            eprintln!(
-                "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} {DIM}(prefill){RESET}"
-            );
-        }
-
-        // Decode loop
-        let mut current_token = next_token;
-        for step in 1..max_new_tokens {
-            if seq_len + step >= max_seq_len {
-                log_warn!("context limit reached (max_seq_len={})", max_seq_len);
-                break;
-            }
-
-            let step_start = std::time::Instant::now();
-            let input_ids = Buffer::from_slice::<i64>(&[current_token as i64], &[1, 1], DType::I64);
-            let outputs = self.run_kv(&input_ids, max_seq_len)?;
-
-            let logits = &outputs[0];
-            let logits_data = logits.as_slice::<f32>();
-            let logits_vec = logits_data[..vocab_size].to_vec();
-            current_token = sample_token(&logits_vec, sampling, &generated_ids, &mut rng);
-
-            let step_elapsed = step_start.elapsed();
-            decode_times.push(step_elapsed);
-
-            let token_text = tokenizer.decode(&[current_token]);
-            // Stream to stdout
-            if use_stdout {
-                print!("{token_text}");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            if verbose {
-                let tok_s = 1.0 / step_elapsed.as_secs_f64();
-                let token_display = escape_token_text(&token_text);
-                eprintln!(
-                    "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
-                     {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
-                    step + 1,
-                    step_elapsed.as_secs_f64() * 1000.0,
-                );
-            }
-
-            if current_token == eos_token_id {
-                break;
-            }
-            generated_ids.push(current_token);
-
-            if !sampling.stop_sequences.is_empty() {
-                let text_so_far = tokenizer.decode(&generated_ids);
-                if sampling
-                    .stop_sequences
-                    .iter()
-                    .any(|s| text_so_far.contains(s.as_str()))
-                {
-                    break;
-                }
-            }
-        }
-
-        if use_stdout {
-            println!();
-        }
-        let prefill_time = std::time::Duration::from_secs_f64(prefill_s);
-        let stats = GenerationStats {
-            prompt_tokens: seq_len,
-            generated_tokens: generated_ids.len(),
+        Ok(PrefillOutput {
+            first_token,
+            prompt_len: seq_len,
+            real_pos: seq_len,
             prefill_time,
-            decode_times,
-            seed: sampling.seed,
-        };
-        eprintln!(
-            "\n  {BOLD_MAGENTA}-- done --{RESET} {}",
-            stats.format_summary()
-        );
+        })
+    }
 
-        Ok(tokenizer.decode(&generated_ids))
+    fn decode_step(
+        &mut self,
+        token: u32,
+        _real_pos: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let vocab_size = self.model.config.vocab_size;
+        let input_ids = Buffer::from_slice::<i64>(&[token as i64], &[1, 1], DType::I64);
+        let outputs = self.model.run_kv(&input_ids, self.max_seq_len)?;
+
+        let logits = &outputs[0];
+        let logits_data = logits.as_slice::<f32>();
+        Ok(logits_data[..vocab_size].to_vec())
+    }
+
+    fn eos_token_id(&self) -> u32 {
+        self.model.config.eos_token_id.unwrap_or(u32::MAX)
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
     }
 }

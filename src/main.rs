@@ -290,7 +290,7 @@ fn cmd_generate(
     // Prefer unified single-model KV cache, fall back to full-recompute.
     let generated = if has_unified_model(&model_dir) {
         log::info!("using unified KV cache generator");
-        let generator = UnifiedKvGenerator::load(model_dir_str, 1024, 50256)?;
+        let mut generator = UnifiedKvGenerator::load(model_dir_str, 1024, 50256)?;
         log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
         log::info!("generating (max_tokens={max_tokens})");
