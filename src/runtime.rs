@@ -6,14 +6,72 @@ use crate::{DType, Shape};
 
 // ── Buffer ────────────────────────────────────────────────────────────────────
 
-/// A type-erased, owned tensor buffer. Stores raw bytes with an associated
-/// shape, dtype, and row-major strides.
-#[derive(Debug, Clone)]
+/// Internal storage for a Buffer: either an owned allocation or a borrowed
+/// view into externally-owned memory (used for zero-copy KV cache views).
+///
+/// # Safety
+///
+/// The `View` variant holds a raw pointer that must outlive the `Buffer`.
+/// This is only used internally by `KvCache::view_single`, which returns a
+/// view into the KvCache's own pre-allocated buffers. Callers must not let
+/// a `View` buffer escape the scope in which the KvCache is alive.
+enum BufferData {
+    Owned(Vec<u8>),
+    /// Borrowed view into external memory. Not owned — must not outlive source.
+    View {
+        ptr: *const u8,
+        len: usize,
+    },
+}
+
+// SAFETY: the raw pointer in View points to KvCache-owned data, which is
+// Send+Sync. We only ever create View buffers from &[u8] references.
+unsafe impl Send for BufferData {}
+unsafe impl Sync for BufferData {}
+
+/// A type-erased tensor buffer. Stores raw bytes with an associated
+/// shape, dtype, and strides. Strides may be non-row-major for zero-copy
+/// views (e.g., KV cache views with max_len-based strides).
 pub struct Buffer {
-    pub(crate) data: Vec<u8>,
+    data: BufferData,
     shape: Shape,
     strides: Vec<i64>,
     dtype: DType,
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        let data = match &self.data {
+            BufferData::Owned(v) => BufferData::Owned(v.clone()),
+            // View: copy the pointer — both point to the same underlying data.
+            BufferData::View { ptr, len } => BufferData::View {
+                ptr: *ptr,
+                len: *len,
+            },
+        };
+        Self {
+            data,
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            dtype: self.dtype,
+        }
+    }
+}
+
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.data {
+            BufferData::Owned(_) => "Owned",
+            BufferData::View { .. } => "View",
+        };
+        f.debug_struct("Buffer")
+            .field("kind", &kind)
+            .field("shape", &self.shape)
+            .field("strides", &self.strides)
+            .field("dtype", &self.dtype)
+            .field("byte_len", &self.byte_len())
+            .finish()
+    }
 }
 
 impl Buffer {
@@ -35,7 +93,7 @@ impl Buffer {
         let strides = row_major_strides(shape);
         let num_bytes = s.num_elements() as usize * dtype.size_bytes();
         Self {
-            data: vec![0u8; num_bytes],
+            data: BufferData::Owned(vec![0u8; num_bytes]),
             shape: s,
             strides,
             dtype,
@@ -67,10 +125,54 @@ impl Buffer {
         let num_bytes = std::mem::size_of_val(data);
         let raw = unsafe { slice::from_raw_parts(data.as_ptr() as *const u8, num_bytes) };
         Self {
-            data: raw.to_vec(),
+            data: BufferData::Owned(raw.to_vec()),
             shape: Shape(shape.to_vec()),
             strides: row_major_strides(shape),
             dtype,
+        }
+    }
+
+    /// Raw pointer to the buffer data.
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        match &self.data {
+            BufferData::Owned(v) => v.as_ptr(),
+            BufferData::View { ptr, .. } => *ptr,
+        }
+    }
+
+    /// Mutable raw pointer. Only valid for Owned buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics on View buffers (views are read-only).
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        match &mut self.data {
+            BufferData::Owned(v) => v.as_mut_ptr(),
+            BufferData::View { .. } => panic!("as_mut_ptr called on a View buffer (read-only)"),
+        }
+    }
+
+    /// Byte length of the data.
+    pub(crate) fn byte_len(&self) -> usize {
+        match &self.data {
+            BufferData::Owned(v) => v.len(),
+            BufferData::View { len, .. } => *len,
+        }
+    }
+
+    /// Byte capacity of the underlying allocation. Returns 0 for View buffers.
+    pub(crate) fn capacity(&self) -> usize {
+        match &self.data {
+            BufferData::Owned(v) => v.capacity(),
+            BufferData::View { .. } => 0,
+        }
+    }
+
+    /// Raw byte slice view of the data.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match &self.data {
+            BufferData::Owned(v) => v.as_slice(),
+            BufferData::View { ptr, len } => unsafe { slice::from_raw_parts(*ptr, *len) },
         }
     }
 
@@ -89,12 +191,10 @@ impl Buffer {
             self.dtype,
             self.dtype.size_bytes(),
         );
-        if self.data.is_empty() {
+        if self.byte_len() == 0 {
             return &[];
         }
-        unsafe {
-            slice::from_raw_parts(self.data.as_ptr() as *const T, self.data.len() / elem_size)
-        }
+        unsafe { slice::from_raw_parts(self.as_ptr() as *const T, self.byte_len() / elem_size) }
     }
 
     pub fn shape(&self) -> &Shape {
@@ -113,7 +213,8 @@ impl Buffer {
     ///
     /// # Panics
     ///
-    /// Panics if `size_of::<T>()` does not match the buffer's dtype element size.
+    /// Panics if `size_of::<T>()` does not match the buffer's dtype element
+    /// size, or if this is a View buffer (views are read-only).
     pub fn as_slice_mut<T: Copy + 'static>(&mut self) -> &mut [T] {
         let elem_size = std::mem::size_of::<T>();
         assert_eq!(
@@ -124,20 +225,24 @@ impl Buffer {
             self.dtype,
             self.dtype.size_bytes(),
         );
-        if self.data.is_empty() {
+        if self.byte_len() == 0 {
             return &mut [];
         }
         unsafe {
-            slice::from_raw_parts_mut(
-                self.data.as_mut_ptr() as *mut T,
-                self.data.len() / elem_size,
-            )
+            slice::from_raw_parts_mut(self.as_mut_ptr() as *mut T, self.byte_len() / elem_size)
         }
     }
 
-    /// Mutable access to the raw byte storage.
+    /// Mutable access to the raw byte Vec. Only valid for Owned buffers.
+    ///
+    /// # Panics
+    ///
+    /// Panics on View buffers.
     pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.data
+        match &mut self.data {
+            BufferData::Owned(v) => v,
+            BufferData::View { .. } => panic!("data_mut called on a View buffer (read-only)"),
+        }
     }
 
     /// Reconfigure this buffer for a new shape/dtype, reusing the existing
@@ -148,11 +253,19 @@ impl Buffer {
     ///
     /// The returned buffer's `data` contents are **uninitialized** (or stale).
     /// Only pass it to a compiled kernel that overwrites the entire output.
+    ///
+    /// # Panics
+    ///
+    /// Panics on View buffers.
     pub(crate) fn reconfigure(&mut self, shape: &[u64], dtype: DType) {
+        let v = match &mut self.data {
+            BufferData::Owned(v) => v,
+            BufferData::View { .. } => panic!("reconfigure called on a View buffer"),
+        };
         let s = Shape(shape.to_vec());
         let num_bytes = s.num_elements() as usize * dtype.size_bytes();
-        self.data.clear();
-        self.data.resize(num_bytes, 0u8);
+        v.clear();
+        v.resize(num_bytes, 0u8);
         self.shape = s;
         self.strides = row_major_strides(shape);
         self.dtype = dtype;
@@ -184,13 +297,13 @@ fn native_concat(inputs: &[&Buffer], axis: usize, out_shape: &[u64], dtype: DTyp
             let chunk = in_axis_len * inner_size;
             let read_offset = outer * in_axis_len * inner_size;
             out_data[write_offset..write_offset + chunk]
-                .copy_from_slice(&input.data[read_offset..read_offset + chunk]);
+                .copy_from_slice(&input.as_bytes()[read_offset..read_offset + chunk]);
             write_offset += chunk;
         }
     }
 
     Buffer {
-        data: out_data,
+        data: BufferData::Owned(out_data),
         shape: Shape(out_shape.to_vec()),
         strides: row_major_strides(out_shape),
         dtype,
@@ -223,12 +336,16 @@ struct KvLayerCache {
 /// Persistent KV cache for autoregressive decoding.
 ///
 /// Pre-allocates buffers for `max_seq_len` tokens per layer. Each decode step
-/// appends one new K/V entry via `append()`, and `view()` returns a Buffer
-/// covering `[0..current_len]` without re-allocating.
+/// appends one new K/V entry via `append()`, and `view()` / `view_key()` /
+/// `view_value()` return Buffers covering `[0..current_len]`.
 ///
-/// The append writes only `num_heads * head_dim * elem_size` bytes per tensor
-/// (e.g., 3KB for GPT-2). Views copy the valid region into a fresh Buffer —
-/// a future optimization can make this zero-copy with borrowed buffer support.
+/// `view_key` and `view_value` return zero-copy views into the pre-allocated
+/// buffers using non-row-major strides (stride along seq dim = max_len *
+/// head_dim instead of current_len * head_dim). The compiled kernel's memref
+/// descriptor uses these strides to correctly skip over unused max_len gaps.
+///
+/// `view()` (used for prefill shape resolution) still copies the valid region
+/// into a contiguous buffer, because callers may call `as_slice()` on it.
 pub struct KvCache {
     layers: Vec<KvLayerCache>,
     current_len: usize,
@@ -291,17 +408,17 @@ impl KvCache {
             let dst_offset = (h * self.max_len + self.current_len) * stride_seq;
             let src_offset = h * row_bytes; // new_k is [1, heads, 1, head_dim]
             self.layers[layer].key[dst_offset..dst_offset + row_bytes]
-                .copy_from_slice(&new_k.data[src_offset..src_offset + row_bytes]);
+                .copy_from_slice(&new_k.as_bytes()[src_offset..src_offset + row_bytes]);
             self.layers[layer].value[dst_offset..dst_offset + row_bytes]
-                .copy_from_slice(&new_v.data[src_offset..src_offset + row_bytes]);
+                .copy_from_slice(&new_v.as_bytes()[src_offset..src_offset + row_bytes]);
         }
     }
 
     /// Return Buffer views of the KV cache for the given layer,
     /// covering `[1, num_heads, 0..current_len, head_dim]`.
     ///
-    /// Currently copies the valid region into new Buffers. The pre-allocated
-    /// buffer uses max_len strides, so we extract the contiguous sub-region.
+    /// Copies the valid region into new contiguous Buffers (safe for `as_slice`
+    /// callers). Used during prefill / shape resolution in `run_kv`.
     pub fn view(&self, layer: usize) -> (Buffer, Buffer) {
         let elem_size = self.dtype.size_bytes();
         let view_shape = [
@@ -329,13 +446,13 @@ impl KvCache {
         }
 
         let k_buf = Buffer {
-            data: k_data,
+            data: BufferData::Owned(k_data),
             shape: Shape(view_shape.to_vec()),
             strides: row_major_strides(&view_shape),
             dtype: self.dtype,
         };
         let v_buf = Buffer {
-            data: v_data,
+            data: BufferData::Owned(v_data),
             shape: Shape(view_shape.to_vec()),
             strides: row_major_strides(&view_shape),
             dtype: self.dtype,
@@ -351,7 +468,7 @@ impl KvCache {
             let dst = (h * self.max_len + self.current_len) * row_bytes;
             let src = h * row_bytes;
             self.layers[layer].key[dst..dst + row_bytes]
-                .copy_from_slice(&new_k.data[src..src + row_bytes]);
+                .copy_from_slice(&new_k.as_bytes()[src..src + row_bytes]);
         }
     }
 
@@ -363,46 +480,60 @@ impl KvCache {
             let dst = (h * self.max_len + self.current_len) * row_bytes;
             let src = h * row_bytes;
             self.layers[layer].value[dst..dst + row_bytes]
-                .copy_from_slice(&new_v.data[src..src + row_bytes]);
+                .copy_from_slice(&new_v.as_bytes()[src..src + row_bytes]);
         }
     }
 
-    /// Return a K view covering `[1, heads, 0..current_len+1, head_dim]`.
+    /// Return a zero-copy K view covering `[1, heads, 0..current_len+1, head_dim]`.
+    ///
     /// Includes the entry just appended at `current_len` (before `advance()`).
+    /// The returned Buffer uses max_len-based strides so the kernel's memref
+    /// descriptor correctly skips over the unused max_len gap between heads.
     pub fn view_key(&self, layer: usize) -> Buffer {
         self.view_single(&self.layers[layer].key, self.current_len + 1)
     }
 
-    /// Return a V view covering `[1, heads, 0..current_len+1, head_dim]`.
+    /// Return a zero-copy V view covering `[1, heads, 0..current_len+1, head_dim]`.
     pub fn view_value(&self, layer: usize) -> Buffer {
         self.view_single(&self.layers[layer].value, self.current_len + 1)
     }
 
-    /// Extract a contiguous view of `[1, heads, 0..seq_len, head_dim]` from
-    /// a max_len-strided buffer.
+    /// Return a zero-copy view of `[1, heads, 0..seq_len, head_dim]` into
+    /// a max_len-strided pre-allocated buffer.
+    ///
+    /// The shape is `[1, num_heads, seq_len, head_dim]` but strides are based
+    /// on max_len, not seq_len. The compiled kernel uses these strides via its
+    /// memref descriptor to correctly access each head's data with the max_len
+    /// gap between heads.
+    ///
+    /// # Safety
+    ///
+    /// The returned Buffer holds a raw pointer into `src`. It must not outlive
+    /// the KvCache (and thus `src`) — this is guaranteed by the call sites in
+    /// `view_key` and `view_value`, which pass slices from `self.layers`.
     fn view_single(&self, src: &[u8], seq_len: usize) -> Buffer {
-        let elem_size = self.dtype.size_bytes();
-        let row_bytes = self.head_dim * elem_size;
         let view_shape = [
             1u64,
             self.num_heads as u64,
             seq_len as u64,
             self.head_dim as u64,
         ];
-        let view_bytes = self.num_heads * seq_len * self.head_dim * elem_size;
-        let mut data = vec![0u8; view_bytes];
-
-        for h in 0..self.num_heads {
-            let src_off = h * self.max_len * row_bytes;
-            let dst_off = h * seq_len * row_bytes;
-            let chunk = seq_len * row_bytes;
-            data[dst_off..dst_off + chunk].copy_from_slice(&src[src_off..src_off + chunk]);
-        }
-
+        // Strides in element counts, based on max_len layout.
+        // The seq dimension strides by head_dim (row size), not seq_len * head_dim.
+        // The head dimension strides by max_len * head_dim (full row in buffer).
+        let strides = vec![
+            (self.num_heads * self.max_len * self.head_dim) as i64,
+            (self.max_len * self.head_dim) as i64,
+            self.head_dim as i64,
+            1i64,
+        ];
         Buffer {
-            data,
+            data: BufferData::View {
+                ptr: src.as_ptr(),
+                len: src.len(),
+            },
             shape: Shape(view_shape.to_vec()),
-            strides: row_major_strides(&view_shape),
+            strides,
             dtype: self.dtype,
         }
     }
@@ -716,7 +847,7 @@ impl CompiledGraph {
             .zip(input_shapes.iter())
             .zip(input_strides.iter())
             .map(|((buf, shape), strides)| {
-                build_memref_descriptor(buf.data.as_ptr() as *mut u8, shape.as_slice(), strides)
+                build_memref_descriptor(buf.as_ptr() as *mut u8, shape.as_slice(), strides)
             })
             .collect();
 
@@ -725,7 +856,7 @@ impl CompiledGraph {
             .map(|buf| {
                 let shape_i64: Vec<i64> = buf.shape().0.iter().map(|&d| d as i64).collect();
                 let strides = buf.strides().to_vec();
-                build_memref_descriptor(buf.data.as_mut_ptr(), &shape_i64, &strides)
+                build_memref_descriptor(buf.as_mut_ptr(), &shape_i64, &strides)
             })
             .collect();
 
@@ -747,14 +878,14 @@ impl CompiledGraph {
         {
             tracing::debug!(count = inputs.len(), "memref inputs");
             for (i, buf) in inputs.iter().enumerate() {
-                let data_ptr = buf.data.as_ptr();
+                let data_ptr = buf.as_ptr();
                 match buf.dtype() {
                     DType::F32 => {
-                        let n = buf.data.len() / 4;
+                        let n = buf.byte_len() / 4;
                         let show = n.min(4);
                         let elems: Vec<f32> = (0..show)
                             .map(|k| {
-                                let bytes = &buf.data[k * 4..(k + 1) * 4];
+                                let bytes = &buf.as_bytes()[k * 4..(k + 1) * 4];
                                 f32::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
@@ -764,11 +895,11 @@ impl CompiledGraph {
                         );
                     }
                     DType::I64 => {
-                        let n = buf.data.len() / 8;
+                        let n = buf.byte_len() / 8;
                         let show = n.min(4);
                         let elems: Vec<i64> = (0..show)
                             .map(|k| {
-                                let bytes = &buf.data[k * 8..(k + 1) * 8];
+                                let bytes = &buf.as_bytes()[k * 8..(k + 1) * 8];
                                 i64::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
@@ -787,10 +918,10 @@ impl CompiledGraph {
             }
             tracing::debug!(count = output_bufs.len(), "memref outputs");
             for (i, buf) in output_bufs.iter().enumerate() {
-                let data_ptr = buf.data.as_ptr();
+                let data_ptr = buf.as_ptr();
                 tracing::debug!(
                     i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
-                    ptr = ?data_ptr, size_bytes = buf.data.len(), "output memref"
+                    ptr = ?data_ptr, size_bytes = buf.byte_len(), "output memref"
                 );
             }
         }
@@ -1215,9 +1346,7 @@ impl ExecutionPlan {
                 .map(|&(shape, dtype)| {
                     let need_bytes = shape.iter().product::<u64>() as usize * dtype.size_bytes();
                     // Find a free buffer with enough capacity.
-                    let reuse_idx = free_list
-                        .iter()
-                        .position(|b| b.data.capacity() >= need_bytes);
+                    let reuse_idx = free_list.iter().position(|b| b.capacity() >= need_bytes);
                     let mut buf = if let Some(idx) = reuse_idx {
                         free_list.swap_remove(idx)
                     } else {
@@ -1510,9 +1639,7 @@ impl ExecutionPlan {
                 .iter()
                 .map(|&(shape, dtype)| {
                     let need_bytes = shape.iter().product::<u64>() as usize * dtype.size_bytes();
-                    let reuse_idx = free_list
-                        .iter()
-                        .position(|b| b.data.capacity() >= need_bytes);
+                    let reuse_idx = free_list.iter().position(|b| b.capacity() >= need_bytes);
                     let mut buf = if let Some(idx) = reuse_idx {
                         free_list.swap_remove(idx)
                     } else {
@@ -1602,9 +1729,9 @@ impl ExecutionPlan {
                 let dst_off = h * max_seq_len * row_bytes;
                 let chunk = seq_len * row_bytes;
                 cache.layers[layer].key[dst_off..dst_off + chunk]
-                    .copy_from_slice(&k_buf.data[src_off..src_off + chunk]);
+                    .copy_from_slice(&k_buf.as_bytes()[src_off..src_off + chunk]);
                 cache.layers[layer].value[dst_off..dst_off + chunk]
-                    .copy_from_slice(&v_buf.data[src_off..src_off + chunk]);
+                    .copy_from_slice(&v_buf.as_bytes()[src_off..src_off + chunk]);
             }
         }
         cache.current_len = seq_len;
