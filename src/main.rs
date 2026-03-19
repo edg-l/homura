@@ -655,6 +655,23 @@ fn cmd_chat(
                 content: input.to_string(),
             });
             tokens_in_cache = 0;
+
+            // Revalidate: if even this single message exceeds the context, skip it.
+            let check_text = chat_template.render(
+                &messages,
+                true,
+                if enable_thinking { Some(true) } else { None },
+            )?;
+            let check_tokens = tokenizer.encode_with_special(&check_text);
+            if check_tokens.len() + max_tokens_per_turn > max_seq_len {
+                eprintln!(
+                    "Error: message too long ({} tokens, max context {}).\n",
+                    check_tokens.len(),
+                    max_seq_len
+                );
+                messages.pop(); // remove the oversized user message
+                continue;
+            }
         }
 
         // Render (possibly updated after overflow) and compute delta.

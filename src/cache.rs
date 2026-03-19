@@ -119,7 +119,7 @@ fn dtype_to_str(d: DType) -> &'static str {
         DType::F64 => "f64",
         DType::I32 => "i32",
         DType::I64 => "i64",
-        DType::BF16 => panic!("BF16 not supported in computation; convert to F32 first"),
+        DType::BF16 => "bf16",
     }
 }
 
@@ -268,7 +268,13 @@ fn dirs_cache_dir() -> Option<PathBuf> {
 /// Returns 1024 for lengths > 1024.
 pub fn bucket_pad(len: usize) -> usize {
     const BUCKETS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
-    *BUCKETS.iter().find(|&&b| b >= len).unwrap_or(&1024)
+    match BUCKETS.iter().find(|&&b| b >= len) {
+        Some(&b) => b,
+        None => {
+            log_warn!("sequence length {len} exceeds max bucket 1024, clamping");
+            1024
+        }
+    }
 }
 
 // ── Compiler fingerprint ──────────────────────────────────────────────────────

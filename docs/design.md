@@ -79,20 +79,9 @@ Two execution paths share the same plan:
 
 `KvCache` pre-allocates `[1, heads, max_seq_len, head_dim]` per layer. Generation flow: `prefill (run) -> init_kv_cache -> decode loop (run_kv)`.
 
-### 8. Chat Mode
+Multi-token KV cache append is supported: `run_kv` accepts input sequences longer than 1 token, enabling incremental prefill for chat turns without reprocessing the entire history. See [chat.md](chat.md) for details.
 
-Interactive multi-turn chat with persistent KV cache across turns. Chat templates are loaded from `tokenizer_config.json` and rendered via minijinja (Jinja2), so any HF model's chat format works automatically.
-
-Each turn:
-1. Render the full conversation with the chat template
-2. Compute delta tokens (only new tokens since last turn)
-3. Feed delta through `run_kv` to extend the existing KV cache (incremental prefill)
-4. Decode loop generates the assistant response
-5. KV cache persists for the next turn
-
-This avoids re-processing the entire conversation history each turn.
-
-### 9. Native ABI
+### 8. Native ABI
 
 The compiled function ABI uses **N-D memref descriptors** -- C structs with allocated_ptr, aligned_ptr, offset, sizes[N], strides[N]. The `llvm.emit_c_interface` attribute generates a C-compatible wrapper `_mlir__mlir_ciface_compute` that accepts a packed pointer array.
 
@@ -106,7 +95,7 @@ config.json + model.safetensors
 
 HfModel
   |-- run()     -> full prefill (empty KV cache)
-  |-- run_kv()  -> KV-cached decode step
+  |-- run_kv()  -> KV-cached decode step (single or multi-token)
   |-- generate()  -> single-prompt generation
   \-- chat (via HfGenerationContext)
        |-- incremental prefill across turns
@@ -144,17 +133,6 @@ The emitter walks the ONNX graph per kernel group, emitting linalg ops into each
 
 **Multiple outputs:** `Model::run()` returns `Vec<Buffer>`. GPT-2 produces logits + 24 KV cache tensors.
 
-## Compilation Cache
-
-Compiled `.so` files are cached on disk at `~/.cache/homura/` (or `HOMURA_CACHE_DIR`). The cache key is a hash of:
-- Model bytes (any model change invalidates)
-- Input shapes (different seq_len = different compilation)
-- Compiler fingerprint: homura version, LLVM version, host CPU name + features
-
-On cache hit, compilation is skipped entirely -- the `.so` is loaded via dlopen in milliseconds. Power-of-2 bucket padding for sequence lengths limits the number of unique compilations to at most 6 (32, 64, 128, 256, 512, 1024).
-
-`homura clean-cache` removes all cached files.
-
 ## Text Generation
 
 Two model backends share the same `GenerativeModel` trait and `generate_streaming` loop:
@@ -170,7 +148,30 @@ let mut gen = UnifiedKvGenerator::load("model_dir", 1024, 50256)?;
 let text = gen.generate("Hello", 50);
 ```
 
-Sampling: temperature, top-k, top-p (nucleus), min-p, repetition penalty, frequency penalty, presence penalty, seeded RNG.
+Sampling: temperature, top-k, top-p (nucleus), min-p, repetition penalty, frequency penalty, presence penalty, seeded RNG (xorshift64).
+
+### generate_streaming_from_ids
+
+For chat mode, `generate_streaming_from_ids` accepts pre-tokenized token IDs directly, avoiding a decode-then-re-encode round-trip that would lose special tokens (`<|im_start|>`, `<|im_end|>`, etc.). This is critical for correct incremental prefill with chat templates.
+
+### ThinkConfig
+
+The `ThinkConfig` struct controls think-block handling during generation:
+- `token_ids: Option<(u32, u32)>` -- the `<think>` and `</think>` token IDs
+- `style_content: bool` -- when true, think content is shown in gray italic; when false, it is hidden entirely
+
+Think tags are always hidden from output. The `--think` CLI flag sets `style_content = true`, so reasoning content is visible but visually distinct.
+
+## Compilation Cache
+
+Compiled `.so` files are cached on disk at `~/.cache/homura/` (or `HOMURA_CACHE_DIR`). The cache key is a hash of:
+- Model bytes (any model change invalidates)
+- Input shapes (different seq_len = different compilation)
+- Compiler fingerprint: homura version, LLVM version, host CPU name + features
+
+On cache hit, compilation is skipped entirely -- the `.so` is loaded via dlopen in milliseconds. Power-of-2 bucket padding for sequence lengths limits the number of unique compilations to at most 6 (32, 64, 128, 256, 512, 1024).
+
+`homura clean-cache` removes all cached files.
 
 ## Architecture Decisions
 
@@ -206,7 +207,7 @@ src/
 |-- compiler.rs         Transform schedule, emit_object_files, link_shared_lib
 |-- runtime.rs          Buffer, CompiledGraph, ExecutionPlan, KvCache
 |-- cache.rs            Disk-based per-kernel compilation cache
-|-- generate.rs         GenerativeModel trait, generate_streaming, sampling
+|-- generate.rs         GenerativeModel trait, generate_streaming, sampling, ThinkConfig
 |-- kv_generate.rs      UnifiedKvGenerator (ONNX KV-cached generation)
 |-- tokenizer.rs        Byte-level BPE tokenizer (GPT-2)
 |-- llvm_ffi.rs         LLVM C API FFI helpers
@@ -220,13 +221,13 @@ src/
 |-- hf/
 |   |-- mod.rs          Module root
 |   |-- config.rs       TransformerConfig (generic HF config.json)
-|   |-- model.rs        HfModel (load, run, run_kv, generate, chat)
+|   |-- model.rs        HfModel (load, run, run_kv, generate), HfGenerationContext
 |   |-- emitter.rs      Transformer plan emission (attention + FFN kernels)
 |   |-- weights.rs      TransformerWeights (safetensors -> weight buffers)
 |   |-- safetensors.rs  Safetensors file loading
 |   |-- tokenizer.rs    HfTokenizer (wraps tokenizers crate)
 |   |-- precompute.rs   RoPE cos/sin tables, causal masks
-|   \-- chat.rs         Chat template rendering (minijinja), stop token detection
+|   \-- chat.rs         ChatTemplate (minijinja), ChatMessage, stop/think token detection
 \-- onnx/
     |-- mod.rs          Model struct (load/run/run_kv), lazy compilation
     |-- proto.rs        Prost-generated protobuf types
@@ -254,10 +255,11 @@ scripts/
 - **libc** -- dlopen/dlsym for loading compiled `.so` files.
 - **serde** / **serde_json** -- Config and tokenizer JSON parsing.
 - **tokenizers** -- HuggingFace tokenizer library (BPE, WordPiece, etc.).
-- **minijinja** -- Jinja2 template engine for HF chat templates.
+- **minijinja** / **minijinja-contrib** -- Jinja2 template engine for HF chat templates, with Python string method compatibility (pycompat).
 - **hf-hub** -- HuggingFace Hub API for model downloads.
 - **rayon** -- Parallel kernel compilation.
 - **memmap2** -- Memory-mapped file I/O for safetensors.
+- **atty** -- TTY detection for streaming output vs. piped mode.
 - Requires **LLVM 21** with `libMLIR-C.so` and `libmlir_c_runner_utils.so`.
 
 ## Current Limitations
@@ -287,6 +289,7 @@ scripts/
 - QK-norm for Qwen3-style models
 - Interactive multi-turn chat mode with incremental KV cache
 - Jinja2 chat template rendering (any HF model's format)
+- Think block support for reasoning models (Qwen3)
 - GPT-2 at ~50 tok/s, Qwen2.5-0.5B at ~10 tok/s on CPU
 
 ### Next

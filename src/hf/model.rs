@@ -234,10 +234,11 @@ impl<'a> GenerativeModel for HfGenerationContext<'a> {
         if self.model.kv_cache_len() > 0 {
             // Incremental prefill: KV cache already exists from a prior turn.
             // Feed new tokens through run_kv to extend the cache.
+            let prior_len = self.model.kv_cache_len(); // snapshot before run_kv advances cache
             let outputs = self.model.run_kv(&input_ids, self.max_seq_len)?;
             let logits = &outputs[0];
             let first_token = argmax_at_position(logits, seq_len - 1, vocab_size);
-            let real_pos = self.model.kv_cache_len();
+            let real_pos = prior_len + seq_len; // correct: prior cache len + new tokens
             let prefill_time = step_start.elapsed();
 
             Ok(PrefillOutput {

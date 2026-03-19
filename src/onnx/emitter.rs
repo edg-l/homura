@@ -471,19 +471,21 @@ fn emit_node<'c>(
                 get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0])
             };
 
-            let out = builder.emit_conv2d(
-                &x,
-                &w,
-                bias.as_ref(),
-                [
-                    pads[0] as u64,
-                    pads[1] as u64,
-                    pads[2] as u64,
-                    pads[3] as u64,
-                ],
-                [strides[0] as u64, strides[1] as u64],
-                [dilations[0] as u64, dilations[1] as u64],
-            );
+            let out = builder
+                .emit_conv2d(
+                    &x,
+                    &w,
+                    bias.as_ref(),
+                    [
+                        pads[0] as u64,
+                        pads[1] as u64,
+                        pads[2] as u64,
+                        pads[3] as u64,
+                    ],
+                    [strides[0] as u64, strides[1] as u64],
+                    [dilations[0] as u64, dilations[1] as u64],
+                )
+                .map_err(|e| OnnxError::CompileError(e.to_string()))?;
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "MaxPool" => {
@@ -497,18 +499,20 @@ fn emit_node<'c>(
             let strides = get_ints_attr(&node.attributes, "strides", &[1, 1]);
             let pads = get_ints_attr(&node.attributes, "pads", &[0, 0, 0, 0]);
             let dilations = get_ints_attr(&node.attributes, "dilations", &[1, 1]);
-            let out = builder.emit_max_pool2d(
-                &x,
-                [kernel_shape[0] as u64, kernel_shape[1] as u64],
-                [
-                    pads[0] as u64,
-                    pads[1] as u64,
-                    pads[2] as u64,
-                    pads[3] as u64,
-                ],
-                [strides[0] as u64, strides[1] as u64],
-                [dilations[0] as u64, dilations[1] as u64],
-            );
+            let out = builder
+                .emit_max_pool2d(
+                    &x,
+                    [kernel_shape[0] as u64, kernel_shape[1] as u64],
+                    [
+                        pads[0] as u64,
+                        pads[1] as u64,
+                        pads[2] as u64,
+                        pads[3] as u64,
+                    ],
+                    [strides[0] as u64, strides[1] as u64],
+                    [dilations[0] as u64, dilations[1] as u64],
+                )
+                .map_err(|e| OnnxError::CompileError(e.to_string()))?;
             insert_tensor(value_map, &node.outputs[0], out);
         }
         "GlobalAveragePool" => {

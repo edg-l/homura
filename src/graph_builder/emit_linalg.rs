@@ -1944,7 +1944,7 @@ impl<'c> GraphBuilder<'c> {
         pads: [u64; 4],
         strides: [u64; 2],
         dilations: [u64; 2],
-    ) -> Tensor<'c> {
+    ) -> Result<Tensor<'c>, CompileError> {
         let in_shape = input.shape(); // [N, CI, H, W]
         let wt_shape = weight.shape(); // [CO, CI, KH, KW]
         assert_eq!(in_shape.len(), 4, "conv2d: input must be rank-4 (NCHW)");
@@ -2040,10 +2040,11 @@ impl<'c> GraphBuilder<'c> {
             dyn_vals.push(self.emit_tensor_dim(weight.value(), 0));
         }
         // dim 2 (OH) and dim 3 (OW) — must be static for now.
-        assert!(
-            oh.is_some() && ow.is_some(),
-            "conv2d: dynamic output spatial dims not yet supported"
-        );
+        if oh.is_none() || ow.is_none() {
+            return Err(CompileError::Shape(
+                "conv2d: dynamic output spatial dims not yet supported".into(),
+            ));
+        }
 
         let init_empty: melior::ir::Value = self
             .block
@@ -2135,9 +2136,9 @@ impl<'c> GraphBuilder<'c> {
         if let Some(b) = bias {
             // bias shape: [CO] → unsqueeze to [1, CO, 1, 1] → emit_add.
             let bias_4d = self.emit_unsqueeze(b, &[0, 2, 3]);
-            self.emit_add(&conv_tensor, &bias_4d)
+            Ok(self.emit_add(&conv_tensor, &bias_4d))
         } else {
-            conv_tensor
+            Ok(conv_tensor)
         }
     }
 
@@ -2153,7 +2154,7 @@ impl<'c> GraphBuilder<'c> {
         bias: Option<&Tensor<'c>>,
         strides: [u64; 2],
         dilations: [u64; 2],
-    ) -> Tensor<'c> {
+    ) -> Result<Tensor<'c>, CompileError> {
         let in_shape = input.shape();
         let wt_shape = weight.shape();
         assert_eq!(
@@ -2288,7 +2289,7 @@ impl<'c> GraphBuilder<'c> {
         pads: [u64; 4],
         strides: [u64; 2],
         dilations: [u64; 2],
-    ) -> Tensor<'c> {
+    ) -> Result<Tensor<'c>, CompileError> {
         let in_shape = input.shape(); // [N, C, H, W]
         assert_eq!(in_shape.len(), 4, "max_pool2d: input must be rank-4 (NCHW)");
 
@@ -2368,10 +2369,11 @@ impl<'c> GraphBuilder<'c> {
         if c.is_none() {
             dyn_vals.push(self.emit_tensor_dim(input_val, 1));
         }
-        assert!(
-            oh.is_some() && ow.is_some(),
-            "max_pool2d: dynamic output spatial dims not yet supported"
-        );
+        if oh.is_none() || ow.is_none() {
+            return Err(CompileError::Shape(
+                "max_pool2d: dynamic output spatial dims not yet supported".into(),
+            ));
+        }
 
         let init_empty: melior::ir::Value = self
             .block
@@ -2468,7 +2470,7 @@ impl<'c> GraphBuilder<'c> {
             .unwrap()
             .into();
 
-        Tensor::from_value(pool_result)
+        Ok(Tensor::from_value(pool_result))
     }
 
     /// Build the region for `linalg.pooling_nchw_max`:

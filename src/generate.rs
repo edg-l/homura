@@ -127,6 +127,7 @@ fn generate_streaming_core(
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
     let mut rng = Rng::from_optional_seed(sampling.seed);
     let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
+    let mut generated_text = String::new();
     let verbose = crate::log::enabled(crate::log::Level::Debug);
     let use_stdout = atty::is(atty::Stream::Stdout);
     let mut in_think_block = false;
@@ -213,16 +214,15 @@ fn generate_streaming_core(
 
         // Check stop sequences against the generated text so far.
         if !sampling.stop_sequences.is_empty() {
-            let text_so_far = model.decode_tokens(&generated_ids);
+            generated_text.push_str(&token_text);
             if let Some(seq) = sampling
                 .stop_sequences
                 .iter()
-                .find(|s| text_so_far.contains(s.as_str()))
+                .find(|s| generated_text.contains(s.as_str()))
             {
                 log_info!("stop sequence {:?} reached", seq);
-                // Trim the generated text at the stop sequence and re-encode.
-                if let Some(pos) = text_so_far.find(seq.as_str()) {
-                    let trimmed_text = &text_so_far[..pos];
+                if let Some(pos) = generated_text.find(seq.as_str()) {
+                    let trimmed_text = &generated_text[..pos];
                     let trimmed_ids: Vec<u32> = model
                         .encode(trimmed_text)
                         .into_iter()

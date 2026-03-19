@@ -265,7 +265,11 @@ impl Buffer {
         let s = Shape(shape.to_vec());
         let num_bytes = s.num_elements() as usize * dtype.size_bytes();
         v.clear();
-        v.resize(num_bytes, 0u8);
+        v.reserve(num_bytes);
+        // SAFETY: the compiled kernel writes every output byte before any read.
+        unsafe {
+            v.set_len(num_bytes);
+        }
         self.shape = s;
         self.strides = row_major_strides(shape);
         self.dtype = dtype;
@@ -422,8 +426,34 @@ impl KvCache {
     /// Return Buffer views of the KV cache for the given layer,
     /// covering `[1, num_heads, 0..current_len, head_dim]`.
     ///
+    /// Return a pair of zero-byte Buffers with the correct KV shape for
+    /// shape resolution, without copying any data. Used in `run_kv` to
+    /// resolve symbolic output shapes before execution.
+    pub fn view_shape(&self) -> (Buffer, Buffer) {
+        let shape = &[
+            1u64,
+            self.num_heads as u64,
+            self.current_len as u64,
+            self.head_dim as u64,
+        ];
+        let k = Buffer {
+            data: BufferData::Owned(Vec::new()),
+            shape: Shape(shape.to_vec()),
+            strides: row_major_strides(shape),
+            dtype: self.dtype,
+        };
+        let v = Buffer {
+            data: BufferData::Owned(Vec::new()),
+            shape: Shape(shape.to_vec()),
+            strides: row_major_strides(shape),
+            dtype: self.dtype,
+        };
+        (k, v)
+    }
+
     /// Copies the valid region into new contiguous Buffers (safe for `as_slice`
-    /// callers). Used during prefill / shape resolution in `run_kv`.
+    /// callers). Used in tests.
+    #[cfg(test)]
     pub fn view(&self, layer: usize) -> (Buffer, Buffer) {
         let elem_size = self.dtype.size_bytes();
         let view_shape = [
@@ -499,6 +529,11 @@ impl KvCache {
             new_seq,
             self.max_len
         );
+        debug_assert!(
+            self.new_tokens == 0 || self.new_tokens == new_seq,
+            "KV cache: append_value new_seq={new_seq} != append_key new_tokens={}",
+            self.new_tokens
+        );
         self.new_tokens = new_seq;
         let row_bytes = self.head_dim * self.dtype.size_bytes();
         for h in 0..self.num_heads {
@@ -568,6 +603,7 @@ impl KvCache {
     }
 
     /// Advance the sequence position after all layers have appended.
+    #[cfg(test)]
     pub fn advance(&mut self) {
         self.current_len += 1;
         self.new_tokens = 0;
@@ -1543,14 +1579,11 @@ impl ExecutionPlan {
             inputs.len()
         );
 
-        // Resolve shapes using the full input set (including KV cache views
-        // for past_kv slots). Build temporary Buffer refs for shape resolution.
+        // Resolve shapes using the KV cache shape (no data copy needed).
         let cache = self.kv_cache.as_ref().unwrap();
-        let kv_views: Vec<Buffer> = (0..kv_info.num_layers)
-            .flat_map(|layer| {
-                let (k, v) = cache.view(layer);
-                vec![k, v]
-            })
+        let (shape_k, shape_v) = cache.view_shape();
+        let kv_views: Vec<&Buffer> = (0..kv_info.num_layers)
+            .flat_map(|_| vec![&shape_k, &shape_v])
             .collect();
 
         // Build the full input list matching input_slots order.
@@ -1559,7 +1592,7 @@ impl ExecutionPlan {
         let mut kv_idx = 0;
         for &slot in &self.input_slots {
             if past_kv_set.contains(&slot) {
-                full_inputs.push(&kv_views[kv_idx]);
+                full_inputs.push(kv_views[kv_idx]);
                 kv_idx += 1;
             } else {
                 full_inputs.push(inputs[ext_idx]);
@@ -1569,7 +1602,7 @@ impl ExecutionPlan {
 
         let resolved_shapes = self.resolve_slot_shapes(&full_inputs);
 
-        let profile = std::env::var("HOMURA_PROFILE").is_ok();
+        let profile = std::env::var("HOMURA_PROFILE").is_ok_and(|v| v == "1");
         let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = Vec::new();
 
         // Initialize pool.

@@ -59,7 +59,11 @@ impl TransformMode {
         let target_tiles = num_cores + num_cores / 2;
         let ideal = min_n / target_tiles;
         // Round down to power of two, clamp to [16, 256].
-        let n_tile = ideal.next_power_of_two() >> 1; // round down
+        let n_tile = if ideal <= 1 {
+            1
+        } else {
+            1usize << (usize::BITS - 1 - ideal.leading_zeros())
+        };
         let n_tile = n_tile.max(16).min(256);
         TransformMode::TileParallel { n_tile }
     }
@@ -126,6 +130,7 @@ pub(super) fn mlir_element_type_to_dtype(ty: melior::ir::Type) -> DType {
         "f64" => DType::F64,
         "i32" => DType::I32,
         "i64" => DType::I64,
+        "bf16" => DType::BF16,
         other => panic!("unsupported MLIR element type: {other}"),
     }
 }
@@ -316,18 +321,18 @@ pub fn compile_to_objects(
         .map_err(CompileError::Pass)?;
     pass_manager.run(&mut module).map_err(CompileError::Pass)?;
 
-    let nanos = std::time::SystemTime::now()
+    let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
+        .unwrap_or_default();
     let tid = std::thread::current().id();
     let base_name = format!(
-        "homura_{func_name}_{}_{}_{:08x}",
+        "homura_{func_name}_{}_{}_{}_{:08x}",
         std::process::id(),
         format!("{:?}", tid)
             .replace("ThreadId(", "")
             .replace(")", ""),
-        nanos
+        dur.as_secs(),
+        dur.subsec_nanos()
     );
 
     crate::compiler::emit_object_files_monolithic_pub(
@@ -3340,7 +3345,9 @@ mod tests {
         let mut gb = ctx.builder();
         let input = gb.input(&[Some(1), Some(1), Some(4), Some(4)], DType::F32);
         let weight = gb.add_weight(&[Some(1), Some(1), Some(3), Some(3)], DType::F32);
-        let out = gb.emit_conv2d(&input, &weight, None, [0, 0, 0, 0], [1, 1], [1, 1]);
+        let out = gb
+            .emit_conv2d(&input, &weight, None, [0, 0, 0, 0], [1, 1], [1, 1])
+            .expect("emit_conv2d");
         assert_eq!(out.shape(), vec![Some(1), Some(1), Some(2), Some(2)]);
         let graph = gb.compile(&[&out]).expect("compile conv2d_no_padding");
 
@@ -3364,7 +3371,9 @@ mod tests {
         let mut gb = ctx.builder();
         let input = gb.input(&[Some(1), Some(1), Some(4), Some(4)], DType::F32);
         let weight = gb.add_weight(&[Some(1), Some(1), Some(3), Some(3)], DType::F32);
-        let out = gb.emit_conv2d(&input, &weight, None, [1, 1, 1, 1], [1, 1], [1, 1]);
+        let out = gb
+            .emit_conv2d(&input, &weight, None, [1, 1, 1, 1], [1, 1], [1, 1])
+            .expect("emit_conv2d");
         assert_eq!(out.shape(), vec![Some(1), Some(1), Some(4), Some(4)]);
         let graph = gb.compile(&[&out]).expect("compile conv2d_with_padding");
 
@@ -3399,7 +3408,9 @@ mod tests {
         let ctx = GraphContext::new();
         let mut gb = ctx.builder();
         let input = gb.input(&[Some(1), Some(1), Some(4), Some(4)], DType::F32);
-        let out = gb.emit_max_pool2d(&input, [2, 2], [0, 0, 0, 0], [2, 2], [1, 1]);
+        let out = gb
+            .emit_max_pool2d(&input, [2, 2], [0, 0, 0, 0], [2, 2], [1, 1])
+            .expect("emit_max_pool2d");
         assert_eq!(out.shape(), vec![Some(1), Some(1), Some(2), Some(2)]);
         let graph = gb.compile(&[&out]).expect("compile max_pool2d_basic");
 

@@ -392,7 +392,19 @@ impl<'c> GraphBuilder<'c> {
         let mut builder = OperationBuilder::new(body_op, self.location)
             .add_operands(&[a, b])
             .add_results(&[elem_type]);
-        if body_op.ends_with('f') {
+        if matches!(
+            body_op,
+            "arith.addf"
+                | "arith.subf"
+                | "arith.mulf"
+                | "arith.divf"
+                | "arith.maximumf"
+                | "arith.minimumf"
+                | "math.powf"
+                | "math.expf"
+                | "math.sqrtf"
+                | "math.absf"
+        ) {
             // Float arith ops: enable FMA contraction.
             let (id, val) = self.fastmath_contract_attr();
             builder = builder.add_attributes(&[(id, val)]);

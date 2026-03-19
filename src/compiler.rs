@@ -24,6 +24,8 @@ pub enum CompileError {
     ObjectEmit(String),
     /// Failed to link the object file into a shared library.
     Link(String),
+    /// Shape constraint violated or unsupported shape configuration.
+    Shape(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -35,6 +37,7 @@ impl std::fmt::Display for CompileError {
             Self::AttributeParse(s) => write!(f, "failed to parse MLIR attribute: {s}"),
             Self::ObjectEmit(s) => write!(f, "object emit failed: {s}"),
             Self::Link(s) => write!(f, "link failed: {s}"),
+            Self::Shape(s) => write!(f, "shape error: {s}"),
         }
     }
 }
@@ -222,7 +225,6 @@ fn emit_object_files_impl(
     use llvm_sys::bit_writer::LLVMWriteBitcodeToMemoryBuffer;
     use llvm_sys::core::*;
     use llvm_sys::target::*;
-    use std::ffi::CString;
     use std::sync::OnceLock;
 
     unsafe {
@@ -245,13 +247,6 @@ fn emit_object_files_impl(
             translate_start.elapsed().as_millis()
         );
 
-        if !llvm_module.is_null() {
-            let dl = CString::new(
-                "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
-            )
-            .unwrap();
-            LLVMSetDataLayout(llvm_module, dl.as_ptr());
-        }
         if llvm_module.is_null() {
             LLVMContextDispose(llvm_ctx);
             return Err(CompileError::ObjectEmit(
@@ -305,7 +300,6 @@ fn emit_object_files_impl(
             };
             log_compile!(label, "monolithic: {n_funcs} func, {}KB", bc_size / 1024);
             let obj_path = output_dir.join(format!("{base_name}.o"));
-            internalize_module(llvm_module, func_name);
             optimise_and_emit(llvm_module, llvm_ctx, &obj_path, "O2")?;
             return Ok(vec![obj_path]);
         }
@@ -386,8 +380,10 @@ fn emit_object_files_impl(
                                 "partition {i}: failed to parse bitcode"
                             )));
                         }
-                        // O3 for small partitions, O2 for large ones
-                        // (O3 is superlinear in IR size)
+                        // O3 for partitions under 50KB of bitcode, O2 for larger ones.
+                        // O3 compile time is superlinear in IR size; for small per-kernel
+                        // partitions (~1 function each) O3 is always fast and beneficial.
+                        // The 50KB threshold is empirical: GPT-2's largest kernel is ~40KB.
                         let bc_bytes = bc.len();
                         let opt = if bc_bytes < 50_000 { "O3" } else { "O2" };
                         match optimise_and_emit(part_module, ctx, obj_path, opt) {
@@ -524,7 +520,7 @@ unsafe fn emit_packed_wrapper(
         let packed_name = CString::new(format!("_mlir__mlir_ciface_{func_name}")).unwrap();
         let wrapper_fn = LLVMAddFunction(llvm_module, packed_name.as_ptr(), wrapper_fn_ty);
 
-        // Set internal linkage so the optimiser can inline it.
+        // External linkage so the wrapper is visible for dlsym.
         LLVMSetLinkage(wrapper_fn, llvm_sys::LLVMLinkage::LLVMExternalLinkage);
 
         // Build the function body.

@@ -15,9 +15,12 @@ Models are downloaded and cached automatically from HuggingFace Hub.
 ```sh
 homura chat Qwen/Qwen2.5-0.5B
 homura chat Qwen/Qwen2.5-0.5B --system "You are a pirate." --max-tokens 500
+homura chat Qwen/Qwen3-0.6B --think              # enable thinking/reasoning output
 ```
 
 Multi-turn conversation with persistent KV cache across turns. Chat templates are loaded from `tokenizer_config.json` via minijinja, so any HF model's chat format works out of the box. Type `/help` for REPL commands.
+
+The `--think` flag enables styled thinking output for reasoning models like Qwen3 -- think blocks are rendered in gray italic. Without the flag, think blocks are suppressed via `/no_think` in the system prompt.
 
 ### ONNX model inference
 
@@ -35,6 +38,7 @@ let outputs = model.run(&[&input]).unwrap();  // Vec<Buffer>
 homura run Qwen/Qwen2.5-0.5B --prompt "Hello" --max-tokens 50   # HF model by name
 homura run ./my-model/ --prompt "Hello" --max-tokens 50          # local HF model
 homura chat Qwen/Qwen2.5-0.5B                                   # interactive chat
+homura chat Qwen/Qwen3-0.6B --think                             # chat with thinking
 homura run model.onnx                                            # ONNX inference
 homura run model.onnx --input data.bin --shape 1,1,28,28
 homura info model.onnx                                           # inspect model graph
@@ -75,6 +79,7 @@ cargo build
 ```sh
 cargo run -- run Qwen/Qwen2.5-0.5B --prompt "Hello" --max-tokens 20
 cargo run -- chat Qwen/Qwen2.5-0.5B
+cargo run -- chat Qwen/Qwen3-0.6B --think
 cargo run --example onnx_mnist                                   # MNIST digit classification
 cargo run --example onnx_resnet                                  # ResNet-18 image classification
 cargo run -- clean-cache                                         # clear compilation cache
@@ -98,7 +103,7 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 - **HuggingFace Hub**: Download models by name (`Qwen/Qwen2.5-0.5B`), cached locally
 - **ONNX ops**: Conv2d, MatMul, Gemm, BatchNorm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, MaxPool, GlobalAvgPool, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Squeeze, Unsqueeze, Where, Cast, Shape, ConstantOfShape, Range, and more
 - **HF architectures**: Decoder-only transformers with RoPE (Qwen2, Qwen3, and compatible architectures). QK-norm support for Qwen3. Config auto-detection from `config.json`.
-- **Chat mode**: Interactive multi-turn REPL with persistent KV cache across turns, Jinja2 chat template rendering via minijinja
+- **Chat mode**: Interactive multi-turn REPL with persistent KV cache, Jinja2 chat template rendering via minijinja, think block support for reasoning models (--think flag)
 - **Compilation**: Per-kernel MLIR (linalg dialect) -> LLVM, parallel via rayon, cached on disk
 - **Tiling**: Adaptive OpenMP-parallel tiling for matmuls, scaled to available cores
 - **Vectorization**: LLVM auto-vectorization of tiled scalar loops to AVX-512 FMA

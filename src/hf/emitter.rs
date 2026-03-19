@@ -648,7 +648,6 @@ fn emit_qkv_kernel(
 
     let func_name = format!("k{kernel_idx}");
     // h, ln_w, q_w, [q_b], k_w, [k_b], v_w, [v_b], cos, sin, [q_norm_w, k_norm_w]
-    let num_in = if has_bias { 11 } else { 8 } + if has_qk_norm { 2 } else { 0 };
     let (mlir_text, num_inputs, output_descs) = gb.finalize_to_mlir_named(
         &[&q_rope, &k_bhsd, &v_bhsd],
         TransformMode::VectorizeOnly,
@@ -660,7 +659,7 @@ fn emit_qkv_kernel(
         num_inputs,
         output_descs,
         group_idx: kernel_idx,
-        num_in,
+        num_in: num_inputs,
         num_out: 3,
         ops_label: if has_qk_norm {
             "QKV+QKNorm+RoPE".into()
@@ -709,9 +708,11 @@ fn emit_attention_kernel(
     // Transpose Q from BSHD to BHSD: [1, seq, num_heads, head_dim] -> [1, num_heads, seq, head_dim]
     let q_bhsd = gb.emit_transpose(&q, &[0, 2, 1, 3]);
 
-    // GQA: expand K and V heads if needed
-    // K is [1, kv_heads, total_seq, head_dim], need [1, num_heads, total_seq, head_dim]
-    // Transpose K to BSHD first for repeat_kv, then back to BHSD
+    // GQA: expand K and V heads if needed.
+    // K is [1, kv_heads, total_seq, head_dim], need [1, num_heads, total_seq, head_dim].
+    // TODO: emit_repeat_kv works in BSHD layout, so we transpose BHSD->BSHD, repeat,
+    // then transpose back. A BHSD-native repeat_kv would eliminate two transposes and
+    // save O(kv_heads * seq * head_dim * gqa_repeat) bandwidth.
     let k_bshd = gb.emit_transpose(&k, &[0, 2, 1, 3]); // [1, total_seq, kv_heads, head_dim]
     let k_expanded = gb.emit_repeat_kv(&k_bshd, gqa_repeat); // [1, total_seq, num_heads, head_dim]
     let k_bhsd = gb.emit_transpose(&k_expanded, &[0, 2, 1, 3]); // [1, num_heads, total_seq, head_dim]
@@ -982,7 +983,11 @@ pub fn emit_transformer_plan(
     }
 
     // --- LM head kernel ---
-    let last_hidden = layout.layers.last().unwrap().hidden_out_slot;
+    let last_hidden = layout
+        .layers
+        .last()
+        .ok_or_else(|| CompileError::Shape("transformer has no layers".into()))?
+        .hidden_out_slot;
     emit_results.push(emit_lm_head_kernel(config, kernel_idx)?);
     steps.push(KernelStep::kernel(
         kernel_idx,
