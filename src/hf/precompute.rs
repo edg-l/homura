@@ -107,18 +107,25 @@ mod tests {
         // theta=10000, head_dim=4, max_seq_len=3
         // freq[0] = 1/10000^(0/4) = 1.0
         // freq[1] = 1/10000^(2/4) = 1/100 = 0.01
-        // cos[pos=0] = [cos(0), cos(0)] = [1.0, 1.0]
-        // cos[pos=1] = [cos(1.0), cos(0.01)] = [0.5403, 0.99995]
+        //
+        // Output shape: [seq_len, head_dim] with HF rotate_half convention:
+        // each row is [cos0, cos1, cos0, cos1] (first half duplicated in second half)
         let (cos, sin) = precompute_rope_cos_sin(4, 3, 10_000.0);
-        assert_eq!(cos.shape().0, vec![3, 2]);
+        assert_eq!(cos.shape().0, vec![3, 4]);
         let cos_data = cos.as_slice::<f32>();
-        assert!((cos_data[0] - 1.0).abs() < 1e-5); // pos=0, i=0
-        assert!((cos_data[1] - 1.0).abs() < 1e-5); // pos=0, i=1
-        assert!((cos_data[2] - 0.5403023).abs() < 1e-4); // pos=1, i=0
-        assert!((cos_data[3] - 0.99995).abs() < 1e-4); // pos=1, i=1
+        // pos=0: [cos(0), cos(0), cos(0), cos(0)] = [1, 1, 1, 1]
+        assert!((cos_data[0] - 1.0).abs() < 1e-5);
+        assert!((cos_data[1] - 1.0).abs() < 1e-5);
+        assert_eq!(cos_data[0], cos_data[2]); // duplicated
+        assert_eq!(cos_data[1], cos_data[3]);
+        // pos=1: [cos(1.0), cos(0.01), cos(1.0), cos(0.01)]
+        assert!((cos_data[4] - 0.5403023).abs() < 1e-4);
+        assert!((cos_data[5] - 0.99995).abs() < 1e-4);
+        assert_eq!(cos_data[4], cos_data[6]);
+        assert_eq!(cos_data[5], cos_data[7]);
         let sin_data = sin.as_slice::<f32>();
         assert!((sin_data[0]).abs() < 1e-5); // pos=0 => sin(0)
-        assert!((sin_data[2] - 0.8414709).abs() < 1e-4); // pos=1, i=0 => sin(1.0)
+        assert!((sin_data[4] - 0.8414709).abs() < 1e-4); // pos=1, i=0 => sin(1.0)
     }
 
     #[test]
@@ -154,16 +161,18 @@ mod tests {
     #[test]
     fn slice_rope() {
         let (full_cos, full_sin) = precompute_rope_cos_sin(4, 10, 10_000.0);
-        // Slice positions [3, 7]
+        // Slice positions [3, 7] -- output shape [2, head_dim=4]
         let (cos, _sin) = slice_rope_for_positions(&full_cos, &full_sin, &[3, 7]);
-        assert_eq!(cos.shape().0, vec![2, 2]);
+        assert_eq!(cos.shape().0, vec![2, 4]);
         let full_cos_data = full_cos.as_slice::<f32>();
         let cos_data = cos.as_slice::<f32>();
         // Row 0 should match position 3 in full table
-        assert_eq!(cos_data[0], full_cos_data[3 * 2]);
-        assert_eq!(cos_data[1], full_cos_data[3 * 2 + 1]);
+        for i in 0..4 {
+            assert_eq!(cos_data[i], full_cos_data[3 * 4 + i]);
+        }
         // Row 1 should match position 7
-        assert_eq!(cos_data[2], full_cos_data[7 * 2]);
-        assert_eq!(cos_data[3], full_cos_data[7 * 2 + 1]);
+        for i in 0..4 {
+            assert_eq!(cos_data[4 + i], full_cos_data[7 * 4 + i]);
+        }
     }
 }

@@ -37,8 +37,9 @@ fn qwen2_compile_and_forward() {
     let outputs = model.run(&input_ids).expect("forward pass failed");
     eprintln!("forward pass in {:.2}s", t1.elapsed().as_secs_f64());
 
-    // Should produce logits [1, 3, vocab_size]
-    assert_eq!(outputs.len(), 1);
+    // Should produce logits [1, 3, vocab_size] + KV cache outputs (2 per layer).
+    let expected_outputs = 1 + config.num_hidden_layers * 2;
+    assert_eq!(outputs.len(), expected_outputs);
     let logits = &outputs[0];
     assert_eq!(logits.shape().0, vec![1, 3, config.vocab_size as u64]);
 }
