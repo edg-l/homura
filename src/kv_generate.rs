@@ -245,17 +245,26 @@ impl UnifiedKvGenerator {
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut rng = Rng::from_optional_seed(sampling.seed);
         let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
+        let verbose = crate::log::enabled(crate::log::Level::Debug);
+        let use_stdout = atty::is(atty::Stream::Stdout);
 
         if next_token == self.config.eos_token_id {
             log_info!("EOS after prefill");
             return String::new();
         }
         generated_ids.push(next_token);
-        let token_display = escape_token_text(&self.tokenizer.decode(&[next_token]));
-        eprintln!(
-            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
-             {DIM}(prefill){RESET}"
-        );
+        let token_text = self.tokenizer.decode(&[next_token]);
+        if use_stdout {
+            print!("{token_text}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if verbose {
+            let token_display = escape_token_text(&token_text);
+            eprintln!(
+                "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
+                 {DIM}(prefill){RESET}"
+            );
+        }
 
         // Decode loop
         for step in 1..max_new_tokens {
@@ -280,17 +289,24 @@ impl UnifiedKvGenerator {
 
             let step_elapsed = step_start.elapsed();
             decode_times.push(step_elapsed);
-            let tok_s = 1.0 / step_elapsed.as_secs_f64();
-            let token_display = escape_token_text(&self.tokenizer.decode(&[next_token]));
-            eprintln!(
-                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
-                 {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
-                step + 1,
-                step_elapsed.as_secs_f64() * 1000.0,
-            );
+
+            let token_text = self.tokenizer.decode(&[next_token]);
+            if use_stdout {
+                print!("{token_text}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            if verbose {
+                let tok_s = 1.0 / step_elapsed.as_secs_f64();
+                let token_display = escape_token_text(&token_text);
+                eprintln!(
+                    "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
+                     {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
+                    step + 1,
+                    step_elapsed.as_secs_f64() * 1000.0,
+                );
+            }
 
             if next_token == self.config.eos_token_id {
-                log_info!("EOS token reached");
                 break;
             }
             generated_ids.push(next_token);
@@ -316,6 +332,9 @@ impl UnifiedKvGenerator {
             }
         }
 
+        if use_stdout {
+            println!();
+        }
         let prefill_time = std::time::Duration::from_secs_f64(prefill_s);
         let stats = GenerationStats {
             prompt_tokens: token_ids.len(),
@@ -325,7 +344,7 @@ impl UnifiedKvGenerator {
             seed: sampling.seed,
         };
         eprintln!(
-            "  {BOLD_MAGENTA}── done ──{RESET} {}",
+            "\n  {BOLD_MAGENTA}── done ──{RESET} {}",
             stats.format_summary()
         );
 
