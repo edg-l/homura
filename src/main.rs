@@ -101,6 +101,19 @@ enum Commands {
 }
 
 fn main() {
+    // Register an atexit handler that calls _exit() to skip C++ global
+    // destructors. LLVM has a static initialization order fiasco
+    // (llvm/llvm-project#154528) that causes double-free/segfault during
+    // __cxa_finalize when MLIR dialects have been loaded. This catches
+    // all exit paths including clap's --help/--version which call
+    // std::process::exit() before we reach our own _exit().
+    extern "C" fn force_exit() {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        unsafe { libc::_exit(0) }
+    }
+    unsafe { libc::atexit(force_exit) };
+
     let cli = Cli::parse();
     if cli.verbose {
         log::set_level(log::Level::Debug);
@@ -112,10 +125,6 @@ fn main() {
             1
         }
     };
-    // Flush output before exiting. We use libc::_exit() to skip global C++
-    // destructors — LLVM has a static initialization order fiasco
-    // (llvm/llvm-project#154528) that causes segfaults during __cxa_finalize
-    // when MLIR dialects have been loaded.
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
     unsafe { libc::_exit(code) }
