@@ -743,8 +743,11 @@ fn emit_mlp_kernel(
     let out = gb.emit_add(&residual, &down);
 
     let func_name = format!("k{kernel_idx}");
+    // Smallest matmul N in MLP: min(intermediate, hidden) for down projection.
+    let min_n = hidden.min(intermediate) as usize;
+    let mode = TransformMode::tile_parallel_adaptive(min_n);
     let (mlir_text, num_inputs, output_descs) =
-        gb.finalize_to_mlir_named(&[&out], TransformMode::TileParallel, &func_name)?;
+        gb.finalize_to_mlir_named(&[&out], mode, &func_name)?;
 
     Ok(KernelEmitResult {
         mlir_text,
@@ -781,8 +784,9 @@ fn emit_lm_head_kernel(
     let logits = gb.emit_matmul(&normed, &lm_head_w);
 
     let func_name = format!("k{kernel_idx}");
+    let mode = TransformMode::tile_parallel_adaptive(vocab as usize);
     let (mlir_text, num_inputs, output_descs) =
-        gb.finalize_to_mlir_named(&[&logits], TransformMode::TileParallel, &func_name)?;
+        gb.finalize_to_mlir_named(&[&logits], mode, &func_name)?;
 
     Ok(KernelEmitResult {
         mlir_text,

@@ -2376,7 +2376,17 @@ pub fn emit_and_compile_plan(
                         })
                         .is_some_and(|n| n > 256);
                     if is_gemm || has_large_static_n {
-                        crate::graph_builder::TransformMode::TileParallel
+                        // Use the static N dimension if available for adaptive tiling.
+                        let static_n = node
+                            .inputs
+                            .get(1)
+                            .and_then(|inp| {
+                                shape_info
+                                    .get(inp)
+                                    .and_then(|info| info.shape.last().copied().flatten())
+                            })
+                            .unwrap_or(768) as usize;
+                        crate::graph_builder::TransformMode::tile_parallel_adaptive(static_n)
                     } else {
                         crate::graph_builder::TransformMode::VectorizeOnly
                     }

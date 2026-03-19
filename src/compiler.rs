@@ -1364,6 +1364,7 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
     context: &'c Context,
     module: &Module<'c>,
     location: Location<'c>,
+    n_tile: usize,
 ) {
     let any_op_type =
         melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
@@ -1498,23 +1499,23 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
     ));
 
     // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
-    // 3D matmul (M, N, K): forall N=256 (parallel), for K=16 only.
-    // N=256 gives good thread distribution: N=768→3 tiles, N=3072→12 tiles,
-    // N=50257→197 tiles. K is the only inner tile — N streams contiguously
-    // within each forall chunk for optimal M=1 vector-matrix multiply.
+    // 3D matmul (M, N, K): forall N=n_tile (parallel), for K=16 only.
+    // n_tile is chosen per-kernel to ensure enough tiles for available cores.
+    let forall_3d = format!("array<i64: 0, {n_tile}, 0>");
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_3d",
-        "array<i64: 0, 256, 0>", // forall: tile N=256, skip M and K
+        &forall_3d, // forall: tile N=n_tile, skip M and K
         "array<i1: false, false, false>",
         "array<i64: 0, 0, 16>", // for: tile K=16 only, N streams freely
         "array<i1: false, false, false>",
         1, // 1 non-zero for-tile dim (K)
     ));
     // ── @tile_parallel_contraction_4d ─────────────────────────────────────────
-    // 4D batched matmul (B, M, N, K): forall N=256 (parallel), for K=16.
+    // 4D batched matmul (B, M, N, K): forall N=n_tile (parallel), for K=16.
+    let forall_4d = format!("array<i64: 0, 0, {n_tile}, 0>");
     module.body().append_operation(build_tile_parallel_seq(
         "tile_parallel_contraction_4d",
-        "array<i64: 0, 0, 256, 0>", // forall: tile N=256, skip B, M, K
+        &forall_4d, // forall: tile N=n_tile, skip B, M, K
         "array<i1: false, false, false, false>",
         "array<i64: 0, 0, 0, 16>", // for: tile K=16 only
         "array<i1: false, false, false, false>",

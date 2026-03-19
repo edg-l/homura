@@ -41,7 +41,28 @@ pub enum TransformMode {
     /// Tile + OpenMP parallel on N for large-N matmuls (e.g. LM head 768×50257).
     /// Uses forall on N for multi-threaded memory bandwidth, inner for on N+K
     /// for LLVM auto-vectorization. No MLIR vectorize/pad/outline.
-    TileParallel,
+    /// The `n_tile` field controls the forall tile size on the N dimension.
+    TileParallel { n_tile: usize },
+}
+
+impl TransformMode {
+    /// Choose a TileParallel mode with an adaptive forall tile size.
+    ///
+    /// Given the smallest N dimension across matmuls in the kernel, picks
+    /// a tile size that produces at least `available_parallelism` tiles,
+    /// rounded down to a power of two (for clean division), clamped to [16, 256].
+    pub fn tile_parallel_adaptive(min_n: usize) -> Self {
+        let num_cores = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(8);
+        // Target at least 1.5× cores worth of tiles for good load balancing.
+        let target_tiles = num_cores + num_cores / 2;
+        let ideal = min_n / target_tiles;
+        // Round down to power of two, clamp to [16, 256].
+        let n_tile = ideal.next_power_of_two() >> 1; // round down
+        let n_tile = n_tile.max(16).min(256);
+        TransformMode::TileParallel { n_tile }
+    }
 }
 
 // ── Tensor wrapper ────────────────────────────────────────────────────────────
@@ -1161,13 +1182,13 @@ impl<'c> GraphBuilder<'c> {
                     .set_attribute("homura.vectorize_only", Attribute::unit(context));
                 crate::compiler::build_vectorize_only_schedule(context, &module, location);
             }
-            TransformMode::TileParallel => {
+            TransformMode::TileParallel { n_tile } => {
                 // Uses the Full pipeline (with OpenMP) but a simpler schedule
                 // (forall + for, no pad/outline/vectorize).
                 module
                     .as_operation_mut()
                     .set_attribute("transform.with_named_sequence", Attribute::unit(context));
-                crate::compiler::build_tile_parallel_schedule(context, &module, location);
+                crate::compiler::build_tile_parallel_schedule(context, &module, location, n_tile);
             }
             TransformMode::None => {}
         }
