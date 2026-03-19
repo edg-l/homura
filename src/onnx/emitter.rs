@@ -1893,50 +1893,20 @@ struct ValueShapeInfo {
     dtype: DType,
 }
 
-/// Emit and compile all kernels, producing an ExecutionPlan.
-///
-/// Each kernel group gets its own `GraphContext` + `GraphBuilder`, so MLIR
-/// passes and codegen run on small independent modules.
-pub fn emit_and_compile_plan(
+/// Shape state seeded from model inputs and weights, used during kernel emission.
+struct ShapeState {
+    shape_info: HashMap<String, ValueShapeInfo>,
+    const_i64: HashMap<String, Vec<i64>>,
+    sym_shape_info: HashMap<String, crate::shape::SymShape>,
+    sym_const_i64: HashMap<String, Vec<crate::shape::SymDim>>,
+}
+
+fn seed_shape_state(
     model: &OnnxModel,
     inputs: &[&Buffer],
-    _model_bytes: Option<&[u8]>,
     keep_dynamic: &HashSet<String>,
-) -> Result<(crate::runtime::ExecutionPlan, Vec<Buffer>), OnnxError> {
-    use crate::Shape;
-    use crate::graph_builder::GraphContext;
-    use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
+) -> ShapeState {
     use crate::shape::DIM_DYNAMIC;
-
-    let mut groups = partition_nodes(&model.nodes);
-    let gemm_residual_fusions = detect_and_absorb_gemm_residual(&model.nodes, &mut groups);
-    if !gemm_residual_fusions.is_empty() {
-        log_compile!("plan", "fused {} Gemm+residual Add pairs", gemm_residual_fusions.len());
-    }
-    let (groups, kv_concat_node_indices, kv_concat_ordered) =
-        split_kv_concat_groups(&model.nodes, groups);
-    if !kv_concat_node_indices.is_empty() {
-        log_compile!("plan", "split {} KV Concat nodes into native ops", kv_concat_node_indices.len());
-    }
-
-    let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
-        assign_buffer_slots(model, &groups);
-
-    // KV Concat node indices (used to identify KV vs normal Concat steps).
-    let kv_concat_meta: HashSet<usize> = kv_concat_ordered.iter().copied().collect();
-
-    // Build model input name set for identifying "past" KV inputs.
-    let model_input_names: HashSet<&str> = model
-        .dynamic_inputs
-        .iter()
-        .map(|inp| inp.name.as_str())
-        .collect();
-
-    // Track past_kv input slots and present_kv output slots for KvPlanInfo.
-    let mut past_kv_input_slots: Vec<usize> = Vec::new();
-    let mut present_kv_output_slots: Vec<usize> = Vec::new();
-
-    log_compile!("plan", "{} nodes → {} kernels, {} buffer slots", model.nodes.len(), groups.len(), num_slots);
 
     // Seed shape info from model inputs.
     let mut shape_info: HashMap<String, ValueShapeInfo> = HashMap::new();
@@ -2034,21 +2004,230 @@ pub fn emit_and_compile_plan(
                 }
     }
 
+    ShapeState {
+        shape_info,
+        const_i64,
+        sym_shape_info,
+        sym_const_i64,
+    }
+}
+
+/// Metadata produced by emitting a single kernel, deferred for parallel compilation.
+struct KernelEmitResult {
+    mlir_text: String,
+    num_inputs: usize,
+    output_descs: Vec<crate::runtime::OutputDesc>,
+    group_idx: usize,
+    num_in: usize,
+    num_out: usize,
+    ops_label: String,
+}
+
+/// Compile all emitted kernels in parallel, link into a unified .so, dlopen it,
+/// and return the loaded `CompiledGraph` handles together with the raw lib handle.
+fn compile_and_link_kernels(
+    emit_results: &[KernelEmitResult],
+) -> Result<(Vec<crate::runtime::CompiledGraph>, *mut libc::c_void), OnnxError> {
+    log_compile!("plan", "compiling {} kernels in parallel...", emit_results.len());
+    let compile_start = std::time::Instant::now();
+
+    // Phase 2a: Compile each kernel to .o files in parallel (no linking yet).
+    let tmp_dir = crate::graph_builder::tempfile_dir()
+        .ok_or_else(|| OnnxError::CompileError("cannot determine temp directory".into()))?;
+
+    let all_obj_paths: Vec<(usize, Vec<std::path::PathBuf>)> = {
+        use rayon::prelude::*;
+        let results: Vec<Result<(usize, Vec<std::path::PathBuf>), OnnxError>> = emit_results
+            .par_iter()
+            .map(|er| {
+                let t0 = std::time::Instant::now();
+                let func_name = format!("k{}", er.group_idx);
+                let label = format!("k{}:{}", er.group_idx, er.ops_label);
+                let obj_paths = crate::graph_builder::compile_to_objects(
+                    &er.mlir_text,
+                    &label,
+                    &func_name,
+                    &tmp_dir,
+                )
+                .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
+                log_compile!(
+                    "plan",
+                    "k{} [{}] ({} in / {} out): {}ms",
+                    er.group_idx,
+                    er.ops_label,
+                    er.num_in,
+                    er.num_out,
+                    t0.elapsed().as_millis()
+                );
+                Ok((er.group_idx, obj_paths))
+            })
+            .collect();
+        results.into_iter().collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Phase 2b: Link all .o files into a single .so.
+    let link_start = std::time::Instant::now();
+    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let unified_so = tmp_dir.join(format!(
+        "homura_unified_{}_{:08x}.so",
+        std::process::id(),
+        nanos
+    ));
+    crate::compiler::link_shared_lib_pub(&all_objs, &unified_so)
+        .map_err(|e| OnnxError::CompileError(format!("unified link: {e}")))?;
+    log_compile!("plan", "unified link ({} .o files): {}ms", all_objs.len(), link_start.elapsed().as_millis());
+
+    // Clean up .o files.
+    for p in &all_objs {
+        std::fs::remove_file(p).ok();
+    }
+
+    // Phase 2c: dlopen once, dlsym each kernel.
+    let lib = {
+        use std::ffi::CString;
+        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
+        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
+        if lib.is_null() {
+            let err = unsafe {
+                let msg = libc::dlerror();
+                if msg.is_null() {
+                    "unknown dlopen error".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+                }
+            };
+            return Err(OnnxError::CompileError(format!(
+                "dlopen unified .so failed: {err}"
+            )));
+        }
+        lib
+    };
+
+    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
+        .iter()
+        .map(|er| {
+            let func_name = format!("k{}", er.group_idx);
+            crate::runtime::CompiledGraph::load_from_handle(
+                lib,
+                er.num_inputs,
+                er.output_descs.clone(),
+                &func_name,
+            )
+            .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Clean up the .so file (it's already dlopen'd).
+    std::fs::remove_file(&unified_so).ok();
+
+    log_compile!("plan", "all {} kernels compiled + linked: {}ms total", kernels.len(), compile_start.elapsed().as_millis());
+
+    Ok((kernels, lib))
+}
+
+/// Build KV plan metadata from the KV Concat nodes detected during partitioning.
+fn build_kv_plan_info(
+    model: &OnnxModel,
+    kv_concat_ordered: &[usize],
+    model_input_names: &HashSet<&str>,
+    shape_info: &HashMap<String, ValueShapeInfo>,
+    past_kv_input_slots: Vec<usize>,
+    present_kv_output_slots: Vec<usize>,
+) -> crate::runtime::KvPlanInfo {
+    assert_eq!(
+        kv_concat_ordered.len() % 2,
+        0,
+        "expected even number of KV Concat nodes (K+V pairs)"
+    );
+    let num_layers = kv_concat_ordered.len() / 2;
+
+    // Extract num_heads and head_dim from the first KV Concat's new input shape.
+    let first_node = &model.nodes[kv_concat_ordered[0]];
+    let new_input_name = if model_input_names.contains(first_node.inputs[0].as_str()) {
+        &first_node.inputs[1]
+    } else {
+        &first_node.inputs[0]
+    };
+    let new_info = shape_info
+        .get(new_input_name)
+        .expect("no shape info for KV Concat new input");
+    // Shape: [1, num_heads, 1, head_dim]
+    let num_heads = new_info.shape[1].expect("KV num_heads must be static") as usize;
+    let head_dim = new_info.shape[3].expect("KV head_dim must be static") as usize;
+
+    crate::runtime::KvPlanInfo {
+        num_layers,
+        num_heads,
+        head_dim,
+        past_kv_input_slots,
+        present_kv_output_slots,
+    }
+}
+
+/// Emit and compile all kernels, producing an ExecutionPlan.
+///
+/// Each kernel group gets its own `GraphContext` + `GraphBuilder`, so MLIR
+/// passes and codegen run on small independent modules.
+pub fn emit_and_compile_plan(
+    model: &OnnxModel,
+    inputs: &[&Buffer],
+    _model_bytes: Option<&[u8]>,
+    keep_dynamic: &HashSet<String>,
+) -> Result<(crate::runtime::ExecutionPlan, Vec<Buffer>), OnnxError> {
+    use crate::Shape;
+    use crate::graph_builder::GraphContext;
+    use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
+    use crate::shape::DIM_DYNAMIC;
+
+    let mut groups = partition_nodes(&model.nodes);
+    let gemm_residual_fusions = detect_and_absorb_gemm_residual(&model.nodes, &mut groups);
+    if !gemm_residual_fusions.is_empty() {
+        log_compile!("plan", "fused {} Gemm+residual Add pairs", gemm_residual_fusions.len());
+    }
+    let (groups, kv_concat_node_indices, kv_concat_ordered) =
+        split_kv_concat_groups(&model.nodes, groups);
+    if !kv_concat_node_indices.is_empty() {
+        log_compile!("plan", "split {} KV Concat nodes into native ops", kv_concat_node_indices.len());
+    }
+
+    let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
+        assign_buffer_slots(model, &groups);
+
+    // KV Concat node indices (used to identify KV vs normal Concat steps).
+    let kv_concat_meta: HashSet<usize> = kv_concat_ordered.iter().copied().collect();
+
+    // Build model input name set for identifying "past" KV inputs.
+    let model_input_names: HashSet<&str> = model
+        .dynamic_inputs
+        .iter()
+        .map(|inp| inp.name.as_str())
+        .collect();
+
+    // Track past_kv input slots and present_kv output slots for KvPlanInfo.
+    let mut past_kv_input_slots: Vec<usize> = Vec::new();
+    let mut present_kv_output_slots: Vec<usize> = Vec::new();
+
+    log_compile!("plan", "{} nodes → {} kernels, {} buffer slots", model.nodes.len(), groups.len(), num_slots);
+
+    let ShapeState {
+        mut shape_info,
+        mut const_i64,
+        mut sym_shape_info,
+        mut sym_const_i64,
+    } = seed_shape_state(model, inputs, keep_dynamic);
+
     // Collect weights in initializer order.
     let weights: Vec<Buffer> = model.initializers.iter().map(|(_, b)| b.clone()).collect();
 
     // Phase 1: Emit all kernels sequentially (shape propagation requires order).
     // Each kernel produces an MLIR module text + metadata for deferred compilation.
-    struct KernelEmitResult {
-        mlir_text: String,
-        num_inputs: usize,
-        output_descs: Vec<crate::runtime::OutputDesc>,
-        group_idx: usize,
-        num_in: usize,
-        num_out: usize,
-        ops_label: String,
-    }
-
     let mut emit_results: Vec<KernelEmitResult> = Vec::new();
     let mut steps: Vec<KernelStep> = Vec::new();
     let mut next_kernel_idx: usize = 0;
@@ -2358,106 +2537,7 @@ pub fn emit_and_compile_plan(
     );
 
     // Phase 2: Compile all kernels in parallel.
-    log_compile!("plan", "compiling {} kernels in parallel...", emit_results.len());
-    let compile_start = std::time::Instant::now();
-
-    // Phase 2a: Compile each kernel to .o files in parallel (no linking yet).
-    let tmp_dir = crate::graph_builder::tempfile_dir()
-        .ok_or_else(|| OnnxError::CompileError("cannot determine temp directory".into()))?;
-
-    let all_obj_paths: Vec<(usize, Vec<std::path::PathBuf>)> = {
-        use rayon::prelude::*;
-        let results: Vec<Result<(usize, Vec<std::path::PathBuf>), OnnxError>> = emit_results
-            .par_iter()
-            .map(|er| {
-                let t0 = std::time::Instant::now();
-                let func_name = format!("k{}", er.group_idx);
-                let label = format!("k{}:{}", er.group_idx, er.ops_label);
-                let obj_paths = crate::graph_builder::compile_to_objects(
-                    &er.mlir_text,
-                    &label,
-                    &func_name,
-                    &tmp_dir,
-                )
-                .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
-                log_compile!(
-                    "plan",
-                    "k{} [{}] ({} in / {} out): {}ms",
-                    er.group_idx,
-                    er.ops_label,
-                    er.num_in,
-                    er.num_out,
-                    t0.elapsed().as_millis()
-                );
-                Ok((er.group_idx, obj_paths))
-            })
-            .collect();
-        results.into_iter().collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Phase 2b: Link all .o files into a single .so.
-    let link_start = std::time::Instant::now();
-    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
-        .iter()
-        .flat_map(|(_, paths)| paths.iter().cloned())
-        .collect();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let unified_so = tmp_dir.join(format!(
-        "homura_unified_{}_{:08x}.so",
-        std::process::id(),
-        nanos
-    ));
-    crate::compiler::link_shared_lib_pub(&all_objs, &unified_so)
-        .map_err(|e| OnnxError::CompileError(format!("unified link: {e}")))?;
-    log_compile!("plan", "unified link ({} .o files): {}ms", all_objs.len(), link_start.elapsed().as_millis());
-
-    // Clean up .o files.
-    for p in &all_objs {
-        std::fs::remove_file(p).ok();
-    }
-
-    // Phase 2c: dlopen once, dlsym each kernel.
-    let lib = {
-        use std::ffi::CString;
-        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
-        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
-        if lib.is_null() {
-            let err = unsafe {
-                let msg = libc::dlerror();
-                if msg.is_null() {
-                    "unknown dlopen error".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
-                }
-            };
-            return Err(OnnxError::CompileError(format!(
-                "dlopen unified .so failed: {err}"
-            )));
-        }
-        lib
-    };
-
-    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
-        .iter()
-        .map(|er| {
-            let func_name = format!("k{}", er.group_idx);
-            crate::runtime::CompiledGraph::load_from_handle(
-                lib,
-                er.num_inputs,
-                er.output_descs.clone(),
-                &func_name,
-            )
-            .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Clean up the .so file (it's already dlopen'd).
-    std::fs::remove_file(&unified_so).ok();
-
-    log_compile!("plan", "all {} kernels compiled + linked: {}ms total", kernels.len(), compile_start.elapsed().as_millis());
+    let (kernels, lib) = compile_and_link_kernels(&emit_results)?;
 
     // Build slot descriptors.
     let slot_descs: Vec<SlotDesc> = slot_names
@@ -2494,35 +2574,16 @@ pub fn emit_and_compile_plan(
 
     // Attach KV cache info if KV Concats were detected.
     if !kv_concat_ordered.is_empty() {
-        assert_eq!(
-            kv_concat_ordered.len() % 2,
-            0,
-            "expected even number of KV Concat nodes (K+V pairs)"
-        );
-        let num_layers = kv_concat_ordered.len() / 2;
-
-        // Extract num_heads and head_dim from the first KV Concat's new input shape.
-        let first_node = &model.nodes[kv_concat_ordered[0]];
-        let new_input_name = if model_input_names.contains(first_node.inputs[0].as_str()) {
-            &first_node.inputs[1]
-        } else {
-            &first_node.inputs[0]
-        };
-        let new_info = shape_info
-            .get(new_input_name)
-            .expect("no shape info for KV Concat new input");
-        // Shape: [1, num_heads, 1, head_dim]
-        let num_heads = new_info.shape[1].expect("KV num_heads must be static") as usize;
-        let head_dim = new_info.shape[3].expect("KV head_dim must be static") as usize;
-
-        plan.set_kv_info(crate::runtime::KvPlanInfo {
-            num_layers,
-            num_heads,
-            head_dim,
+        let kv_info = build_kv_plan_info(
+            model,
+            &kv_concat_ordered,
+            &model_input_names,
+            &shape_info,
             past_kv_input_slots,
             present_kv_output_slots,
-        });
-        log_compile!("plan", "KV cache: {} layers, {} heads, head_dim={}", num_layers, num_heads, head_dim);
+        );
+        log_compile!("plan", "KV cache: {} layers, {} heads, head_dim={}", kv_info.num_layers, kv_info.num_heads, kv_info.head_dim);
+        plan.set_kv_info(kv_info);
     }
 
     Ok((plan, weights))
