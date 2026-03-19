@@ -32,7 +32,7 @@ const SUPPORTED_OPS: &[&str] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "homura", about = "ONNX inference with homura")]
+#[command(name = "homura", about = "Rust ML inference engine")]
 struct Cli {
     /// Show compilation progress (MLIR passes, kernel timing)
     #[arg(long, short, global = true)]
@@ -51,7 +51,7 @@ enum Commands {
     },
     /// Clear the compilation cache (~/.cache/homura/ or HOMURA_CACHE_DIR)
     CleanCache,
-    /// Run inference on an ONNX model
+    /// Run inference or text generation
     Run {
         /// Path to the ONNX model file or directory (for text generation)
         model: PathBuf,
