@@ -123,6 +123,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_qwen3_config_explicit_head_dim() {
+        let json = r#"{
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "vocab_size": 151936,
+            "head_dim": 128,
+            "rope_theta": 1000000,
+            "tie_word_embeddings": true,
+            "eos_token_id": 151645
+        }"#;
+
+        let config: TransformerConfig = serde_json::from_str(json).expect("parse failed");
+        assert_eq!(config.hidden_size, 1024);
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.kv_heads(), 8);
+        // head_dim is explicit 128, not hidden_size/num_heads = 64
+        assert_eq!(config.head_dim(), 128);
+        assert_eq!(config.gqa_repeat(), 2);
+        // Q dim = num_heads * head_dim = 2048 != hidden_size
+        assert_eq!(config.num_attention_heads * config.head_dim(), 2048);
+    }
+
+    #[test]
     fn load_real_qwen2_config() {
         let path = std::path::Path::new(concat!(
             env!("HOME"),
