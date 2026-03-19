@@ -648,11 +648,12 @@ fn emit_qkv_kernel(
 
     let func_name = format!("k{kernel_idx}");
     // h, ln_w, q_w, [q_b], k_w, [k_b], v_w, [v_b], cos, sin, [q_norm_w, k_norm_w]
-    let (mlir_text, num_inputs, output_descs) = gb.finalize_to_mlir_named(
-        &[&q_rope, &k_bhsd, &v_bhsd],
-        TransformMode::VectorizeOnly,
-        &func_name,
-    )?;
+    // Use TileParallel: matmul contractions get OpenMP forall tiling,
+    // non-contraction ops (RMSNorm, RoPE, QKNorm) pass through untiled.
+    let min_n = kv_dim.min(q_dim) as usize; // smallest matmul N dimension
+    let mode = TransformMode::tile_parallel_adaptive(min_n);
+    let (mlir_text, num_inputs, output_descs) =
+        gb.finalize_to_mlir_named(&[&q_rope, &k_bhsd, &v_bhsd], mode, &func_name)?;
 
     Ok(KernelEmitResult {
         mlir_text,
@@ -750,8 +751,11 @@ fn emit_attention_kernel(
     let out = gb.emit_matmul(&attn_flat, &o_w);
 
     let func_name = format!("k{kernel_idx}");
+    // Use TileParallel for O_proj matmul. The small attention matmuls (QK^T, AV)
+    // will also match but at decode seq_len they're 1 tile → negligible overhead.
+    let mode = TransformMode::tile_parallel_adaptive(hidden as usize);
     let (mlir_text, num_inputs, output_descs) =
-        gb.finalize_to_mlir_named(&[&out], TransformMode::VectorizeOnly, &func_name)?;
+        gb.finalize_to_mlir_named(&[&out], mode, &func_name)?;
 
     Ok(KernelEmitResult {
         mlir_text,
