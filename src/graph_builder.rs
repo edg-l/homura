@@ -1626,7 +1626,14 @@ impl<'c> GraphBuilder<'c> {
     }
 
     /// Emit a `linalg.generic` unary elementwise op (single-operand body op).
-    fn emit_linalg_unary(&mut self, body_op: &str, input: &Tensor<'c>) -> Tensor<'c> {
+    /// Emit a unary `linalg.generic` op. The `build_body` closure receives the
+    /// body block, the input element value, and the element type, and must
+    /// append ops to the block and return the result value to yield.
+    fn emit_linalg_unary_with_body(
+        &mut self,
+        input: &Tensor<'c>,
+        build_body: impl FnOnce(&Block, melior::ir::Value, melior::ir::Type),
+    ) -> Tensor<'c> {
         let shape = input.shape();
         let dtype = input.dtype();
         let rank = shape.len();
@@ -1649,24 +1656,10 @@ impl<'c> GraphBuilder<'c> {
         let iterator_types = self.make_iterator_types(rank);
 
         let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
-        let a: melior::ir::Value = body_block.argument(0).unwrap().into();
-        let op_result = body_block
-            .append_operation(
-                OperationBuilder::new(body_op, self.location)
-                    .add_operands(&[a])
-                    .add_results(&[elem_type])
-                    .build()
-                    .unwrap_or_else(|e| panic!("{body_op} in linalg body: {e}")),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        body_block.append_operation(
-            OperationBuilder::new("linalg.yield", self.location)
-                .add_operands(&[op_result])
-                .build()
-                .expect("linalg.yield"),
-        );
+        let x: melior::ir::Value = body_block.argument(0).unwrap().into();
+
+        build_body(&body_block, x, elem_type);
+
         let body_region = Region::new();
         body_region.append_block(body_block);
 
@@ -1700,293 +1693,163 @@ impl<'c> GraphBuilder<'c> {
         Tensor::from_value(result)
     }
 
+    fn emit_linalg_unary(&mut self, body_op: &str, input: &Tensor<'c>) -> Tensor<'c> {
+        let op_name = body_op.to_string();
+        let loc = self.location;
+        self.emit_linalg_unary_with_body(input, |block, x, elem_type| {
+            let op_result = block
+                .append_operation(
+                    OperationBuilder::new(&op_name, loc)
+                        .add_operands(&[x])
+                        .add_results(&[elem_type])
+                        .build()
+                        .unwrap_or_else(|e| panic!("{op_name} in linalg body: {e}")),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            block.append_operation(
+                OperationBuilder::new("linalg.yield", loc)
+                    .add_operands(&[op_result])
+                    .build()
+                    .expect("linalg.yield"),
+            );
+        })
+    }
+
     /// Integer negation via `0 - x` (arith has no negsi).
     fn emit_linalg_unary_int_neg(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
-        let shape = input.shape();
         let dtype = input.dtype();
-        let rank = shape.len();
-        let elem_type = dtype.to_mlir_type(self.context);
-
-        let dims_u64: Vec<u64> = shape
-            .iter()
-            .map(|d| match d {
-                Some(n) => *n,
-                None => i64::MIN as u64,
-            })
-            .collect();
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&dims_u64, elem_type, None).into();
-
-        let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
-        let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
-            .expect("indexing_maps");
-        let iterator_types = self.make_iterator_types(rank);
-
-        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
-        let x: melior::ir::Value = body_block.argument(0).unwrap().into();
-
-        // Emit zero constant of matching integer type.
-        let zero_attr = match dtype {
-            DType::I32 => Attribute::parse(self.context, "0 : i32"),
-            DType::I64 => Attribute::parse(self.context, "0 : i64"),
-            _ => unreachable!(),
-        }
-        .expect("zero constant");
-        let zero = body_block
-            .append_operation(
-                OperationBuilder::new("arith.constant", self.location)
-                    .add_results(&[elem_type])
-                    .add_attributes(&[(Identifier::new(self.context, "value"), zero_attr)])
+        let ctx = self.context;
+        let loc = self.location;
+        self.emit_linalg_unary_with_body(input, |block, x, elem_type| {
+            let zero_attr = match dtype {
+                DType::I32 => Attribute::parse(ctx, "0 : i32"),
+                DType::I64 => Attribute::parse(ctx, "0 : i64"),
+                _ => unreachable!(),
+            }
+            .expect("zero constant");
+            let zero: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.constant", loc)
+                        .add_results(&[elem_type])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), zero_attr)])
+                        .build()
+                        .expect("arith.constant zero"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let neg: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.subi", loc)
+                        .add_operands(&[zero, x])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.subi"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            block.append_operation(
+                OperationBuilder::new("linalg.yield", loc)
+                    .add_operands(&[neg])
                     .build()
-                    .expect("arith.constant zero"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-
-        let neg = body_block
-            .append_operation(
-                OperationBuilder::new("arith.subi", self.location)
-                    .add_operands(&[zero, x])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect("arith.subi"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        body_block.append_operation(
-            OperationBuilder::new("linalg.yield", self.location)
-                .add_operands(&[neg])
-                .build()
-                .expect("linalg.yield"),
-        );
-        let body_region = Region::new();
-        body_region.append_block(body_block);
-
-        let result = self
-            .block
-            .append_operation(
-                OperationBuilder::new("linalg.generic", self.location)
-                    .add_operands(&[input.value(), init])
-                    .add_results(&[tensor_type])
-                    .add_attributes(&[
-                        (
-                            Identifier::new(self.context, "indexing_maps"),
-                            indexing_maps,
-                        ),
-                        (
-                            Identifier::new(self.context, "iterator_types"),
-                            iterator_types,
-                        ),
-                        (
-                            Identifier::new(self.context, "operandSegmentSizes"),
-                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
-                        ),
-                    ])
-                    .add_regions([body_region])
-                    .build()
-                    .expect("linalg.generic int neg"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        Tensor::from_value(result)
+                    .expect("linalg.yield"),
+            );
+        })
     }
 
     /// ReLU: max(x, 0.0) via `arith.maximumf`.
     fn emit_linalg_unary_relu(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
-        let shape = input.shape();
         let dtype = input.dtype();
-        let rank = shape.len();
-        let elem_type = dtype.to_mlir_type(self.context);
-
-        let dims_u64: Vec<u64> = shape
-            .iter()
-            .map(|d| match d {
-                Some(n) => *n,
-                None => i64::MIN as u64,
-            })
-            .collect();
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&dims_u64, elem_type, None).into();
-
-        let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
-        let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
-            .expect("indexing_maps");
-        let iterator_types = self.make_iterator_types(rank);
-
-        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
-        let x: melior::ir::Value = body_block.argument(0).unwrap().into();
-
-        let zero_attr = match dtype {
-            DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
-            DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
-            DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
-            DType::I32 => Attribute::parse(self.context, "0 : i32"),
-            DType::I64 => Attribute::parse(self.context, "0 : i64"),
-        }
-        .expect("zero for relu");
-        let zero = body_block
-            .append_operation(
-                OperationBuilder::new("arith.constant", self.location)
-                    .add_results(&[elem_type])
-                    .add_attributes(&[(Identifier::new(self.context, "value"), zero_attr)])
+        let ctx = self.context;
+        let loc = self.location;
+        self.emit_linalg_unary_with_body(input, |block, x, elem_type| {
+            let zero_attr = match dtype {
+                DType::F32 => Attribute::parse(ctx, "0.0 : f32"),
+                DType::F64 => Attribute::parse(ctx, "0.0 : f64"),
+                DType::BF16 => Attribute::parse(ctx, "0.0 : bf16"),
+                DType::I32 => Attribute::parse(ctx, "0 : i32"),
+                DType::I64 => Attribute::parse(ctx, "0 : i64"),
+            }
+            .expect("zero for relu");
+            let zero: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.constant", loc)
+                        .add_results(&[elem_type])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), zero_attr)])
+                        .build()
+                        .expect("arith.constant"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let relu_op = match dtype {
+                DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
+                DType::I32 | DType::I64 => "arith.maxsi",
+            };
+            let relu_val: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new(relu_op, loc)
+                        .add_operands(&[x, zero])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect(relu_op),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            block.append_operation(
+                OperationBuilder::new("linalg.yield", loc)
+                    .add_operands(&[relu_val])
                     .build()
-                    .expect("arith.constant"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-
-        let relu_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
-            DType::I32 | DType::I64 => "arith.maxsi",
-        };
-        let relu_val = body_block
-            .append_operation(
-                OperationBuilder::new(relu_op, self.location)
-                    .add_operands(&[x, zero])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect(relu_op),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        body_block.append_operation(
-            OperationBuilder::new("linalg.yield", self.location)
-                .add_operands(&[relu_val])
-                .build()
-                .expect("linalg.yield"),
-        );
-        let body_region = Region::new();
-        body_region.append_block(body_block);
-
-        let result = self
-            .block
-            .append_operation(
-                OperationBuilder::new("linalg.generic", self.location)
-                    .add_operands(&[input.value(), init])
-                    .add_results(&[tensor_type])
-                    .add_attributes(&[
-                        (
-                            Identifier::new(self.context, "indexing_maps"),
-                            indexing_maps,
-                        ),
-                        (
-                            Identifier::new(self.context, "iterator_types"),
-                            iterator_types,
-                        ),
-                        (
-                            Identifier::new(self.context, "operandSegmentSizes"),
-                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
-                        ),
-                    ])
-                    .add_regions([body_region])
-                    .build()
-                    .expect("linalg.generic relu"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        Tensor::from_value(result)
+                    .expect("linalg.yield"),
+            );
+        })
     }
 
     /// Reciprocal: 1.0 / x via `arith.divf`.
     fn emit_linalg_unary_reciprocal(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
-        let shape = input.shape();
         let dtype = input.dtype();
-        let rank = shape.len();
-        let elem_type = dtype.to_mlir_type(self.context);
-
-        let dims_u64: Vec<u64> = shape
-            .iter()
-            .map(|d| match d {
-                Some(n) => *n,
-                None => i64::MIN as u64,
-            })
-            .collect();
-        let tensor_type: melior::ir::Type =
-            RankedTensorType::new(&dims_u64, elem_type, None).into();
-
-        let init = self.emit_tensor_empty_dyn(&shape, dtype, Some(input.value()));
-        let identity = identity_map_str(rank);
-        let indexing_maps = Attribute::parse(self.context, &format!("[{0}, {0}]", identity))
-            .expect("indexing_maps");
-        let iterator_types = self.make_iterator_types(rank);
-
-        let body_block = Block::new(&[(elem_type, self.location), (elem_type, self.location)]);
-        let x: melior::ir::Value = body_block.argument(0).unwrap().into();
-
-        let one_attr = match dtype {
-            DType::F32 => Attribute::parse(self.context, "1.0 : f32"),
-            DType::F64 => Attribute::parse(self.context, "1.0 : f64"),
-            _ => panic!("reciprocal is float-only"),
-        }
-        .expect("one for reciprocal");
-        let one = body_block
-            .append_operation(
-                OperationBuilder::new("arith.constant", self.location)
-                    .add_results(&[elem_type])
-                    .add_attributes(&[(Identifier::new(self.context, "value"), one_attr)])
+        let ctx = self.context;
+        let loc = self.location;
+        self.emit_linalg_unary_with_body(input, |block, x, elem_type| {
+            let one_attr = match dtype {
+                DType::F32 => Attribute::parse(ctx, "1.0 : f32"),
+                DType::F64 => Attribute::parse(ctx, "1.0 : f64"),
+                _ => panic!("reciprocal is float-only"),
+            }
+            .expect("one for reciprocal");
+            let one: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.constant", loc)
+                        .add_results(&[elem_type])
+                        .add_attributes(&[(Identifier::new(ctx, "value"), one_attr)])
+                        .build()
+                        .expect("arith.constant"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let recip: melior::ir::Value = block
+                .append_operation(
+                    OperationBuilder::new("arith.divf", loc)
+                        .add_operands(&[one, x])
+                        .add_results(&[elem_type])
+                        .build()
+                        .expect("arith.divf reciprocal"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            block.append_operation(
+                OperationBuilder::new("linalg.yield", loc)
+                    .add_operands(&[recip])
                     .build()
-                    .expect("arith.constant"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-
-        let recip = body_block
-            .append_operation(
-                OperationBuilder::new("arith.divf", self.location)
-                    .add_operands(&[one, x])
-                    .add_results(&[elem_type])
-                    .build()
-                    .expect("arith.divf reciprocal"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        body_block.append_operation(
-            OperationBuilder::new("linalg.yield", self.location)
-                .add_operands(&[recip])
-                .build()
-                .expect("linalg.yield"),
-        );
-        let body_region = Region::new();
-        body_region.append_block(body_block);
-
-        let result = self
-            .block
-            .append_operation(
-                OperationBuilder::new("linalg.generic", self.location)
-                    .add_operands(&[input.value(), init])
-                    .add_results(&[tensor_type])
-                    .add_attributes(&[
-                        (
-                            Identifier::new(self.context, "indexing_maps"),
-                            indexing_maps,
-                        ),
-                        (
-                            Identifier::new(self.context, "iterator_types"),
-                            iterator_types,
-                        ),
-                        (
-                            Identifier::new(self.context, "operandSegmentSizes"),
-                            Attribute::parse(self.context, "array<i32: 1, 1>").unwrap(),
-                        ),
-                    ])
-                    .add_regions([body_region])
-                    .build()
-                    .expect("linalg.generic reciprocal"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        Tensor::from_value(result)
+                    .expect("linalg.yield"),
+            );
+        })
     }
 
     // ── Reductions ────────────────────────────────────────────────────────────
