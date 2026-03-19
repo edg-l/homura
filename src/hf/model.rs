@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::DType;
-use crate::generate::{SamplingConfig, argmax_at_position, sample_token};
+use crate::generate::{GenerationStats, Rng, SamplingConfig, argmax_at_position, sample_token};
 use crate::hf::config::TransformerConfig;
 use crate::hf::precompute::{build_causal_mask, precompute_rope_cos_sin, slice_rope_for_positions};
 use crate::hf::tokenizer::HfTokenizer;
@@ -189,8 +189,6 @@ impl HfModel {
             max_new_tokens,
         );
 
-        let gen_start = std::time::Instant::now();
-
         // Prefill
         let step_start = std::time::Instant::now();
         let seq_len = token_ids.len();
@@ -208,6 +206,8 @@ impl HfModel {
         log_info!("prefill complete in {prefill_s:.2}s ({seq_len} tokens)");
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let mut rng = Rng::from_optional_seed(sampling.seed);
+        let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
 
         if next_token == eos_token_id {
             log_info!("EOS after prefill");
@@ -234,16 +234,17 @@ impl HfModel {
             let logits = &outputs[0];
             let logits_data = logits.as_slice::<f32>();
             let logits_vec = logits_data[..vocab_size].to_vec();
-            current_token = sample_token(&logits_vec, sampling, &generated_ids);
+            current_token = sample_token(&logits_vec, sampling, &generated_ids, &mut rng);
 
+            let step_elapsed = step_start.elapsed();
+            decode_times.push(step_elapsed);
+            let tok_s = 1.0 / step_elapsed.as_secs_f64();
             let token_text = tokenizer.decode(&[current_token]);
-            let step_elapsed = step_start.elapsed().as_secs_f64();
-            let tok_s = 1.0 / step_elapsed;
             eprintln!(
                 "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET}  \
                  {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,
-                step_elapsed * 1000.0,
+                step_elapsed.as_secs_f64() * 1000.0,
             );
 
             if current_token == eos_token_id {
@@ -265,20 +266,17 @@ impl HfModel {
         }
 
         eprintln!();
-        let total = gen_start.elapsed();
-        let decode_tokens = generated_ids.len();
-        let total_s = total.as_secs_f64();
-        let per_tok = if decode_tokens == 0 {
-            0.0
-        } else {
-            total_s / decode_tokens as f64
+        let prefill_time = std::time::Duration::from_secs_f64(prefill_s);
+        let stats = GenerationStats {
+            prompt_tokens: seq_len,
+            generated_tokens: generated_ids.len(),
+            prefill_time,
+            decode_times,
+            seed: sampling.seed,
         };
-        let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
         eprintln!(
-            "  {BOLD_MAGENTA}-- done --{RESET} {decode_tokens} tokens in \
-             {YELLOW}{total_s:.2}s{RESET} | {GREEN}{tok_s:.1} tok/s{RESET} | \
-             {:.0}ms/tok",
-            per_tok * 1000.0,
+            "  {BOLD_MAGENTA}-- done --{RESET} {}",
+            stats.format_summary()
         );
 
         Ok(tokenizer.decode(&generated_ids))

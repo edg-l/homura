@@ -78,6 +78,18 @@ enum Commands {
         /// Top-k filtering (0 = disabled, default: 50)
         #[arg(long, default_value = "50")]
         top_k: usize,
+        /// min_p sampling: filter tokens with prob < min_p * max_prob (default: 0, disabled)
+        #[arg(long, default_value = "0.0")]
+        min_p: f32,
+        /// Frequency penalty: subtract freq * count(token) from logits (default: 0, off)
+        #[arg(long, default_value = "0.0")]
+        frequency_penalty: f32,
+        /// Presence penalty: subtract penalty for any previously seen token (default: 0, off)
+        #[arg(long, default_value = "0.0")]
+        presence_penalty: f32,
+        /// RNG seed for reproducible sampling
+        #[arg(long)]
+        seed: Option<u64>,
         /// Stop sequences (comma-separated, e.g. "\n\n,Posted by")
         #[arg(long)]
         stop: Option<String>,
@@ -117,6 +129,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             top_p,
             repetition_penalty,
             top_k,
+            min_p,
+            frequency_penalty,
+            presence_penalty,
+            seed,
             stop,
         } => {
             if let Some(prompt_text) = prompt {
@@ -127,8 +143,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     temperature,
                     top_k,
                     top_p,
+                    min_p,
                     repetition_penalty,
+                    frequency_penalty,
+                    presence_penalty,
                     stop_sequences,
+                    seed,
                 };
                 // Auto-detect HF model (has config.json + model.safetensors)
                 let model_dir = if model.is_dir() {

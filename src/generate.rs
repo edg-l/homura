@@ -157,6 +157,43 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
         .unwrap_or(0)
 }
 
+// ── RNG ──────────────────────────────────────────────────────────────────────
+
+/// Seedable xorshift64 RNG for token sampling.
+pub struct Rng {
+    state: u64,
+}
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self { state: seed | 1 } // ensure nonzero (xorshift64 fixpoint)
+    }
+
+    pub fn from_system_time() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self::new(seed)
+    }
+
+    /// Construct from an optional seed: use the seed if provided, else system time.
+    pub fn from_optional_seed(seed: Option<u64>) -> Self {
+        match seed {
+            Some(s) => Self::new(s),
+            None => Self::from_system_time(),
+        }
+    }
+
+    /// Returns f32 in [0, 1).
+    pub fn next_f32(&mut self) -> f32 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
 // ── Sampling ──────────────────────────────────────────────────────────────────
 
 /// Configuration for token sampling.
@@ -168,10 +205,18 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Nucleus sampling: keep smallest set of tokens with cumulative prob >= top_p.
     pub top_p: f32,
+    /// min_p: filter tokens with prob < min_p * max_prob. 0 = disabled.
+    pub min_p: f32,
     /// Repetition penalty: logits of already-generated tokens are divided by this.
     pub repetition_penalty: f32,
+    /// Frequency penalty: subtract freq_penalty * count(token) from logits. 0 = off.
+    pub frequency_penalty: f32,
+    /// Presence penalty: subtract presence_penalty for any previously seen token. 0 = off.
+    pub presence_penalty: f32,
     /// Stop generation when any of these strings appear in the output.
     pub stop_sequences: Vec<String>,
+    /// RNG seed for reproducible sampling. None = use system time.
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingConfig {
@@ -180,17 +225,35 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             stop_sequences: vec![],
+            seed: None,
         }
     }
 }
 
-/// Sample a token from a logit slice using temperature, repetition penalty, and top-p.
+/// Sample a token from a logit slice using temperature, penalties, and filtering.
 ///
-/// `logits` is the raw logit vector for a single position (length = vocab_size).
-/// `generated_ids` is the list of already-generated token IDs (for repetition penalty).
-pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u32]) -> u32 {
+/// Sampling order:
+/// 1. Repetition penalty (multiplicative, existing tokens)
+/// 2. Frequency penalty (additive, proportional to count)
+/// 3. Presence penalty (additive, flat for any seen token)
+/// 4. Greedy early-return if temperature=0
+/// 5. Temperature scaling
+/// 6. Softmax
+/// 7. min_p filtering
+/// 8. top_k
+/// 9. top_p
+/// 10. Sample from distribution
+pub fn sample_token(
+    logits: &[f32],
+    config: &SamplingConfig,
+    generated_ids: &[u32],
+    rng: &mut Rng,
+) -> u32 {
     let mut logits = logits.to_vec();
 
     // Repetition penalty: divide logits of previously generated tokens.
@@ -203,6 +266,20 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u3
                 } else {
                     logits[idx] *= config.repetition_penalty;
                 }
+            }
+        }
+    }
+
+    // Frequency and presence penalties (additive).
+    if config.frequency_penalty != 0.0 || config.presence_penalty != 0.0 {
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for &id in generated_ids {
+            *counts.entry(id as usize).or_insert(0) += 1;
+        }
+        for (&idx, &count) in &counts {
+            if idx < logits.len() {
+                logits[idx] -= config.frequency_penalty * count as f32;
+                logits[idx] -= config.presence_penalty;
             }
         }
     }
@@ -231,6 +308,17 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u3
         *p /= sum;
     }
 
+    // min_p: filter tokens with prob < min_p * max_prob.
+    if config.min_p > 0.0 {
+        let max_prob = probs.iter().cloned().fold(0.0f32, f32::max);
+        let threshold = config.min_p * max_prob;
+        for p in &mut probs {
+            if *p < threshold {
+                *p = 0.0;
+            }
+        }
+    }
+
     // Sort by probability descending for top-k and top-p filtering.
     let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -254,7 +342,7 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u3
 
     // Renormalize and sample.
     let total: f32 = candidates.iter().map(|(_, p)| p).sum();
-    let r = simple_random() * total;
+    let r = rng.next_f32() * total;
     let mut accum = 0.0;
     for &(token_id, p) in candidates {
         accum += p;
@@ -265,25 +353,62 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u3
     candidates.last().map(|(id, _)| *id as u32).unwrap_or(0)
 }
 
-/// Simple pseudo-random f32 in [0, 1) using thread-local xorshift64.
-fn simple_random() -> f32 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64 | 1
-        );
+// ── Generation stats ─────────────────────────────────────────────────────────
+
+/// Statistics collected during generation for the summary line.
+pub struct GenerationStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prefill_time: std::time::Duration,
+    pub decode_times: Vec<std::time::Duration>,
+    pub seed: Option<u64>,
+}
+
+impl GenerationStats {
+    pub fn format_summary(&self) -> String {
+        let decode_total: f64 = self.decode_times.iter().map(|d| d.as_secs_f64()).sum();
+        let total = self.prefill_time.as_secs_f64() + decode_total;
+
+        let n = self.decode_times.len();
+        if n == 0 {
+            return format!(
+                "prefill {:.2}s ({} tokens) | 0 decode tokens | total {:.2}s",
+                self.prefill_time.as_secs_f64(),
+                self.prompt_tokens,
+                total,
+            );
+        }
+
+        let tok_s: Vec<f64> = self
+            .decode_times
+            .iter()
+            .map(|d| 1.0 / d.as_secs_f64())
+            .collect();
+        let avg_tok_s = tok_s.iter().sum::<f64>() / n as f64;
+        let min_tok_s = tok_s.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_tok_s = tok_s.iter().cloned().fold(0.0f64, f64::max);
+        let avg_ms = decode_total * 1000.0 / n as f64;
+
+        let seed_str = match self.seed {
+            Some(s) => format!(" | seed {s}"),
+            None => String::new(),
+        };
+
+        format!(
+            "prefill {:.2}s ({} tok) | \
+             decode {} tok in {:.2}s ({:.1} avg, {:.1} min, {:.1} max tok/s | {:.0}ms/tok) | \
+             total {:.2}s{seed_str}",
+            self.prefill_time.as_secs_f64(),
+            self.prompt_tokens,
+            n,
+            decode_total,
+            avg_tok_s,
+            min_tok_s,
+            max_tok_s,
+            avg_ms,
+            total,
+        )
     }
-    STATE.with(|s| {
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        (x >> 40) as f32 / (1u64 << 24) as f32
-    })
 }
 
 #[cfg(test)]
@@ -301,5 +426,44 @@ mod tests {
         let text = generator.generate("Hello", 3);
         assert!(!text.is_empty(), "should generate at least one token");
         println!("Generated: {text:?}");
+    }
+
+    #[test]
+    fn rng_is_deterministic() {
+        let mut rng1 = Rng::new(42);
+        let mut rng2 = Rng::new(42);
+        let vals1: Vec<f32> = (0..10).map(|_| rng1.next_f32()).collect();
+        let vals2: Vec<f32> = (0..10).map(|_| rng2.next_f32()).collect();
+        assert_eq!(vals1, vals2);
+    }
+
+    #[test]
+    fn sample_token_greedy() {
+        let logits = vec![0.0, 1.0, 0.5, 0.2];
+        let config = SamplingConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(1);
+        assert_eq!(sample_token(&logits, &config, &[], &mut rng), 1);
+    }
+
+    #[test]
+    fn min_p_filters_low_prob() {
+        // With min_p=0.5, only tokens with prob >= 0.5 * max_prob survive.
+        let logits = vec![10.0, 0.0, 0.0, 0.0]; // token 0 dominates
+        let config = SamplingConfig {
+            temperature: 1.0,
+            min_p: 0.5,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(42);
+        // With such skewed logits + min_p=0.5, should always pick token 0.
+        for _ in 0..10 {
+            assert_eq!(sample_token(&logits, &config, &[], &mut rng), 0);
+        }
     }
 }
