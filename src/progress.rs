@@ -198,9 +198,8 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
         return;
     }
 
-    // Find the widest stats line (plain text width) + box border
-    let max_plain_width = stats_lines.iter().map(|(p, _)| p.len()).max().unwrap_or(0);
-    let box_inner = max_plain_width + 2; // 1 space padding each side
+    // Fixed box width for consistent positioning across turns.
+    let box_inner = 32; // fixed inner width
     let box_outer = box_inner + 2; // border chars
 
     let term_width = if is_tty { term.size().1 as usize } else { 0 };
@@ -231,7 +230,8 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
 
         // Content lines
         for (plain, colored) in &stats_lines {
-            let padding = box_inner - 2 - plain.len();
+            let content_width = box_inner.saturating_sub(2); // space for padding inside │ │
+            let padding = content_width.saturating_sub(plain.len());
             eprint!(
                 "\x1b[{}G\x1b[2m│\x1b[0m {colored}{} \x1b[2m│\x1b[0m",
                 col + 1,
