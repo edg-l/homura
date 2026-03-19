@@ -123,6 +123,9 @@ enum Commands {
         /// Maximum number of tokens to generate (default: 100)
         #[arg(long, default_value = "100")]
         max_tokens: usize,
+        /// Maximum context length for KV cache (default: 2048, capped by model limit)
+        #[arg(long = "ctx", default_value = "2048")]
+        context_len: usize,
         #[command(flatten)]
         sampling: SamplingArgs,
     },
@@ -136,6 +139,9 @@ enum Commands {
         /// Maximum tokens to generate per turn (default: 512)
         #[arg(long, default_value = "512")]
         max_tokens: usize,
+        /// Maximum context length for KV cache (default: 2048, capped by model limit)
+        #[arg(long = "ctx", default_value = "2048")]
+        context_len: usize,
         /// Enable thinking/reasoning output (for models like Qwen3 that support it)
         #[arg(long)]
         think: bool,
@@ -185,6 +191,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             output,
             prompt,
             max_tokens,
+            context_len,
             sampling,
         } => {
             if let Some(prompt_text) = prompt {
@@ -195,7 +202,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let has_weights = model_dir.join("model.safetensors").exists()
                     || model_dir.join("model.safetensors.index.json").exists();
                 if has_config && has_weights {
-                    cmd_generate_hf(&model_dir, &prompt_text, max_tokens, &sampling)
+                    cmd_generate_hf(&model_dir, &prompt_text, max_tokens, context_len, &sampling)
                 } else {
                     cmd_generate(&model_dir, &prompt_text, max_tokens, &sampling)
                 }
@@ -212,6 +219,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             model,
             system,
             max_tokens,
+            context_len,
             think,
             sampling,
         } => {
@@ -222,6 +230,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &model_name,
                 &system,
                 max_tokens,
+                context_len,
                 think,
                 &sampling,
             )
@@ -463,6 +472,7 @@ fn cmd_generate_hf(
     model_dir: &std::path::Path,
     prompt: &str,
     max_tokens: usize,
+    context_len: usize,
     sampling: &homura::generate::SamplingConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("loading HF model from {}", model_dir.display());
@@ -474,7 +484,7 @@ fn cmd_generate_hf(
 
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, 2048);
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);
     log::info!("generating (max_tokens={max_tokens}, max_seq_len={max_seq_len})");
 
     let generated = model.generate(&tokenizer, prompt, max_tokens, max_seq_len, sampling)?;
@@ -493,6 +503,7 @@ fn cmd_chat(
     model_name: &str,
     system_prompt: &str,
     max_tokens_per_turn: usize,
+    context_len: usize,
     enable_thinking: bool,
     sampling_args: &SamplingArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -511,7 +522,7 @@ fn cmd_chat(
 
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, 2048);
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);
     let stop_token = find_chat_stop_token(model_dir, &tokenizer);
     // Always look up think tokens so we can hide them from output.
     // The --think flag controls whether content is styled, not whether tags are hidden.
