@@ -265,6 +265,8 @@ fn generate_streaming_core(
         prompt_tokens: prompt_len,
         generated_tokens: generated_ids.len(),
         prefill_time: prefill_out.prefill_time,
+        context_used: real_pos,
+        context_max: model.max_seq_len(),
         decode_times,
         seed: sampling.seed,
     };
@@ -715,6 +717,10 @@ pub struct GenerationStats {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_time: std::time::Duration,
+    /// Current position in context (tokens used).
+    pub context_used: usize,
+    /// Maximum context length.
+    pub context_max: usize,
     pub decode_times: Vec<std::time::Duration>,
     pub seed: Option<u64>,
 }

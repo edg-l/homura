@@ -702,7 +702,10 @@ fn cmd_chat(
             if enable_thinking { Some(true) } else { None },
         )?;
         let full_tokens = tokenizer.encode_with_special(&full_text);
-        let delta_tokens = &full_tokens[tokens_in_cache..];
+        // Clamp: re-encoding can shift token boundaries, making full_tokens
+        // shorter than tokens_in_cache. In that case, re-prefill everything.
+        let cache_pos = tokens_in_cache.min(full_tokens.len());
+        let delta_tokens = &full_tokens[cache_pos..];
         let delta_token_ids: Vec<i64> = delta_tokens.iter().map(|&id| id as i64).collect();
 
         // Pass token IDs directly to avoid decode→re-encode round-trip

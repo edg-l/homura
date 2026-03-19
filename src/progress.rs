@@ -140,6 +140,30 @@ fn build_stats_lines(stats: &GenerationStats) -> Vec<(String, String)> {
         ),
     ));
 
+    if stats.context_max > 0 {
+        let pct = stats.context_used as f64 / stats.context_max as f64 * 100.0;
+        let pct_style = if pct > 80.0 {
+            style(format!("{pct:.0}%")).red()
+        } else if pct > 50.0 {
+            style(format!("{pct:.0}%")).yellow()
+        } else {
+            style(format!("{pct:.0}%")).dim()
+        };
+        lines.push((
+            format!(
+                "ctx {}/{} ({}%)",
+                stats.context_used, stats.context_max, pct as u32
+            ),
+            format!(
+                "{} {}/{}  {}",
+                style("ctx").dim(),
+                style(stats.context_used).dim(),
+                style(stats.context_max).dim(),
+                pct_style,
+            ),
+        ));
+    }
+
     lines
 }
 
@@ -196,8 +220,10 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
     if use_side {
         let col = term_width - box_outer; // 0-indexed column where box starts
 
-        // Move cursor up by output_lines (the println!() after text already moved us down)
-        eprint!("\x1b[{}A", output_lines + 1);
+        // Position box at the bottom of the output.
+        // Cursor is on the line after the trailing println!(), so move up
+        // by box_height to align the box with the last few lines of output.
+        eprint!("\x1b[{}A", box_height);
 
         // Top border
         eprint!("\x1b[{}G\x1b[2m╭{}╮\x1b[0m", col + 1, "─".repeat(box_inner));
@@ -214,14 +240,8 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
             eprint!("\n");
         }
 
-        // Bottom border
+        // Bottom border -- on the same line as the last output line
         eprint!("\x1b[{}G\x1b[2m╰{}╯\x1b[0m", col + 1, "─".repeat(box_inner));
-
-        // Move cursor back down to after the output
-        let remaining = output_lines + 1 - box_height;
-        if remaining > 0 {
-            eprint!("\x1b[{}B", remaining);
-        }
         eprintln!();
     } else {
         // Fallback: compact line below output
@@ -244,12 +264,31 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
                 / n as f64;
             let avg_ms = decode_total * 1000.0 / n as f64;
             let total = stats.prefill_time.as_secs_f64() + decode_total;
+            let ctx_str = if stats.context_max > 0 {
+                let pct = stats.context_used as f64 / stats.context_max as f64 * 100.0;
+                let pct_styled = if pct > 80.0 {
+                    style(format!("{pct:.0}%")).red()
+                } else if pct > 50.0 {
+                    style(format!("{pct:.0}%")).yellow()
+                } else {
+                    style(format!("{pct:.0}%")).dim()
+                };
+                format!(
+                    "  {} {}/{}",
+                    pct_styled,
+                    style(stats.context_used).dim(),
+                    style(stats.context_max).dim(),
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "\n  {} tok  {} tok/s  {}  {}",
+                "\n  {} tok  {} tok/s  {}  {}{}",
                 style(n).cyan().bold(),
                 style(format!("{avg_tok_s:.1}")).green().bold(),
                 style(format!("{avg_ms:.0}ms/tok")).yellow(),
                 style(format!("{total:.2}s")).dim(),
+                ctx_str,
             );
         }
     }
