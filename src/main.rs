@@ -130,7 +130,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     repetition_penalty,
                     stop_sequences,
                 };
-                cmd_generate(&model, &prompt_text, max_tokens, &sampling)
+                // Auto-detect HF model (has config.json + model.safetensors)
+                let model_dir = if model.is_dir() {
+                    model.clone()
+                } else {
+                    model.parent().unwrap_or(&model).to_path_buf()
+                };
+                if model_dir.join("config.json").exists()
+                    && model_dir.join("model.safetensors").exists()
+                {
+                    cmd_generate_hf(&model_dir, &prompt_text, max_tokens, &sampling)
+                } else {
+                    cmd_generate(&model, &prompt_text, max_tokens, &sampling)
+                }
             } else {
                 cmd_run(
                     &model,
@@ -274,6 +286,32 @@ fn cmd_generate(
     // Print full text (prompt + generated) to stdout.
     println!("{}{}", prompt, generated);
 
+    Ok(())
+}
+
+// ── generate-hf ─────────────────────────────────────────────────────────────
+
+fn cmd_generate_hf(
+    model_dir: &std::path::Path,
+    prompt: &str,
+    max_tokens: usize,
+    sampling: &homura::generate::SamplingConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!("loading HF model from {}", model_dir.display());
+    let t_load = Instant::now();
+
+    let model = homura::hf::model::HfModel::load(model_dir)?;
+    let tokenizer =
+        homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+
+    log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, 2048);
+    log::info!("generating (max_tokens={max_tokens}, max_seq_len={max_seq_len})");
+
+    let generated = model.generate(&tokenizer, prompt, max_tokens, max_seq_len, sampling)?;
+
+    println!("{}{}", prompt, generated);
     Ok(())
 }
 

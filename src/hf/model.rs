@@ -4,9 +4,12 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::DType;
+use crate::generate::{SamplingConfig, argmax_at_position, sample_token};
 use crate::hf::config::TransformerConfig;
 use crate::hf::precompute::{build_causal_mask, precompute_rope_cos_sin, slice_rope_for_positions};
+use crate::hf::tokenizer::HfTokenizer;
 use crate::hf::weights::{TransformerWeights, load_transformer_weights};
+use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::runtime::{Buffer, ExecutionPlan};
 
 /// A compiled HuggingFace transformer model.
@@ -28,7 +31,7 @@ struct CompiledState {
 impl HfModel {
     /// Load a model from a HuggingFace model directory.
     ///
-    /// Expects: `config.json`, `model.safetensors` (or sharded), `tokenizer.json`.
+    /// Expects: `config.json`, `model.safetensors`, `tokenizer.json`.
     pub fn load(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let config = TransformerConfig::load(&model_dir.join("config.json"))?;
         let tensors =
@@ -38,7 +41,6 @@ impl HfModel {
 
         let weights = load_transformer_weights(&config, tensors)?;
 
-        // Precompute RoPE tables for max_position_embeddings.
         let (rope_cos, rope_sin) = precompute_rope_cos_sin(
             config.head_dim(),
             config.max_position_embeddings,
@@ -71,8 +73,7 @@ impl HfModel {
 
     /// Run prefill: process a full sequence of input tokens.
     ///
-    /// `input_ids`: token IDs, shape `[1, seq_len]` I64.
-    /// Returns logits `[1, seq_len, vocab_size]` F32.
+    /// Returns all outputs: `[logits, present_k_0, present_v_0, ..., present_k_N, present_v_N]`.
     pub fn run(&self, input_ids: &Buffer) -> Result<Vec<Buffer>, Box<dyn std::error::Error>> {
         self.ensure_compiled()?;
 
@@ -82,7 +83,6 @@ impl HfModel {
         let positions: Vec<usize> = (0..seq_len).collect();
         let (cos, sin) = slice_rope_for_positions(&self.rope_cos, &self.rope_sin, &positions);
 
-        // Build past_kv dummy buffers (empty: [1, kv_heads, 0, head_dim])
         let kv_heads = self.config.kv_heads() as u64;
         let head_dim = self.config.head_dim() as u64;
         let num_layers = self.config.num_hidden_layers;
@@ -95,7 +95,6 @@ impl HfModel {
         let state = self.state.lock().unwrap();
         let cs = state.as_ref().unwrap();
 
-        // Inputs: [input_ids, mask, cos, sin, past_k_0, past_v_0, ..., past_k_N, past_v_N]
         let mut inputs: Vec<&Buffer> = vec![input_ids, &mask, &cos, &sin];
         for buf in &past_kv {
             inputs.push(buf);
@@ -105,11 +104,9 @@ impl HfModel {
         Ok(outputs)
     }
 
-    /// Run KV-cached decode.
+    /// Run KV-cached decode step.
     ///
-    /// `input_ids`: shape `[1, seq_len]` I64.
-    /// `max_seq_len`: maximum sequence length for KV cache allocation.
-    /// Returns logits `[1, seq_len, vocab_size]` F32.
+    /// Returns logits only (KV cache updated internally).
     pub fn run_kv(
         &self,
         input_ids: &Buffer,
@@ -127,7 +124,6 @@ impl HfModel {
         let positions: Vec<usize> = (past_len..past_len + seq_len).collect();
         let (cos, sin) = slice_rope_for_positions(&self.rope_cos, &self.rope_sin, &positions);
 
-        // run_kv expects only non-KV inputs (it fills past_kv from cache)
         let inputs: Vec<&Buffer> = vec![input_ids, &mask, &cos, &sin];
         let outputs = cs.plan.run_kv(&inputs, &cs.weight_bufs, max_seq_len);
         Ok(outputs)
@@ -162,5 +158,129 @@ impl HfModel {
     /// Access the model config.
     pub fn config(&self) -> &TransformerConfig {
         &self.config
+    }
+
+    /// Generate text with KV-cached decoding.
+    pub fn generate(
+        &self,
+        tokenizer: &HfTokenizer,
+        prompt: &str,
+        max_new_tokens: usize,
+        max_seq_len: usize,
+        sampling: &SamplingConfig,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let token_ids: Vec<i64> = tokenizer
+            .encode(prompt)
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+
+        if token_ids.is_empty() || max_new_tokens == 0 {
+            return Ok(String::new());
+        }
+
+        let eos_token_id = self.config.eos_token_id.unwrap_or(u32::MAX);
+        let vocab_size = self.config.vocab_size;
+        let num_kv = self.config.num_hidden_layers * 2;
+
+        log_info!(
+            "starting generation: {} prompt tokens, max_new_tokens={}",
+            token_ids.len(),
+            max_new_tokens,
+        );
+
+        let gen_start = std::time::Instant::now();
+
+        // Prefill
+        let step_start = std::time::Instant::now();
+        let seq_len = token_ids.len();
+        let input_ids = Buffer::from_slice::<i64>(&token_ids, &[1, seq_len as u64], DType::I64);
+        let outputs = self.run(&input_ids)?;
+
+        let logits = &outputs[0];
+        let next_token = argmax_at_position(logits, seq_len - 1, vocab_size);
+
+        // Extract KV cache from prefill outputs (outputs[1..1+num_kv])
+        let kv_cache: Vec<Buffer> = outputs[1..1 + num_kv].to_vec();
+        self.init_kv_cache(&kv_cache, max_seq_len)?;
+
+        let prefill_s = step_start.elapsed().as_secs_f64();
+        log_info!("prefill complete in {prefill_s:.2}s ({seq_len} tokens)");
+
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+        if next_token == eos_token_id {
+            log_info!("EOS after prefill");
+            return Ok(String::new());
+        }
+        generated_ids.push(next_token);
+        let token_text = tokenizer.decode(&[next_token]);
+        eprint!(
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET} {DIM}(prefill){RESET}"
+        );
+
+        // Decode loop
+        let mut current_token = next_token;
+        for step in 1..max_new_tokens {
+            if seq_len + step >= max_seq_len {
+                log_warn!("context limit reached (max_seq_len={})", max_seq_len);
+                break;
+            }
+
+            let step_start = std::time::Instant::now();
+            let input_ids = Buffer::from_slice::<i64>(&[current_token as i64], &[1, 1], DType::I64);
+            let outputs = self.run_kv(&input_ids, max_seq_len)?;
+
+            let logits = &outputs[0];
+            let logits_data = logits.as_slice::<f32>();
+            let logits_vec = logits_data[..vocab_size].to_vec();
+            current_token = sample_token(&logits_vec, sampling, &generated_ids);
+
+            let token_text = tokenizer.decode(&[current_token]);
+            let step_elapsed = step_start.elapsed().as_secs_f64();
+            let tok_s = 1.0 / step_elapsed;
+            eprint!(
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET}  \
+                 {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
+                step + 1,
+                step_elapsed * 1000.0,
+            );
+
+            if current_token == eos_token_id {
+                log_info!("EOS token reached");
+                break;
+            }
+            generated_ids.push(current_token);
+
+            if !sampling.stop_sequences.is_empty() {
+                let text_so_far = tokenizer.decode(&generated_ids);
+                if sampling
+                    .stop_sequences
+                    .iter()
+                    .any(|s| text_so_far.contains(s.as_str()))
+                {
+                    break;
+                }
+            }
+        }
+
+        eprintln!();
+        let total = gen_start.elapsed();
+        let decode_tokens = generated_ids.len();
+        let total_s = total.as_secs_f64();
+        let per_tok = if decode_tokens == 0 {
+            0.0
+        } else {
+            total_s / decode_tokens as f64
+        };
+        let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
+        eprintln!(
+            "  {BOLD_MAGENTA}-- done --{RESET} {decode_tokens} tokens in \
+             {YELLOW}{total_s:.2}s{RESET} | {GREEN}{tok_s:.1} tok/s{RESET} | \
+             {:.0}ms/tok",
+            per_tok * 1000.0,
+        );
+
+        Ok(tokenizer.decode(&generated_ids))
     }
 }

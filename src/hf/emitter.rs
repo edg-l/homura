@@ -444,7 +444,9 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
     });
     slot_descs_vec.push(d);
 
-    let output_slots = vec![logits_slot];
+    // Output slots: logits + all present_kv (needed for prefill -> init_kv_cache)
+    let mut output_slots = vec![logits_slot];
+    output_slots.extend_from_slice(&present_kv_output_slots);
 
     // Pad slot_descs to cover all slots
     assert_eq!(slot_descs_vec.len(), next);
