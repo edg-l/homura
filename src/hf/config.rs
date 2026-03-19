@@ -27,6 +27,9 @@ pub struct TransformerConfig {
     pub max_position_embeddings: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Explicit per-head dimension. If absent, computed as hidden_size / num_attention_heads.
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     #[serde(default)]
     pub eos_token_id: Option<u32>,
     #[serde(default)]
@@ -56,9 +59,11 @@ impl TransformerConfig {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 
-    /// Per-head dimension: hidden_size / num_attention_heads.
+    /// Per-head dimension. Uses explicit `head_dim` from config if present,
+    /// otherwise computes `hidden_size / num_attention_heads`.
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     /// GQA repeat factor: num_attention_heads / kv_heads.

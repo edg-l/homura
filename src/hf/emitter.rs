@@ -518,6 +518,7 @@ fn emit_qkv_kernel(
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
     let kv_dim = (config.kv_heads() * config.head_dim()) as u64;
+    let q_dim = (config.num_attention_heads * config.head_dim()) as u64;
     let num_heads = config.num_attention_heads as u64;
     let kv_heads = config.kv_heads() as u64;
     let head_dim = config.head_dim() as u64;
@@ -528,9 +529,9 @@ fn emit_qkv_kernel(
     // Inputs
     let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
     let ln_w = gb.input(&[Some(hidden)], DType::F32);
-    let q_w = gb.input(&[Some(hidden), Some(hidden)], DType::F32);
+    let q_w = gb.input(&[Some(hidden), Some(q_dim)], DType::F32);
     let q_b = if has_bias {
-        Some(gb.input(&[Some(hidden)], DType::F32))
+        Some(gb.input(&[Some(q_dim)], DType::F32))
     } else {
         None
     };
@@ -622,6 +623,7 @@ fn emit_attention_kernel(
     let num_heads = config.num_attention_heads as u64;
     let kv_heads = config.kv_heads() as u64;
     let head_dim = config.head_dim() as u64;
+    let q_dim = num_heads * head_dim; // may differ from hidden when head_dim is explicit
     let gqa_repeat = config.gqa_repeat();
 
     let ctx = GraphContext::new();
@@ -638,8 +640,8 @@ fn emit_attention_kernel(
     let v = gb.input(&[Some(1), Some(kv_heads), None, Some(head_dim)], DType::F32);
     // Mask: [1, 1, seq, total_seq]
     let mask = gb.input(&[Some(1), Some(1), None, None], DType::F32);
-    // O projection weight: [hidden, hidden]
-    let o_w = gb.input(&[Some(hidden), Some(hidden)], DType::F32);
+    // O projection weight: [q_dim, hidden]
+    let o_w = gb.input(&[Some(q_dim), Some(hidden)], DType::F32);
 
     // Transpose Q from BSHD to BHSD: [1, seq, num_heads, head_dim] -> [1, num_heads, seq, head_dim]
     let q_bhsd = gb.emit_transpose(&q, &[0, 2, 1, 3]);
@@ -677,10 +679,10 @@ fn emit_attention_kernel(
     // Transpose back: [1, num_heads, seq, head_dim] -> [1, seq, num_heads, head_dim]
     let attn_bshd = gb.emit_transpose(&attn_output, &[0, 2, 1, 3]);
 
-    // Reshape to [1, seq, hidden]
-    let attn_flat = gb.emit_reshape(&attn_bshd, &[1, -1, hidden as i64]);
+    // Reshape to [1, seq, q_dim]
+    let attn_flat = gb.emit_reshape(&attn_bshd, &[1, -1, q_dim as i64]);
 
-    // O projection: [1, seq, hidden] @ [hidden, hidden] -> [1, seq, hidden]
+    // O projection: [1, seq, q_dim] @ [q_dim, hidden] -> [1, seq, hidden]
     let out = gb.emit_matmul(&attn_flat, &o_w);
 
     let func_name = format!("k{kernel_idx}");
