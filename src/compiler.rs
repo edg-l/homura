@@ -668,6 +668,137 @@ fn link_shared_lib(
 //   @tile_contraction_4d   — tiles [0, 32, 32, 0] (B untiled; M, N parallel; K sequential)
 //   @__transform_main      — foreach_match dispatching the two pairs
 
+/// Build a `@match_contraction_Nd` named_sequence that matches
+/// `linalg.generic` contraction ops with exactly `rank` iteration dims.
+///
+/// Filters by: operation_name == linalg.generic, contraction body [mulf, addf],
+/// structured rank == `rank`.
+fn build_match_contraction_seq<'c>(
+    context: &'c Context,
+    location: Location<'c>,
+    any_op_type: melior::ir::Type<'c>,
+    param_i64_type: melior::ir::Type<'c>,
+    name: &str,
+    rank: i64,
+) -> melior::ir::Operation<'c> {
+    // ── inner block of match.structured ──────────────────────────────────
+    let inner_block = Block::new(&[(any_op_type, location)]);
+    let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
+
+    let contraction_attr = ArrayAttribute::new(
+        context,
+        &[
+            StringAttribute::new(context, "arith.mulf").into(),
+            StringAttribute::new(context, "arith.addf").into(),
+        ],
+    );
+    let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
+        .add_operands(&[inner_arg])
+        .add_attributes(&[(
+            Identifier::new(context, "contraction"),
+            contraction_attr.into(),
+        )])
+        .build()
+        .expect("build transform.match.structured.body");
+    inner_block.append_operation(body_check_op);
+
+    let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
+        .add_operands(&[inner_arg])
+        .add_results(&[param_i64_type])
+        .build()
+        .expect("build transform.match.structured.rank");
+    let rank_ref = inner_block.append_operation(rank_op);
+    let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
+
+    let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
+        .add_operands(&[inner_arg, rank_param])
+        .build()
+        .expect("build transform.match.structured.yield");
+    inner_block.append_operation(inner_yield_op);
+
+    let inner_region = Region::new();
+    inner_region.append_block(inner_block);
+
+    // ── outer block of @match_contraction_Nd ─────────────────────────────
+    let match_outer_block = Block::new(&[(any_op_type, location)]);
+    let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
+
+    let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
+        .add_operands(&[candidate])
+        .add_attributes(&[(
+            Identifier::new(context, "op_names"),
+            ArrayAttribute::new(
+                context,
+                &[StringAttribute::new(context, "linalg.generic").into()],
+            )
+            .into(),
+        )])
+        .build()
+        .expect("build transform.match.operation_name");
+    match_outer_block.append_operation(op_name_filter);
+
+    let match_structured_op = OperationBuilder::new("transform.match.structured", location)
+        .add_operands(&[candidate])
+        .add_results(&[any_op_type, param_i64_type])
+        .add_regions([inner_region])
+        .build()
+        .expect("build transform.match.structured");
+    let match_structured_ref = match_outer_block.append_operation(match_structured_op);
+    let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
+    let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
+
+    let rank_const_attr =
+        Attribute::parse(context, &format!("{rank} : i64")).expect("parse rank constant attr");
+    let rank_const_op = OperationBuilder::new("transform.param.constant", location)
+        .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
+        .add_results(&[param_i64_type])
+        .build()
+        .expect("build transform.param.constant");
+    let rank_const_ref = match_outer_block.append_operation(rank_const_op);
+    let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
+
+    let predicate_attr = Attribute::parse(context, "0 : i32").expect("parse eq predicate");
+    let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
+        .add_operands(&[matched_rank, expected_rank])
+        .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
+        .build()
+        .expect("build transform.match.param.cmpi");
+    match_outer_block.append_operation(cmpi_op);
+
+    let match_outer_yield = OperationBuilder::new("transform.yield", location)
+        .add_operands(&[matched_op])
+        .build()
+        .expect("build transform.yield (match_contraction)");
+    match_outer_block.append_operation(match_outer_yield);
+
+    let match_outer_region = Region::new();
+    match_outer_region.append_block(match_outer_block);
+
+    let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
+    let match_arg_attrs =
+        Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
+
+    OperationBuilder::new("transform.named_sequence", location)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "sym_name"),
+                StringAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "function_type"),
+                TypeAttribute::new(match_func_type.into()).into(),
+            ),
+            (Identifier::new(context, "arg_attrs"), match_arg_attrs),
+            (
+                Identifier::new(context, "sym_visibility"),
+                StringAttribute::new(context, "private").into(),
+            ),
+        ])
+        .add_regions([match_outer_region])
+        .build()
+        .expect("build transform.named_sequence @match_contraction_Nd")
+}
+
 pub(crate) fn build_transform_schedule<'c>(
     context: &'c Context,
     module: &Module<'c>,
@@ -677,145 +808,6 @@ pub(crate) fn build_transform_schedule<'c>(
         melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
     let param_i64_type = melior::ir::Type::parse(context, "!transform.param<i64>")
         .expect("parse !transform.param<i64>");
-
-    // Helper: build a @match_contraction_Nd named_sequence that matches
-    // linalg.generic contraction ops with exactly `rank` iteration dims.
-    //
-    // The sequence filters by:
-    //   1. transform.match.operation_name — must be "linalg.generic"
-    //   2. transform.match.structured body — must have contraction [mulf, addf] body
-    //   3. transform.match.structured.rank — iteration dims must equal `rank`
-    //   4. transform.match.param.cmpi eq  — enforce exact rank
-    let build_match_seq = |name: &str, rank: i64| {
-        // ── inner block of match.structured ──────────────────────────────────
-        // ^bb0(%arg0: !transform.any_op):
-        //   transform.match.structured.body %arg0 {contraction = ["arith.mulf", "arith.addf"]}
-        //   %rank = transform.match.structured.rank %arg0 : ... -> !transform.param<i64>
-        //   transform.match.structured.yield %arg0, %rank
-        let inner_block = Block::new(&[(any_op_type, location)]);
-        let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
-
-        let contraction_attr = ArrayAttribute::new(
-            context,
-            &[
-                StringAttribute::new(context, "arith.mulf").into(),
-                StringAttribute::new(context, "arith.addf").into(),
-            ],
-        );
-        let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
-            .add_operands(&[inner_arg])
-            .add_attributes(&[(
-                Identifier::new(context, "contraction"),
-                contraction_attr.into(),
-            )])
-            .build()
-            .expect("build transform.match.structured.body");
-        inner_block.append_operation(body_check_op);
-
-        // Capture the iteration rank of this structured op.
-        let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
-            .add_operands(&[inner_arg])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.match.structured.rank");
-        let rank_ref = inner_block.append_operation(rank_op);
-        let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
-
-        // Yield both the op handle and rank param out of the inner block.
-        let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
-            .add_operands(&[inner_arg, rank_param])
-            .build()
-            .expect("build transform.match.structured.yield");
-        inner_block.append_operation(inner_yield_op);
-
-        let inner_region = Region::new();
-        inner_region.append_block(inner_block);
-
-        // ── outer block of @match_contraction_Nd ─────────────────────────────
-        let match_outer_block = Block::new(&[(any_op_type, location)]);
-        let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
-
-        // Filter to linalg.generic only.
-        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
-            .add_operands(&[candidate])
-            .add_attributes(&[(
-                Identifier::new(context, "op_names"),
-                ArrayAttribute::new(
-                    context,
-                    &[StringAttribute::new(context, "linalg.generic").into()],
-                )
-                .into(),
-            )])
-            .build()
-            .expect("build transform.match.operation_name");
-        match_outer_block.append_operation(op_name_filter);
-
-        // match.structured returns (!transform.any_op, !transform.param<i64>)
-        let match_structured_op = OperationBuilder::new("transform.match.structured", location)
-            .add_operands(&[candidate])
-            .add_results(&[any_op_type, param_i64_type])
-            .add_regions([inner_region])
-            .build()
-            .expect("build transform.match.structured");
-        let match_structured_ref = match_outer_block.append_operation(match_structured_op);
-        let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
-        let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
-
-        // transform.param.constant <rank> : i64 -> !transform.param<i64>
-        let rank_const_attr =
-            Attribute::parse(context, &format!("{rank} : i64")).expect("parse rank constant attr");
-        let rank_const_op = OperationBuilder::new("transform.param.constant", location)
-            .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.param.constant");
-        let rank_const_ref = match_outer_block.append_operation(rank_const_op);
-        let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
-
-        // transform.match.param.cmpi eq %matched_rank, %expected_rank : !transform.param<i64>
-        // predicate attr: I32EnumAttr with value eq=0
-        let predicate_attr = Attribute::parse(context, "0 : i32").expect("parse eq predicate");
-        let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
-            .add_operands(&[matched_rank, expected_rank])
-            .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
-            .build()
-            .expect("build transform.match.param.cmpi");
-        match_outer_block.append_operation(cmpi_op);
-
-        // transform.yield %matched_op
-        let match_outer_yield = OperationBuilder::new("transform.yield", location)
-            .add_operands(&[matched_op])
-            .build()
-            .expect("build transform.yield (match_contraction)");
-        match_outer_block.append_operation(match_outer_yield);
-
-        let match_outer_region = Region::new();
-        match_outer_region.append_block(match_outer_block);
-
-        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
-        let match_arg_attrs =
-            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
-
-        OperationBuilder::new("transform.named_sequence", location)
-            .add_attributes(&[
-                (
-                    Identifier::new(context, "sym_name"),
-                    StringAttribute::new(context, name).into(),
-                ),
-                (
-                    Identifier::new(context, "function_type"),
-                    TypeAttribute::new(match_func_type.into()).into(),
-                ),
-                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
-                (
-                    Identifier::new(context, "sym_visibility"),
-                    StringAttribute::new(context, "private").into(),
-                ),
-            ])
-            .add_regions([match_outer_region])
-            .build()
-            .expect("build transform.named_sequence @match_contraction_Nd")
-    };
 
     // Helper: build a @tile_contraction_Nd named_sequence.
     //
@@ -980,7 +972,7 @@ pub(crate) fn build_transform_schedule<'c>(
     // Matches plain (2D) matmul generics: 3 iteration dims (M, N, K).
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_3d", 3));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
 
     // ── @tile_contraction_3d ───────────────────────────────────────────────────
     // Tile sizes [32, 32, 0]: tile M and N at L1 cache level; K is reduction (untiled).
@@ -1001,7 +993,7 @@ pub(crate) fn build_transform_schedule<'c>(
     // Matches batched matmul generics: 4 iteration dims (B, M, N, K).
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_4d", 4));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
 
     // ── @tile_contraction_4d ───────────────────────────────────────────────────
     // Tile sizes [0, 32, 32, 0]: skip B, tile M and N at L1; K is reduction (untiled).
@@ -1183,124 +1175,6 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
     let param_i64_type = melior::ir::Type::parse(context, "!transform.param<i64>")
         .expect("parse !transform.param<i64>");
 
-    // Reuse same match sequence builder as build_transform_schedule.
-    let build_match_seq = |name: &str, rank: i64| {
-        let inner_block = Block::new(&[(any_op_type, location)]);
-        let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
-
-        let contraction_attr = ArrayAttribute::new(
-            context,
-            &[
-                StringAttribute::new(context, "arith.mulf").into(),
-                StringAttribute::new(context, "arith.addf").into(),
-            ],
-        );
-        let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
-            .add_operands(&[inner_arg])
-            .add_attributes(&[(
-                Identifier::new(context, "contraction"),
-                contraction_attr.into(),
-            )])
-            .build()
-            .expect("build transform.match.structured.body");
-        inner_block.append_operation(body_check_op);
-
-        let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
-            .add_operands(&[inner_arg])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.match.structured.rank");
-        let rank_ref = inner_block.append_operation(rank_op);
-        let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
-
-        let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
-            .add_operands(&[inner_arg, rank_param])
-            .build()
-            .expect("build transform.match.structured.yield");
-        inner_block.append_operation(inner_yield_op);
-
-        let inner_region = Region::new();
-        inner_region.append_block(inner_block);
-
-        let match_outer_block = Block::new(&[(any_op_type, location)]);
-        let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
-
-        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
-            .add_operands(&[candidate])
-            .add_attributes(&[(
-                Identifier::new(context, "op_names"),
-                ArrayAttribute::new(
-                    context,
-                    &[StringAttribute::new(context, "linalg.generic").into()],
-                )
-                .into(),
-            )])
-            .build()
-            .expect("build transform.match.operation_name");
-        match_outer_block.append_operation(op_name_filter);
-
-        let match_structured_op = OperationBuilder::new("transform.match.structured", location)
-            .add_operands(&[candidate])
-            .add_results(&[any_op_type, param_i64_type])
-            .add_regions([inner_region])
-            .build()
-            .expect("build transform.match.structured");
-        let match_structured_ref = match_outer_block.append_operation(match_structured_op);
-        let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
-        let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
-
-        let rank_const_attr =
-            Attribute::parse(context, &format!("{rank} : i64")).expect("parse rank constant attr");
-        let rank_const_op = OperationBuilder::new("transform.param.constant", location)
-            .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.param.constant");
-        let rank_const_ref = match_outer_block.append_operation(rank_const_op);
-        let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
-
-        let predicate_attr = Attribute::parse(context, "0 : i32").expect("parse eq predicate");
-        let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
-            .add_operands(&[matched_rank, expected_rank])
-            .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
-            .build()
-            .expect("build transform.match.param.cmpi");
-        match_outer_block.append_operation(cmpi_op);
-
-        let match_outer_yield = OperationBuilder::new("transform.yield", location)
-            .add_operands(&[matched_op])
-            .build()
-            .expect("build transform.yield (match_contraction)");
-        match_outer_block.append_operation(match_outer_yield);
-
-        let match_outer_region = Region::new();
-        match_outer_region.append_block(match_outer_block);
-
-        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
-        let match_arg_attrs =
-            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
-
-        OperationBuilder::new("transform.named_sequence", location)
-            .add_attributes(&[
-                (
-                    Identifier::new(context, "sym_name"),
-                    StringAttribute::new(context, name).into(),
-                ),
-                (
-                    Identifier::new(context, "function_type"),
-                    TypeAttribute::new(match_func_type.into()).into(),
-                ),
-                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
-                (
-                    Identifier::new(context, "sym_visibility"),
-                    StringAttribute::new(context, "private").into(),
-                ),
-            ])
-            .add_regions([match_outer_region])
-            .build()
-            .expect("build transform.named_sequence @match_contraction_Nd")
-    };
-
     // Helper: build a @vectorize_contraction_Nd named_sequence.
     //
     // Tiles N and K with tile_using_for to create small inner loops
@@ -1374,10 +1248,10 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
     // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_3d", 3));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_4d", 4));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
 
     // ── @vectorize_contraction_3d ──────────────────────────────────────────────
     // 3D matmul (M, N, K): tile N=16, K=16. LLVM O2 auto-vectorizes the
@@ -1463,124 +1337,6 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         melior::ir::Type::parse(context, "!transform.any_op").expect("parse !transform.any_op");
     let param_i64_type = melior::ir::Type::parse(context, "!transform.param<i64>")
         .expect("parse !transform.param<i64>");
-
-    // Match sequences are identical to build_vectorize_only_schedule.
-    let build_match_seq = |name: &str, rank: i64| {
-        let inner_block = Block::new(&[(any_op_type, location)]);
-        let inner_arg: melior::ir::Value = inner_block.argument(0).unwrap().into();
-
-        let contraction_attr = ArrayAttribute::new(
-            context,
-            &[
-                StringAttribute::new(context, "arith.mulf").into(),
-                StringAttribute::new(context, "arith.addf").into(),
-            ],
-        );
-        let body_check_op = OperationBuilder::new("transform.match.structured.body", location)
-            .add_operands(&[inner_arg])
-            .add_attributes(&[(
-                Identifier::new(context, "contraction"),
-                contraction_attr.into(),
-            )])
-            .build()
-            .expect("build transform.match.structured.body");
-        inner_block.append_operation(body_check_op);
-
-        let rank_op = OperationBuilder::new("transform.match.structured.rank", location)
-            .add_operands(&[inner_arg])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.match.structured.rank");
-        let rank_ref = inner_block.append_operation(rank_op);
-        let rank_param: melior::ir::Value = rank_ref.result(0).unwrap().into();
-
-        let inner_yield_op = OperationBuilder::new("transform.match.structured.yield", location)
-            .add_operands(&[inner_arg, rank_param])
-            .build()
-            .expect("build transform.match.structured.yield");
-        inner_block.append_operation(inner_yield_op);
-
-        let inner_region = Region::new();
-        inner_region.append_block(inner_block);
-
-        let match_outer_block = Block::new(&[(any_op_type, location)]);
-        let candidate: melior::ir::Value = match_outer_block.argument(0).unwrap().into();
-
-        let op_name_filter = OperationBuilder::new("transform.match.operation_name", location)
-            .add_operands(&[candidate])
-            .add_attributes(&[(
-                Identifier::new(context, "op_names"),
-                ArrayAttribute::new(
-                    context,
-                    &[StringAttribute::new(context, "linalg.generic").into()],
-                )
-                .into(),
-            )])
-            .build()
-            .expect("build transform.match.operation_name");
-        match_outer_block.append_operation(op_name_filter);
-
-        let match_structured_op = OperationBuilder::new("transform.match.structured", location)
-            .add_operands(&[candidate])
-            .add_results(&[any_op_type, param_i64_type])
-            .add_regions([inner_region])
-            .build()
-            .expect("build transform.match.structured");
-        let match_structured_ref = match_outer_block.append_operation(match_structured_op);
-        let matched_op: melior::ir::Value = match_structured_ref.result(0).unwrap().into();
-        let matched_rank: melior::ir::Value = match_structured_ref.result(1).unwrap().into();
-
-        let rank_const_attr =
-            Attribute::parse(context, &format!("{rank} : i64")).expect("parse rank constant attr");
-        let rank_const_op = OperationBuilder::new("transform.param.constant", location)
-            .add_attributes(&[(Identifier::new(context, "value"), rank_const_attr)])
-            .add_results(&[param_i64_type])
-            .build()
-            .expect("build transform.param.constant");
-        let rank_const_ref = match_outer_block.append_operation(rank_const_op);
-        let expected_rank: melior::ir::Value = rank_const_ref.result(0).unwrap().into();
-
-        let predicate_attr = Attribute::parse(context, "0 : i32").expect("parse eq predicate");
-        let cmpi_op = OperationBuilder::new("transform.match.param.cmpi", location)
-            .add_operands(&[matched_rank, expected_rank])
-            .add_attributes(&[(Identifier::new(context, "predicate"), predicate_attr)])
-            .build()
-            .expect("build transform.match.param.cmpi");
-        match_outer_block.append_operation(cmpi_op);
-
-        let match_outer_yield = OperationBuilder::new("transform.yield", location)
-            .add_operands(&[matched_op])
-            .build()
-            .expect("build transform.yield (match_contraction)");
-        match_outer_block.append_operation(match_outer_yield);
-
-        let match_outer_region = Region::new();
-        match_outer_region.append_block(match_outer_block);
-
-        let match_func_type = FunctionType::new(context, &[any_op_type], &[any_op_type]);
-        let match_arg_attrs =
-            Attribute::parse(context, "[{transform.readonly}]").expect("parse match arg_attrs");
-
-        OperationBuilder::new("transform.named_sequence", location)
-            .add_attributes(&[
-                (
-                    Identifier::new(context, "sym_name"),
-                    StringAttribute::new(context, name).into(),
-                ),
-                (
-                    Identifier::new(context, "function_type"),
-                    TypeAttribute::new(match_func_type.into()).into(),
-                ),
-                (Identifier::new(context, "arg_attrs"), match_arg_attrs),
-                (
-                    Identifier::new(context, "sym_visibility"),
-                    StringAttribute::new(context, "private").into(),
-                ),
-            ])
-            .add_regions([match_outer_region])
-            .build()
-            .expect("build transform.named_sequence @match_contraction_Nd")
-    };
 
     // Helper: build a @tile_parallel_contraction_Nd named_sequence.
     //
@@ -1694,10 +1450,10 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
     // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_3d", 3));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
     module
         .body()
-        .append_operation(build_match_seq("match_contraction_4d", 4));
+        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
 
     // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
     // 3D matmul (M, N, K): forall N=256 (parallel), for K=16 only.
