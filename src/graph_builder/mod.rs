@@ -236,6 +236,7 @@ pub fn compile_to_objects(
             func.func(lower-vector-multi-reduction,lower-vector-mask),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
             func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            ownership-based-buffer-deallocation,buffer-deallocation-simplification,convert-bufferization-to-memref,canonicalize,\
             scf-forall-to-parallel,\
             fold-memref-alias-ops,\
             convert-vector-to-scf,\
@@ -271,6 +272,7 @@ pub fn compile_to_objects(
             func.func(lower-vector-multi-reduction,lower-vector-mask),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
             func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            ownership-based-buffer-deallocation,buffer-deallocation-simplification,convert-bufferization-to-memref,canonicalize,\
             fold-memref-alias-ops,\
             convert-vector-to-scf,\
             convert-linalg-to-loops,\
@@ -297,6 +299,7 @@ pub fn compile_to_objects(
             func.func(linalg-fuse-elementwise-ops,canonicalize,cse),\
             one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
             func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            ownership-based-buffer-deallocation,buffer-deallocation-simplification,convert-bufferization-to-memref,canonicalize,\
             fold-memref-alias-ops,\
             convert-linalg-to-loops,\
             fold-memref-alias-ops,\
@@ -1407,6 +1410,7 @@ impl<'c> GraphBuilder<'c> {
                 func.func(lower-vector-multi-reduction,lower-vector-mask),\
                 one-shot-bufferize{bufferize-function-boundaries=1 function-boundary-type-conversion=identity-layout-map unknown-type-conversion=identity-layout-map},\
                 func.func(buffer-hoisting,promote-buffers-to-stack{max-alloc-size-in-bytes=4096}),\
+            ownership-based-buffer-deallocation,buffer-deallocation-simplification,convert-bufferization-to-memref,canonicalize,\
                 scf-forall-to-parallel,\
                 fold-memref-alias-ops,\
                 convert-vector-to-scf,\
