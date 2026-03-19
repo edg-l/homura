@@ -166,12 +166,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     stop_sequences,
                     seed,
                 };
-                // Auto-detect HF model (has config.json + model.safetensors)
-                let model_dir = if model.is_dir() {
-                    model.clone()
-                } else {
-                    model.parent().unwrap_or(&model).to_path_buf()
-                };
+                // Resolve model path: HF repo ID, local directory, or file.
+                let model_dir = resolve_model_path(&model)?;
                 if model_dir.join("config.json").exists()
                     && model_dir.join("model.safetensors").exists()
                 {
@@ -189,6 +185,78 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+// ── model resolution ─────────────────────────────────────────────────────────
+
+/// Resolve a model path: HF repo ID (e.g. "Qwen/Qwen2.5-0.5B"), local directory, or file.
+///
+/// For HF repo IDs, downloads config.json, model.safetensors, and tokenizer.json
+/// to the HF cache and returns the local snapshot directory.
+fn resolve_model_path(model: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // If it's an existing local path, use it directly.
+    if model.exists() {
+        return if model.is_dir() {
+            Ok(model.to_path_buf())
+        } else {
+            Ok(model.parent().unwrap_or(model).to_path_buf())
+        };
+    }
+
+    // Treat as HF repo ID if it looks like "org/model" or "org/model/revision".
+    let model_str = model.to_str().unwrap_or("");
+    let parts: Vec<&str> = model_str.split('/').collect();
+    if parts.len() < 2 {
+        return Err(format!("model path does not exist: {}", model.display()).into());
+    }
+
+    let repo_id = if parts.len() >= 3 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        model_str.to_string()
+    };
+    let revision = if parts.len() >= 3 { parts[2] } else { "main" };
+
+    log::info!(
+        "fetching {} (rev: {}) from HuggingFace Hub",
+        repo_id,
+        revision
+    );
+
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_progress(true)
+        .build()?;
+    let repo = api.repo(hf_hub::Repo::with_revision(
+        repo_id,
+        hf_hub::RepoType::Model,
+        revision.to_string(),
+    ));
+
+    // Download the essential files. hf-hub caches them automatically.
+    let files = [
+        "config.json",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ];
+    let mut snapshot_dir = None;
+    for file in &files {
+        match repo.get(file) {
+            Ok(path) => {
+                if snapshot_dir.is_none() {
+                    snapshot_dir = path.parent().map(|p| p.to_path_buf());
+                }
+            }
+            Err(e) => {
+                // tokenizer_config.json is optional
+                if *file != "tokenizer_config.json" {
+                    return Err(format!("failed to fetch {file}: {e}").into());
+                }
+            }
+        }
+    }
+
+    snapshot_dir.ok_or_else(|| "failed to resolve HF model directory".into())
 }
 
 // ── clean-cache ──────────────────────────────────────────────────────────────
