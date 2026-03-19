@@ -66,6 +66,15 @@ enum Commands {
         /// Maximum number of tokens to generate (default: 100)
         #[arg(long, default_value = "100")]
         max_tokens: usize,
+        /// Sampling temperature (0 = greedy, default: 0.7)
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+        /// Top-p nucleus sampling threshold (default: 0.9)
+        #[arg(long, default_value = "0.9")]
+        top_p: f32,
+        /// Repetition penalty (1.0 = off, default: 1.1)
+        #[arg(long, default_value = "1.1")]
+        repetition_penalty: f32,
     },
 }
 
@@ -98,9 +107,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             output,
             prompt,
             max_tokens,
+            temperature,
+            top_p,
+            repetition_penalty,
         } => {
             if let Some(prompt_text) = prompt {
-                cmd_generate(&model, &prompt_text, max_tokens)
+                let sampling = homura::generate::SamplingConfig {
+                    temperature,
+                    top_p,
+                    repetition_penalty,
+                };
+                cmd_generate(&model, &prompt_text, max_tokens, &sampling)
             } else {
                 cmd_run(
                     &model,
@@ -201,6 +218,7 @@ fn cmd_generate(
     model_path: &std::path::Path,
     prompt: &str,
     max_tokens: usize,
+    sampling: &homura::generate::SamplingConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve model directory: if given a file, use its parent.
     let model_dir = if model_path.is_dir() {
@@ -225,7 +243,7 @@ fn cmd_generate(
 
         log::info!("generating (max_tokens={max_tokens})");
         let t_gen = Instant::now();
-        let text = generator.generate(prompt, max_tokens);
+        let text = generator.generate_with_sampling(prompt, max_tokens, sampling);
         log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
         text
     } else {

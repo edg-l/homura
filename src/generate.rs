@@ -157,6 +157,123 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
         .unwrap_or(0)
 }
 
+// ── Sampling ──────────────────────────────────────────────────────────────────
+
+/// Configuration for token sampling.
+#[derive(Clone, Debug)]
+pub struct SamplingConfig {
+    /// Temperature: 1.0 = neutral, <1 sharper, >1 flatter. 0 = greedy.
+    pub temperature: f32,
+    /// Nucleus sampling: keep smallest set of tokens with cumulative prob >= top_p.
+    pub top_p: f32,
+    /// Repetition penalty: logits of already-generated tokens are divided by this.
+    pub repetition_penalty: f32,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+        }
+    }
+}
+
+/// Sample a token from a logit slice using temperature, repetition penalty, and top-p.
+///
+/// `logits` is the raw logit vector for a single position (length = vocab_size).
+/// `generated_ids` is the list of already-generated token IDs (for repetition penalty).
+pub fn sample_token(logits: &[f32], config: &SamplingConfig, generated_ids: &[u32]) -> u32 {
+    let mut logits = logits.to_vec();
+
+    // Repetition penalty: divide logits of previously generated tokens.
+    if config.repetition_penalty != 1.0 {
+        for &id in generated_ids {
+            let idx = id as usize;
+            if idx < logits.len() {
+                if logits[idx] > 0.0 {
+                    logits[idx] /= config.repetition_penalty;
+                } else {
+                    logits[idx] *= config.repetition_penalty;
+                }
+            }
+        }
+    }
+
+    // Temperature = 0 means greedy.
+    if config.temperature <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+    }
+
+    // Apply temperature.
+    let inv_temp = 1.0 / config.temperature;
+    for l in &mut logits {
+        *l *= inv_temp;
+    }
+
+    // Softmax.
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    for p in &mut probs {
+        *p /= sum;
+    }
+
+    // Top-p (nucleus) filtering.
+    let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut cumulative = 0.0;
+    let mut cutoff_idx = indexed.len();
+    for (i, &(_, p)) in indexed.iter().enumerate() {
+        cumulative += p;
+        if cumulative >= config.top_p {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+    let candidates = &indexed[..cutoff_idx];
+
+    // Renormalize and sample.
+    let total: f32 = candidates.iter().map(|(_, p)| p).sum();
+    let r = simple_random() * total;
+    let mut accum = 0.0;
+    for &(token_id, p) in candidates {
+        accum += p;
+        if accum >= r {
+            return token_id as u32;
+        }
+    }
+    candidates.last().map(|(id, _)| *id as u32).unwrap_or(0)
+}
+
+/// Simple pseudo-random f32 in [0, 1) using thread-local xorshift64.
+fn simple_random() -> f32 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64 | 1
+        );
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

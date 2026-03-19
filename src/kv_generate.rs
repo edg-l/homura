@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::{
     DType,
-    generate::argmax_at_position,
+    generate::{SamplingConfig, argmax_at_position, sample_token},
     onnx::parser::Dim,
     onnx::{Model, parser},
     runtime::Buffer,
@@ -184,6 +184,16 @@ impl UnifiedKvGenerator {
     ///
     /// Returns only the generated text (prompt excluded).
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> String {
+        self.generate_with_sampling(prompt, max_new_tokens, &SamplingConfig::default())
+    }
+
+    /// Generate text with explicit sampling configuration.
+    pub fn generate_with_sampling(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        sampling: &SamplingConfig,
+    ) -> String {
         let mut token_ids: Vec<i64> = self
             .tokenizer
             .encode(prompt)
@@ -249,13 +259,14 @@ impl UnifiedKvGenerator {
             }
 
             let step_start = std::time::Instant::now();
-            next_token = match self.decode_step_kv(next_token, real_pos) {
-                Ok(t) => t,
+            let logits = match self.decode_step_logits(next_token, real_pos) {
+                Ok(l) => l,
                 Err(e) => {
                     log_error!("decode step failed: {e}");
                     break;
                 }
             };
+            next_token = sample_token(&logits, sampling, &generated_ids);
             real_pos += 1;
 
             let token_text = self.tokenizer.decode(&[next_token]);
@@ -353,12 +364,12 @@ impl UnifiedKvGenerator {
 
     /// Run one decode step using the persistent KV cache.
     ///
-    /// Only passes [input_ids, attention_mask] — KV is managed internally.
-    fn decode_step_kv(
+    /// Returns the raw logit vector for position 0 (single-token decode).
+    fn decode_step_logits(
         &self,
         next_token: u32,
         real_pos: usize,
-    ) -> Result<u32, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let input_ids = Buffer::from_slice::<i64>(&[next_token as i64], &[1, 1], DType::I64);
         let mask_len = real_pos + 1;
         let mask_data = vec![1i64; mask_len];
@@ -369,10 +380,10 @@ impl UnifiedKvGenerator {
             .model
             .run_kv(&[&input_ids, &attention_mask], self.config.max_seq_len)?;
 
-        // run_kv returns only non-KV outputs: [logits]
         let logits = &outputs[0];
         let vocab_size = logits.shape().0[2] as usize;
-        Ok(argmax_at_position(logits, 0, vocab_size))
+        let data = logits.as_slice::<f32>();
+        Ok(data[..vocab_size].to_vec())
     }
 }
 
