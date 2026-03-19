@@ -215,7 +215,7 @@ impl HfModel {
         }
         generated_ids.push(next_token);
         let token_text = tokenizer.decode(&[next_token]);
-        eprint!(
+        eprintln!(
             "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET} {DIM}(prefill){RESET}"
         );
 
@@ -239,7 +239,7 @@ impl HfModel {
             let token_text = tokenizer.decode(&[current_token]);
             let step_elapsed = step_start.elapsed().as_secs_f64();
             let tok_s = 1.0 / step_elapsed;
-            eprint!(
+            eprintln!(
                 "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET}  \
                  {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,

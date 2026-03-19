@@ -87,7 +87,6 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
     let num_heads = config.num_attention_heads as u64;
     let kv_heads = config.kv_heads() as u64;
     let head_dim = config.head_dim() as u64;
-    let half_dim = head_dim / 2;
 
     let dyn_val = crate::shape::DIM_DYNAMIC;
 
@@ -108,14 +107,14 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
         ]),
     });
     let (cos_slot, cos_desc) = alloc(SlotDesc {
-        shape: Shape(vec![dyn_val, half_dim]),
+        shape: Shape(vec![dyn_val, head_dim]),
         dtype: DType::F32,
-        sym_shape: Some(vec![seq(), SymDim::Concrete(half_dim)]),
+        sym_shape: Some(vec![seq(), SymDim::Concrete(head_dim)]),
     });
     let (sin_slot, sin_desc) = alloc(SlotDesc {
-        shape: Shape(vec![dyn_val, half_dim]),
+        shape: Shape(vec![dyn_val, head_dim]),
         dtype: DType::F32,
-        sym_shape: Some(vec![seq(), SymDim::Concrete(half_dim)]),
+        sym_shape: Some(vec![seq(), SymDim::Concrete(head_dim)]),
     });
 
     let mut input_slots = vec![input_ids_slot, mask_slot, cos_slot, sin_slot];
@@ -512,7 +511,7 @@ fn emit_embed_kernel(
 ///          q_w [hidden, hidden], [q_b [hidden]],
 ///          k_w [hidden, kv_dim], [k_b [kv_dim]],
 ///          v_w [hidden, kv_dim], [v_b [kv_dim]]
-///          cos [seq, half_dim], sin [seq, half_dim]
+///          cos [seq, head_dim], sin [seq, head_dim]
 /// Outputs: q [1, seq, num_heads, head_dim],
 ///          k [1, seq, kv_heads, head_dim],
 ///          v [1, seq, kv_heads, head_dim]
@@ -526,7 +525,6 @@ fn emit_qkv_kernel(
     let num_heads = config.num_attention_heads as u64;
     let kv_heads = config.kv_heads() as u64;
     let head_dim = config.head_dim() as u64;
-    let half_dim = head_dim / 2;
 
     let ctx = GraphContext::new();
     let mut gb = ctx.builder();
@@ -552,8 +550,8 @@ fn emit_qkv_kernel(
     } else {
         None
     };
-    let cos = gb.input(&[None, Some(half_dim)], DType::F32);
-    let sin = gb.input(&[None, Some(half_dim)], DType::F32);
+    let cos = gb.input(&[None, Some(head_dim)], DType::F32);
+    let sin = gb.input(&[None, Some(head_dim)], DType::F32);
 
     // RMSNorm
     let normed = gb.emit_rms_norm(&h, &ln_w, config.rms_norm_eps as f32);
@@ -585,8 +583,8 @@ fn emit_qkv_kernel(
     let v_4d = gb.emit_reshape(&v, &[1, -1, kv_heads as i64, head_dim as i64]);
 
     // RoPE on Q and K (before KV concat so cached K is already rotated)
-    let q_rope = gb.emit_rope(&q_4d, &cos, &sin);
-    let k_rope = gb.emit_rope(&k_4d, &cos, &sin);
+    let q_rope = gb.emit_rope_half(&q_4d, &cos, &sin);
+    let k_rope = gb.emit_rope_half(&k_4d, &cos, &sin);
 
     // Transpose K and V from BSHD [1, seq, kv_heads, head_dim]
     // to BHSD [1, kv_heads, seq, head_dim] for KV cache concat on axis=2.

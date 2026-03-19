@@ -7,3 +7,4 @@ debug_memref*
 tests/fixtures/gpt2_decoder_model.onnx
 tests/fixtures/gpt2_decoder_model_merged.onnx
 tests/fixtures/gpt2_decoder_with_past_model.onnx
+.venv/

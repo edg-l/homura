@@ -112,6 +112,43 @@ impl<'c> GraphBuilder<'c> {
             "[[0], [1], [2], [3, 4]]",
         )
     }
+    /// Apply RoPE using the HuggingFace half-rotation convention.
+    ///
+    /// `x`:   `[batch, seq, heads, head_dim]`
+    /// `cos`: `[seq, head_dim]` -- full head_dim (first half == second half)
+    /// `sin`: `[seq, head_dim]` -- full head_dim
+    ///
+    /// Implements: `x * cos + rotate_half(x) * sin`
+    /// where `rotate_half(x) = cat(-x[..., d//2:], x[..., :d//2])`.
+    pub fn emit_rope_half(
+        &mut self,
+        x: &Tensor<'c>,
+        cos: &Tensor<'c>,
+        sin: &Tensor<'c>,
+    ) -> Tensor<'c> {
+        let shape = x.shape();
+        let head_dim = shape[3].expect("head_dim must be static for RoPE");
+        let half = head_dim / 2;
+
+        // Split x into first half and second half along last axis
+        // x1 = x[..., :d//2], x2 = x[..., d//2:]
+        let x1 = self.emit_slice(x, &[0], &[half as i64], &[-1], &[1]);
+        let x2 = self.emit_slice(x, &[half as i64], &[head_dim as i64], &[-1], &[1]);
+
+        // rotate_half(x) = cat(-x2, x1)
+        let neg_x2 = self.emit_neg(&x2);
+        let rotated = self.emit_concat(&[neg_x2, x1], 3);
+
+        // cos/sin are [seq, head_dim] -- unsqueeze to [1, seq, 1, head_dim]
+        let cos_4d = self.emit_unsqueeze(cos, &[0, 2]);
+        let sin_4d = self.emit_unsqueeze(sin, &[0, 2]);
+
+        // result = x * cos + rotate_half(x) * sin
+        let x_cos = self.emit_mul(x, &cos_4d);
+        let rot_sin = self.emit_mul(&rotated, &sin_4d);
+        self.emit_add(&x_cos, &rot_sin)
+    }
+
     // ── Reductions ────────────────────────────────────────────────────────────
 
     /// Reduce along a single axis via summation.

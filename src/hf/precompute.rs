@@ -1,18 +1,19 @@
 use crate::DType;
 use crate::runtime::Buffer;
 
-/// Precompute full RoPE cos/sin tables.
+/// Precompute RoPE cos/sin tables (HuggingFace half-rotation convention).
 ///
-/// Returns (cos, sin) buffers of shape [max_seq_len, head_dim / 2].
-/// cos[pos, i] = cos(pos / theta^(2i / head_dim))
-/// sin[pos, i] = sin(pos / theta^(2i / head_dim))
+/// Returns (cos, sin) buffers of shape `[max_seq_len, head_dim]`.
+/// The first `head_dim/2` elements and second `head_dim/2` elements are
+/// identical (matching PyTorch's `rotate_half` convention where
+/// `q_embed = q * cos + rotate_half(q) * sin`).
 pub fn precompute_rope_cos_sin(
     head_dim: usize,
     max_seq_len: usize,
     theta: f64,
 ) -> (Buffer, Buffer) {
     let half_dim = head_dim / 2;
-    let num_elems = max_seq_len * half_dim;
+    let num_elems = max_seq_len * head_dim;
     let mut cos_data = vec![0.0f32; num_elems];
     let mut sin_data = vec![0.0f32; num_elems];
 
@@ -20,12 +21,17 @@ pub fn precompute_rope_cos_sin(
         for i in 0..half_dim {
             let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
             let angle = pos as f64 * freq;
-            cos_data[pos * half_dim + i] = angle.cos() as f32;
-            sin_data[pos * half_dim + i] = angle.sin() as f32;
+            let c = angle.cos() as f32;
+            let s = angle.sin() as f32;
+            // Duplicate: first half and second half are identical
+            cos_data[pos * head_dim + i] = c;
+            cos_data[pos * head_dim + half_dim + i] = c;
+            sin_data[pos * head_dim + i] = s;
+            sin_data[pos * head_dim + half_dim + i] = s;
         }
     }
 
-    let shape = &[max_seq_len as u64, half_dim as u64];
+    let shape = &[max_seq_len as u64, head_dim as u64];
     let cos_buf = Buffer::from_slice::<f32>(&cos_data, shape, DType::F32);
     let sin_buf = Buffer::from_slice::<f32>(&sin_data, shape, DType::F32);
     (cos_buf, sin_buf)
@@ -57,8 +63,8 @@ pub fn build_causal_mask(seq_len: usize, past_len: usize) -> Buffer {
 
 /// Slice RoPE tables for specific positions.
 ///
-/// Given full cos/sin tables of shape [max_seq_len, half_dim], extract rows
-/// at the given positions. Returns (cos, sin) of shape [positions.len(), half_dim].
+/// Given full cos/sin tables of shape [max_seq_len, dim], extract rows
+/// at the given positions. Returns (cos, sin) of shape [positions.len(), dim].
 ///
 /// For prefill: positions = [0, 1, ..., seq_len-1]
 /// For decode:  positions = [past_len]
@@ -68,25 +74,25 @@ pub fn slice_rope_for_positions(
     positions: &[usize],
 ) -> (Buffer, Buffer) {
     let shape = full_cos.shape();
-    let half_dim = shape.0[1] as usize;
+    let row_dim = shape.0[1] as usize;
     let n = positions.len();
 
     let full_cos_data = full_cos.as_slice::<f32>();
     let full_sin_data = full_sin.as_slice::<f32>();
 
-    let mut cos_data = vec![0.0f32; n * half_dim];
-    let mut sin_data = vec![0.0f32; n * half_dim];
+    let mut cos_data = vec![0.0f32; n * row_dim];
+    let mut sin_data = vec![0.0f32; n * row_dim];
 
     for (out_row, &pos) in positions.iter().enumerate() {
-        let src_start = pos * half_dim;
-        let dst_start = out_row * half_dim;
-        cos_data[dst_start..dst_start + half_dim]
-            .copy_from_slice(&full_cos_data[src_start..src_start + half_dim]);
-        sin_data[dst_start..dst_start + half_dim]
-            .copy_from_slice(&full_sin_data[src_start..src_start + half_dim]);
+        let src_start = pos * row_dim;
+        let dst_start = out_row * row_dim;
+        cos_data[dst_start..dst_start + row_dim]
+            .copy_from_slice(&full_cos_data[src_start..src_start + row_dim]);
+        sin_data[dst_start..dst_start + row_dim]
+            .copy_from_slice(&full_sin_data[src_start..src_start + row_dim]);
     }
 
-    let out_shape = &[n as u64, half_dim as u64];
+    let out_shape = &[n as u64, row_dim as u64];
     let cos_buf = Buffer::from_slice::<f32>(&cos_data, out_shape, DType::F32);
     let sin_buf = Buffer::from_slice::<f32>(&sin_data, out_shape, DType::F32);
     (cos_buf, sin_buf)
