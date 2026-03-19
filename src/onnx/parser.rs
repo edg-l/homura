@@ -230,7 +230,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
     // optimum export), extract the then_branch subgraph transparently.
     let graph = match try_extract_if_then_branch(&mut graph) {
         Some(subgraph) => {
-            tracing::info!("extracted then_branch from single-If merged model");
+            log_info!("extracted then_branch from single-If merged model");
             subgraph
         }
         None => graph,

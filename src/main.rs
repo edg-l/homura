@@ -7,6 +7,7 @@ use homura::generate::Generator;
 use homura::kv_generate::{
     KvGenerator, UnifiedKvGenerator, has_unified_model, has_with_past_model,
 };
+use homura::log;
 use homura::onnx::parser;
 use homura::{Buffer, DType, Model};
 
@@ -71,19 +72,11 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(io::stderr)
-        .init();
-
     let cli = Cli::parse();
     let code = match run(cli) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("error: {e}");
+            log::error!("{e}");
             1
         }
     };
@@ -223,39 +216,39 @@ fn cmd_generate(
 
     let model_dir_str = model_dir.to_str().ok_or("model path is not valid UTF-8")?;
 
-    tracing::info!(dir = %model_dir.display(), "loading generator");
+    log::info!("loading generator from {}", model_dir.display());
     let t_load = Instant::now();
 
     // Prefer unified single-model, then two-model KV cache, then full-recompute.
     let generated = if has_unified_model(&model_dir) {
-        tracing::info!("using unified KV cache generator — single-model approach");
+        log::info!("using unified KV cache generator — single-model approach");
         let generator = UnifiedKvGenerator::load(model_dir_str, 1024, 50256)?;
-        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
+        log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-        tracing::info!(max_tokens, "generating");
+        log::info!("generating (max_tokens={max_tokens})");
         let t_gen = Instant::now();
         let text = generator.generate(prompt, max_tokens);
-        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
+        log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
         text
     } else if has_with_past_model(&model_dir) {
-        tracing::info!("using KV cache generator — two-model approach");
+        log::info!("using KV cache generator — two-model approach");
         let generator = KvGenerator::load(model_dir_str, 1024, 50256)?;
-        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
+        log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-        tracing::info!(max_tokens, "generating");
+        log::info!("generating (max_tokens={max_tokens})");
         let t_gen = Instant::now();
         let text = generator.generate(prompt, max_tokens);
-        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
+        log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
         text
     } else {
-        tracing::info!("using full-recompute generator — no with-past model found");
+        log::info!("using full-recompute generator — no with-past model found");
         let generator = Generator::load(model_dir_str)?;
-        tracing::info!(elapsed_s = t_load.elapsed().as_secs_f64(), "loaded");
+        log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-        tracing::info!(max_tokens, "generating");
+        log::info!("generating (max_tokens={max_tokens})");
         let t_gen = Instant::now();
         let text = generator.generate(prompt, max_tokens);
-        tracing::info!(elapsed_s = t_gen.elapsed().as_secs_f64(), "generated");
+        log::info!("generated in {:.2}s", t_gen.elapsed().as_secs_f64());
         text
     };
 
@@ -329,9 +322,9 @@ fn cmd_run(
         }
         let first = &onnx.dynamic_inputs[0];
         if onnx.dynamic_inputs.len() > 1 {
-            tracing::info!(
-                count = onnx.dynamic_inputs.len(),
-                "model has multiple dynamic inputs; using all-zeros for each"
+            log::info!(
+                "model has {} dynamic inputs; using all-zeros for each",
+                onnx.dynamic_inputs.len()
             );
         }
         let shape = first
@@ -374,10 +367,10 @@ fn cmd_run(
             .flat_map(|v| v.to_le_bytes())
             .collect();
         std::fs::write(out_path, &bytes)?;
-        tracing::info!(
-            count = output.as_slice::<f32>().len(),
-            path = %out_path.display(),
-            "wrote f32 values"
+        log::info!(
+            "wrote {} f32 values to {}",
+            output.as_slice::<f32>().len(),
+            out_path.display()
         );
     } else {
         let stdout = io::stdout();

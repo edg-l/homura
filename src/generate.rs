@@ -33,9 +33,9 @@ impl Generator {
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
 
-        tracing::info!(path = %model_path.display(), "loading model");
+        log_info!("loading model from {}", model_path.display());
         let model = Model::load(&model_path)?;
-        tracing::info!("loading tokenizer");
+        log_info!("loading tokenizer");
         let tokenizer =
             Tokenizer::from_files(vocab_path.to_str().unwrap(), merges_path.to_str().unwrap())?;
 
@@ -60,10 +60,10 @@ impl Generator {
             return String::new();
         }
 
-        tracing::info!(
-            prompt_tokens = prompt_ids.len(),
-            max_new_tokens,
-            "starting generation"
+        log_info!(
+            "starting generation: {} prompt tokens, max_new_tokens={}",
+            prompt_ids.len(),
+            max_new_tokens
         );
 
         let prompt_len = prompt_ids.len();
@@ -82,7 +82,7 @@ impl Generator {
             let outputs = match self.model.run(&[&input_ids, &attention_mask]) {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::error!(seq_len, "model run failed: {e}");
+                    log_error!("model run failed (seq_len={}): {e}", seq_len);
                     break;
                 }
             };
@@ -93,16 +93,17 @@ impl Generator {
 
             let token_text = self.tokenizer.decode(&[next_token]);
             let elapsed = step_start.elapsed();
-            tracing::info!(
-                step = step + 1,
-                max = max_new_tokens,
-                token = ?token_text,
+            log_info!(
+                "step {}/{}: token={:?} seq_len={} elapsed={:.3}s",
+                step + 1,
+                max_new_tokens,
+                token_text,
                 seq_len,
-                elapsed_s = elapsed.as_secs_f64(),
+                elapsed.as_secs_f64(),
             );
 
             if next_token == EOS_TOKEN_ID {
-                tracing::info!("EOS token reached");
+                log_info!("EOS token reached");
                 break;
             }
 
@@ -111,15 +112,15 @@ impl Generator {
         }
 
         let total = gen_start.elapsed();
-        tracing::info!(
-            tokens = generated_ids.len(),
-            total_s = total.as_secs_f64(),
-            per_token_s = if generated_ids.is_empty() {
+        log_info!(
+            "generation complete: {} tokens in {:.2}s ({:.3}s/tok)",
+            generated_ids.len(),
+            total.as_secs_f64(),
+            if generated_ids.is_empty() {
                 0.0
             } else {
                 total.as_secs_f64() / generated_ids.len() as f64
             },
-            "generation complete"
         );
 
         // Drop the prompt tokens, decode only the generated portion.

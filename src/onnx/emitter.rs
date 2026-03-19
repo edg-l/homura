@@ -404,10 +404,10 @@ pub fn emit_graph_with_split<'c>(
     }
 
     if chunk_index > 0 {
-        tracing::debug!(
+        log_debug!(
+            "emitter: split graph into sub-functions (chunk_index={} split_threshold={})",
             chunk_index,
             split_threshold,
-            "emitter: split graph into sub-functions"
         );
     }
 
@@ -2209,20 +2209,12 @@ pub fn emit_and_compile_plan(
     let mut groups = partition_nodes(&model.nodes);
     let gemm_residual_fusions = detect_and_absorb_gemm_residual(&model.nodes, &mut groups);
     if !gemm_residual_fusions.is_empty() {
-        eprintln!(
-            "[{:>8.2}s] [plan] fused {} Gemm+residual Add pairs",
-            crate::log_ts(),
-            gemm_residual_fusions.len()
-        );
+        log_compile!("plan", "fused {} Gemm+residual Add pairs", gemm_residual_fusions.len());
     }
     let (groups, kv_concat_node_indices, kv_concat_ordered) =
         split_kv_concat_groups(&model.nodes, groups);
     if !kv_concat_node_indices.is_empty() {
-        eprintln!(
-            "[{:>8.2}s] [plan] split {} KV Concat nodes into native ops",
-            crate::log_ts(),
-            kv_concat_node_indices.len()
-        );
+        log_compile!("plan", "split {} KV Concat nodes into native ops", kv_concat_node_indices.len());
     }
 
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
@@ -2242,13 +2234,7 @@ pub fn emit_and_compile_plan(
     let mut past_kv_input_slots: Vec<usize> = Vec::new();
     let mut present_kv_output_slots: Vec<usize> = Vec::new();
 
-    eprintln!(
-        "[{:>8.2}s] [plan] {} nodes → {} kernels, {} buffer slots",
-        crate::log_ts(),
-        model.nodes.len(),
-        groups.len(),
-        num_slots
-    );
+    log_compile!("plan", "{} nodes → {} kernels, {} buffer slots", model.nodes.len(), groups.len(), num_slots);
 
     // Seed shape info from model inputs.
     let mut shape_info: HashMap<String, ValueShapeInfo> = HashMap::new();
@@ -2703,11 +2689,7 @@ pub fn emit_and_compile_plan(
     );
 
     // Phase 2: Compile all kernels in parallel.
-    eprintln!(
-        "[{:>8.2}s] [plan] compiling {} kernels in parallel...",
-        crate::log_ts(),
-        emit_results.len()
-    );
+    log_compile!("plan", "compiling {} kernels in parallel...", emit_results.len());
     let compile_start = std::time::Instant::now();
 
     // Phase 2a: Compile each kernel to .o files in parallel (no linking yet).
@@ -2729,9 +2711,9 @@ pub fn emit_and_compile_plan(
                     &tmp_dir,
                 )
                 .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
-                eprintln!(
-                    "[{:>8.2}s] [plan] k{} [{}] ({} in / {} out): {}ms",
-                    crate::log_ts(),
+                log_compile!(
+                    "plan",
+                    "k{} [{}] ({} in / {} out): {}ms",
                     er.group_idx,
                     er.ops_label,
                     er.num_in,
@@ -2761,12 +2743,7 @@ pub fn emit_and_compile_plan(
     ));
     crate::compiler::link_shared_lib_pub(&all_objs, &unified_so)
         .map_err(|e| OnnxError::CompileError(format!("unified link: {e}")))?;
-    eprintln!(
-        "[{:>8.2}s] [plan] unified link ({} .o files): {}ms",
-        crate::log_ts(),
-        all_objs.len(),
-        link_start.elapsed().as_millis()
-    );
+    log_compile!("plan", "unified link ({} .o files): {}ms", all_objs.len(), link_start.elapsed().as_millis());
 
     // Clean up .o files.
     for p in &all_objs {
@@ -2811,12 +2788,7 @@ pub fn emit_and_compile_plan(
     // Clean up the .so file (it's already dlopen'd).
     std::fs::remove_file(&unified_so).ok();
 
-    eprintln!(
-        "[{:>8.2}s] [plan] all {} kernels compiled + linked: {}ms total",
-        crate::log_ts(),
-        kernels.len(),
-        compile_start.elapsed().as_millis()
-    );
+    log_compile!("plan", "all {} kernels compiled + linked: {}ms total", kernels.len(), compile_start.elapsed().as_millis());
 
     // Build slot descriptors.
     let slot_descs: Vec<SlotDesc> = slot_names
@@ -2881,13 +2853,7 @@ pub fn emit_and_compile_plan(
             past_kv_input_slots,
             present_kv_output_slots,
         });
-        eprintln!(
-            "[{:>8.2}s] [plan] KV cache: {} layers, {} heads, head_dim={}",
-            crate::log_ts(),
-            num_layers,
-            num_heads,
-            head_dim
-        );
+        log_compile!("plan", "KV cache: {} layers, {} heads, head_dim={}", num_layers, num_heads, head_dim);
     }
 
     Ok((plan, weights))

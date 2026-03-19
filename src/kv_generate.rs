@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::{
     DType,
     cache::bucket_pad,
@@ -155,13 +156,13 @@ impl KvGenerator {
             )
         })?;
 
-        tracing::info!(path = %prompt_path.display(), "loading prefill model");
+        log_info!("loading prefill model from {}", prompt_path.display());
         // Prefill runs once per generation — no need to keep sequence_length dynamic.
         // Resolving it to the concrete bucket size avoids DIM_DYNAMIC in output shapes.
         let prompt_model =
             Model::load_with_dynamic_dims(&prompt_path, std::collections::HashSet::new())?;
 
-        tracing::info!(path = %decode_path.display(), "loading decode model");
+        log_info!("loading decode model from {}", decode_path.display());
         // Keep past_sequence_length (and derived dims like "past_sequence_length + 1")
         // dynamic so the decode model compiles ONCE and accepts any past_len at runtime.
         let keep_dynamic: std::collections::HashSet<String> = [
@@ -172,19 +173,19 @@ impl KvGenerator {
         .collect();
         let decode_model = Model::load_with_dynamic_dims(&decode_path, keep_dynamic)?;
 
-        tracing::info!(path = %decode_path.display(), "detecting model config");
+        log_info!("detecting model config from {}", decode_path.display());
         let config = ModelConfig::from_onnx_model(&decode_path, max_seq_len, eos_token_id)?;
-        tracing::info!(
-            num_kv_tensors = config.num_kv_tensors,
-            num_heads = config.num_heads,
-            head_dim = config.head_dim,
-            max_seq_len = config.max_seq_len,
-            "model config"
+        log_info!(
+            "model config: num_kv_tensors={} num_heads={} head_dim={} max_seq_len={}",
+            config.num_kv_tensors,
+            config.num_heads,
+            config.head_dim,
+            config.max_seq_len,
         );
 
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
-        tracing::info!("loading tokenizer");
+        log_info!("loading tokenizer");
         let tokenizer = Tokenizer::from_files(
             vocab_path
                 .to_str()
@@ -222,14 +223,14 @@ impl KvGenerator {
         // Leave room for at least 1 generated token.
         let max_prompt = self.config.max_seq_len - 1;
         if token_ids.len() > max_prompt {
-            tracing::warn!(from = token_ids.len(), to = max_prompt, "truncating prompt");
+            log_warn!("truncating prompt from {} to {} tokens", token_ids.len(), max_prompt);
             token_ids.truncate(max_prompt);
         }
 
-        tracing::info!(
-            prompt_tokens = token_ids.len(),
+        log_info!(
+            "starting generation: {} prompt tokens, max_new_tokens={}",
+            token_ids.len(),
             max_new_tokens,
-            "starting generation"
         );
 
         let gen_start = std::time::Instant::now();
@@ -239,42 +240,39 @@ impl KvGenerator {
         let (mut next_token, kv_cache, mut real_pos) = match self.prefill(&token_ids) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("prefill failed: {e}");
+                log_error!("prefill failed: {e}");
                 return String::new();
             }
         };
         let prefill_s = step_start.elapsed().as_secs_f64();
-        tracing::info!("prefill complete in {prefill_s:.2}s");
+        log_info!("prefill complete in {prefill_s:.2}s");
 
         // Initialize persistent KV cache from prefill outputs.
         if let Err(e) = self
             .decode_model
             .init_kv_cache(&kv_cache, self.config.max_seq_len)
         {
-            tracing::error!("init_kv_cache failed: {e}");
+            log_error!("init_kv_cache failed: {e}");
             return String::new();
         }
-        tracing::info!("KV cache initialized ({real_pos} positions)");
+        log_info!("KV cache initialized ({real_pos} positions)");
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
         if next_token == self.config.eos_token_id {
-            tracing::info!("EOS after prefill");
+            log_info!("EOS after prefill");
             return String::new();
         }
         generated_ids.push(next_token);
         let token_text = self.tokenizer.decode(&[next_token]);
         eprintln!(
-            "  \x1b[36m[1/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m \x1b[2m(prefill)\x1b[0m"
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET} {DIM}(prefill){RESET}"
         );
 
         // Decode loop
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
-                tracing::warn!(
-                    max_seq_len = self.config.max_seq_len,
-                    "context limit reached"
-                );
+                log_warn!("context limit reached (max_seq_len={})", self.config.max_seq_len);
                 break;
             }
 
@@ -282,7 +280,7 @@ impl KvGenerator {
             next_token = match self.decode_step_kv(next_token, real_pos) {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::error!("decode step failed: {e}");
+                    log_error!("decode step failed: {e}");
                     break;
                 }
             };
@@ -292,14 +290,14 @@ impl KvGenerator {
             let step_elapsed = step_start.elapsed().as_secs_f64();
             let tok_s = 1.0 / step_elapsed;
             eprintln!(
-                "  \x1b[36m[{}/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m  \
-                 \x1b[33m{:.0}ms\x1b[0m  \x1b[32m{tok_s:.1} tok/s\x1b[0m",
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET}  \
+                 {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,
                 step_elapsed * 1000.0,
             );
 
             if next_token == self.config.eos_token_id {
-                tracing::info!("EOS token reached");
+                log_info!("EOS token reached");
                 break;
             }
             generated_ids.push(next_token);
@@ -315,8 +313,8 @@ impl KvGenerator {
         };
         let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
         eprintln!(
-            "  \x1b[1;35m── done ──\x1b[0m {decode_tokens} tokens in \
-             \x1b[33m{total_s:.2}s\x1b[0m · \x1b[32m{tok_s:.1} tok/s\x1b[0m · \
+            "  {BOLD_MAGENTA}── done ──{RESET} {decode_tokens} tokens in \
+             {YELLOW}{total_s:.2}s{RESET} · {GREEN}{tok_s:.1} tok/s{RESET} · \
              {:.0}ms/tok",
             per_tok * 1000.0,
         );
@@ -368,12 +366,12 @@ impl KvGenerator {
                 .iter()
                 .map(|(i, v)| format!("{}={:.4}", i, v))
                 .collect();
-            tracing::debug!(
-                top5 = top5.join(", "),
-                min = pos_logits.iter().cloned().fold(f32::INFINITY, f32::min),
-                max = pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                result_token = next_token,
-                "prefill logits top5"
+            log_debug!(
+                "prefill logits top5: {} min={:.4} max={:.4} result_token={}",
+                top5.join(", "),
+                pos_logits.iter().cloned().fold(f32::INFINITY, f32::min),
+                pos_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                next_token,
             );
         }
 
@@ -462,7 +460,7 @@ impl UnifiedKvGenerator {
             )
         })?;
 
-        tracing::info!(path = %model_path.display(), "loading unified model");
+        log_info!("loading unified model from {}", model_path.display());
         let keep_dynamic: std::collections::HashSet<String> = [
             "sequence_length",
             "past_sequence_length",
@@ -476,19 +474,19 @@ impl UnifiedKvGenerator {
         .collect();
         let model = Model::load_with_dynamic_dims(&model_path, keep_dynamic)?;
 
-        tracing::info!(path = %model_path.display(), "detecting model config");
+        log_info!("detecting model config from {}", model_path.display());
         let config = ModelConfig::from_onnx_model(&model_path, max_seq_len, eos_token_id)?;
-        tracing::info!(
-            num_kv_tensors = config.num_kv_tensors,
-            num_heads = config.num_heads,
-            head_dim = config.head_dim,
-            max_seq_len = config.max_seq_len,
-            "model config"
+        log_info!(
+            "model config: num_kv_tensors={} num_heads={} head_dim={} max_seq_len={}",
+            config.num_kv_tensors,
+            config.num_heads,
+            config.head_dim,
+            config.max_seq_len,
         );
 
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
-        tracing::info!("loading tokenizer");
+        log_info!("loading tokenizer");
         let tokenizer = Tokenizer::from_files(
             vocab_path
                 .to_str()
@@ -522,14 +520,14 @@ impl UnifiedKvGenerator {
 
         let max_prompt = self.config.max_seq_len - 1;
         if token_ids.len() > max_prompt {
-            tracing::warn!(from = token_ids.len(), to = max_prompt, "truncating prompt");
+            log_warn!("truncating prompt from {} to {} tokens", token_ids.len(), max_prompt);
             token_ids.truncate(max_prompt);
         }
 
-        tracing::info!(
-            prompt_tokens = token_ids.len(),
+        log_info!(
+            "starting unified generation: {} prompt tokens, max_new_tokens={}",
+            token_ids.len(),
             max_new_tokens,
-            "starting unified generation"
         );
 
         let gen_start = std::time::Instant::now();
@@ -539,40 +537,37 @@ impl UnifiedKvGenerator {
         let (mut next_token, kv_cache, mut real_pos) = match self.prefill(&token_ids) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("prefill failed: {e}");
+                log_error!("prefill failed: {e}");
                 return String::new();
             }
         };
         let prefill_s = step_start.elapsed().as_secs_f64();
-        tracing::info!("prefill complete in {prefill_s:.2}s");
+        log_info!("prefill complete in {prefill_s:.2}s");
 
         // Initialize persistent KV cache from prefill outputs.
         if let Err(e) = self.model.init_kv_cache(&kv_cache, self.config.max_seq_len) {
-            tracing::error!("init_kv_cache failed: {e}");
+            log_error!("init_kv_cache failed: {e}");
             return String::new();
         }
-        tracing::info!("KV cache initialized from prefill ({real_pos} positions)");
+        log_info!("KV cache initialized from prefill ({real_pos} positions)");
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
         if next_token == self.config.eos_token_id {
-            tracing::info!("EOS after prefill");
+            log_info!("EOS after prefill");
             return String::new();
         }
         generated_ids.push(next_token);
         let token_text = self.tokenizer.decode(&[next_token]);
         eprintln!(
-            "  \x1b[36m[1/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m \
-             \x1b[2m(prefill)\x1b[0m"
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET} \
+             {DIM}(prefill){RESET}"
         );
 
         // Decode loop
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
-                tracing::warn!(
-                    max_seq_len = self.config.max_seq_len,
-                    "context limit reached"
-                );
+                log_warn!("context limit reached (max_seq_len={})", self.config.max_seq_len);
                 break;
             }
 
@@ -580,7 +575,7 @@ impl UnifiedKvGenerator {
             next_token = match self.decode_step_kv(next_token, real_pos) {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::error!("decode step failed: {e}");
+                    log_error!("decode step failed: {e}");
                     break;
                 }
             };
@@ -590,14 +585,14 @@ impl UnifiedKvGenerator {
             let step_elapsed = step_start.elapsed().as_secs_f64();
             let tok_s = 1.0 / step_elapsed;
             eprintln!(
-                "  \x1b[36m[{}/{max_new_tokens}]\x1b[0m \x1b[1m{token_text:?}\x1b[0m  \
-                 \x1b[33m{:.0}ms\x1b[0m  \x1b[32m{tok_s:.1} tok/s\x1b[0m",
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET}  \
+                 {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,
                 step_elapsed * 1000.0,
             );
 
             if next_token == self.config.eos_token_id {
-                tracing::info!("EOS token reached");
+                log_info!("EOS token reached");
                 break;
             }
             generated_ids.push(next_token);
@@ -613,8 +608,8 @@ impl UnifiedKvGenerator {
         };
         let tok_s = if per_tok > 0.0 { 1.0 / per_tok } else { 0.0 };
         eprintln!(
-            "  \x1b[1;35m── done ──\x1b[0m {decode_tokens} tokens in \
-             \x1b[33m{total_s:.2}s\x1b[0m · \x1b[32m{tok_s:.1} tok/s\x1b[0m · \
+            "  {BOLD_MAGENTA}── done ──{RESET} {decode_tokens} tokens in \
+             {YELLOW}{total_s:.2}s{RESET} · {GREEN}{tok_s:.1} tok/s{RESET} · \
              {:.0}ms/tok",
             per_tok * 1000.0,
         );

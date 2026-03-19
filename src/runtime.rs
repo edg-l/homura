@@ -876,7 +876,7 @@ impl CompiledGraph {
         }
 
         {
-            tracing::debug!(count = inputs.len(), "memref inputs");
+            log_debug!("memref inputs: count={}", inputs.len());
             for (i, buf) in inputs.iter().enumerate() {
                 let data_ptr = buf.as_ptr();
                 match buf.dtype() {
@@ -889,9 +889,9 @@ impl CompiledGraph {
                                 f32::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
-                        tracing::debug!(
-                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
-                            ptr = ?data_ptr, first_elems = ?elems, "input memref"
+                        log_debug!(
+                            "input memref[{i}]: shape={:?} dtype={:?} ptr={:?} first_elems={:?}",
+                            buf.shape().0, buf.dtype(), data_ptr, elems
                         );
                     }
                     DType::I64 => {
@@ -903,25 +903,25 @@ impl CompiledGraph {
                                 i64::from_ne_bytes(bytes.try_into().unwrap())
                             })
                             .collect();
-                        tracing::debug!(
-                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
-                            ptr = ?data_ptr, first_elems = ?elems, "input memref"
+                        log_debug!(
+                            "input memref[{i}]: shape={:?} dtype={:?} ptr={:?} first_elems={:?}",
+                            buf.shape().0, buf.dtype(), data_ptr, elems
                         );
                     }
                     _ => {
-                        tracing::debug!(
-                            i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
-                            ptr = ?data_ptr, "input memref"
+                        log_debug!(
+                            "input memref[{i}]: shape={:?} dtype={:?} ptr={:?}",
+                            buf.shape().0, buf.dtype(), data_ptr
                         );
                     }
                 }
             }
-            tracing::debug!(count = output_bufs.len(), "memref outputs");
+            log_debug!("memref outputs: count={}", output_bufs.len());
             for (i, buf) in output_bufs.iter().enumerate() {
                 let data_ptr = buf.as_ptr();
-                tracing::debug!(
-                    i, shape = ?buf.shape().0, dtype = ?buf.dtype(),
-                    ptr = ?data_ptr, size_bytes = buf.byte_len(), "output memref"
+                log_debug!(
+                    "output memref[{i}]: shape={:?} dtype={:?} ptr={:?} size_bytes={}",
+                    buf.shape().0, buf.dtype(), data_ptr, buf.byte_len()
                 );
             }
         }
@@ -1149,11 +1149,9 @@ impl ExecutionPlan {
                         let actual = actual_shape[dim];
                         if let Some(&existing) = bindings.get(name) {
                             if existing != actual {
-                                tracing::warn!(
-                                    name,
-                                    existing,
-                                    actual,
-                                    "conflicting sym dim binding"
+                                log_warn!(
+                                    "conflicting sym dim binding: name={} existing={} actual={}",
+                                    name, existing, actual
                                 );
                             }
                         }
@@ -1255,10 +1253,7 @@ impl ExecutionPlan {
                 .iter()
                 .any(|&slot| resolved_shapes[slot].0.iter().any(|&d| d == 0));
             if has_zero_output {
-                tracing::debug!(
-                    kernel = step.kernel_idx,
-                    "skipping kernel: output has zero dimension"
-                );
+                log_debug!("skipping kernel {}: output has zero dimension", step.kernel_idx);
                 for &slot in &step.output_slots {
                     let shape = &resolved_shapes[slot];
                     let dtype = self.slot_descs[slot].dtype;

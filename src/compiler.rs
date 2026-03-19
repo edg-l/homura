@@ -239,11 +239,7 @@ fn emit_object_files_impl(
         let translate_start = std::time::Instant::now();
         let llvm_ctx = LLVMContextCreate();
         let llvm_module = mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_ctx);
-        eprintln!(
-            "[{:>8.2}s] [{label}] MLIR→LLVM: {}ms",
-            crate::log_ts(),
-            translate_start.elapsed().as_millis()
-        );
+        log_compile!(label, "MLIR→LLVM: {}ms", translate_start.elapsed().as_millis());
 
         if !llvm_module.is_null() {
             let dl = CString::new(
@@ -303,11 +299,7 @@ fn emit_object_files_impl(
                 LLVMDisposeMemoryBuffer(mb);
                 sz
             };
-            eprintln!(
-                "[{:>8.2}s] [{label}] monolithic: {n_funcs} func, {}KB",
-                crate::log_ts(),
-                bc_size / 1024
-            );
+            log_compile!(label, "monolithic: {n_funcs} func, {}KB", bc_size / 1024);
             let obj_path = output_dir.join(format!("{base_name}.o"));
             internalize_module(llvm_module, func_name);
             optimise_and_emit(llvm_module, llvm_ctx, &obj_path, "O2")?;
@@ -316,12 +308,8 @@ fn emit_object_files_impl(
 
         // Don't create more partitions than functions.
         let n_parts = n_threads.min(n_funcs);
-        eprintln!(
-            "[{:>8.2}s] [{label}] split: {n_funcs} funcs → {n_parts} parts",
-            crate::log_ts()
-        );
-
-        tracing::info!(n_funcs, n_parts, "parallel codegen: splitting LLVM module");
+        log_compile!(label, "split: {n_funcs} funcs → {n_parts} parts");
+        log_info!("parallel codegen: splitting LLVM module ({n_funcs} funcs, {n_parts} parts)");
         let split_start = std::time::Instant::now();
 
         // Split module into partitions (all share the original LLVMContext).
@@ -359,13 +347,10 @@ fn emit_object_files_impl(
         LLVMContextDispose(llvm_ctx);
 
         let split_ms = split_start.elapsed().as_millis() as u64;
-        eprintln!(
-            "[{:>8.2}s] [{label}] split+ser: {split_ms}ms, sizes(KB): {:?}",
-            crate::log_ts(),
-            bitcode_bufs
-                .iter()
-                .map(|b| b.len() / 1024)
-                .collect::<Vec<_>>()
+        log_compile!(
+            label,
+            "split+ser: {split_ms}ms, sizes(KB): {:?}",
+            bitcode_bufs.iter().map(|b| b.len() / 1024).collect::<Vec<_>>()
         );
 
         // Compile each partition in parallel: fresh LLVMContext per thread.
@@ -400,9 +385,9 @@ fn emit_object_files_impl(
                         let opt = if bc_bytes < 50_000 { "O3" } else { "O2" };
                         match optimise_and_emit(part_module, ctx, obj_path, opt) {
                             Ok(()) => {
-                                eprintln!(
-                                    "[{:>8.2}s] [{label}] part {i} ({opt}, {}KB): {}ms",
-                                    crate::log_ts(),
+                                log_compile!(
+                                    label,
+                                    "part {i} ({opt}, {}KB): {}ms",
                                     bc_bytes / 1024,
                                     t0.elapsed().as_millis()
                                 );
@@ -435,12 +420,7 @@ fn emit_object_files_impl(
             }
         }
 
-        eprintln!(
-            "[{:>8.2}s] [{label}] all {} parts: {}ms",
-            crate::log_ts(),
-            obj_paths.len(),
-            split_start.elapsed().as_millis()
-        );
+        log_compile!(label, "all {} parts: {}ms", obj_paths.len(), split_start.elapsed().as_millis());
 
         Ok(obj_paths)
     }

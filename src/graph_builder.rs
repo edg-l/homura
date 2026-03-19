@@ -330,7 +330,7 @@ pub fn compile_from_mlir(
                 match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                     Ok(graph) => return Ok(graph),
                     Err(e) => {
-                        tracing::warn!(path = %so_path.display(), "cache entry unloadable, recompiling: {e}");
+                        log_warn!("cache entry unloadable, recompiling {}: {e}", so_path.display());
                     }
                 }
             }
@@ -459,11 +459,7 @@ pub fn compile_from_mlir(
         .map_err(CompileError::Pass)?;
 
     pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-    eprintln!(
-        "[{:>8.2}s] [{label}] passes: {}ms",
-        crate::log_ts(),
-        passes_start.elapsed().as_millis()
-    );
+    log_compile!(label, "passes: {}ms", passes_start.elapsed().as_millis());
 
     // Dump post-pass IR for specific kernels.
     if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
@@ -501,11 +497,7 @@ pub fn compile_from_mlir(
     )?;
     let link_start = std::time::Instant::now();
     crate::compiler::link_shared_lib_pub(&obj_paths, &tmp_so)?;
-    eprintln!(
-        "[{:>8.2}s] [{label}] link: {}ms",
-        crate::log_ts(),
-        link_start.elapsed().as_millis()
-    );
+    log_compile!(label, "link: {}ms", link_start.elapsed().as_millis());
     for p in &obj_paths {
         std::fs::remove_file(p).ok();
     }
@@ -525,7 +517,7 @@ pub fn compile_from_mlir(
                 .collect(),
         };
         if let Err(e) = cache.store(key, &tmp_so, &meta) {
-            tracing::warn!("cache: failed to write cache entry: {e}");
+            log_warn!("cache: failed to write cache entry: {e}");
         }
     }
 
@@ -4143,10 +4135,10 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Fallback: emit tensor.reshape (the old path).
-        tracing::debug!(
-            in_shape = ?in_shape,
-            out_shape = ?out_shape,
-            "emit_reshape: falling back to tensor.reshape"
+        log_debug!(
+            "emit_reshape: falling back to tensor.reshape (in={:?} out={:?})",
+            in_shape,
+            out_shape,
         );
         self.emit_reshape_tensor_op(input, &out_shape)
     }
@@ -4650,10 +4642,10 @@ impl<'c> GraphBuilder<'c> {
         }
 
         // Final fallback: tensor.reshape via shape tensor.
-        tracing::debug!(
-            ?in_shape,
-            ?out_shape,
-            "emit_reshape_from_index_dims: falling back to tensor.reshape"
+        log_debug!(
+            "emit_reshape_from_index_dims: falling back to tensor.reshape (in={:?} out={:?})",
+            in_shape,
+            out_shape,
         );
         let index_type = melior::ir::Type::parse(self.context, "index").expect("index type");
         let n = dim_vals.len() as u64;
@@ -8122,16 +8114,14 @@ impl<'c> GraphBuilder<'c> {
                 "/tmp/homura_gb_pre_passes.mlir",
                 module.as_operation().to_string(),
             );
-            tracing::debug!("GraphBuilder pre-pass IR dumped to /tmp/homura_gb_pre_passes.mlir");
+            log_debug!("GraphBuilder pre-pass IR dumped to /tmp/homura_gb_pre_passes.mlir");
         }
 
         // Verify.
         if !module.as_operation().verify() {
             let ir = module.as_operation().to_string();
             let _ = std::fs::write("/tmp/homura_gb_failed.mlir", &ir);
-            tracing::warn!(
-                "GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir"
-            );
+            log_warn!("GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir");
             return Err(CompileError::Verification);
         }
 
@@ -8143,7 +8133,7 @@ impl<'c> GraphBuilder<'c> {
                     match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                         Ok(graph) => return Ok(graph),
                         Err(e) => {
-                            tracing::warn!(path = %so_path.display(), "cache entry unloadable, recompiling: {e}");
+                            log_warn!("cache entry unloadable, recompiling {}: {e}", so_path.display());
                         }
                     }
                 }
@@ -8152,10 +8142,7 @@ impl<'c> GraphBuilder<'c> {
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
         let pipeline_start = std::time::Instant::now();
-        eprintln!(
-            "[{:>8.2}s] [pipeline] starting MLIR passes...",
-            crate::log_ts()
-        );
+        log_compile!("pipeline", "starting MLIR passes...");
         register_all_passes();
         let pass_manager = pass::PassManager::new(context);
         parse_pass_pipeline(
@@ -8197,18 +8184,14 @@ impl<'c> GraphBuilder<'c> {
         .map_err(CompileError::Pass)?;
 
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-        eprintln!(
-            "[{:>8.2}s] [pipeline] MLIR passes done: {}ms",
-            crate::log_ts(),
-            pipeline_start.elapsed().as_millis()
-        );
+        log_compile!("pipeline", "MLIR passes done: {}ms", pipeline_start.elapsed().as_millis());
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write(
                 "/tmp/homura_gb_post_passes.mlir",
                 module.as_operation().to_string(),
             );
-            tracing::debug!("GraphBuilder post-pass IR dumped to /tmp/homura_gb_post_passes.mlir");
+            log_debug!("GraphBuilder post-pass IR dumped to /tmp/homura_gb_post_passes.mlir");
         }
 
         // AOT compile.
@@ -8247,7 +8230,7 @@ impl<'c> GraphBuilder<'c> {
                     .collect(),
             };
             if let Err(e) = cache.store(key, &tmp_so, &meta) {
-                tracing::warn!("cache: failed to write cache entry: {e}");
+                log_warn!("cache: failed to write cache entry: {e}");
             }
         }
 
