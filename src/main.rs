@@ -168,12 +168,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 // Resolve model path: HF repo ID, local directory, or file.
                 let model_dir = resolve_model_path(&model)?;
-                if model_dir.join("config.json").exists()
-                    && model_dir.join("model.safetensors").exists()
-                {
+                let has_config = model_dir.join("config.json").exists();
+                let has_weights = model_dir.join("model.safetensors").exists()
+                    || model_dir.join("model.safetensors.index.json").exists();
+                if has_config && has_weights {
                     cmd_generate_hf(&model_dir, &prompt_text, max_tokens, &sampling)
                 } else {
-                    cmd_generate(&model, &prompt_text, max_tokens, &sampling)
+                    cmd_generate(&model_dir, &prompt_text, max_tokens, &sampling)
                 }
             } else {
                 cmd_run(
