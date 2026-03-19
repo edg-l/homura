@@ -892,7 +892,10 @@ impl CompiledGraph {
                             .collect();
                         log_debug!(
                             "input memref[{i}]: shape={:?} dtype={:?} ptr={:?} first_elems={:?}",
-                            buf.shape().0, buf.dtype(), data_ptr, elems
+                            buf.shape().0,
+                            buf.dtype(),
+                            data_ptr,
+                            elems
                         );
                     }
                     DType::I64 => {
@@ -906,13 +909,18 @@ impl CompiledGraph {
                             .collect();
                         log_debug!(
                             "input memref[{i}]: shape={:?} dtype={:?} ptr={:?} first_elems={:?}",
-                            buf.shape().0, buf.dtype(), data_ptr, elems
+                            buf.shape().0,
+                            buf.dtype(),
+                            data_ptr,
+                            elems
                         );
                     }
                     _ => {
                         log_debug!(
                             "input memref[{i}]: shape={:?} dtype={:?} ptr={:?}",
-                            buf.shape().0, buf.dtype(), data_ptr
+                            buf.shape().0,
+                            buf.dtype(),
+                            data_ptr
                         );
                     }
                 }
@@ -922,7 +930,10 @@ impl CompiledGraph {
                 let data_ptr = buf.as_ptr();
                 log_debug!(
                     "output memref[{i}]: shape={:?} dtype={:?} ptr={:?} size_bytes={}",
-                    buf.shape().0, buf.dtype(), data_ptr, buf.byte_len()
+                    buf.shape().0,
+                    buf.dtype(),
+                    data_ptr,
+                    buf.byte_len()
                 );
             }
         }
@@ -1149,12 +1160,15 @@ impl ExecutionPlan {
                     if let crate::shape::SymDim::Var(name) = sym {
                         let actual = actual_shape[dim];
                         if let Some(&existing) = bindings.get(name)
-                            && existing != actual {
-                                log_warn!(
-                                    "conflicting sym dim binding: name={} existing={} actual={}",
-                                    name, existing, actual
-                                );
-                            }
+                            && existing != actual
+                        {
+                            log_warn!(
+                                "conflicting sym dim binding: name={} existing={} actual={}",
+                                name,
+                                existing,
+                                actual
+                            );
+                        }
                         bindings.insert(name.clone(), actual);
                     }
                 }
@@ -1232,7 +1246,34 @@ impl ExecutionPlan {
         let mut free_list: Vec<Buffer> = Vec::new();
 
         // Execute steps.
+        let debug_steps = std::env::var("HOMURA_DEBUG_STEPS").is_ok();
         for (step_idx, step) in self.steps.iter().enumerate() {
+            if debug_steps {
+                let in_shapes: Vec<_> = step
+                    .input_slots
+                    .iter()
+                    .map(|&s| {
+                        pool[s]
+                            .as_ref()
+                            .map(|e| e.as_ref().shape().0.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let out_shapes: Vec<_> = step
+                    .output_slots
+                    .iter()
+                    .map(|&s| resolved_shapes[s].0.clone())
+                    .collect();
+                eprintln!(
+                    "[step {step_idx}] k={} native={:?} in_slots={:?} in_shapes={:?} out_slots={:?} out_shapes={:?}",
+                    step.kernel_idx,
+                    step.native_op.is_some(),
+                    step.input_slots,
+                    in_shapes,
+                    step.output_slots,
+                    out_shapes
+                );
+            }
             // Gather input refs for this kernel.
             let step_inputs: Vec<&Buffer> = step
                 .input_slots
@@ -1253,7 +1294,10 @@ impl ExecutionPlan {
                 .iter()
                 .any(|&slot| resolved_shapes[slot].0.contains(&0));
             if has_zero_output {
-                log_debug!("skipping kernel {}: output has zero dimension", step.kernel_idx);
+                log_debug!(
+                    "skipping kernel {}: output has zero dimension",
+                    step.kernel_idx
+                );
                 for &slot in &step.output_slots {
                     let shape = &resolved_shapes[slot];
                     let dtype = self.slot_descs[slot].dtype;
@@ -1290,9 +1334,10 @@ impl ExecutionPlan {
                 for &slot in &step.input_slots {
                     if let Some(last) = self.slot_last_read[slot]
                         && last == step_idx
-                            && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
-                                free_list.push(buf);
-                            }
+                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take()
+                    {
+                        free_list.push(buf);
+                    }
                 }
                 continue;
             }
@@ -1367,9 +1412,10 @@ impl ExecutionPlan {
             for &slot in &step.input_slots {
                 if let Some(last) = self.slot_last_read[slot]
                     && last == step_idx
-                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
-                            free_list.push(buf);
-                        }
+                    && let Some(PoolEntry::Owned(buf)) = pool[slot].take()
+                {
+                    free_list.push(buf);
+                }
             }
         }
 
@@ -1587,9 +1633,10 @@ impl ExecutionPlan {
                 for &slot in &step.input_slots {
                     if let Some(last) = self.slot_last_read[slot]
                         && last == step_idx
-                            && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
-                                free_list.push(buf);
-                            }
+                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take()
+                    {
+                        free_list.push(buf);
+                    }
                 }
                 continue;
             }
@@ -1654,9 +1701,10 @@ impl ExecutionPlan {
             for &slot in &step.input_slots {
                 if let Some(last) = self.slot_last_read[slot]
                     && last == step_idx
-                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
-                            free_list.push(buf);
-                        }
+                    && let Some(PoolEntry::Owned(buf)) = pool[slot].take()
+                {
+                    free_list.push(buf);
+                }
             }
         }
 

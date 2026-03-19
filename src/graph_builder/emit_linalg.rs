@@ -1197,14 +1197,14 @@ impl<'c> GraphBuilder<'c> {
         let out_shape = vec![m, n];
         let dtype = self.value_dtype(lhs_val);
 
-        let filled = self.emit_zero_filled_tensor(
-            &out_shape,
-            dtype,
-            &[
-                (lhs_val, 0), // M from lhs dim 0
-                (rhs_val, 1), // N from rhs dim 1
-            ],
-        );
+        let mut dyn_sources = Vec::new();
+        if m.is_none() {
+            dyn_sources.push((lhs_val, 0)); // M from lhs dim 0
+        }
+        if n.is_none() {
+            dyn_sources.push((rhs_val, 1)); // N from rhs dim 1
+        }
+        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
         let segment =
@@ -1267,15 +1267,18 @@ impl<'c> GraphBuilder<'c> {
         let out_shape = vec![b, m, n];
         let dtype = self.value_dtype(lhs_val);
 
-        let filled = self.emit_zero_filled_tensor(
-            &out_shape,
-            dtype,
-            &[
-                (lhs_val, 0), // B from lhs dim 0
-                (lhs_val, 1), // M from lhs dim 1
-                (rhs_val, 2), // N from rhs dim 2
-            ],
-        );
+        // Only include dyn_sources for dims that are actually dynamic (None).
+        let mut dyn_sources = Vec::new();
+        if b.is_none() {
+            dyn_sources.push((lhs_val, 0)); // B from lhs dim 0
+        }
+        if m.is_none() {
+            dyn_sources.push((lhs_val, 1)); // M from lhs dim 1
+        }
+        if n.is_none() {
+            dyn_sources.push((rhs_val, 2)); // N from rhs dim 2
+        }
+        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
 
         let out_type = self.make_tensor_type(&out_shape, dtype);
         let segment =
