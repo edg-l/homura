@@ -174,6 +174,7 @@ impl HfModel {
             model: self,
             tokenizer,
             max_seq_len,
+            eos_override: None,
         };
         generate_streaming(&mut ctx, prompt, max_new_tokens, sampling)
     }
@@ -182,10 +183,32 @@ impl HfModel {
 // ── HfGenerationContext ───────────────────────────────────────────────────────
 
 /// Wraps HfModel + HfTokenizer for use with the shared `generate_streaming` loop.
+///
+/// For chat mode, create with `new_chat` which sets an EOS override and keeps
+/// the KV cache alive across calls to `generate_streaming`.
 pub struct HfGenerationContext<'a> {
     model: &'a HfModel,
     tokenizer: &'a HfTokenizer,
     max_seq_len: usize,
+    /// Override the EOS token for chat mode (e.g. `<|im_end|>` instead of `<|endoftext|>`).
+    eos_override: Option<u32>,
+}
+
+impl<'a> HfGenerationContext<'a> {
+    /// Create a context for chat mode with a custom EOS token.
+    pub fn new_chat(
+        model: &'a HfModel,
+        tokenizer: &'a HfTokenizer,
+        max_seq_len: usize,
+        eos_override: Option<u32>,
+    ) -> Self {
+        HfGenerationContext {
+            model,
+            tokenizer,
+            max_seq_len,
+            eos_override,
+        }
+    }
 }
 
 impl<'a> GenerativeModel for HfGenerationContext<'a> {
@@ -204,26 +227,45 @@ impl<'a> GenerativeModel for HfGenerationContext<'a> {
     fn prefill(&mut self, token_ids: &[i64]) -> Result<PrefillOutput, Box<dyn std::error::Error>> {
         let seq_len = token_ids.len();
         let vocab_size = self.model.config.vocab_size;
-        let num_kv = self.model.config.num_hidden_layers * 2;
 
         let step_start = std::time::Instant::now();
         let input_ids = Buffer::from_slice::<i64>(token_ids, &[1, seq_len as u64], DType::I64);
-        let outputs = self.model.run(&input_ids)?;
 
-        let logits = &outputs[0];
-        let first_token = argmax_at_position(logits, seq_len - 1, vocab_size);
+        if self.model.kv_cache_len() > 0 {
+            // Incremental prefill: KV cache already exists from a prior turn.
+            // Feed new tokens through run_kv to extend the cache.
+            let outputs = self.model.run_kv(&input_ids, self.max_seq_len)?;
+            let logits = &outputs[0];
+            let first_token = argmax_at_position(logits, seq_len - 1, vocab_size);
+            let real_pos = self.model.kv_cache_len();
+            let prefill_time = step_start.elapsed();
 
-        let kv_cache: Vec<Buffer> = outputs[1..1 + num_kv].to_vec();
-        self.model.init_kv_cache(&kv_cache, self.max_seq_len)?;
+            Ok(PrefillOutput {
+                first_token,
+                prompt_len: seq_len,
+                real_pos,
+                prefill_time,
+            })
+        } else {
+            // Full prefill: first turn, no KV cache yet.
+            let num_kv = self.model.config.num_hidden_layers * 2;
+            let outputs = self.model.run(&input_ids)?;
 
-        let prefill_time = step_start.elapsed();
+            let logits = &outputs[0];
+            let first_token = argmax_at_position(logits, seq_len - 1, vocab_size);
 
-        Ok(PrefillOutput {
-            first_token,
-            prompt_len: seq_len,
-            real_pos: seq_len,
-            prefill_time,
-        })
+            let kv_cache: Vec<Buffer> = outputs[1..1 + num_kv].to_vec();
+            self.model.init_kv_cache(&kv_cache, self.max_seq_len)?;
+
+            let prefill_time = step_start.elapsed();
+
+            Ok(PrefillOutput {
+                first_token,
+                prompt_len: seq_len,
+                real_pos: seq_len,
+                prefill_time,
+            })
+        }
     }
 
     fn decode_step(
@@ -241,7 +283,9 @@ impl<'a> GenerativeModel for HfGenerationContext<'a> {
     }
 
     fn eos_token_id(&self) -> u32 {
-        self.model.config.eos_token_id.unwrap_or(u32::MAX)
+        self.eos_override
+            .or(self.model.config.eos_token_id)
+            .unwrap_or(u32::MAX)
     }
 
     fn max_seq_len(&self) -> usize {

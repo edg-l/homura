@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use homura::generate::Generator;
 use homura::kv_generate::{UnifiedKvGenerator, has_unified_model};
 use homura::log;
@@ -42,6 +42,59 @@ struct Cli {
     command: Commands,
 }
 
+/// Shared sampling parameters for text generation.
+#[derive(Args, Clone, Debug)]
+struct SamplingArgs {
+    /// Sampling temperature (0 = greedy, default: 0.7)
+    #[arg(long, default_value = "0.7")]
+    temperature: f32,
+    /// Top-p nucleus sampling threshold (default: 0.9)
+    #[arg(long, default_value = "0.9")]
+    top_p: f32,
+    /// Repetition penalty (1.0 = off, default: 1.1)
+    #[arg(long, default_value = "1.1")]
+    repetition_penalty: f32,
+    /// Top-k filtering (0 = disabled, default: 50)
+    #[arg(long, default_value = "50")]
+    top_k: usize,
+    /// min_p sampling: filter tokens with prob < min_p * max_prob (default: 0, disabled)
+    #[arg(long, default_value = "0.0")]
+    min_p: f32,
+    /// Frequency penalty: subtract freq * count(token) from logits (default: 0, off)
+    #[arg(long, default_value = "0.0")]
+    frequency_penalty: f32,
+    /// Presence penalty: subtract penalty for any previously seen token (default: 0, off)
+    #[arg(long, default_value = "0.0")]
+    presence_penalty: f32,
+    /// RNG seed for reproducible sampling
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Stop sequences (comma-separated, e.g. "\n\n,Posted by")
+    #[arg(long)]
+    stop: Option<String>,
+}
+
+impl SamplingArgs {
+    fn to_config(&self) -> homura::generate::SamplingConfig {
+        let stop_sequences = self
+            .stop
+            .as_ref()
+            .map(|s| s.split(',').map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        homura::generate::SamplingConfig {
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repetition_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            stop_sequences,
+            seed: self.seed,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Print model graph info (inputs, outputs, ops) without compiling
@@ -70,33 +123,24 @@ enum Commands {
         /// Maximum number of tokens to generate (default: 100)
         #[arg(long, default_value = "100")]
         max_tokens: usize,
-        /// Sampling temperature (0 = greedy, default: 0.7)
-        #[arg(long, default_value = "0.7")]
-        temperature: f32,
-        /// Top-p nucleus sampling threshold (default: 0.9)
-        #[arg(long, default_value = "0.9")]
-        top_p: f32,
-        /// Repetition penalty (1.0 = off, default: 1.1)
-        #[arg(long, default_value = "1.1")]
-        repetition_penalty: f32,
-        /// Top-k filtering (0 = disabled, default: 50)
-        #[arg(long, default_value = "50")]
-        top_k: usize,
-        /// min_p sampling: filter tokens with prob < min_p * max_prob (default: 0, disabled)
-        #[arg(long, default_value = "0.0")]
-        min_p: f32,
-        /// Frequency penalty: subtract freq * count(token) from logits (default: 0, off)
-        #[arg(long, default_value = "0.0")]
-        frequency_penalty: f32,
-        /// Presence penalty: subtract penalty for any previously seen token (default: 0, off)
-        #[arg(long, default_value = "0.0")]
-        presence_penalty: f32,
-        /// RNG seed for reproducible sampling
+        #[command(flatten)]
+        sampling: SamplingArgs,
+    },
+    /// Interactive multi-turn chat with a HuggingFace model
+    Chat {
+        /// HuggingFace model (e.g. Qwen/Qwen2.5-0.5B) or local directory
+        model: PathBuf,
+        /// System prompt
+        #[arg(long, default_value = "You are a helpful assistant.")]
+        system: String,
+        /// Maximum tokens to generate per turn (default: 512)
+        #[arg(long, default_value = "512")]
+        max_tokens: usize,
+        /// Enable thinking/reasoning output (for models like Qwen3 that support it)
         #[arg(long)]
-        seed: Option<u64>,
-        /// Stop sequences (comma-separated, e.g. "\n\n,Posted by")
-        #[arg(long)]
-        stop: Option<String>,
+        think: bool,
+        #[command(flatten)]
+        sampling: SamplingArgs,
     },
 }
 
@@ -141,31 +185,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             output,
             prompt,
             max_tokens,
-            temperature,
-            top_p,
-            repetition_penalty,
-            top_k,
-            min_p,
-            frequency_penalty,
-            presence_penalty,
-            seed,
-            stop,
+            sampling,
         } => {
             if let Some(prompt_text) = prompt {
-                let stop_sequences = stop
-                    .map(|s| s.split(',').map(|s| s.to_string()).collect())
-                    .unwrap_or_default();
-                let sampling = homura::generate::SamplingConfig {
-                    temperature,
-                    top_k,
-                    top_p,
-                    min_p,
-                    repetition_penalty,
-                    frequency_penalty,
-                    presence_penalty,
-                    stop_sequences,
-                    seed,
-                };
+                let sampling = sampling.to_config();
                 // Resolve model path: HF repo ID, local directory, or file.
                 let model_dir = resolve_model_path(&model)?;
                 let has_config = model_dir.join("config.json").exists();
@@ -184,6 +207,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     output.as_deref(),
                 )
             }
+        }
+        Commands::Chat {
+            model,
+            system,
+            max_tokens,
+            think,
+            sampling,
+        } => {
+            let model_dir = resolve_model_path(&model)?;
+            let model_name = model.to_string_lossy();
+            cmd_chat(
+                &model_dir,
+                &model_name,
+                &system,
+                max_tokens,
+                think,
+                &sampling,
+            )
         }
     }
 }
@@ -442,6 +483,224 @@ fn cmd_generate_hf(
     if !atty::is(atty::Stream::Stdout) {
         println!("{}{}", prompt, generated);
     }
+    Ok(())
+}
+
+// ── chat ─────────────────────────────────────────────────────────────────────
+
+fn cmd_chat(
+    model_dir: &std::path::Path,
+    model_name: &str,
+    system_prompt: &str,
+    max_tokens_per_turn: usize,
+    enable_thinking: bool,
+    sampling_args: &SamplingArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use homura::generate::generate_streaming_from_ids;
+    use homura::hf::chat::{ChatMessage, ChatTemplate, find_chat_stop_token, find_think_tokens};
+    use homura::hf::model::HfGenerationContext;
+    use std::io::BufRead;
+
+    log::info!("loading HF model from {}", model_dir.display());
+    let t_load = Instant::now();
+
+    let model = homura::hf::model::HfModel::load(model_dir)?;
+    let tokenizer =
+        homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
+    let chat_template = ChatTemplate::load(model_dir)?;
+
+    log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, 2048);
+    let stop_token = find_chat_stop_token(model_dir, &tokenizer);
+    // Always look up think tokens so we can hide them from output.
+    // The --think flag controls whether content is styled, not whether tags are hidden.
+    let think_tokens = find_think_tokens(&tokenizer);
+    log::info!(
+        "max_seq_len={max_seq_len}, stop_token={:?}, think_tokens={:?}",
+        stop_token,
+        think_tokens
+    );
+
+    let mut ctx = HfGenerationContext::new_chat(&model, &tokenizer, max_seq_len, stop_token);
+
+    // Build conversation history starting with the system prompt.
+    // Append /no_think for Qwen3-style models when thinking is disabled.
+    let system_content = if !enable_thinking && think_tokens.is_some() {
+        format!("{system_prompt} /no_think")
+    } else {
+        system_prompt.to_string()
+    };
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+        role: "system".into(),
+        content: system_content,
+    }];
+
+    // Prefill system prompt on startup so the KV cache is warm.
+    let system_text = chat_template.render(
+        &messages,
+        false,
+        if enable_thinking { Some(true) } else { None },
+    )?;
+    let system_tokens = tokenizer.encode_with_special(&system_text);
+    let system_token_ids: Vec<i64> = system_tokens.iter().map(|&id| id as i64).collect();
+
+    log::info!(
+        "prefilling system prompt ({} tokens)",
+        system_token_ids.len()
+    );
+    let prefill_start = Instant::now();
+    // Use the model directly for the system-only prefill (no generation).
+    let input_buf = homura::Buffer::from_slice::<i64>(
+        &system_token_ids,
+        &[1, system_token_ids.len() as u64],
+        homura::DType::I64,
+    );
+    let outputs = model.run(&input_buf)?;
+    let num_kv = model.config().num_hidden_layers * 2;
+    let kv_cache: Vec<homura::Buffer> = outputs[1..1 + num_kv].to_vec();
+    model.init_kv_cache(&kv_cache, max_seq_len)?;
+    log::info!(
+        "system prefill done in {:.2}s",
+        prefill_start.elapsed().as_secs_f64()
+    );
+
+    // Track how many tokens have been fed to the KV cache so far.
+    let mut tokens_in_cache = system_token_ids.len();
+
+    eprintln!("\x1b[1m{model_name}\x1b[0m -- type /help for commands.\n");
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let sampling = sampling_args.to_config();
+
+    loop {
+        // Print prompt.
+        eprint!("> ");
+        let _ = io::stderr().flush();
+
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            // EOF
+            break;
+        }
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        match input {
+            "/quit" | "/exit" => break,
+            "/clear" => {
+                model.reset_kv_cache();
+                messages.truncate(1); // keep system prompt
+                // Re-prefill system prompt.
+                let system_text = chat_template.render(
+                    &messages,
+                    false,
+                    if enable_thinking { Some(true) } else { None },
+                )?;
+                let system_tokens = tokenizer.encode_with_special(&system_text);
+                let system_token_ids: Vec<i64> =
+                    system_tokens.iter().map(|&id| id as i64).collect();
+                let input_buf = homura::Buffer::from_slice::<i64>(
+                    &system_token_ids,
+                    &[1, system_token_ids.len() as u64],
+                    homura::DType::I64,
+                );
+                let outputs = model.run(&input_buf)?;
+                let kv_cache: Vec<homura::Buffer> = outputs[1..1 + num_kv].to_vec();
+                model.init_kv_cache(&kv_cache, max_seq_len)?;
+                tokens_in_cache = system_token_ids.len();
+                eprintln!("Conversation cleared.\n");
+                continue;
+            }
+            "/help" => {
+                eprintln!("  /clear  - Reset conversation");
+                eprintln!("  /quit   - Exit chat");
+                eprintln!("  /help   - Show this help\n");
+                continue;
+            }
+            _ => {}
+        }
+
+        // Add user message.
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: input.to_string(),
+        });
+
+        // Render the full conversation with generation prompt, then extract
+        // only the new tokens (delta) that haven't been fed to the KV cache.
+        let full_text = chat_template.render(
+            &messages,
+            true,
+            if enable_thinking { Some(true) } else { None },
+        )?;
+        let full_tokens = tokenizer.encode_with_special(&full_text);
+
+        // Check context window -- if nearly full, reset and re-prefill from scratch.
+        if full_tokens.len() + max_tokens_per_turn > max_seq_len {
+            eprintln!(
+                "Warning: context nearly full ({}/{} tokens). Clearing conversation.\n",
+                full_tokens.len(),
+                max_seq_len
+            );
+            model.reset_kv_cache();
+            // Keep only system + current user message.
+            messages.truncate(1);
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: input.to_string(),
+            });
+            tokens_in_cache = 0;
+        }
+
+        // Render (possibly updated after overflow) and compute delta.
+        let full_text = chat_template.render(
+            &messages,
+            true,
+            if enable_thinking { Some(true) } else { None },
+        )?;
+        let full_tokens = tokenizer.encode_with_special(&full_text);
+        let delta_tokens = &full_tokens[tokens_in_cache..];
+        let delta_token_ids: Vec<i64> = delta_tokens.iter().map(|&id| id as i64).collect();
+
+        // Pass token IDs directly to avoid decode→re-encode round-trip
+        // that would lose special tokens (<|im_start|>, <|im_end|>, etc.).
+        let think_cfg = homura::generate::ThinkConfig {
+            token_ids: think_tokens,
+            style_content: enable_thinking,
+        };
+        let generated = generate_streaming_from_ids(
+            &mut ctx,
+            &delta_token_ids,
+            max_tokens_per_turn,
+            &sampling,
+            false,
+            think_cfg,
+        )?;
+
+        // Add assistant response to history.
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: generated.clone(),
+        });
+
+        // Update token count: delta tokens + the tokens generated.
+        // Re-render to get exact count including the assistant response + im_end.
+        let updated_text = chat_template.render(
+            &messages,
+            false,
+            if enable_thinking { Some(true) } else { None },
+        )?;
+        let updated_tokens = tokenizer.encode_with_special(&updated_text);
+        tokens_in_cache = updated_tokens.len();
+
+        eprintln!();
+    }
+
     Ok(())
 }
 

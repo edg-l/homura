@@ -10,6 +10,15 @@ homura run Qwen/Qwen2.5-0.5B --prompt "The capital of France is" --max-tokens 20
 
 Models are downloaded and cached automatically from HuggingFace Hub.
 
+### Interactive chat
+
+```sh
+homura chat Qwen/Qwen2.5-0.5B
+homura chat Qwen/Qwen2.5-0.5B --system "You are a pirate." --max-tokens 500
+```
+
+Multi-turn conversation with persistent KV cache across turns. Chat templates are loaded from `tokenizer_config.json` via minijinja, so any HF model's chat format works out of the box. Type `/help` for REPL commands.
+
 ### ONNX model inference
 
 ```rust
@@ -25,6 +34,7 @@ let outputs = model.run(&[&input]).unwrap();  // Vec<Buffer>
 ```sh
 homura run Qwen/Qwen2.5-0.5B --prompt "Hello" --max-tokens 50   # HF model by name
 homura run ./my-model/ --prompt "Hello" --max-tokens 50          # local HF model
+homura chat Qwen/Qwen2.5-0.5B                                   # interactive chat
 homura run model.onnx                                            # ONNX inference
 homura run model.onnx --input data.bin --shape 1,1,28,28
 homura info model.onnx                                           # inspect model graph
@@ -39,10 +49,10 @@ Each heavy op (Conv, MatMul, Gemm) is compiled as an independent kernel with its
 
 ```
 model (ONNX, safetensors/HF)
-  → partition into kernel groups
-  → per kernel: MLIR emission (linalg ops) → transform schedule (tile + vectorize) → bufferize → LLVM IR → .o
-  → link all .o into unified .so
-  → ExecutionPlan routes buffers between kernels
+  -> partition into kernel groups
+  -> per kernel: MLIR emission (linalg ops) -> transform schedule (tile + vectorize) -> bufferize -> LLVM IR -> .o
+  -> link all .o into unified .so
+  -> ExecutionPlan routes buffers between kernels
 ```
 
 The transform schedule tiles matmuls (3D, 4D contractions) and Conv2D with adaptive tile sizes based on available parallelism. Large matmuls use OpenMP via `tile_using_forall` for multi-threaded execution, with inner `tile_using_for` loops that LLVM auto-vectorizes to AVX-512 FMA. Untiled ops stay as scalar loops.
@@ -64,9 +74,9 @@ cargo build
 
 ```sh
 cargo run -- run Qwen/Qwen2.5-0.5B --prompt "Hello" --max-tokens 20
+cargo run -- chat Qwen/Qwen2.5-0.5B
 cargo run --example onnx_mnist                                   # MNIST digit classification
 cargo run --example onnx_resnet                                  # ResNet-18 image classification
-cargo run -- run tests/fixtures/ --prompt "Hello" --max-tokens 20  # GPT-2 (ONNX)
 cargo run -- clean-cache                                         # clear compilation cache
 cargo test
 ```
@@ -77,8 +87,8 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 
 | Model | Params | Kernels | Compile time | Decode |
 |---|---|---|---|---|
-| MNIST | — | 6 | 97ms | — |
-| ResNet-18 | 11M | 41 | 467ms | — |
+| MNIST | -- | 6 | 97ms | -- |
+| ResNet-18 | 11M | 41 | 467ms | -- |
 | GPT-2 | 124M | 158 compiled + 24 native | ~650ms | ~50 tok/s |
 | Qwen2.5-0.5B | 494M | 74 compiled + 48 native | ~950ms | ~10 tok/s |
 
@@ -87,8 +97,9 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 - **Model formats**: ONNX, HuggingFace safetensors (auto-detected)
 - **HuggingFace Hub**: Download models by name (`Qwen/Qwen2.5-0.5B`), cached locally
 - **ONNX ops**: Conv2d, MatMul, Gemm, BatchNorm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, MaxPool, GlobalAvgPool, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Squeeze, Unsqueeze, Where, Cast, Shape, ConstantOfShape, Range, and more
-- **HF architectures**: Qwen2, GPT-2 (decoder-only transformers with RoPE or learned position embeddings)
-- **Compilation**: Per-kernel MLIR → LLVM, parallel via rayon, cached on disk
+- **HF architectures**: Decoder-only transformers with RoPE (Qwen2, Qwen3, and compatible architectures). QK-norm support for Qwen3. Config auto-detection from `config.json`.
+- **Chat mode**: Interactive multi-turn REPL with persistent KV cache across turns, Jinja2 chat template rendering via minijinja
+- **Compilation**: Per-kernel MLIR (linalg dialect) -> LLVM, parallel via rayon, cached on disk
 - **Tiling**: Adaptive OpenMP-parallel tiling for matmuls, scaled to available cores
 - **Vectorization**: LLVM auto-vectorization of tiled scalar loops to AVX-512 FMA
 - **Dynamic shapes**: Symbolic dim tracking (`SymDim` expressions) -- compile once, resolve at runtime
@@ -104,4 +115,4 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 - Flash Attention (fused softmax(QK^T)V for O(1) memory)
 - Operator fusion (matmul + bias + activation as one kernel)
 - Weight quantization (INT8/INT4)
-- Per-kernel compilation cache (skip recompilation across runs)
+- GPU backend (CUDA via `gpu-to-nvvm`)

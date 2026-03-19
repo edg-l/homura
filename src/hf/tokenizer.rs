@@ -28,6 +28,15 @@ impl HfTokenizer {
             .decode(ids, true)
             .expect("tokenizer decode failed")
     }
+
+    /// Encode text with special tokens recognized (e.g. `<|im_end|>`).
+    pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .expect("tokenizer encode failed");
+        encoding.get_ids().to_vec()
+    }
 }
 
 #[cfg(test)]

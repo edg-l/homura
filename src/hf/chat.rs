@@ -1,0 +1,197 @@
+//! Chat template rendering via minijinja.
+//!
+//! Loads the Jinja2 `chat_template` from `tokenizer_config.json` and renders
+//! conversation messages into the model's expected format.
+
+use std::path::Path;
+
+use minijinja::Environment;
+
+/// A single message in the conversation.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Chat template loaded from tokenizer_config.json.
+pub struct ChatTemplate {
+    template_source: String,
+}
+
+impl ChatTemplate {
+    /// Load chat_template from tokenizer_config.json.
+    pub fn load(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let config_path = model_dir.join("tokenizer_config.json");
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("failed to read tokenizer_config.json: {e}"))?;
+        let config: serde_json::Value = serde_json::from_str(&text)?;
+
+        let template_source = config
+            .get("chat_template")
+            .and_then(|v| v.as_str())
+            .ok_or("no chat_template field in tokenizer_config.json")?
+            .to_string();
+
+        Ok(ChatTemplate { template_source })
+    }
+
+    /// Render the full conversation to a string.
+    ///
+    /// If `add_generation_prompt` is true, appends the assistant turn prefix
+    /// (e.g. `<|im_start|>assistant\n`) so the model can start generating.
+    /// Render the full conversation to a string.
+    ///
+    /// If `add_generation_prompt` is true, appends the assistant turn prefix
+    /// (e.g. `<|im_start|>assistant\n`) so the model can start generating.
+    ///
+    /// `enable_thinking` controls whether thinking/reasoning models (e.g. Qwen3)
+    /// emit `<think>` blocks. Set to false to disable chain-of-thought output.
+    /// Render the conversation.
+    ///
+    /// `enable_thinking`:
+    /// - `Some(true)` — model thinks freely (Qwen3 `<think>` blocks)
+    /// - `Some(false)` — template inserts empty `<think></think>` to suppress thinking
+    /// - `None` — variable is undefined in the template (no think block inserted at all)
+    ///
+    /// For non-thinking mode, prefer `None` + `/no_think` in the system prompt
+    /// over `Some(false)`, which can confuse small models.
+    pub fn render(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut env = Environment::new();
+        // Python string method compatibility (startswith, endswith, strip, split, etc.)
+        // needed by HF chat templates (especially Qwen3).
+        minijinja_contrib::add_to_environment(&mut env);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", &self.template_source)?;
+
+        let tmpl = env.get_template("chat")?;
+        let rendered = match enable_thinking {
+            Some(val) => tmpl.render(minijinja::context! {
+                messages => messages,
+                add_generation_prompt => add_generation_prompt,
+                enable_thinking => val,
+            })?,
+            None => tmpl.render(minijinja::context! {
+                messages => messages,
+                add_generation_prompt => add_generation_prompt,
+            })?,
+        };
+
+        Ok(rendered)
+    }
+}
+
+/// Find the `<think>` and `</think>` token IDs for thinking models.
+///
+/// Returns `Some((open_id, close_id))` if both tokens exist in the vocabulary.
+pub fn find_think_tokens(tokenizer: &super::tokenizer::HfTokenizer) -> Option<(u32, u32)> {
+    let open_ids = tokenizer.encode_with_special("<think>");
+    let close_ids = tokenizer.encode_with_special("</think>");
+    if open_ids.len() == 1 && close_ids.len() == 1 {
+        Some((open_ids[0], close_ids[0]))
+    } else {
+        None
+    }
+}
+
+/// Find the token ID for the chat turn-end token (e.g. `<|im_end|>`).
+///
+/// Reads `eos_token` from tokenizer_config.json, then looks it up in the
+/// tokenizer's vocabulary. Returns None if not found.
+pub fn find_chat_stop_token(
+    model_dir: &Path,
+    tokenizer: &super::tokenizer::HfTokenizer,
+) -> Option<u32> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    let text = std::fs::read_to_string(&config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+    // For chat models, the eos_token is typically the turn-end marker.
+    // Qwen3: <|im_end|> (151645), Qwen2.5: <|endoftext|> (151643)
+    // For Qwen2.5 base models, we also want to try <|im_end|> explicitly.
+    let eos = config.get("eos_token").and_then(|v| v.as_str())?;
+
+    // If eos_token is already <|im_end|>, use it directly.
+    if eos == "<|im_end|>" {
+        let ids = tokenizer.encode_with_special(eos);
+        if ids.len() == 1 {
+            return Some(ids[0]);
+        }
+    }
+
+    // Otherwise try <|im_end|> as a separate stop token (for base models
+    // where eos is <|endoftext|> but we still want to stop on turn end).
+    let ids = tokenizer.encode_with_special("<|im_end|>");
+    if ids.len() == 1 {
+        return Some(ids[0]);
+    }
+
+    // Fall back to whatever eos_token is.
+    let ids = tokenizer.encode_with_special(eos);
+    if ids.len() == 1 { Some(ids[0]) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_chatml_basic() {
+        // Minimal ChatML template for testing.
+        let template = ChatTemplate {
+            template_source: concat!(
+                "{%- for message in messages %}",
+                "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}",
+                "{%- endfor %}",
+                "{%- if add_generation_prompt %}",
+                "{{- '<|im_start|>assistant\\n' }}",
+                "{%- endif %}",
+            )
+            .to_string(),
+        };
+
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hello".into(),
+            },
+        ];
+
+        let rendered = template.render(&messages, true, None).unwrap();
+        assert!(rendered.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
+        assert!(rendered.contains("<|im_start|>user\nHello<|im_end|>"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn render_without_generation_prompt() {
+        let template = ChatTemplate {
+            template_source: concat!(
+                "{%- for message in messages %}",
+                "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}",
+                "{%- endfor %}",
+                "{%- if add_generation_prompt %}",
+                "{{- '<|im_start|>assistant\\n' }}",
+                "{%- endif %}",
+            )
+            .to_string(),
+        };
+
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+
+        let rendered = template.render(&messages, false, None).unwrap();
+        assert!(!rendered.contains("<|im_start|>assistant"));
+    }
+}

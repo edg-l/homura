@@ -349,6 +349,9 @@ struct KvLayerCache {
 pub struct KvCache {
     layers: Vec<KvLayerCache>,
     current_len: usize,
+    /// Number of new tokens being appended in the current step (set by append_key).
+    /// Used by view_key/view_value to include all new entries before advance_by.
+    new_tokens: usize,
     max_len: usize,
     num_heads: usize,
     head_dim: usize,
@@ -378,6 +381,7 @@ impl KvCache {
         Self {
             layers,
             current_len: 0,
+            new_tokens: 0,
             max_len,
             num_heads,
             head_dim,
@@ -463,25 +467,45 @@ impl KvCache {
 
     /// Append a new K entry at position `current_len` for the given layer.
     pub fn append_key(&mut self, layer: usize, new_k: &Buffer) {
-        assert!(self.current_len < self.max_len, "KV cache full");
+        let new_seq = new_k.shape().0[2] as usize;
+        assert!(
+            self.current_len + new_seq <= self.max_len,
+            "KV cache full ({} + {} > {})",
+            self.current_len,
+            new_seq,
+            self.max_len
+        );
+        self.new_tokens = new_seq;
         let row_bytes = self.head_dim * self.dtype.size_bytes();
         for h in 0..self.num_heads {
             let dst = (h * self.max_len + self.current_len) * row_bytes;
-            let src = h * row_bytes;
-            self.layers[layer].key[dst..dst + row_bytes]
-                .copy_from_slice(&new_k.as_bytes()[src..src + row_bytes]);
+            let src = h * new_seq * row_bytes;
+            let chunk = new_seq * row_bytes;
+            self.layers[layer].key[dst..dst + chunk]
+                .copy_from_slice(&new_k.as_bytes()[src..src + chunk]);
         }
     }
 
-    /// Append a new V entry at position `current_len` for the given layer.
+    /// Append new V entries at position `current_len` for the given layer.
+    ///
+    /// Handles both single-token (shape `[1, heads, 1, dim]`) and multi-token
+    /// (shape `[1, heads, N, dim]`) inputs.
     pub fn append_value(&mut self, layer: usize, new_v: &Buffer) {
-        assert!(self.current_len < self.max_len, "KV cache full");
+        let new_seq = new_v.shape().0[2] as usize;
+        assert!(
+            self.current_len + new_seq <= self.max_len,
+            "KV cache full ({} + {} > {})",
+            self.current_len,
+            new_seq,
+            self.max_len
+        );
         let row_bytes = self.head_dim * self.dtype.size_bytes();
         for h in 0..self.num_heads {
             let dst = (h * self.max_len + self.current_len) * row_bytes;
-            let src = h * row_bytes;
-            self.layers[layer].value[dst..dst + row_bytes]
-                .copy_from_slice(&new_v.as_bytes()[src..src + row_bytes]);
+            let src = h * new_seq * row_bytes;
+            let chunk = new_seq * row_bytes;
+            self.layers[layer].value[dst..dst + chunk]
+                .copy_from_slice(&new_v.as_bytes()[src..src + chunk]);
         }
     }
 
@@ -491,12 +515,15 @@ impl KvCache {
     /// The returned Buffer uses max_len-based strides so the kernel's memref
     /// descriptor correctly skips over the unused max_len gap between heads.
     pub fn view_key(&self, layer: usize) -> Buffer {
-        self.view_single(&self.layers[layer].key, self.current_len + 1)
+        self.view_single(&self.layers[layer].key, self.current_len + self.new_tokens)
     }
 
-    /// Return a zero-copy V view covering `[1, heads, 0..current_len+1, head_dim]`.
+    /// Return a zero-copy V view covering `[1, heads, 0..current_len+new_tokens, head_dim]`.
     pub fn view_value(&self, layer: usize) -> Buffer {
-        self.view_single(&self.layers[layer].value, self.current_len + 1)
+        self.view_single(
+            &self.layers[layer].value,
+            self.current_len + self.new_tokens,
+        )
     }
 
     /// Return a zero-copy view of `[1, heads, 0..seq_len, head_dim]` into
@@ -542,6 +569,13 @@ impl KvCache {
     /// Advance the sequence position after all layers have appended.
     pub fn advance(&mut self) {
         self.current_len += 1;
+        self.new_tokens = 0;
+    }
+
+    /// Advance by N positions (for multi-token KV cache append).
+    pub fn advance_by(&mut self, n: usize) {
+        self.current_len += n;
+        self.new_tokens = 0;
     }
 
     /// Reset for a new sequence. If `initial_len > 0`, the caller must
@@ -1734,9 +1768,10 @@ impl ExecutionPlan {
             eprintln!("  └─");
         }
 
-        // Advance KV cache.
+        // Advance KV cache by the number of new tokens processed.
         if let Some(ref mut cache) = self.kv_cache {
-            cache.advance();
+            let new_seq = inputs[0].shape().0[1] as usize;
+            cache.advance_by(new_seq);
         }
 
         // Extract non-KV outputs only.

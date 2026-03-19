@@ -33,16 +33,76 @@ pub trait GenerativeModel {
 ///
 /// Handles prefill, decode loop, streaming to stdout, verbose token logging,
 /// stop sequences, and the stats summary line.
+///
+/// If `show_prompt` is false, the prompt text is not echoed to stdout
+/// (used in chat mode where the prompt is template markup, not user text).
 pub fn generate_streaming(
     model: &mut impl GenerativeModel,
     prompt: &str,
     max_new_tokens: usize,
     sampling: &SamplingConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let think = ThinkConfig {
+        token_ids: None,
+        style_content: false,
+    };
+    let token_ids = model.encode(prompt);
+    generate_streaming_core(model, &token_ids, max_new_tokens, sampling, true, think)
+}
+
+/// Configuration for think-block handling during generation.
+#[derive(Clone, Copy)]
+pub struct ThinkConfig {
+    /// Token IDs for `<think>` and `</think>`. Both tags are always hidden.
+    pub token_ids: Option<(u32, u32)>,
+    /// Whether to style the content between tags (dim gray). When false,
+    /// the content is hidden entirely (for non-thinking mode where the model
+    /// emits empty `<think></think>` blocks).
+    pub style_content: bool,
+}
+
+/// Like `generate_streaming` but suppresses the prompt echo.
+pub fn generate_streaming_no_echo(
+    model: &mut impl GenerativeModel,
+    prompt: &str,
+    max_new_tokens: usize,
+    sampling: &SamplingConfig,
+    think: ThinkConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let token_ids = model.encode(prompt);
+    generate_streaming_from_ids(model, &token_ids, max_new_tokens, sampling, false, think)
+}
+
+/// Like `generate_streaming_no_echo` but takes pre-tokenized IDs directly,
+/// avoiding a decode→re-encode round-trip that loses special tokens.
+pub fn generate_streaming_from_ids(
+    model: &mut impl GenerativeModel,
+    token_ids: &[i64],
+    max_new_tokens: usize,
+    sampling: &SamplingConfig,
+    show_prompt: bool,
+    think: ThinkConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    generate_streaming_core(
+        model,
+        token_ids,
+        max_new_tokens,
+        sampling,
+        show_prompt,
+        think,
+    )
+}
+
+fn generate_streaming_core(
+    model: &mut impl GenerativeModel,
+    token_ids: &[i64],
+    max_new_tokens: usize,
+    sampling: &SamplingConfig,
+    show_prompt: bool,
+    think: ThinkConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
     use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
     use std::io::Write;
-
-    let token_ids = model.encode(prompt);
 
     if token_ids.is_empty() || max_new_tokens == 0 {
         return Ok(String::new());
@@ -54,7 +114,7 @@ pub fn generate_streaming(
         max_new_tokens,
     );
 
-    let prefill_out = model.prefill(&token_ids)?;
+    let prefill_out = model.prefill(token_ids)?;
     log_info!(
         "prefill complete in {:.2}s",
         prefill_out.prefill_time.as_secs_f64()
@@ -69,10 +129,15 @@ pub fn generate_streaming(
     let mut decode_times: Vec<std::time::Duration> = Vec::with_capacity(max_new_tokens);
     let verbose = crate::log::enabled(crate::log::Level::Debug);
     let use_stdout = atty::is(atty::Stream::Stdout);
+    let mut in_think_block = false;
+    let mut skip_ws_after_think = false;
+    let think_tokens = think.token_ids;
 
     // Print prompt to stdout after all log lines, before tokens stream.
-    if use_stdout {
-        print!("{prompt}");
+    if use_stdout && show_prompt {
+        let prompt_ids: Vec<u32> = token_ids.iter().map(|&id| id as u32).collect();
+        let prompt_text = model.decode_tokens(&prompt_ids);
+        print!("{prompt_text}");
         let _ = std::io::stdout().flush();
     }
 
@@ -83,8 +148,14 @@ pub fn generate_streaming(
     generated_ids.push(first_token);
     let token_text = model.decode_tokens(&[first_token]);
     if use_stdout {
-        print!("{token_text}");
-        let _ = std::io::stdout().flush();
+        print_token_styled(
+            first_token,
+            &token_text,
+            think_tokens,
+            think.style_content,
+            &mut in_think_block,
+            &mut skip_ws_after_think,
+        );
     }
     if verbose {
         let token_display = escape_token_text(&token_text);
@@ -115,8 +186,14 @@ pub fn generate_streaming(
 
         let token_text = model.decode_tokens(&[current_token]);
         if use_stdout {
-            print!("{token_text}");
-            let _ = std::io::stdout().flush();
+            print_token_styled(
+                current_token,
+                &token_text,
+                think_tokens,
+                think.style_content,
+                &mut in_think_block,
+                &mut skip_ws_after_think,
+            );
         }
         if verbose {
             let tok_s = 1.0 / step_elapsed.as_secs_f64();
@@ -159,6 +236,10 @@ pub fn generate_streaming(
     }
 
     if use_stdout {
+        // Reset style if we ended mid-think-block.
+        if in_think_block {
+            print!("\x1b[0m");
+        }
         println!();
     }
 
@@ -328,6 +409,69 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
+}
+
+// ── Think token styling ──────────────────────────────────────────────────────
+
+/// Dark gray + italic for thinking content. The gray is universally supported;
+/// italic renders on terminals that support it and is ignored on others.
+const THINK_STYLE: &str = "\x1b[90;3m";
+const STYLE_RESET: &str = "\x1b[0m";
+
+/// Print a token to stdout, handling think-block styling by token ID.
+///
+/// - Tag tokens (open/close) are always hidden.
+/// - When `style_content` is true, content between tags is shown in gray.
+/// - When `style_content` is false, content between tags is hidden entirely
+///   (for non-thinking mode where the template inserts empty think blocks).
+/// State: true after exiting a hidden think block, until non-whitespace appears.
+/// Used to swallow the trailing `\n\n` after `</think>` in non-thinking mode.
+fn print_token_styled(
+    token_id: u32,
+    token_text: &str,
+    think_tokens: Option<(u32, u32)>,
+    style_content: bool,
+    in_think: &mut bool,
+    skip_whitespace: &mut bool,
+) {
+    use std::io::Write;
+
+    if let Some((open_id, close_id)) = think_tokens {
+        if token_id == open_id {
+            *in_think = true;
+            if style_content {
+                print!("{THINK_STYLE}");
+                let _ = std::io::stdout().flush();
+            }
+            return;
+        }
+        if token_id == close_id {
+            *in_think = false;
+            if style_content {
+                print!("{STYLE_RESET}");
+            } else {
+                // Skip whitespace tokens that follow a hidden think block.
+                *skip_whitespace = true;
+            }
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        // Inside think block: show styled or hide entirely.
+        if *in_think && !style_content {
+            return;
+        }
+    }
+
+    // After a hidden think block, skip whitespace-only tokens.
+    if *skip_whitespace {
+        if token_text.trim().is_empty() {
+            return;
+        }
+        *skip_whitespace = false;
+    }
+
+    print!("{token_text}");
+    let _ = std::io::stdout().flush();
 }
 
 // ── Display helpers ──────────────────────────────────────────────────────────
@@ -641,6 +785,56 @@ mod tests {
         };
         let mut rng = Rng::new(1);
         assert_eq!(sample_token(&logits, &config, &[], &mut rng), 1);
+    }
+
+    #[test]
+    fn think_token_styling_hides_tags() {
+        // Token IDs: 100 = <think>, 101 = </think>, others are content.
+        let think = Some((100u32, 101u32));
+        let mut in_think = false;
+        let mut skip_ws = false;
+
+        print_token_styled(100, "<think>", think, true, &mut in_think, &mut skip_ws);
+        assert!(in_think);
+
+        print_token_styled(42, "reasoning", think, true, &mut in_think, &mut skip_ws);
+        assert!(in_think);
+
+        print_token_styled(101, "</think>", think, true, &mut in_think, &mut skip_ws);
+        assert!(!in_think);
+
+        print_token_styled(43, "answer", think, true, &mut in_think, &mut skip_ws);
+        assert!(!in_think);
+    }
+
+    #[test]
+    fn think_token_styling_disabled() {
+        let mut in_think = false;
+        let mut skip_ws = false;
+        print_token_styled(100, "<think>", None, false, &mut in_think, &mut skip_ws);
+        assert!(!in_think);
+    }
+
+    #[test]
+    fn think_token_hide_without_style() {
+        let think = Some((100u32, 101u32));
+        let mut in_think = false;
+        let mut skip_ws = false;
+
+        print_token_styled(100, "<think>", think, false, &mut in_think, &mut skip_ws);
+        assert!(in_think);
+        print_token_styled(42, "hidden", think, false, &mut in_think, &mut skip_ws);
+        assert!(in_think);
+        print_token_styled(101, "</think>", think, false, &mut in_think, &mut skip_ws);
+        assert!(!in_think);
+        assert!(skip_ws); // should skip trailing whitespace
+        // Whitespace after close is swallowed.
+        print_token_styled(44, "\n\n", think, false, &mut in_think, &mut skip_ws);
+        assert!(skip_ws); // still skipping (was whitespace-only)
+        // Real content stops the skip.
+        print_token_styled(43, "visible", think, false, &mut in_think, &mut skip_ws);
+        assert!(!skip_ws);
+        assert!(!in_think);
     }
 
     #[test]
