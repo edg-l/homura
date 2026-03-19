@@ -126,7 +126,7 @@ fn cmd_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut count = 0u64;
     let mut bytes = 0u64;
-    for entry in std::fs::read_dir(&dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let meta = entry.metadata()?;
         if meta.is_file() {

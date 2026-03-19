@@ -85,7 +85,7 @@ impl Buffer {
     /// to provide concrete output shapes for dynamic models).
     pub fn new(shape: &[u64], dtype: DType) -> Self {
         assert!(
-            !shape.iter().any(|&d| d == DIM_DYNAMIC),
+            !shape.contains(&DIM_DYNAMIC),
             "Buffer::new called with DIM_DYNAMIC in shape {:?}; use CompiledGraph::run_dynamic instead",
             shape
         );
@@ -390,6 +390,7 @@ impl KvCache {
     /// `new_k` and `new_v` must have shape `[1, num_heads, 1, head_dim]`.
     /// Copies `num_heads * head_dim * elem_size` bytes into the pre-allocated
     /// buffer at the correct offset.
+    #[cfg(test)]
     pub fn append(&mut self, layer: usize, new_k: &Buffer, new_v: &Buffer) {
         assert!(
             self.current_len < self.max_len,
@@ -582,7 +583,7 @@ pub(crate) fn build_memref_descriptor(
     // address — the pointer is never dereferenced for 0-element tensors,
     // but MLIR's generated code may still read it into a descriptor.
     static EMPTY_BUF: [u64; 1] = [0];
-    let ptr_val = if data_ptr.is_null() || shape.iter().any(|&d| d == 0) {
+    let ptr_val = if data_ptr.is_null() || shape.contains(&0) {
         EMPTY_BUF.as_ptr() as u64
     } else {
         data_ptr as u64
@@ -806,7 +807,7 @@ impl CompiledGraph {
     ///
     /// Each output buffer must already have the correct shape, strides, dtype,
     /// and sufficient allocation.  The kernel overwrites all output bytes.
-    pub fn run_into(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
+    pub fn run_into(&self, inputs: &[&Buffer], output_bufs: &mut [Buffer]) {
         assert_eq!(inputs.len(), self.num_inputs);
         assert_eq!(output_bufs.len(), self.outputs.len());
         self.run_with_output_bufs(inputs, output_bufs);
@@ -818,7 +819,7 @@ impl CompiledGraph {
         &self,
         inputs: &[&Buffer],
         output_shapes: &[Shape],
-        output_bufs: &mut Vec<Buffer>,
+        output_bufs: &mut [Buffer],
     ) {
         assert_eq!(inputs.len(), self.num_inputs);
         assert_eq!(output_shapes.len(), self.outputs.len());
@@ -833,7 +834,7 @@ impl CompiledGraph {
     }
 
     /// Shared JIT-call implementation for `run`, `run_dynamic`, and `*_into`.
-    fn run_with_output_bufs(&self, inputs: &[&Buffer], output_bufs: &mut Vec<Buffer>) {
+    fn run_with_output_bufs(&self, inputs: &[&Buffer], output_bufs: &mut [Buffer]) {
         // Build memref descriptors for inputs. The function only reads inputs,
         // so the const→mut cast is safe.
         let input_shapes: Vec<Vec<i64>> = inputs
@@ -1147,14 +1148,13 @@ impl ExecutionPlan {
                 for (dim, sym) in sym_shape.iter().enumerate() {
                     if let crate::shape::SymDim::Var(name) = sym {
                         let actual = actual_shape[dim];
-                        if let Some(&existing) = bindings.get(name) {
-                            if existing != actual {
+                        if let Some(&existing) = bindings.get(name)
+                            && existing != actual {
                                 log_warn!(
                                     "conflicting sym dim binding: name={} existing={} actual={}",
                                     name, existing, actual
                                 );
                             }
-                        }
                         bindings.insert(name.clone(), actual);
                     }
                 }
@@ -1251,7 +1251,7 @@ impl ExecutionPlan {
             let has_zero_output = step
                 .output_slots
                 .iter()
-                .any(|&slot| resolved_shapes[slot].0.iter().any(|&d| d == 0));
+                .any(|&slot| resolved_shapes[slot].0.contains(&0));
             if has_zero_output {
                 log_debug!("skipping kernel {}: output has zero dimension", step.kernel_idx);
                 for &slot in &step.output_slots {
@@ -1288,13 +1288,11 @@ impl ExecutionPlan {
                 pool[out_slot] = Some(PoolEntry::Owned(buf));
                 // Recycle dead inputs.
                 for &slot in &step.input_slots {
-                    if let Some(last) = self.slot_last_read[slot] {
-                        if last == step_idx {
-                            if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                    if let Some(last) = self.slot_last_read[slot]
+                        && last == step_idx
+                            && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
                                 free_list.push(buf);
                             }
-                        }
-                    }
                 }
                 continue;
             }
@@ -1367,13 +1365,11 @@ impl ExecutionPlan {
 
             // Recycle dead intermediate buffers into the free-list.
             for &slot in &step.input_slots {
-                if let Some(last) = self.slot_last_read[slot] {
-                    if last == step_idx {
-                        if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                if let Some(last) = self.slot_last_read[slot]
+                    && last == step_idx
+                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
                             free_list.push(buf);
                         }
-                    }
-                }
             }
         }
 
@@ -1533,7 +1529,7 @@ impl ExecutionPlan {
             let has_zero_output = step
                 .output_slots
                 .iter()
-                .any(|&slot| resolved_shapes[slot].0.iter().any(|&d| d == 0));
+                .any(|&slot| resolved_shapes[slot].0.contains(&0));
             if has_zero_output {
                 for &slot in &step.output_slots {
                     let shape = &resolved_shapes[slot];
@@ -1589,13 +1585,11 @@ impl ExecutionPlan {
                 drop(step_inputs);
                 pool[out_slot] = Some(PoolEntry::Owned(buf));
                 for &slot in &step.input_slots {
-                    if let Some(last) = self.slot_last_read[slot] {
-                        if last == step_idx {
-                            if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                    if let Some(last) = self.slot_last_read[slot]
+                        && last == step_idx
+                            && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
                                 free_list.push(buf);
                             }
-                        }
-                    }
                 }
                 continue;
             }
@@ -1658,13 +1652,11 @@ impl ExecutionPlan {
             }
 
             for &slot in &step.input_slots {
-                if let Some(last) = self.slot_last_read[slot] {
-                    if last == step_idx {
-                        if let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
+                if let Some(last) = self.slot_last_read[slot]
+                    && last == step_idx
+                        && let Some(PoolEntry::Owned(buf)) = pool[slot].take() {
                             free_list.push(buf);
                         }
-                    }
-                }
             }
         }
 

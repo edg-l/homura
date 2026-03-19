@@ -322,11 +322,10 @@ pub fn emit_graph_with_split<'c>(
         weight_compute_tensors.insert(name.clone(), t);
         weights.push(buffer.clone());
         // Seed const_i64 with small integer initializers.
-        if buffer.shape().num_elements() <= 64 {
-            if let Ok(vals) = read_i64_buffer(buffer) {
+        if buffer.shape().num_elements() <= 64
+            && let Ok(vals) = read_i64_buffer(buffer) {
                 const_i64.insert(name.clone(), vals);
             }
-        }
     }
 
     // ── 2b. Build last_use map (forward scan) ────────────────────────────────────
@@ -473,8 +472,8 @@ fn collect_live_values<'c>(
         if weight_names.contains(name) {
             continue;
         }
-        if let Some(&lu) = last_use.get(name) {
-            if lu >= current_node_idx {
+        if let Some(&lu) = last_use.get(name)
+            && lu >= current_node_idx {
                 match ev {
                     EmitValue::Tensor(t) => live.push((name.clone(), *t)),
                     EmitValue::ShapeDims(_) => {
@@ -482,7 +481,6 @@ fn collect_live_values<'c>(
                     }
                 }
             }
-        }
     }
     live.sort_by(|a, b| a.0.cmp(&b.0));
     live
@@ -567,11 +565,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            ) {
-                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a + b) {
+            )
+                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a + b) {
                     const_i64.insert(node.outputs[0].clone(), result);
                 }
-            }
         }
         "Sub" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -583,11 +580,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            ) {
-                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a - b) {
+            )
+                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a - b) {
                     const_i64.insert(node.outputs[0].clone(), result);
                 }
-            }
         }
         "Mul" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -598,11 +594,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            ) {
-                if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a * b) {
+            )
+                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a * b) {
                     const_i64.insert(node.outputs[0].clone(), result);
                 }
-            }
         }
         "Div" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -613,13 +608,11 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            ) {
-                if vb.iter().all(|&b| b != 0) {
-                    if let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a / b) {
+            )
+                && vb.iter().all(|&b| b != 0)
+                    && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a / b) {
                         const_i64.insert(node.outputs[0].clone(), result);
                     }
-                }
-            }
         }
         "Neg" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -832,11 +825,10 @@ fn emit_node<'c>(
                 if allowzero == 0 {
                     let in_shape = x.shape();
                     for (i, d) in target_shape.iter_mut().enumerate() {
-                        if *d == 0 {
-                            if i < in_shape.len() {
+                        if *d == 0
+                            && i < in_shape.len() {
                                 *d = in_shape[i].map(|n| n as i64).unwrap_or(0);
                             }
-                        }
                     }
                 }
                 builder.emit_reshape(&x, &target_shape)
@@ -1000,7 +992,7 @@ fn emit_node<'c>(
                             Some(EmitValue::ShapeDims(dims)) => dims.len(),
                             None => 1,
                         };
-                        concat_vals.extend(std::iter::repeat(CONST_I64_UNKNOWN).take(n));
+                        concat_vals.extend(std::iter::repeat_n(CONST_I64_UNKNOWN, n));
                     }
                 }
                 if has_any {
@@ -1047,8 +1039,8 @@ fn emit_node<'c>(
                 insert_tensor(value_map, &node.outputs[0], out);
 
                 // Propagate const_i64 through static Slice on 1-D data.
-                if let Some(data_vals) = lookup_const_i64(const_i64, &node.inputs[0]) {
-                    if axes.len() == 1 && axes[0] == 0 && steps.iter().all(|&s| s == 1) {
+                if let Some(data_vals) = lookup_const_i64(const_i64, &node.inputs[0])
+                    && axes.len() == 1 && axes[0] == 0 && steps.iter().all(|&s| s == 1) {
                         let n = data_vals.len() as i64;
                         let s = if starts[0] < 0 {
                             (n + starts[0]).max(0)
@@ -1064,7 +1056,6 @@ fn emit_node<'c>(
                             const_i64.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
                         }
                     }
-                }
             } else {
                 // ── Dynamic path ─────────────────────────────────────────────
                 // starts/ends are runtime 1-D I64 tensors in value_map.
@@ -1123,8 +1114,8 @@ fn emit_node<'c>(
             if let (Some(data_vals), Some(idx_vals)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            ) {
-                if axis_usize == 0 && data.rank() == 1 {
+            )
+                && axis_usize == 0 && data.rank() == 1 {
                     let gathered: Vec<i64> = idx_vals
                         .iter()
                         .map(|&idx| {
@@ -1138,7 +1129,6 @@ fn emit_node<'c>(
                         .collect();
                     const_i64.insert(node.outputs[0].clone(), gathered);
                 }
-            }
         }
         "Where" => {
             let cond = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -1336,11 +1326,10 @@ fn emit_node<'c>(
                     )
                 })?;
             // Seed const_i64 for small integer constants (axes, split sizes, shape inputs).
-            if buf.shape().num_elements() <= 64 {
-                if let Ok(vals) = read_i64_buffer(buf) {
+            if buf.shape().num_elements() <= 64
+                && let Ok(vals) = read_i64_buffer(buf) {
                     const_i64.insert(node.outputs[0].clone(), vals);
                 }
-            }
             let out = emit_buffer_as_constant(builder, buf);
             insert_tensor(value_map, &node.outputs[0], out);
         }
@@ -1704,12 +1693,11 @@ fn split_kv_concat_groups(
         let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
         for &ni in &group.node_indices {
             for input_name in &nodes[ni].inputs {
-                if let Some(&prod_ni) = producer.get(input_name.as_str()) {
-                    if prod_ni != ni {
+                if let Some(&prod_ni) = producer.get(input_name.as_str())
+                    && prod_ni != ni {
                         consumers.entry(prod_ni).or_default().insert(ni);
                         dependencies.entry(ni).or_default().insert(prod_ni);
                     }
-                }
             }
         }
 
@@ -1936,24 +1924,26 @@ fn detect_and_absorb_gemm_residual(
                     continue;
                 }
             }
-            if node.op_type == "Add" && reshape_idx.is_some() && add_idx.is_none() {
-                let reshape_out = &nodes[reshape_idx.unwrap()].outputs[0];
-                // One Add input must be the Reshape output.
-                if node.inputs[0] == *reshape_out || node.inputs[1] == *reshape_out {
-                    add_idx = Some(ni);
-                    // Find the residual (the other input).
-                    let residual = if node.inputs[0] == *reshape_out {
-                        &node.inputs[1]
-                    } else {
-                        &node.inputs[0]
-                    };
-                    // The residual must NOT be produced within this lightweight group
-                    // (it comes from outside — the actual residual connection).
-                    let produced_in_group = next_nodes
-                        .iter()
-                        .any(|&nj| nodes[nj].outputs.contains(residual));
-                    if produced_in_group {
-                        add_idx = None; // Not a residual pattern
+            if node.op_type == "Add" && add_idx.is_none() {
+                if let Some(ri) = reshape_idx {
+                    let reshape_out = &nodes[ri].outputs[0];
+                    // One Add input must be the Reshape output.
+                    if node.inputs[0] == *reshape_out || node.inputs[1] == *reshape_out {
+                        add_idx = Some(ni);
+                        // Find the residual (the other input).
+                        let residual = if node.inputs[0] == *reshape_out {
+                            &node.inputs[1]
+                        } else {
+                            &node.inputs[0]
+                        };
+                        // The residual must NOT be produced within this lightweight group
+                        // (it comes from outside — the actual residual connection).
+                        let produced_in_group = next_nodes
+                            .iter()
+                            .any(|&nj| nodes[nj].outputs.contains(residual));
+                        if produced_in_group {
+                            add_idx = None; // Not a residual pattern
+                        }
                     }
                 }
                 break; // Stop after first Add
@@ -2033,21 +2023,17 @@ struct KernelIO {
     output_slots: Vec<(String, usize)>,
 }
 
+/// `(kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_value_names)`
+/// where `slot_value_names[i]` is the ONNX value name for slot `i`.
+type BufferSlotAssignment = (Vec<KernelIO>, usize, Vec<usize>, Vec<usize>, Vec<usize>, Vec<String>);
+
 /// Assign buffer pool slots and compute per-kernel I/O mappings.
 ///
-/// Returns `(kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_value_names)`
-/// where `slot_value_names[i]` is the ONNX value name for slot `i`.
+/// Returns a [`BufferSlotAssignment`].
 fn assign_buffer_slots(
     model: &OnnxModel,
     groups: &[KernelGroup],
-) -> (
-    Vec<KernelIO>,
-    usize,
-    Vec<usize>,
-    Vec<usize>,
-    Vec<usize>,
-    Vec<String>,
-) {
+) -> BufferSlotAssignment {
     let mut name_to_slot: HashMap<String, usize> = HashMap::new();
     let mut slot_names: Vec<String> = Vec::new();
     let mut next_slot = 0usize;
@@ -2197,11 +2183,10 @@ struct ValueShapeInfo {
 pub fn emit_and_compile_plan(
     model: &OnnxModel,
     inputs: &[&Buffer],
-    model_bytes: Option<&[u8]>,
+    _model_bytes: Option<&[u8]>,
     keep_dynamic: &HashSet<String>,
 ) -> Result<(crate::runtime::ExecutionPlan, Vec<Buffer>), OnnxError> {
     use crate::Shape;
-    use crate::cache::CompilationCache;
     use crate::graph_builder::GraphContext;
     use crate::runtime::{ExecutionPlan, KernelStep, SlotDesc};
     use crate::shape::DIM_DYNAMIC;
@@ -2273,11 +2258,10 @@ pub fn emit_and_compile_plan(
     // Seed const_i64 from small integer initializers.
     let mut const_i64: HashMap<String, Vec<i64>> = HashMap::new();
     for (name, buf) in &model.initializers {
-        if buf.shape().num_elements() <= 64 {
-            if let Ok(vals) = read_i64_buffer(buf) {
+        if buf.shape().num_elements() <= 64
+            && let Ok(vals) = read_i64_buffer(buf) {
                 const_i64.insert(name.clone(), vals);
             }
-        }
     }
 
     // Seed symbolic shape info from model inputs.
@@ -2321,9 +2305,9 @@ pub fn emit_and_compile_plan(
     // u64 overflow when these propagate through arithmetic.
     let mut sym_const_i64: HashMap<String, Vec<crate::shape::SymDim>> = HashMap::new();
     for (name, buf) in &model.initializers {
-        if buf.shape().num_elements() <= 64 {
-            if let Ok(vals) = read_i64_buffer(buf) {
-                if vals.iter().all(|&v| v >= 0) {
+        if buf.shape().num_elements() <= 64
+            && let Ok(vals) = read_i64_buffer(buf)
+                && vals.iter().all(|&v| v >= 0) {
                     sym_const_i64.insert(
                         name.clone(),
                         vals.iter()
@@ -2331,37 +2315,10 @@ pub fn emit_and_compile_plan(
                             .collect(),
                     );
                 }
-            }
-        }
     }
 
     // Collect weights in initializer order.
     let weights: Vec<Buffer> = model.initializers.iter().map(|(_, b)| b.clone()).collect();
-
-    // Build input_shapes for cache key.
-    let input_shapes: Vec<Shape> = model
-        .dynamic_inputs
-        .iter()
-        .zip(inputs.iter())
-        .map(|(spec, buf)| {
-            let dims: Vec<u64> = spec
-                .dims
-                .iter()
-                .enumerate()
-                .map(|(i, d)| match d {
-                    Dim::Fixed(v) if *v == DIM_DYNAMIC => DIM_DYNAMIC,
-                    Dim::Fixed(v) => *v,
-                    Dim::Symbolic(name) if keep_dynamic.contains(name) => DIM_DYNAMIC,
-                    Dim::Symbolic(_) => buf.shape().0[i],
-                })
-                .collect();
-            Shape(dims)
-        })
-        .collect();
-    let model_cache_key = model_bytes.map(|b| {
-        let shape_refs: Vec<&[u64]> = input_shapes.iter().map(|s| s.0.as_slice()).collect();
-        CompilationCache::cache_key(b, &shape_refs)
-    });
 
     // Phase 1: Emit all kernels sequentially (shape propagation requires order).
     // Each kernel produces an MLIR module text + metadata for deferred compilation.
@@ -2369,7 +2326,6 @@ pub fn emit_and_compile_plan(
         mlir_text: String,
         num_inputs: usize,
         output_descs: Vec<crate::runtime::OutputDesc>,
-        cache_key: Option<String>,
         group_idx: usize,
         num_in: usize,
         num_out: usize,
@@ -2422,15 +2378,14 @@ pub fn emit_and_compile_plan(
                 );
             }
             // Propagate sym shapes.
-            if let Some(sym0) = sym_shape_info.get(&node.inputs[0]) {
-                if let Some(sym1) = sym_shape_info.get(&node.inputs[1]) {
+            if let Some(sym0) = sym_shape_info.get(&node.inputs[0])
+                && let Some(sym1) = sym_shape_info.get(&node.inputs[1]) {
                     let mut out_sym = sym0.clone();
                     if axis < out_sym.len() && axis < sym1.len() {
                         out_sym[axis] = sym0[axis].clone().add(sym1[axis].clone());
                     }
                     sym_shape_info.insert(node.outputs[0].clone(), out_sym);
                 }
-            }
             let ni = group.node_indices[0];
             let all_input_slots: Vec<usize> = io.input_slots.iter().map(|(_, s)| *s).collect();
             let all_output_slots: Vec<usize> = io.output_slots.iter().map(|(_, s)| *s).collect();
@@ -2613,7 +2568,7 @@ pub fn emit_and_compile_plan(
                                 .get(inp)
                                 .and_then(|info| info.shape.last().copied().flatten())
                         })
-                        .map_or(false, |n| n > 256);
+                        .is_some_and(|n| n > 256);
                     if is_gemm || has_large_static_n {
                         crate::graph_builder::TransformMode::TileParallel
                     } else {
@@ -2636,8 +2591,6 @@ pub fn emit_and_compile_plan(
         let (mlir_text, num_inputs, output_descs) = builder
             .finalize_to_mlir_named(&output_refs, transform_mode, &func_name)
             .map_err(|e| OnnxError::CompileError(format!("kernel {gi}: {e}")))?;
-
-        let cache_key = model_cache_key.as_ref().map(|k| format!("pk_{k}_{gi}"));
 
         // Build a short label for the kernel's op types.
         let ops_label = if group.node_indices.len() == 1 {
@@ -2666,7 +2619,6 @@ pub fn emit_and_compile_plan(
             mlir_text,
             num_inputs,
             output_descs,
-            cache_key,
             group_idx: gi,
             num_in: io.input_slots.len(),
             num_out: io.output_slots.len(),

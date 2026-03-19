@@ -52,7 +52,7 @@ impl Shape {
 
     /// Returns `true` if any dimension in this shape is `DIM_DYNAMIC`.
     pub fn has_dynamic_dims(&self) -> bool {
-        self.0.iter().any(|&d| d == DIM_DYNAMIC)
+        self.0.contains(&DIM_DYNAMIC)
     }
 
     /// Compute the numpy-style broadcast shape of `self` and `other`.
@@ -133,16 +133,19 @@ impl SymDim {
     }
 
     /// Build Add expression.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: SymDim) -> SymDim {
         SymDim::Add(Box::new(self), Box::new(other))
     }
 
     /// Build Mul expression.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: SymDim) -> SymDim {
         SymDim::Mul(Box::new(self), Box::new(other))
     }
 
     /// Build Div expression.
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: SymDim) -> SymDim {
         SymDim::Div(Box::new(self), Box::new(other))
     }

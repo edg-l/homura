@@ -93,12 +93,11 @@ impl Tokenizer {
             let mut best_rank = usize::MAX;
             for i in 0..word.len() - 1 {
                 let pair = (word[i].clone(), word[i + 1].clone());
-                if let Some(&rank) = self.bpe_ranks.get(&pair) {
-                    if rank < best_rank {
+                if let Some(&rank) = self.bpe_ranks.get(&pair)
+                    && rank < best_rank {
                         best_rank = rank;
                         best_pair = Some(i);
                     }
-                }
             }
 
             let Some(i) = best_pair else { break };

@@ -278,7 +278,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
     let output_shapes = graph
         .output
         .iter()
-        .map(|vi| parse_output_dims(vi))
+        .map(parse_output_dims)
         .collect();
 
     Ok(OnnxModel {

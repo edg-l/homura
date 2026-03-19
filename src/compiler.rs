@@ -410,14 +410,12 @@ fn emit_object_files_impl(
         });
 
         // Propagate first error.
-        for err in errors {
-            if let Some(e) = err {
-                // Clean up any .o files that were produced.
-                for p in &obj_paths {
-                    std::fs::remove_file(p).ok();
-                }
-                return Err(e);
+        if let Some(e) = errors.into_iter().flatten().next() {
+            // Clean up any .o files that were produced.
+            for p in &obj_paths {
+                std::fs::remove_file(p).ok();
             }
+            return Err(e);
         }
 
         log_compile!(label, "all {} parts: {}ms", obj_paths.len(), split_start.elapsed().as_millis());

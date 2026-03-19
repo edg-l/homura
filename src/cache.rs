@@ -25,9 +25,8 @@ pub(crate) struct CacheMeta {
     pub(crate) outputs: Vec<OutputDesc>,
 }
 
-impl CompilationCache {
-    /// Create a cache, creating the cache directory if it does not exist.
-    pub fn new() -> Self {
+impl Default for CompilationCache {
+    fn default() -> Self {
         let cache_dir = std::env::var("HOMURA_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -37,6 +36,13 @@ impl CompilationCache {
             });
         std::fs::create_dir_all(&cache_dir).ok();
         Self { cache_dir }
+    }
+}
+
+impl CompilationCache {
+    /// Create a cache, creating the cache directory if it does not exist.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Return the cache directory path.
@@ -269,9 +275,11 @@ pub fn bucket_pad(len: usize) -> usize {
 
 /// Returns a string that changes whenever the compilation environment changes,
 /// invalidating cached `.so` files. Includes:
+///
 /// - Homura crate version (codegen changes)
 /// - LLVM version (backend changes)
 /// - Host CPU name + features (AVX2, SSE4.2, etc.)
+///
 /// Bump this when the pass pipeline changes in a way that invalidates cached
 /// .so files (e.g. adding OpenMP threading support).
 const PIPELINE_VERSION: u32 = 2;

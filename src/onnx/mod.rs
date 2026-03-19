@@ -165,7 +165,7 @@ impl Model {
         }
 
         // For models with symbolic dims, recompile only if non-dynamic dims changed.
-        if self.parsed.is_some() {
+        if let Some(parsed) = self.parsed.as_ref() {
             let shapes_changed =
                 {
                     let state = guard.as_ref().unwrap();
@@ -181,10 +181,6 @@ impl Model {
                     })
                 };
             if shapes_changed {
-                let parsed = self
-                    .parsed
-                    .as_ref()
-                    .expect("parsed model must be present when symbolic dims exist");
                 let resolved = resolve_symbolic_dims(parsed, inputs, &self.keep_dynamic)?;
                 *guard = Some(self.do_compile(&resolved, inputs)?);
             }
@@ -451,11 +447,10 @@ fn resolve_symbolic_dims(
     // Verify all non-keep_dynamic symbolic dims are resolved.
     for input_spec in &model.dynamic_inputs {
         for dim in &input_spec.dims {
-            if let Dim::Symbolic(name) = dim {
-                if !keep_dynamic.contains(name) && !sym_map.contains_key(name) {
+            if let Dim::Symbolic(name) = dim
+                && !keep_dynamic.contains(name) && !sym_map.contains_key(name) {
                     return Err(OnnxError::UnresolvedSymbolicDim(name.clone()));
                 }
-            }
         }
     }
 

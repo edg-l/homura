@@ -149,6 +149,12 @@ pub struct GraphContext {
     context: Context,
 }
 
+impl Default for GraphContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GraphContext {
     pub fn new() -> Self {
         Self {
@@ -189,7 +195,7 @@ pub fn compile_to_objects(
     }
 
     let mut module =
-        Module::parse(&context, mlir_text).ok_or_else(|| CompileError::Verification)?;
+        Module::parse(&context, mlir_text).ok_or(CompileError::Verification)?;
 
     let has_schedule = mlir_text.contains("transform.with_named_sequence");
     let vectorize_only = mlir_text.contains("homura.vectorize_only");
@@ -325,8 +331,8 @@ pub fn compile_from_mlir(
     // Cache check.
     if let Some(key) = cache_key {
         let cache = crate::cache::CompilationCache::new();
-        if let Some((so_path, meta_path)) = cache.get(key) {
-            if let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
+        if let Some((so_path, meta_path)) = cache.get(key)
+            && let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
                 match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                     Ok(graph) => return Ok(graph),
                     Err(e) => {
@@ -334,12 +340,11 @@ pub fn compile_from_mlir(
                     }
                 }
             }
-        }
     }
 
     // Parse module from text.
     let mut module =
-        Module::parse(&context, mlir_text).ok_or_else(|| CompileError::Verification)?;
+        Module::parse(&context, mlir_text).ok_or(CompileError::Verification)?;
 
     // Dump pre-pass IR for specific kernels.
     if std::env::var("HOMURA_DUMP_KERNEL").is_ok_and(|k| label.contains(&k)) {
@@ -682,20 +687,20 @@ fn try_collapse(in_shape: &[Option<u64>], out_shape: &[Option<u64>]) -> Option<R
             return None; // more output groups than input dims
         }
         let mut in_fwd = 0;
-        for out_i in 0..out_end {
+        for (out_i, group) in reassoc[..out_end].iter_mut().enumerate() {
             if out_i == 0 {
                 // First group: take (1 + excess) input dims.
                 let n = 1 + excess as usize;
                 for _ in 0..n {
                     if in_fwd < in_end {
-                        reassoc[out_i].push(in_fwd);
+                        group.push(in_fwd);
                         in_fwd += 1;
                     }
                 }
             } else {
                 // Subsequent groups: take one input dim each.
                 if in_fwd < in_end {
-                    reassoc[out_i].push(in_fwd);
+                    group.push(in_fwd);
                     in_fwd += 1;
                 }
             }
@@ -1431,12 +1436,10 @@ impl<'c> GraphBuilder<'c> {
     ) -> Vec<Option<u64>> {
         let out_rank = lhs_shape.len().max(rhs_shape.len());
         // Right-align by padding with 1s on the left.
-        let lhs_padded: Vec<Option<u64>> = std::iter::repeat(Some(1))
-            .take(out_rank - lhs_shape.len())
+        let lhs_padded: Vec<Option<u64>> = std::iter::repeat_n(Some(1), out_rank - lhs_shape.len())
             .chain(lhs_shape.iter().copied())
             .collect();
-        let rhs_padded: Vec<Option<u64>> = std::iter::repeat(Some(1))
-            .take(out_rank - rhs_shape.len())
+        let rhs_padded: Vec<Option<u64>> = std::iter::repeat_n(Some(1), out_rank - rhs_shape.len())
             .chain(rhs_shape.iter().copied())
             .collect();
 
@@ -1477,7 +1480,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = out_shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -1531,8 +1534,7 @@ impl<'c> GraphBuilder<'c> {
         let (rank_promoted_val, promoted_shape) = if src_rank < out_rank {
             let extra = out_rank - src_rank;
             let broadcast_dims: Vec<usize> = (0..extra).collect();
-            let promoted_shape: Vec<Option<u64>> = std::iter::repeat(Some(1))
-                .take(extra)
+            let promoted_shape: Vec<Option<u64>> = std::iter::repeat_n(Some(1), extra)
                 .chain(src_shape.iter().copied())
                 .collect();
             let val =
@@ -1579,7 +1581,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = target_shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -1854,7 +1856,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -1929,7 +1931,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -2024,7 +2026,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -2124,7 +2126,7 @@ impl<'c> GraphBuilder<'c> {
         let dims_u64: Vec<u64> = shape
             .iter()
             .map(|d| match d {
-                Some(n) => *n as u64,
+                Some(n) => *n,
                 None => i64::MIN as u64,
             })
             .collect();
@@ -3182,6 +3184,7 @@ impl<'c> GraphBuilder<'c> {
     ///
     /// Handles optional transposes for A and B. `alpha` and `beta` are f32
     /// scalars. `c` is the bias/residual term.
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_gemm(
         &mut self,
         a: &Tensor<'c>,
@@ -3554,6 +3557,7 @@ impl<'c> GraphBuilder<'c> {
     /// Emit `Y = A @ B + bias + residual` as a single matmul with fused
     /// accumulator.  The init pass computes `bias[n] + residual[m,n]` per
     /// element, then the matmul accumulates `A[m,k]*B[k,n]` on top.
+    #[allow(clippy::too_many_arguments)]
     fn emit_matmul_2d_with_bias_and_residual(
         &mut self,
         lhs_val: melior::ir::Value<'c, 'c>,
@@ -4180,8 +4184,8 @@ impl<'c> GraphBuilder<'c> {
         let needs_infer = out_shape.iter().any(|d| d.is_none());
         let total_elems: Option<melior::ir::Value<'c, 'c>> = if needs_infer {
             let mut prod: Option<melior::ir::Value<'c, 'c>> = None;
-            for i in 0..rank {
-                let dim_val = match in_shape[i] {
+            for (i, &dim) in in_shape[..rank].iter().enumerate() {
+                let dim_val = match dim {
                     Some(n) => emit_index_const(&self.block, self.context, n),
                     None => self.emit_tensor_dim(input.value(), i),
                 };
@@ -4370,8 +4374,8 @@ impl<'c> GraphBuilder<'c> {
 
         // Compute total input elements.
         let mut total: melior::ir::Value<'c, 'c> = c1;
-        for i in 0..in_rank {
-            let dim_val = match in_shape[i] {
+        for (i, &dim) in in_shape[..in_rank].iter().enumerate() {
+            let dim_val = match dim {
                 Some(n) => self.emit_arith_constant_index(n),
                 None => self.emit_tensor_dim(input.value(), i),
             };
@@ -4621,8 +4625,8 @@ impl<'c> GraphBuilder<'c> {
             let cast_shape: Vec<Option<u64>> = in_shape.iter().map(|_| None).collect();
             let cast_val = self.emit_tensor_cast(input.value(), &cast_shape);
             let cast_in_shape = cast_val.shape();
-            if let Some(reassoc) = compute_reassociation(&cast_in_shape, out_shape) {
-                if let ReassocResult::Expand { reassoc } = reassoc {
+            if let Some(reassoc) = compute_reassociation(&cast_in_shape, out_shape)
+                && let ReassocResult::Expand { reassoc } = reassoc {
                     let reassoc_str = reassoc_to_string(&reassoc);
                     let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
                         .iter()
@@ -4638,7 +4642,6 @@ impl<'c> GraphBuilder<'c> {
                         &dyn_vals,
                     );
                 }
-            }
         }
 
         // Final fallback: tensor.reshape via shape tensor.
@@ -5379,11 +5382,11 @@ impl<'c> GraphBuilder<'c> {
         let mut all_dyn_sizes: Vec<melior::ir::Value<'c, 'c>> = Vec::new();
         {
             let mut sliced_j = 0usize;
-            for i in 0..rank {
+            for (i, &dim) in in_shape[..rank].iter().enumerate() {
                 if norm_axes.contains(&i) {
                     all_dyn_sizes.push(dyn_sizes_per_axis[sliced_j]);
                     sliced_j += 1;
-                } else if in_shape[i].is_none() {
+                } else if dim.is_none() {
                     let sz = self.emit_tensor_dim(input.value(), i);
                     all_dyn_sizes.push(sz);
                 }
@@ -6736,8 +6739,8 @@ impl<'c> GraphBuilder<'c> {
                 }
                 ']' => {
                     depth -= 1;
-                    if depth == 0 {
-                        if let Some(start) = group_start {
+                    if depth == 0
+                        && let Some(start) = group_start {
                             let group_content = &inner[start..i];
                             for num_str in group_content.split(',') {
                                 let num: usize = num_str.trim().parse().unwrap();
@@ -6747,7 +6750,6 @@ impl<'c> GraphBuilder<'c> {
                             }
                             group_idx += 1;
                         }
-                    }
                 }
                 _ => {}
             }
@@ -6789,7 +6791,6 @@ impl<'c> GraphBuilder<'c> {
     /// positions.
     ///
     /// If `dyn_source` is `None` and any dim is dynamic, this panics.
-
     /// Like `emit_tensor_empty` but with an explicit dynamic-dim source.
     fn emit_tensor_empty_dyn(
         &mut self,
@@ -6948,7 +6949,7 @@ impl<'c> GraphBuilder<'c> {
     ) -> melior::ir::Value<'c, 'c> {
         let rtt = RankedTensorType::try_from(input.r#type())
             .expect("tensor.pad: input must be RankedTensorType");
-        let rank = rtt.rank() as usize;
+        let rank = rtt.rank();
         assert_eq!(pad_low.len(), rank);
         assert_eq!(pad_high.len(), rank);
 
@@ -8128,8 +8129,8 @@ impl<'c> GraphBuilder<'c> {
         // Cache check.
         if let Some(key) = cache_key {
             let cache = crate::cache::CompilationCache::new();
-            if let Some((so_path, meta_path)) = cache.get(key) {
-                if let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
+            if let Some((so_path, meta_path)) = cache.get(key)
+                && let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
                     match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
                         Ok(graph) => return Ok(graph),
                         Err(e) => {
@@ -8137,7 +8138,6 @@ impl<'c> GraphBuilder<'c> {
                         }
                     }
                 }
-            }
         }
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
