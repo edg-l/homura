@@ -110,7 +110,7 @@ def parse_output(output: str) -> dict:
             "ms_per_tok": float(m.group(7)),
         }
     else:
-        # New multi-line format
+        # New multi-line or compact format
         prefill_s = decode_tokens = decode_s = avg_tok_s = min_tok_s = max_tok_s = ms_tok = 0.0
         for line in lines:
             m = re.search(r"prefill\s+([\d.]+)s\s+\((\d+) tokens?\)", line)
@@ -125,9 +125,17 @@ def parse_output(output: str) -> dict:
                 avg_tok_s = float(m.group(1))
                 min_tok_s = float(m.group(2))
                 max_tok_s = float(m.group(3))
-            m = re.search(r"(\d+) ms/tok", line)
+            m = re.search(r"(\d+)ms/tok", line)
             if m:
                 ms_tok = float(m.group(1))
+            # Compact fallback: "39 tok  14.8 tok/s  69ms/tok  5.68s"
+            m = re.search(r"(\d+) tok\s+([\d.]+) tok/s\s+(\d+)ms/tok\s+([\d.]+)s", line)
+            if m:
+                decode_tokens = int(m.group(1))
+                avg_tok_s = float(m.group(2))
+                ms_tok = float(m.group(3))
+                total_s = float(m.group(4))
+                decode_s = total_s  # approximate
         if decode_tokens > 0:
             summary = {
                 "prefill_s": prefill_s,

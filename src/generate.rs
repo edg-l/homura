@@ -268,9 +268,10 @@ fn generate_streaming_core(
         decode_times,
         seed: sampling.seed,
     };
-    crate::progress::print_stats(&stats);
+    let output_text = model.decode_tokens(&generated_ids);
+    crate::progress::print_stats(&stats, &output_text);
 
-    Ok(model.decode_tokens(&generated_ids))
+    Ok(output_text)
 }
 
 /// GPT-2 text generator using a single decoder ONNX model (full-recompute per step).
