@@ -1,6 +1,6 @@
 # Homura
 
-A Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation (IREE-style) with parallel codegen via rayon. Supports ONNX and HuggingFace/safetensors models. Runs MNIST, ResNet-18, GPT-2.
+A Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation with parallel codegen via rayon. Supports ONNX and HuggingFace/safetensors models. Runs MNIST, ResNet-18, GPT-2.
 
 ### ONNX model inference
 
