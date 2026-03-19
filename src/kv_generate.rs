@@ -284,6 +284,22 @@ impl UnifiedKvGenerator {
                 break;
             }
             generated_ids.push(next_token);
+
+            // Check stop sequences against the generated text so far.
+            if !sampling.stop_sequences.is_empty() {
+                let text_so_far = self.tokenizer.decode(&generated_ids);
+                if let Some(seq) = sampling.stop_sequences.iter().find(|s| text_so_far.contains(s.as_str())) {
+                    log_info!("stop sequence {:?} reached", seq);
+                    // Trim the generated text at the stop sequence.
+                    if let Some(pos) = text_so_far.find(seq.as_str()) {
+                        let trimmed_text = &text_so_far[..pos];
+                        // Re-encode to get the right token count for the trimmed output.
+                        let trimmed_ids: Vec<u32> = self.tokenizer.encode(trimmed_text);
+                        generated_ids = trimmed_ids;
+                    }
+                    break;
+                }
+            }
         }
 
         let total = gen_start.elapsed();

@@ -75,6 +75,12 @@ enum Commands {
         /// Repetition penalty (1.0 = off, default: 1.1)
         #[arg(long, default_value = "1.1")]
         repetition_penalty: f32,
+        /// Top-k filtering (0 = disabled, default: 50)
+        #[arg(long, default_value = "50")]
+        top_k: usize,
+        /// Stop sequences (comma-separated, e.g. "\n\n,Posted by")
+        #[arg(long)]
+        stop: Option<String>,
     },
 }
 
@@ -110,12 +116,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             temperature,
             top_p,
             repetition_penalty,
+            top_k,
+            stop,
         } => {
             if let Some(prompt_text) = prompt {
+                let stop_sequences = stop
+                    .map(|s| s.split(',').map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
                 let sampling = homura::generate::SamplingConfig {
                     temperature,
+                    top_k,
                     top_p,
                     repetition_penalty,
+                    stop_sequences,
                 };
                 cmd_generate(&model, &prompt_text, max_tokens, &sampling)
             } else {
