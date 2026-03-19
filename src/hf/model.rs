@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::DType;
-use crate::generate::{GenerationStats, Rng, SamplingConfig, argmax_at_position, sample_token};
+use crate::generate::{
+    GenerationStats, Rng, SamplingConfig, argmax_at_position, escape_token_text, sample_token,
+};
 use crate::hf::config::TransformerConfig;
 use crate::hf::precompute::{build_causal_mask, precompute_rope_cos_sin, slice_rope_for_positions};
 use crate::hf::tokenizer::HfTokenizer;
@@ -214,9 +216,9 @@ impl HfModel {
             return Ok(String::new());
         }
         generated_ids.push(next_token);
-        let token_text = tokenizer.decode(&[next_token]);
+        let token_display = escape_token_text(&tokenizer.decode(&[next_token]));
         eprintln!(
-            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET} {DIM}(prefill){RESET}"
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} {DIM}(prefill){RESET}"
         );
 
         // Decode loop
@@ -239,9 +241,9 @@ impl HfModel {
             let step_elapsed = step_start.elapsed();
             decode_times.push(step_elapsed);
             let tok_s = 1.0 / step_elapsed.as_secs_f64();
-            let token_text = tokenizer.decode(&[current_token]);
+            let token_display = escape_token_text(&tokenizer.decode(&[current_token]));
             eprintln!(
-                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text}{RESET}  \
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
                  {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,
                 step_elapsed.as_secs_f64() * 1000.0,

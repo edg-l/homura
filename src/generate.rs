@@ -157,6 +157,28 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
         .unwrap_or(0)
 }
 
+// ── Display helpers ──────────────────────────────────────────────────────────
+
+/// Escape control characters in token text for single-line display.
+/// Newlines become `\n`, tabs become `\t`, other control chars become `\xNN`.
+pub fn escape_token_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                for b in c.to_string().bytes() {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // ── RNG ──────────────────────────────────────────────────────────────────────
 
 /// Seedable xorshift64 RNG for token sampling.

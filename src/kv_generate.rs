@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use crate::log::{BOLD, BOLD_MAGENTA, CYAN, DIM, GREEN, RESET, YELLOW};
 use crate::{
     DType,
-    generate::{GenerationStats, Rng, SamplingConfig, argmax_at_position, sample_token},
+    generate::{
+        GenerationStats, Rng, SamplingConfig, argmax_at_position, escape_token_text, sample_token,
+    },
     onnx::parser::Dim,
     onnx::{Model, parser},
     runtime::Buffer,
@@ -249,9 +251,9 @@ impl UnifiedKvGenerator {
             return String::new();
         }
         generated_ids.push(next_token);
-        let token_text = self.tokenizer.decode(&[next_token]);
+        let token_display = escape_token_text(&self.tokenizer.decode(&[next_token]));
         eprintln!(
-            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET} \
+            "  {CYAN}[1/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET} \
              {DIM}(prefill){RESET}"
         );
 
@@ -279,9 +281,9 @@ impl UnifiedKvGenerator {
             let step_elapsed = step_start.elapsed();
             decode_times.push(step_elapsed);
             let tok_s = 1.0 / step_elapsed.as_secs_f64();
-            let token_text = self.tokenizer.decode(&[next_token]);
+            let token_display = escape_token_text(&self.tokenizer.decode(&[next_token]));
             eprintln!(
-                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_text:?}{RESET}  \
+                "  {CYAN}[{}/{max_new_tokens}]{RESET} {BOLD}{token_display}{RESET}  \
                  {YELLOW}{:.0}ms{RESET}  {GREEN}{tok_s:.1} tok/s{RESET}",
                 step + 1,
                 step_elapsed.as_secs_f64() * 1000.0,
