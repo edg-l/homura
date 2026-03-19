@@ -1,0 +1,289 @@
+use std::collections::HashMap;
+
+use crate::DType;
+use crate::hf::config::TransformerConfig;
+use crate::runtime::Buffer;
+
+/// Weights for a single transformer layer.
+pub struct LayerWeights {
+    pub input_layernorm_weight: Buffer,
+    pub q_proj_weight: Buffer, // transposed to [in, out] at load
+    pub q_proj_bias: Option<Buffer>,
+    pub k_proj_weight: Buffer, // transposed
+    pub k_proj_bias: Option<Buffer>,
+    pub v_proj_weight: Buffer, // transposed
+    pub v_proj_bias: Option<Buffer>,
+    pub o_proj_weight: Buffer, // transposed
+    pub post_attention_layernorm_weight: Buffer,
+    pub gate_proj_weight: Buffer, // transposed
+    pub up_proj_weight: Buffer,   // transposed
+    pub down_proj_weight: Buffer, // transposed
+}
+
+/// All weights for a decoder-only transformer model.
+pub struct TransformerWeights {
+    pub embed_tokens_weight: Buffer,
+    pub layers: Vec<LayerWeights>,
+    pub final_norm_weight: Buffer,
+    /// None when tie_word_embeddings=true (reuse embed_tokens_weight).
+    pub lm_head_weight: Option<Buffer>,
+}
+
+impl TransformerWeights {
+    /// Returns all weight buffers as a flat Vec<Buffer> in a deterministic order.
+    ///
+    /// Order:
+    ///   - embed_tokens_weight
+    ///   - For each layer i (0..num_layers):
+    ///     - input_layernorm_weight
+    ///     - q_proj_weight, [q_proj_bias], k_proj_weight, [k_proj_bias],
+    ///       v_proj_weight, [v_proj_bias]
+    ///     - o_proj_weight
+    ///     - post_attention_layernorm_weight
+    ///     - gate_proj_weight, up_proj_weight, down_proj_weight
+    ///   - final_norm_weight
+    ///   - [lm_head_weight] (only if not tied)
+    ///
+    /// Biases are only included when they exist (inferred from the first layer).
+    pub fn to_slot_buffers(&self) -> Vec<Buffer> {
+        let has_bias = self
+            .layers
+            .first()
+            .map(|l| l.q_proj_bias.is_some())
+            .unwrap_or(false);
+
+        let mut bufs = Vec::new();
+        bufs.push(self.embed_tokens_weight.clone());
+
+        for layer in &self.layers {
+            bufs.push(layer.input_layernorm_weight.clone());
+            bufs.push(layer.q_proj_weight.clone());
+            if has_bias {
+                bufs.push(layer.q_proj_bias.as_ref().unwrap().clone());
+            }
+            bufs.push(layer.k_proj_weight.clone());
+            if has_bias {
+                bufs.push(layer.k_proj_bias.as_ref().unwrap().clone());
+            }
+            bufs.push(layer.v_proj_weight.clone());
+            if has_bias {
+                bufs.push(layer.v_proj_bias.as_ref().unwrap().clone());
+            }
+            bufs.push(layer.o_proj_weight.clone());
+            bufs.push(layer.post_attention_layernorm_weight.clone());
+            bufs.push(layer.gate_proj_weight.clone());
+            bufs.push(layer.up_proj_weight.clone());
+            bufs.push(layer.down_proj_weight.clone());
+        }
+
+        bufs.push(self.final_norm_weight.clone());
+
+        if let Some(lm_head) = &self.lm_head_weight {
+            bufs.push(lm_head.clone());
+        }
+
+        bufs
+    }
+}
+
+/// Transpose a 2D buffer from [rows, cols] to [cols, rows].
+fn transpose_2d(buf: &Buffer) -> Buffer {
+    let shape = buf.shape().0.clone();
+    let rows = shape[0] as usize;
+    let cols = shape[1] as usize;
+    let src = buf.as_slice::<f32>();
+    let mut dst = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            dst[c * rows + r] = src[r * cols + c];
+        }
+    }
+    Buffer::from_slice::<f32>(&dst, &[cols as u64, rows as u64], DType::F32)
+}
+
+/// Load and organize transformer weights from a flat safetensors map.
+///
+/// All linear weight matrices are transposed from HF layout [out, in] to
+/// matmul layout [in, out]. Embedding and layernorm weights are left as-is.
+pub fn load_transformer_weights(
+    config: &TransformerConfig,
+    mut tensors: HashMap<String, Buffer>,
+) -> Result<TransformerWeights, Box<dyn std::error::Error>> {
+    // Detect whether biases exist by checking the first layer.
+    let has_bias = tensors.contains_key("model.layers.0.self_attn.q_proj.bias");
+
+    let take = |tensors: &mut HashMap<String, Buffer>,
+                key: &str|
+     -> Result<Buffer, Box<dyn std::error::Error>> {
+        tensors
+            .remove(key)
+            .ok_or_else(|| format!("missing weight: {key}").into())
+    };
+
+    let embed_tokens_weight = take(&mut tensors, "model.embed_tokens.weight")?;
+
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for i in 0..config.num_hidden_layers {
+        let input_layernorm_weight = take(
+            &mut tensors,
+            &format!("model.layers.{i}.input_layernorm.weight"),
+        )?;
+
+        let q_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.self_attn.q_proj.weight"),
+        )?);
+        let q_proj_bias = if has_bias {
+            Some(take(
+                &mut tensors,
+                &format!("model.layers.{i}.self_attn.q_proj.bias"),
+            )?)
+        } else {
+            None
+        };
+
+        let k_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.self_attn.k_proj.weight"),
+        )?);
+        let k_proj_bias = if has_bias {
+            Some(take(
+                &mut tensors,
+                &format!("model.layers.{i}.self_attn.k_proj.bias"),
+            )?)
+        } else {
+            None
+        };
+
+        let v_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.self_attn.v_proj.weight"),
+        )?);
+        let v_proj_bias = if has_bias {
+            Some(take(
+                &mut tensors,
+                &format!("model.layers.{i}.self_attn.v_proj.bias"),
+            )?)
+        } else {
+            None
+        };
+
+        let o_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.self_attn.o_proj.weight"),
+        )?);
+
+        let post_attention_layernorm_weight = take(
+            &mut tensors,
+            &format!("model.layers.{i}.post_attention_layernorm.weight"),
+        )?;
+
+        let gate_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.mlp.gate_proj.weight"),
+        )?);
+        let up_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.mlp.up_proj.weight"),
+        )?);
+        let down_proj_weight = transpose_2d(&take(
+            &mut tensors,
+            &format!("model.layers.{i}.mlp.down_proj.weight"),
+        )?);
+
+        layers.push(LayerWeights {
+            input_layernorm_weight,
+            q_proj_weight,
+            q_proj_bias,
+            k_proj_weight,
+            k_proj_bias,
+            v_proj_weight,
+            v_proj_bias,
+            o_proj_weight,
+            post_attention_layernorm_weight,
+            gate_proj_weight,
+            up_proj_weight,
+            down_proj_weight,
+        });
+    }
+
+    let final_norm_weight = take(&mut tensors, "model.norm.weight")?;
+
+    let lm_head_weight = if config.tie_word_embeddings {
+        None
+    } else {
+        Some(transpose_2d(&take(&mut tensors, "lm_head.weight")?))
+    };
+
+    Ok(TransformerWeights {
+        embed_tokens_weight,
+        layers,
+        final_norm_weight,
+        lm_head_weight,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hf::config::TransformerConfig;
+
+    #[test]
+    fn transpose_2d_basic() {
+        // [2, 3] -> [3, 2]
+        let buf =
+            Buffer::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], crate::DType::F32);
+        let t = transpose_2d(&buf);
+        assert_eq!(t.shape().0, vec![3, 2]);
+        assert_eq!(t.as_slice::<f32>(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn load_real_qwen2_weights() {
+        let model_dir = std::path::Path::new(concat!(
+            env!("HOME"),
+            "/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/",
+            "snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987"
+        ));
+        let config_path = model_dir.join("config.json");
+        let safetensors_path = model_dir.join("model.safetensors");
+        if !config_path.exists() || !safetensors_path.exists() {
+            eprintln!("skipping: Qwen2.5-0.5B not found");
+            return;
+        }
+
+        let config = TransformerConfig::load(&config_path).unwrap();
+        let tensors = crate::hf::safetensors::load_safetensors(&safetensors_path).unwrap();
+        let weights = load_transformer_weights(&config, tensors).unwrap();
+
+        assert_eq!(weights.layers.len(), 24);
+        // embed_tokens: [vocab=151936, hidden=896] - NOT transposed
+        assert_eq!(weights.embed_tokens_weight.shape().0, vec![151936, 896]);
+        // q_proj: originally [896, 896], transposed to [896, 896] (square, same shape)
+        assert_eq!(weights.layers[0].q_proj_weight.shape().0, vec![896, 896]);
+        // k_proj: originally [128, 896], transposed to [896, 128]
+        assert_eq!(weights.layers[0].k_proj_weight.shape().0, vec![896, 128]);
+        // v_proj: same as k_proj
+        assert_eq!(weights.layers[0].v_proj_weight.shape().0, vec![896, 128]);
+        // biases exist for Qwen2
+        assert!(weights.layers[0].q_proj_bias.is_some());
+        // gate_proj: originally [4864, 896], transposed to [896, 4864]
+        assert_eq!(
+            weights.layers[0].gate_proj_weight.shape().0,
+            vec![896, 4864]
+        );
+        // lm_head is tied
+        assert!(weights.lm_head_weight.is_none());
+        // final norm
+        assert_eq!(weights.final_norm_weight.shape().0, vec![896]);
+
+        // Check flat buffers count.
+        // Per layer: 9 weights (input_ln, q, k, v, o, post_attn_ln, gate, up, down)
+        //           + 3 biases (q, k, v) when present = 12 total with biases, 9 without.
+        let has_bias = weights.layers[0].q_proj_bias.is_some();
+        let per_layer = if has_bias { 12 } else { 9 };
+        let expected = 1 /* embed */ + 24 * per_layer + 1 /* final_norm */ + 0 /* no lm_head (tied) */;
+        let flat = weights.to_slot_buffers();
+        assert_eq!(flat.len(), expected);
+    }
+}

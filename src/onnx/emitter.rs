@@ -283,10 +283,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            )
-                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a + b) {
-                    const_i64.insert(node.outputs[0].clone(), result);
-                }
+            ) && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a + b)
+            {
+                const_i64.insert(node.outputs[0].clone(), result);
+            }
         }
         "Sub" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -298,10 +298,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            )
-                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a - b) {
-                    const_i64.insert(node.outputs[0].clone(), result);
-                }
+            ) && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a - b)
+            {
+                const_i64.insert(node.outputs[0].clone(), result);
+            }
         }
         "Mul" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -312,10 +312,10 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            )
-                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a * b) {
-                    const_i64.insert(node.outputs[0].clone(), result);
-                }
+            ) && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a * b)
+            {
+                const_i64.insert(node.outputs[0].clone(), result);
+            }
         }
         "Div" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -326,11 +326,11 @@ fn emit_node<'c>(
             if let (Some(va), Some(vb)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            )
-                && vb.iter().all(|&b| b != 0)
-                    && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a / b) {
-                        const_i64.insert(node.outputs[0].clone(), result);
-                    }
+            ) && vb.iter().all(|&b| b != 0)
+                && let Some(result) = const_i64_elementwise(&va, &vb, |a, b| a / b)
+            {
+                const_i64.insert(node.outputs[0].clone(), result);
+            }
         }
         "Neg" => {
             let a = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -543,10 +543,9 @@ fn emit_node<'c>(
                 if allowzero == 0 {
                     let in_shape = x.shape();
                     for (i, d) in target_shape.iter_mut().enumerate() {
-                        if *d == 0
-                            && i < in_shape.len() {
-                                *d = in_shape[i].map(|n| n as i64).unwrap_or(0);
-                            }
+                        if *d == 0 && i < in_shape.len() {
+                            *d = in_shape[i].map(|n| n as i64).unwrap_or(0);
+                        }
                     }
                 }
                 builder.emit_reshape(&x, &target_shape)
@@ -758,22 +757,25 @@ fn emit_node<'c>(
 
                 // Propagate const_i64 through static Slice on 1-D data.
                 if let Some(data_vals) = lookup_const_i64(const_i64, &node.inputs[0])
-                    && axes.len() == 1 && axes[0] == 0 && steps.iter().all(|&s| s == 1) {
-                        let n = data_vals.len() as i64;
-                        let s = if starts[0] < 0 {
-                            (n + starts[0]).max(0)
-                        } else {
-                            starts[0].min(n)
-                        } as usize;
-                        let e = if ends[0] < 0 {
-                            (n + ends[0]).max(0)
-                        } else {
-                            ends[0].min(n)
-                        } as usize;
-                        if s <= e && e <= data_vals.len() {
-                            const_i64.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
-                        }
+                    && axes.len() == 1
+                    && axes[0] == 0
+                    && steps.iter().all(|&s| s == 1)
+                {
+                    let n = data_vals.len() as i64;
+                    let s = if starts[0] < 0 {
+                        (n + starts[0]).max(0)
+                    } else {
+                        starts[0].min(n)
+                    } as usize;
+                    let e = if ends[0] < 0 {
+                        (n + ends[0]).max(0)
+                    } else {
+                        ends[0].min(n)
+                    } as usize;
+                    if s <= e && e <= data_vals.len() {
+                        const_i64.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
                     }
+                }
             } else {
                 // ── Dynamic path ─────────────────────────────────────────────
                 // starts/ends are runtime 1-D I64 tensors in value_map.
@@ -832,21 +834,22 @@ fn emit_node<'c>(
             if let (Some(data_vals), Some(idx_vals)) = (
                 lookup_const_i64(const_i64, &node.inputs[0]),
                 lookup_const_i64(const_i64, &node.inputs[1]),
-            )
-                && axis_usize == 0 && data.rank() == 1 {
-                    let gathered: Vec<i64> = idx_vals
-                        .iter()
-                        .map(|&idx| {
-                            let i = if idx < 0 {
-                                (data_vals.len() as i64 + idx) as usize
-                            } else {
-                                idx as usize
-                            };
-                            data_vals[i]
-                        })
-                        .collect();
-                    const_i64.insert(node.outputs[0].clone(), gathered);
-                }
+            ) && axis_usize == 0
+                && data.rank() == 1
+            {
+                let gathered: Vec<i64> = idx_vals
+                    .iter()
+                    .map(|&idx| {
+                        let i = if idx < 0 {
+                            (data_vals.len() as i64 + idx) as usize
+                        } else {
+                            idx as usize
+                        };
+                        data_vals[i]
+                    })
+                    .collect();
+                const_i64.insert(node.outputs[0].clone(), gathered);
+            }
         }
         "Where" => {
             let cond = get_tensor(value_map, builder, &node.inputs[0])?;
@@ -1045,9 +1048,10 @@ fn emit_node<'c>(
                 })?;
             // Seed const_i64 for small integer constants (axes, split sizes, shape inputs).
             if buf.shape().num_elements() <= 64
-                && let Ok(vals) = read_i64_buffer(buf) {
-                    const_i64.insert(node.outputs[0].clone(), vals);
-                }
+                && let Ok(vals) = read_i64_buffer(buf)
+            {
+                const_i64.insert(node.outputs[0].clone(), vals);
+            }
             let out = emit_buffer_as_constant(builder, buf);
             insert_tensor(value_map, &node.outputs[0], out);
         }
@@ -1412,10 +1416,11 @@ fn split_kv_concat_groups(
         for &ni in &group.node_indices {
             for input_name in &nodes[ni].inputs {
                 if let Some(&prod_ni) = producer.get(input_name.as_str())
-                    && prod_ni != ni {
-                        consumers.entry(prod_ni).or_default().insert(ni);
-                        dependencies.entry(ni).or_default().insert(prod_ni);
-                    }
+                    && prod_ni != ni
+                {
+                    consumers.entry(prod_ni).or_default().insert(ni);
+                    dependencies.entry(ni).or_default().insert(prod_ni);
+                }
             }
         }
 
@@ -1743,15 +1748,19 @@ struct KernelIO {
 
 /// `(kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_value_names)`
 /// where `slot_value_names[i]` is the ONNX value name for slot `i`.
-type BufferSlotAssignment = (Vec<KernelIO>, usize, Vec<usize>, Vec<usize>, Vec<usize>, Vec<String>);
+type BufferSlotAssignment = (
+    Vec<KernelIO>,
+    usize,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<String>,
+);
 
 /// Assign buffer pool slots and compute per-kernel I/O mappings.
 ///
 /// Returns a [`BufferSlotAssignment`].
-fn assign_buffer_slots(
-    model: &OnnxModel,
-    groups: &[KernelGroup],
-) -> BufferSlotAssignment {
+fn assign_buffer_slots(model: &OnnxModel, groups: &[KernelGroup]) -> BufferSlotAssignment {
     let mut name_to_slot: HashMap<String, usize> = HashMap::new();
     let mut slot_names: Vec<String> = Vec::new();
     let mut next_slot = 0usize;
@@ -1946,9 +1955,10 @@ fn seed_shape_state(
     let mut const_i64: HashMap<String, Vec<i64>> = HashMap::new();
     for (name, buf) in &model.initializers {
         if buf.shape().num_elements() <= 64
-            && let Ok(vals) = read_i64_buffer(buf) {
-                const_i64.insert(name.clone(), vals);
-            }
+            && let Ok(vals) = read_i64_buffer(buf)
+        {
+            const_i64.insert(name.clone(), vals);
+        }
     }
 
     // Seed symbolic shape info from model inputs.
@@ -1994,14 +2004,15 @@ fn seed_shape_state(
     for (name, buf) in &model.initializers {
         if buf.shape().num_elements() <= 64
             && let Ok(vals) = read_i64_buffer(buf)
-                && vals.iter().all(|&v| v >= 0) {
-                    sym_const_i64.insert(
-                        name.clone(),
-                        vals.iter()
-                            .map(|&v| crate::shape::SymDim::Concrete(v as u64))
-                            .collect(),
-                    );
-                }
+            && vals.iter().all(|&v| v >= 0)
+        {
+            sym_const_i64.insert(
+                name.clone(),
+                vals.iter()
+                    .map(|&v| crate::shape::SymDim::Concrete(v as u64))
+                    .collect(),
+            );
+        }
     }
 
     ShapeState {
@@ -2013,124 +2024,8 @@ fn seed_shape_state(
 }
 
 /// Metadata produced by emitting a single kernel, deferred for parallel compilation.
-struct KernelEmitResult {
-    mlir_text: String,
-    num_inputs: usize,
-    output_descs: Vec<crate::runtime::OutputDesc>,
-    group_idx: usize,
-    num_in: usize,
-    num_out: usize,
-    ops_label: String,
-}
-
-/// Compile all emitted kernels in parallel, link into a unified .so, dlopen it,
-/// and return the loaded `CompiledGraph` handles together with the raw lib handle.
-fn compile_and_link_kernels(
-    emit_results: &[KernelEmitResult],
-) -> Result<(Vec<crate::runtime::CompiledGraph>, *mut libc::c_void), OnnxError> {
-    log_compile!("plan", "compiling {} kernels in parallel...", emit_results.len());
-    let compile_start = std::time::Instant::now();
-
-    // Phase 2a: Compile each kernel to .o files in parallel (no linking yet).
-    let tmp_dir = crate::graph_builder::tempfile_dir()
-        .ok_or_else(|| OnnxError::CompileError("cannot determine temp directory".into()))?;
-
-    let all_obj_paths: Vec<(usize, Vec<std::path::PathBuf>)> = {
-        use rayon::prelude::*;
-        let results: Vec<Result<(usize, Vec<std::path::PathBuf>), OnnxError>> = emit_results
-            .par_iter()
-            .map(|er| {
-                let t0 = std::time::Instant::now();
-                let func_name = format!("k{}", er.group_idx);
-                let label = format!("k{}:{}", er.group_idx, er.ops_label);
-                let obj_paths = crate::graph_builder::compile_to_objects(
-                    &er.mlir_text,
-                    &label,
-                    &func_name,
-                    &tmp_dir,
-                )
-                .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))?;
-                log_compile!(
-                    "plan",
-                    "k{} [{}] ({} in / {} out): {}ms",
-                    er.group_idx,
-                    er.ops_label,
-                    er.num_in,
-                    er.num_out,
-                    t0.elapsed().as_millis()
-                );
-                Ok((er.group_idx, obj_paths))
-            })
-            .collect();
-        results.into_iter().collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Phase 2b: Link all .o files into a single .so.
-    let link_start = std::time::Instant::now();
-    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
-        .iter()
-        .flat_map(|(_, paths)| paths.iter().cloned())
-        .collect();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let unified_so = tmp_dir.join(format!(
-        "homura_unified_{}_{:08x}.so",
-        std::process::id(),
-        nanos
-    ));
-    crate::compiler::link_shared_lib_pub(&all_objs, &unified_so)
-        .map_err(|e| OnnxError::CompileError(format!("unified link: {e}")))?;
-    log_compile!("plan", "unified link ({} .o files): {}ms", all_objs.len(), link_start.elapsed().as_millis());
-
-    // Clean up .o files.
-    for p in &all_objs {
-        std::fs::remove_file(p).ok();
-    }
-
-    // Phase 2c: dlopen once, dlsym each kernel.
-    let lib = {
-        use std::ffi::CString;
-        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
-        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
-        if lib.is_null() {
-            let err = unsafe {
-                let msg = libc::dlerror();
-                if msg.is_null() {
-                    "unknown dlopen error".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
-                }
-            };
-            return Err(OnnxError::CompileError(format!(
-                "dlopen unified .so failed: {err}"
-            )));
-        }
-        lib
-    };
-
-    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
-        .iter()
-        .map(|er| {
-            let func_name = format!("k{}", er.group_idx);
-            crate::runtime::CompiledGraph::load_from_handle(
-                lib,
-                er.num_inputs,
-                er.output_descs.clone(),
-                &func_name,
-            )
-            .map_err(|e| OnnxError::CompileError(format!("kernel {}: {e}", er.group_idx)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Clean up the .so file (it's already dlopen'd).
-    std::fs::remove_file(&unified_so).ok();
-
-    log_compile!("plan", "all {} kernels compiled + linked: {}ms total", kernels.len(), compile_start.elapsed().as_millis());
-
-    Ok((kernels, lib))
-}
+// KernelEmitResult and compile_and_link_kernels are in crate::compiler (shared with HF emitter).
+use crate::compiler::KernelEmitResult;
 
 /// Build KV plan metadata from the KV Concat nodes detected during partitioning.
 fn build_kv_plan_info(
@@ -2189,12 +2084,20 @@ pub fn emit_and_compile_plan(
     let mut groups = partition_nodes(&model.nodes);
     let gemm_residual_fusions = detect_and_absorb_gemm_residual(&model.nodes, &mut groups);
     if !gemm_residual_fusions.is_empty() {
-        log_compile!("plan", "fused {} Gemm+residual Add pairs", gemm_residual_fusions.len());
+        log_compile!(
+            "plan",
+            "fused {} Gemm+residual Add pairs",
+            gemm_residual_fusions.len()
+        );
     }
     let (groups, kv_concat_node_indices, kv_concat_ordered) =
         split_kv_concat_groups(&model.nodes, groups);
     if !kv_concat_node_indices.is_empty() {
-        log_compile!("plan", "split {} KV Concat nodes into native ops", kv_concat_node_indices.len());
+        log_compile!(
+            "plan",
+            "split {} KV Concat nodes into native ops",
+            kv_concat_node_indices.len()
+        );
     }
 
     let (kernel_ios, num_slots, input_slots, weight_slots, output_slots, slot_names) =
@@ -2214,7 +2117,13 @@ pub fn emit_and_compile_plan(
     let mut past_kv_input_slots: Vec<usize> = Vec::new();
     let mut present_kv_output_slots: Vec<usize> = Vec::new();
 
-    log_compile!("plan", "{} nodes → {} kernels, {} buffer slots", model.nodes.len(), groups.len(), num_slots);
+    log_compile!(
+        "plan",
+        "{} nodes → {} kernels, {} buffer slots",
+        model.nodes.len(),
+        groups.len(),
+        num_slots
+    );
 
     let ShapeState {
         mut shape_info,
@@ -2275,13 +2184,14 @@ pub fn emit_and_compile_plan(
             }
             // Propagate sym shapes.
             if let Some(sym0) = sym_shape_info.get(&node.inputs[0])
-                && let Some(sym1) = sym_shape_info.get(&node.inputs[1]) {
-                    let mut out_sym = sym0.clone();
-                    if axis < out_sym.len() && axis < sym1.len() {
-                        out_sym[axis] = sym0[axis].clone().add(sym1[axis].clone());
-                    }
-                    sym_shape_info.insert(node.outputs[0].clone(), out_sym);
+                && let Some(sym1) = sym_shape_info.get(&node.inputs[1])
+            {
+                let mut out_sym = sym0.clone();
+                if axis < out_sym.len() && axis < sym1.len() {
+                    out_sym[axis] = sym0[axis].clone().add(sym1[axis].clone());
                 }
+                sym_shape_info.insert(node.outputs[0].clone(), out_sym);
+            }
             let ni = group.node_indices[0];
             let all_input_slots: Vec<usize> = io.input_slots.iter().map(|(_, s)| *s).collect();
             let all_output_slots: Vec<usize> = io.output_slots.iter().map(|(_, s)| *s).collect();
@@ -2537,7 +2447,8 @@ pub fn emit_and_compile_plan(
     );
 
     // Phase 2: Compile all kernels in parallel.
-    let (kernels, lib) = compile_and_link_kernels(&emit_results)?;
+    let (kernels, lib) = crate::compiler::compile_and_link_kernels(&emit_results)
+        .map_err(|e| OnnxError::CompileError(e.to_string()))?;
 
     // Build slot descriptors.
     let slot_descs: Vec<SlotDesc> = slot_names
@@ -2582,7 +2493,13 @@ pub fn emit_and_compile_plan(
             past_kv_input_slots,
             present_kv_output_slots,
         );
-        log_compile!("plan", "KV cache: {} layers, {} heads, head_dim={}", kv_info.num_layers, kv_info.num_heads, kv_info.head_dim);
+        log_compile!(
+            "plan",
+            "KV cache: {} layers, {} heads, head_dim={}",
+            kv_info.num_layers,
+            kv_info.num_heads,
+            kv_info.head_dim
+        );
         plan.set_kv_info(kv_info);
     }
 

@@ -239,7 +239,11 @@ fn emit_object_files_impl(
         let translate_start = std::time::Instant::now();
         let llvm_ctx = LLVMContextCreate();
         let llvm_module = mlirTranslateModuleToLLVMIR(module.as_operation().to_raw(), llvm_ctx);
-        log_compile!(label, "MLIR→LLVM: {}ms", translate_start.elapsed().as_millis());
+        log_compile!(
+            label,
+            "MLIR→LLVM: {}ms",
+            translate_start.elapsed().as_millis()
+        );
 
         if !llvm_module.is_null() {
             let dl = CString::new(
@@ -350,7 +354,10 @@ fn emit_object_files_impl(
         log_compile!(
             label,
             "split+ser: {split_ms}ms, sizes(KB): {:?}",
-            bitcode_bufs.iter().map(|b| b.len() / 1024).collect::<Vec<_>>()
+            bitcode_bufs
+                .iter()
+                .map(|b| b.len() / 1024)
+                .collect::<Vec<_>>()
         );
 
         // Compile each partition in parallel: fresh LLVMContext per thread.
@@ -418,7 +425,12 @@ fn emit_object_files_impl(
             return Err(e);
         }
 
-        log_compile!(label, "all {} parts: {}ms", obj_paths.len(), split_start.elapsed().as_millis());
+        log_compile!(
+            label,
+            "all {} parts: {}ms",
+            obj_paths.len(),
+            split_start.elapsed().as_millis()
+        );
 
         Ok(obj_paths)
     }
@@ -970,9 +982,14 @@ pub(crate) fn build_transform_schedule<'c>(
 
     // ── @match_contraction_3d ──────────────────────────────────────────────────
     // Matches plain (2D) matmul generics: 3 iteration dims (M, N, K).
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_3d",
+        3,
+    ));
 
     // ── @tile_contraction_3d ───────────────────────────────────────────────────
     // Tile sizes [32, 32, 0]: tile M and N at L1 cache level; K is reduction (untiled).
@@ -991,9 +1008,14 @@ pub(crate) fn build_transform_schedule<'c>(
 
     // ── @match_contraction_4d ──────────────────────────────────────────────────
     // Matches batched matmul generics: 4 iteration dims (B, M, N, K).
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_4d",
+        4,
+    ));
 
     // ── @tile_contraction_4d ───────────────────────────────────────────────────
     // Tile sizes [0, 32, 32, 0]: skip B, tile M and N at L1; K is reduction (untiled).
@@ -1246,12 +1268,22 @@ pub(crate) fn build_vectorize_only_schedule<'c>(
         };
 
     // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_3d",
+        3,
+    ));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_4d",
+        4,
+    ));
 
     // ── @vectorize_contraction_3d ──────────────────────────────────────────────
     // 3D matmul (M, N, K): tile N=16, K=16. LLVM O2 auto-vectorizes the
@@ -1448,12 +1480,22 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
     };
 
     // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_3d", 3));
-    module
-        .body()
-        .append_operation(build_match_contraction_seq(context, location, any_op_type, param_i64_type, "match_contraction_4d", 4));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_3d",
+        3,
+    ));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_4d",
+        4,
+    ));
 
     // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
     // 3D matmul (M, N, K): forall N=256 (parallel), for K=16 only.
@@ -1567,4 +1609,137 @@ pub(crate) fn link_shared_lib_pub(
     so_path: &std::path::Path,
 ) -> Result<(), CompileError> {
     link_shared_lib(obj_paths, so_path)
+}
+
+// ── Shared kernel compilation ────────────────────────────────────────────────
+
+/// Result of emitting a single kernel's MLIR text.
+/// Used by both ONNX and native HF emitters.
+pub(crate) struct KernelEmitResult {
+    pub mlir_text: String,
+    pub num_inputs: usize,
+    pub output_descs: Vec<crate::runtime::OutputDesc>,
+    pub group_idx: usize,
+    pub num_in: usize,
+    pub num_out: usize,
+    pub ops_label: String,
+}
+
+/// Compile all emitted kernels in parallel, link into a unified .so, dlopen it,
+/// and return the loaded `CompiledGraph` handles together with the raw lib handle.
+pub(crate) fn compile_and_link_kernels(
+    emit_results: &[KernelEmitResult],
+) -> Result<(Vec<crate::runtime::CompiledGraph>, *mut libc::c_void), CompileError> {
+    log_compile!(
+        "plan",
+        "compiling {} kernels in parallel...",
+        emit_results.len()
+    );
+    let compile_start = std::time::Instant::now();
+
+    let tmp_dir = crate::graph_builder::tempfile_dir()
+        .ok_or_else(|| CompileError::Link("cannot determine temp directory".into()))?;
+
+    // Compile each kernel to .o files in parallel.
+    let all_obj_paths: Vec<(usize, Vec<std::path::PathBuf>)> = {
+        use rayon::prelude::*;
+        let results: Vec<Result<(usize, Vec<std::path::PathBuf>), CompileError>> = emit_results
+            .par_iter()
+            .map(|er| {
+                let t0 = std::time::Instant::now();
+                let func_name = format!("k{}", er.group_idx);
+                let label = format!("k{}:{}", er.group_idx, er.ops_label);
+                let obj_paths = crate::graph_builder::compile_to_objects(
+                    &er.mlir_text,
+                    &label,
+                    &func_name,
+                    &tmp_dir,
+                )?;
+                log_compile!(
+                    "plan",
+                    "k{} [{}] ({} in / {} out): {}ms",
+                    er.group_idx,
+                    er.ops_label,
+                    er.num_in,
+                    er.num_out,
+                    t0.elapsed().as_millis()
+                );
+                Ok((er.group_idx, obj_paths))
+            })
+            .collect();
+        results.into_iter().collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Link all .o files into a single .so.
+    let link_start = std::time::Instant::now();
+    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let unified_so = tmp_dir.join(format!(
+        "homura_unified_{}_{:08x}.so",
+        std::process::id(),
+        nanos
+    ));
+    link_shared_lib(&all_objs, &unified_so)?;
+    log_compile!(
+        "plan",
+        "unified link ({} .o files): {}ms",
+        all_objs.len(),
+        link_start.elapsed().as_millis()
+    );
+
+    for p in &all_objs {
+        std::fs::remove_file(p).ok();
+    }
+
+    // dlopen once, dlsym each kernel.
+    let lib = {
+        use std::ffi::CString;
+        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
+        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
+        if lib.is_null() {
+            let err = unsafe {
+                let msg = libc::dlerror();
+                if msg.is_null() {
+                    "unknown dlopen error".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+                }
+            };
+            return Err(CompileError::Link(format!(
+                "dlopen unified .so failed: {err}"
+            )));
+        }
+        lib
+    };
+
+    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
+        .iter()
+        .map(|er| {
+            let func_name = format!("k{}", er.group_idx);
+            crate::runtime::CompiledGraph::load_from_handle(
+                lib,
+                er.num_inputs,
+                er.output_descs.clone(),
+                &func_name,
+            )
+            .map_err(|e| CompileError::Link(format!("kernel {}: {e}", er.group_idx)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    std::fs::remove_file(&unified_so).ok();
+
+    log_compile!(
+        "plan",
+        "all {} kernels compiled + linked: {}ms total",
+        kernels.len(),
+        compile_start.elapsed().as_millis()
+    );
+
+    Ok((kernels, lib))
 }
