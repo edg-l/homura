@@ -232,26 +232,52 @@ fn resolve_model_path(model: &std::path::Path) -> Result<PathBuf, Box<dyn std::e
         revision.to_string(),
     ));
 
-    // Download the essential files. hf-hub caches them automatically.
-    let files = [
-        "config.json",
-        "model.safetensors",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ];
+    // Download essential files. hf-hub caches them automatically.
     let mut snapshot_dir = None;
-    for file in &files {
-        match repo.get(file) {
-            Ok(path) => {
-                if snapshot_dir.is_none() {
-                    snapshot_dir = path.parent().map(|p| p.to_path_buf());
-                }
-            }
-            Err(e) => {
-                // tokenizer_config.json is optional
-                if *file != "tokenizer_config.json" {
-                    return Err(format!("failed to fetch {file}: {e}").into());
-                }
+    let mut track = |path: &std::path::Path| {
+        if snapshot_dir.is_none() {
+            snapshot_dir = path.parent().map(|p| p.to_path_buf());
+        }
+    };
+
+    // Required: config.json, tokenizer.json
+    for file in &["config.json", "tokenizer.json"] {
+        let path = repo
+            .get(file)
+            .map_err(|e| format!("failed to fetch {file}: {e}"))?;
+        track(&path);
+    }
+
+    // Optional metadata
+    for file in &["tokenizer_config.json", "generation_config.json"] {
+        if let Ok(path) = repo.get(file) {
+            track(&path);
+        }
+    }
+
+    // Weights: try single model.safetensors first, fall back to sharded index.
+    if let Ok(path) = repo.get("model.safetensors") {
+        track(&path);
+    } else {
+        // Sharded: fetch the index, then each shard file.
+        let index_path = repo
+            .get("model.safetensors.index.json")
+            .map_err(|e| format!("no model.safetensors or index: {e}"))?;
+        track(&index_path);
+
+        let index_text = std::fs::read_to_string(&index_path)?;
+        let index: serde_json::Value = serde_json::from_str(&index_text)?;
+        if let Some(map) = index.get("weight_map").and_then(|m| m.as_object()) {
+            // Collect unique shard filenames.
+            let mut shards: Vec<&str> = map.values().filter_map(|v| v.as_str()).collect();
+            shards.sort();
+            shards.dedup();
+            for shard in &shards {
+                log::info!("fetching shard {shard}");
+                let path = repo
+                    .get(shard)
+                    .map_err(|e| format!("failed to fetch shard {shard}: {e}"))?;
+                track(&path);
             }
         }
     }
