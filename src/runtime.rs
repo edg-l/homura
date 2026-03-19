@@ -1708,6 +1708,32 @@ impl ExecutionPlan {
             }
         }
 
+        // Print per-step profiling summary.
+        if profile && !step_times.is_empty() {
+            let total: std::time::Duration = step_times.iter().map(|(_, d, _)| *d).sum();
+            eprintln!(
+                "  ┌─ decode kernel profile ({} steps, {:.1}ms total)",
+                step_times.len(),
+                total.as_secs_f64() * 1000.0
+            );
+            for (kid, dur, shapes) in &step_times {
+                let ms = dur.as_secs_f64() * 1000.0;
+                if ms >= 0.01 {
+                    let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+                    let shape_str: Vec<String> =
+                        shapes.iter().map(|s| format!("{:?}", s)).collect();
+                    eprintln!(
+                        "  │ k{:<4} {:>8.2}ms  ({:>5.1}%)  {}",
+                        kid,
+                        ms,
+                        pct,
+                        shape_str.join(" × ")
+                    );
+                }
+            }
+            eprintln!("  └─");
+        }
+
         // Advance KV cache.
         if let Some(ref mut cache) = self.kv_cache {
             cache.advance();
