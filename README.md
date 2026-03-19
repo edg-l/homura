@@ -1,6 +1,6 @@
 # Homura
 
-A Rust ML inference framework that compiles ONNX models through MLIR/LLVM to native shared libraries and executes them. Per-kernel compilation (IREE-style) with parallel codegen via rayon. Runs MNIST, ResNet-18, GPT-2.
+A Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation (IREE-style) with parallel codegen via rayon. Supports ONNX and HuggingFace/safetensors models. Runs MNIST, ResNet-18, GPT-2.
 
 ### ONNX model inference
 
@@ -24,13 +24,13 @@ homura clean-cache                              # clear compiled .so cache
 
 ## How it works
 
-Each heavy ONNX op (Conv, MatMul, Gemm) is compiled as an independent kernel with its own MLIR context. Lightweight ops (BatchNorm, Relu, Add) are grouped between heavy ops. All kernels compile in parallel via rayon. A Rust-side `ExecutionPlan` routes buffers between kernels at runtime.
+Each heavy op (Conv, MatMul, Gemm) is compiled as an independent kernel with its own MLIR context. Lightweight ops (BatchNorm, Relu, Add) are grouped between heavy ops. All kernels compile in parallel via rayon. A Rust-side `ExecutionPlan` routes buffers between kernels at runtime.
 
 ```
-ONNX model
+model (ONNX, safetensors/HF)
   → partition into kernel groups
-  → per kernel: MLIR emission → transform schedule (tile + vectorize) → bufferize → LLVM IR → .so
-  → link all .so files
+  → per kernel: MLIR emission (linalg ops) → transform schedule (tile + vectorize) → bufferize → LLVM IR → .o
+  → link all .o into unified .so
   → ExecutionPlan routes buffers between kernels
 ```
 
