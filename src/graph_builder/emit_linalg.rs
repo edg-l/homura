@@ -52,6 +52,168 @@ impl<'c> GraphBuilder<'c> {
         self.emit_collapse_shape_with_reassoc(tiled.value(), &out_shape, "[[0], [1], [2, 3], [4]]")
     }
 
+    /// GQA-aware QK^T: `scores[b,h,m,n] = sum_k Q[b,h,m,k] * K[b, h floordiv gqa, n, k]`
+    ///
+    /// Q is BHSD: `[B, num_heads, seq, head_dim]`
+    /// K is BHSD: `[B, kv_heads, total_seq, head_dim]` (directly from KV cache)
+    /// Output:    `[B, num_heads, seq, total_seq]`
+    ///
+    /// Uses a 5D linalg.generic with `floordiv` indexing to avoid materializing
+    /// the GQA head expansion. When `gqa_repeat == 1`, the floordiv is a no-op.
+    pub fn emit_gqa_qk_transpose(
+        &mut self,
+        q: &Tensor<'c>, // [B, num_heads, seq, head_dim]
+        k: &Tensor<'c>, // [B, kv_heads, total_seq, head_dim]
+        gqa_repeat: usize,
+    ) -> Tensor<'c> {
+        let q_shape = q.shape();
+        let k_shape = k.shape();
+        let b = q_shape[0]; // B (static)
+        let num_heads = q_shape[1]; // H (static)
+        let seq = q_shape[2]; // M (dynamic)
+        let total_seq = k_shape[2]; // N (dynamic)
+
+        let out_shape = vec![b, num_heads, seq, total_seq];
+        let dtype = self.value_dtype(q.value());
+
+        let mut dyn_sources = Vec::new();
+        if seq.is_none() {
+            dyn_sources.push((q.value(), 2)); // M from Q dim 2
+        }
+        if total_seq.is_none() {
+            dyn_sources.push((k.value(), 2)); // N from K dim 2
+        }
+        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("gqa qkt segment sizes");
+        let matmul_region = self.make_matmul_region(dtype);
+
+        // 5 iteration dims: d0=B, d1=H, d2=M, d3=N, d4=K (reduction)
+        let q_map = "affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>";
+        let k_map =
+            format!("affine_map<(d0, d1, d2, d3, d4) -> (d0, d1 floordiv {gqa_repeat}, d3, d4)>");
+        let out_map = "affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>";
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{q_map}, {k_map}, {out_map}]"))
+                .expect("gqa qkt indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, \
+              #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, \
+              #linalg.iterator_type<reduction>]",
+        )
+        .expect("gqa qkt iterator types");
+
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[q.value(), k.value(), filled])
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
+                    ])
+                    .add_regions([matmul_region])
+                    .build()
+                    .expect("linalg.generic gqa qkt"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
+    /// GQA-aware AV: `out[b,h,m,d] = sum_n weights[b,h,m,n] * V[b, h floordiv gqa, n, d]`
+    ///
+    /// weights: `[B, num_heads, seq, total_seq]` (softmax output)
+    /// V is BHSD: `[B, kv_heads, total_seq, head_dim]` (directly from KV cache)
+    /// Output:   `[B, num_heads, seq, head_dim]`
+    pub fn emit_gqa_av(
+        &mut self,
+        weights: &Tensor<'c>, // [B, num_heads, seq, total_seq]
+        v: &Tensor<'c>,       // [B, kv_heads, total_seq, head_dim]
+        gqa_repeat: usize,
+    ) -> Tensor<'c> {
+        let w_shape = weights.shape();
+        let v_shape = v.shape();
+        let b = w_shape[0]; // B (static)
+        let num_heads = w_shape[1]; // H (static)
+        let seq = w_shape[2]; // M (dynamic)
+        let head_dim = v_shape[3]; // D (static)
+
+        let out_shape = vec![b, num_heads, seq, head_dim];
+        let dtype = self.value_dtype(weights.value());
+
+        let mut dyn_sources = Vec::new();
+        if seq.is_none() {
+            dyn_sources.push((weights.value(), 2)); // M from weights dim 2
+        }
+        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+
+        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let segment =
+            Attribute::parse(self.context, "array<i32: 2, 1>").expect("gqa av segment sizes");
+        let matmul_region = self.make_matmul_region(dtype);
+
+        // 5 iteration dims: d0=B, d1=H, d2=M, d3=D, d4=N (reduction)
+        let w_map = "affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>";
+        let v_map =
+            format!("affine_map<(d0, d1, d2, d3, d4) -> (d0, d1 floordiv {gqa_repeat}, d4, d3)>");
+        let out_map = "affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>";
+        let indexing_maps =
+            Attribute::parse(self.context, &format!("[{w_map}, {v_map}, {out_map}]"))
+                .expect("gqa av indexing maps");
+        let iterator_types = Attribute::parse(
+            self.context,
+            "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, \
+              #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, \
+              #linalg.iterator_type<reduction>]",
+        )
+        .expect("gqa av iterator types");
+
+        let result = self
+            .block
+            .append_operation(
+                OperationBuilder::new("linalg.generic", self.location)
+                    .add_operands(&[weights.value(), v.value(), filled])
+                    .add_results(&[out_type])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(self.context, "indexing_maps"),
+                            indexing_maps,
+                        ),
+                        (
+                            Identifier::new(self.context, "iterator_types"),
+                            iterator_types,
+                        ),
+                        (
+                            Identifier::new(self.context, "operandSegmentSizes"),
+                            segment,
+                        ),
+                    ])
+                    .add_regions([matmul_region])
+                    .build()
+                    .expect("linalg.generic gqa av"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        Tensor::from_value(result)
+    }
+
     /// Embedding lookup: gather rows from `weight` by `indices`.
     ///
     /// `weight`:  `[vocab_size, hidden_size]` (F32)

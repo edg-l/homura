@@ -709,23 +709,11 @@ fn emit_attention_kernel(
     // Transpose Q from BSHD to BHSD: [1, seq, num_heads, head_dim] -> [1, num_heads, seq, head_dim]
     let q_bhsd = gb.emit_transpose(&q, &[0, 2, 1, 3]);
 
-    // GQA: expand K and V heads if needed.
-    // K is [1, kv_heads, total_seq, head_dim], need [1, num_heads, total_seq, head_dim].
-    // TODO: emit_repeat_kv works in BSHD layout, so we transpose BHSD->BSHD, repeat,
-    // then transpose back. A BHSD-native repeat_kv would eliminate two transposes and
-    // save O(kv_heads * seq * head_dim * gqa_repeat) bandwidth.
-    let k_bshd = gb.emit_transpose(&k, &[0, 2, 1, 3]); // [1, total_seq, kv_heads, head_dim]
-    let k_expanded = gb.emit_repeat_kv(&k_bshd, gqa_repeat); // [1, total_seq, num_heads, head_dim]
-    let k_bhsd = gb.emit_transpose(&k_expanded, &[0, 2, 1, 3]); // [1, num_heads, total_seq, head_dim]
-
-    let v_bshd = gb.emit_transpose(&v, &[0, 2, 1, 3]);
-    let v_expanded = gb.emit_repeat_kv(&v_bshd, gqa_repeat);
-    let v_bhsd = gb.emit_transpose(&v_expanded, &[0, 2, 1, 3]);
-
-    // QK^T: [1, num_heads, seq, head_dim] @ [1, num_heads, head_dim, total_seq]
-    //     = [1, num_heads, seq, total_seq]
-    let k_t = gb.emit_transpose(&k_bhsd, &[0, 1, 3, 2]);
-    let scores = gb.emit_matmul(&q_bhsd, &k_t);
+    // GQA-aware QK^T: reads K directly in BHSD layout using floordiv indexing
+    // to map Q head indices to KV head indices. No copies or transposes needed.
+    // Q: [1, num_heads, seq, head_dim], K: [1, kv_heads, total_seq, head_dim]
+    // -> scores: [1, num_heads, seq, total_seq]
+    let scores = gb.emit_gqa_qk_transpose(&q_bhsd, &k, gqa_repeat);
 
     // Scale by 1/sqrt(head_dim)
     let scale = gb.emit_arith_constant(1.0 / (head_dim as f64).sqrt(), DType::F32);
@@ -737,9 +725,10 @@ fn emit_attention_kernel(
     // Softmax along last axis
     let attn_weights = gb.emit_softmax(&masked, -1);
 
-    // AV: [1, num_heads, seq, total_seq] @ [1, num_heads, total_seq, head_dim]
-    //   = [1, num_heads, seq, head_dim]
-    let attn_output = gb.emit_matmul(&attn_weights, &v_bhsd);
+    // GQA-aware AV: reads V directly in BHSD layout using floordiv indexing.
+    // weights: [1, num_heads, seq, total_seq], V: [1, kv_heads, total_seq, head_dim]
+    // -> [1, num_heads, seq, head_dim]
+    let attn_output = gb.emit_gqa_av(&attn_weights, &v, gqa_repeat);
 
     // Transpose back: [1, num_heads, seq, head_dim] -> [1, seq, num_heads, head_dim]
     let attn_bshd = gb.emit_transpose(&attn_output, &[0, 2, 1, 3]);
