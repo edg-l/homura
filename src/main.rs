@@ -287,12 +287,6 @@ fn cmd_generate(
     log::info!("loading generator from {}", model_dir.display());
     let t_load = Instant::now();
 
-    // Print prompt to stdout before generation starts streaming tokens.
-    if atty::is(atty::Stream::Stdout) {
-        print!("{}", prompt);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-
     // Prefer unified single-model KV cache, fall back to full-recompute.
     let generated = if has_unified_model(&model_dir) {
         log::info!("using unified KV cache generator");
@@ -338,15 +332,9 @@ fn cmd_generate_hf(
     let max_seq_len = std::cmp::min(model.config().max_position_embeddings, 2048);
     log::info!("generating (max_tokens={max_tokens}, max_seq_len={max_seq_len})");
 
-    // Print prompt to stdout before generation starts streaming tokens.
-    if atty::is(atty::Stream::Stdout) {
-        print!("{}", prompt);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-
     let generated = model.generate(&tokenizer, prompt, max_tokens, max_seq_len, sampling)?;
 
-    // If stdout is not a tty (piped), print the full text at the end.
+    // If stdout is piped, print the full text at the end.
     if !atty::is(atty::Stream::Stdout) {
         println!("{}{}", prompt, generated);
     }

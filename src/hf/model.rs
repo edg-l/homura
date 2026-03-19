@@ -213,6 +213,12 @@ impl HfModel {
         let verbose = crate::log::enabled(crate::log::Level::Debug);
         let use_stdout = atty::is(atty::Stream::Stdout);
 
+        // Print prompt to stdout after all log lines, before tokens stream.
+        if use_stdout {
+            print!("{}", prompt);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
         if next_token == eos_token_id {
             log_info!("EOS after prefill");
             return Ok(String::new());
