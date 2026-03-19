@@ -702,10 +702,18 @@ fn cmd_chat(
             if enable_thinking { Some(true) } else { None },
         )?;
         let full_tokens = tokenizer.encode_with_special(&full_text);
-        // Clamp: re-encoding can shift token boundaries, making full_tokens
-        // shorter than tokens_in_cache. In that case, re-prefill everything.
-        let cache_pos = tokens_in_cache.min(full_tokens.len());
-        let delta_tokens = &full_tokens[cache_pos..];
+        // If re-encoding shifted token boundaries (full_tokens shorter than
+        // cache position), the KV cache is misaligned. Reset and re-prefill.
+        if tokens_in_cache > full_tokens.len() {
+            log::info!(
+                "token boundary shift ({} cached > {} rendered), re-prefilling",
+                tokens_in_cache,
+                full_tokens.len()
+            );
+            model.reset_kv_cache();
+            tokens_in_cache = 0;
+        }
+        let delta_tokens = &full_tokens[tokens_in_cache..];
         let delta_token_ids: Vec<i64> = delta_tokens.iter().map(|&id| id as i64).collect();
 
         // Pass token IDs directly to avoid decode→re-encode round-trip
