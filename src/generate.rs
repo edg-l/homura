@@ -130,7 +130,9 @@ fn generate_streaming_core(
     let mut generated_text = String::new();
     let verbose = crate::log::enabled(crate::log::Level::Debug);
     let use_stdout = atty::is(atty::Stream::Stdout);
-    let decode_pb = if !verbose {
+    // Only show decode progress bar when stdout is NOT a terminal (piped output),
+    // so it doesn't fight with streaming token text on the same terminal.
+    let decode_pb = if !verbose && !use_stdout {
         let pb = crate::progress::decode_progress(max_new_tokens);
         Some(pb)
     } else {
