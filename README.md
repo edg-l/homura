@@ -70,7 +70,7 @@ cargo test                                        # ~150 tests
 |---|---|---|---|
 | MNIST | 6 | 97ms | — |
 | ResNet-18 | 41 | 467ms | — |
-| GPT-2 (124M) | 146 | ~1.2s | ~3 tok/s decode |
+| GPT-2 (124M) | 158 compiled + 24 native | ~650ms | ~50 tok/s decode (~20ms/tok) |
 
 ## Current status
 
@@ -81,15 +81,14 @@ cargo test                                        # ~150 tests
 - **Dynamic shapes**: Symbolic dim tracking (`SymDim` expressions) — compile once, resolve at runtime
 - **Dtype**: F32, F64, I32, I64
 - **Tokenizer**: Byte-level BPE (GPT-2 compatible)
-- **Generation**: Autoregressive text generation with KV-cache
+- **Generation**: Autoregressive text generation with persistent KV cache
+- **KV cache**: Pre-allocated per-layer buffers, `run_kv()` manages append+view internally
 - **Models**: MNIST CNN, ResNet-18, GPT-2 (124M) all run end-to-end
 
 ## Roadmap
 
-See [perf.md](perf.md) for the performance improvement roadmap.
-
 Next priorities:
-- Unified single-model inference (eliminate separate prefill/decode models)
+- Zero-copy KV cache views (eliminate view copies for decode speedup)
 - Packed GEMM layout for better cache utilization
 - AVX-512 micro-kernel tuning
 - Operator fusion (matmul + bias + relu as one kernel)

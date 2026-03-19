@@ -1,219 +1,122 @@
 # Homura Design Document
 
-Homura is a Rust ML inference framework that traces tensor operations into a computation graph, compiles them through MLIR to native shared libraries, and loads them via dlopen for execution.
+Homura is a Rust ML inference framework that compiles ONNX models through MLIR/LLVM to native shared libraries. Per-kernel compilation (IREE-style) with parallel codegen via rayon. Runs MNIST, ResNet-18, GPT-2.
 
 ## The Big Picture
 
-```mermaid
-flowchart LR
-    subgraph User Code
-        A["let a = Tensor::new(...)<br>let b = Tensor::new(...)<br>let c = &a + &b"]
-    end
-    subgraph Trace
-        B["Op::Input(a)<br>Op::Input(b)<br>Op::Add(a, b)"]
-    end
-    subgraph MLIR
-        C["tosa.add %t0, %t1"]
-    end
-    subgraph AOT
-        D["LLVM IR → .so"]
-    end
-    A --> B --> C --> D
+```
+ONNX model
+  → partition into kernel groups
+  → per-kernel MLIR emission (linalg ops)
+  → transform schedule (tile + vectorize)
+  → bufferize → LLVM IR → .o → link .so
+  → ExecutionPlan (Rust-side buffer routing)
 ```
 
-Nothing runs until you say so. You write math, Homura writes it down, then compiles and runs it all at once.
+Each heavy ONNX op becomes its own compiled kernel. Lightweight ops are grouped between heavy ops. All kernels compile in parallel. A Rust-side ExecutionPlan routes buffers between kernels at runtime.
 
 ## How It Works: Step by Step
 
-### 1. Tracing — Recording the Recipe
+### 1. ONNX Parsing and Partitioning
 
-When you write tensor operations, nothing computes. Homura records each operation into a flat list called a **trace**.
+`parser.rs` loads the ONNX protobuf into `OnnxModel` (nodes, weights, dynamic inputs).
+`emitter.rs` partitions nodes into kernel groups:
+- Each heavy op (Conv, MatMul, Gemm) becomes its own kernel
+- Lightweight ops (Reshape, Transpose, Add, Relu) are grouped between heavy ops
+- KV Concat groups are split via `split_kv_concat_groups` into pre-concat, concat, and post-concat sub-groups
 
-```rust
-begin_trace();                          // open the notebook
-let a = Tensor::new(&[4], DType::F32);  // write down: "input A, 4 floats"
-let b = Tensor::new(&[4], DType::F32);  // write down: "input B, 4 floats"
-let c = &a + &b;                        // write down: "add A + B"
-let trace = take_trace();               // close the notebook
+### 2. Per-Kernel MLIR Emission
+
+Each kernel group gets its own MLIR context and module. `GraphBuilder` emits
+**linalg dialect** ops directly (not TOSA):
+- `linalg.matmul`, `linalg.batch_matmul`, `linalg.conv_2d_nchw_fchw` for heavy ops
+- `linalg.generic` for elementwise, reductions, gather, etc.
+- `tensor.empty` + `linalg.fill` for output allocation
+- Fused Gemm+residual Add via accumulator trick
+
+### 3. Transform Schedule (tile + vectorize)
+
+`build_transform_schedule` in compiler.rs emits transform dialect sequences:
+- Match 3D contractions (matmul), 4D contractions (batched matmul), Conv2D NCHW
+- Tile with `tile_using_forall` (cache level) + `tile_using_for` (register level) + `pad`
+- Outline the forall loop into a temporary function via `transform.loop.outline`
+- Vectorize the outlined function with `vectorize_children_and_apply_patterns`
+- LLVM inlines the outlined function during O2 codegen
+
+Kernels without tileable ops (BatchNorm, Relu, elementwise) don't match the
+schedule — the transform-interpreter is a no-op, they go straight to scalar
+lowering with compact LLVM IR.
+
+### 4. Bufferize and Lower to LLVM
+
+```
+linalg ops on tensors
+  → transform-interpreter (tile + vectorize)
+  → one-shot-bufferize (tensor → memref)
+  → convert-linalg-to-loops
+  → lower-affine → scf → cf
+  → convert to LLVM dialect
+  → LLVM IR → .o
 ```
 
-The trace after this looks like:
+### 5. Parallel Compilation and Linking
 
-```
-index 0: Input { shape: [4], dtype: F32, arg_index: 0 }
-index 1: Input { shape: [4], dtype: F32, arg_index: 1 }
-index 2: Add   { lhs: 0, rhs: 1, shape: [4], dtype: F32 }
-```
+All kernels compile in parallel via rayon. Each produces a `.o` object file.
+All objects are linked into a single `.so` via `link_shared_lib`. The `.so`
+is loaded once via dlopen; each kernel's function is resolved via dlsym.
 
-Each entry references earlier entries by index (`NodeId`). A `Tensor` is not actual data — it's just a handle holding a `NodeId`, a `Shape`, and a `DType`.
+### 6. Execution — ExecutionPlan
 
-The trace lives in a **thread-local** variable. This means:
-- No context object to pass around — operations implicitly record to the active trace
-- Each thread gets its own isolated trace
-- Calling `begin_trace()` twice without `take_trace()` panics (one trace at a time)
+`ExecutionPlan` holds the compiled kernels and a sequence of `KernelStep`s.
+Each step specifies input/output buffer slot indices and either a compiled
+kernel index or a `NativeOp` (e.g., Concat for KV cache ops).
 
-### 2. Compilation — Turning the Recipe into MLIR
+The buffer pool routes data between kernels. Dead intermediates are recycled
+via a free-list. Model inputs are borrowed (zero-copy), outputs are extracted.
 
-`Compiler::compile(trace, outputs)` walks the trace and emits MLIR intermediate representation (IR). The compiler primarily emits **TOSA dialect** ops — MLIR's Tensor Operator Set Architecture, designed for ML inference workloads.
+### 7. KV Cache (Autoregressive Decode)
 
-For `c = a + b` with shape `[4]` and dtype `f32`, the generated IR is:
+For models with KV Concat ops (axis=-2, 2 inputs), `KvPlanInfo` tracks
+which buffer slots are past_kv inputs and present_kv outputs.
 
-```mlir
-func.func @compute(%arg0: memref<4xf32>,   // input a
-                    %arg1: memref<4xf32>,   // input b
-                    %arg2: memref<4xf32>)   // output c
-    attributes { llvm.emit_c_interface } {
+Two execution paths share the same plan:
+- `run()` — treats KV Concats as normal concat (prefill path)
+- `run_kv()` — intercepts KV Concats via `KvPlanInfo`, routes through
+  `KvCache.append_key/value` + `view_key/value` (decode path)
 
-  %t0 = bufferization.to_tensor %arg0 restrict : memref<4xf32> to tensor<4xf32>
-  %t1 = bufferization.to_tensor %arg1 restrict : memref<4xf32> to tensor<4xf32>
+`KvCache` pre-allocates `[1, heads, max_seq_len, head_dim]` per layer.
+Generation flow: `prefill (run) → init_kv_cache → decode loop (run_kv)`.
 
-  %result = tosa.add %t0, %t1 : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+### 8. Native ABI
 
-  %out_memref = bufferization.to_buffer %result : tensor<4xf32> to memref<4xf32>
-  memref.copy %out_memref, %arg2 : memref<4xf32> to memref<4xf32>
-  return
-}
-```
-
-Key things to notice:
-
-- **The function takes memref arguments** (pointers to memory), not tensors. This is the ABI for the compiled shared library.
-- **Internally everything is tensors.** `bufferization.to_tensor` at the boundary converts memrefs to tensors; `bufferization.to_buffer` converts back.
-- **TOSA ops are high-level.** `tosa.add` says "add these tensors" without specifying loops. MLIR's lowering passes decide how to execute it.
-- **linalg.generic fallback** for ops TOSA doesn't support (float division, integer matmul, gather, batched matmul).
-
-### 3. Lowering — From High-Level IR to LLVM Dialect
-
-The MLIR IR goes through a multi-stage pipeline that progressively lowers abstractions:
-
-```mermaid
-flowchart TD
-    A["tosa.* ops on tensors"] --> B
-
-    subgraph TOSA["TOSA lowering (function-level)"]
-        B["tosa-make-broadcastable<br>auto-insert reshapes for broadcast"]
-        B --> B2["tosa-to-linalg-named<br>conv, matmul → named linalg ops"]
-        B2 --> B3["tosa-to-linalg<br>element-wise → linalg.generic"]
-        B3 --> B4["tosa-to-arith / tosa-to-tensor<br>remaining TOSA → arith/tensor"]
-    end
-
-    B4 --> OPT1["canonicalize + cse<br>simplify linalg IR"]
-    OPT1 --> C["one-shot-bufferize<br>tensor → memref"]
-    C --> BUF["buffer-hoisting +<br>promote-buffers-to-stack"]
-    BUF --> D["convert-linalg-to-affine-loops"]
-    D --> LICM["affine-loop-invariant-code-motion<br>+ affine-scalrep"]
-    LICM --> F["lower-affine"]
-    F --> E["convert-scf-to-cf<br>structured loops → branches"]
-    E --> OPT2["canonicalize + cse + sccp<br>final cleanup"]
-
-    subgraph LLVM_LOWER["LLVM dialect lowering"]
-        G["convert-math-to-llvm"]
-        G --> G2["expand-strided-metadata"]
-        G2 --> G3["finalize-memref-to-llvm"]
-        G3 --> G4["convert-arith/index/cf/func-to-llvm"]
-    end
-
-    OPT2 --> G
-    G4 --> H["reconcile-unrealized-casts"]
-```
-
-### 4. AOT Compilation — From LLVM Dialect to Native Code
-
-After the MLIR pass pipeline produces LLVM dialect IR, the module is compiled ahead-of-time to a native shared library:
-
-```mermaid
-flowchart LR
-    A["MLIR module<br>(LLVM dialect)"] -->|mlirTranslateModuleToLLVMIR| B["LLVM IR"]
-    B -->|"LLVMRunPasses<br>default&lt;O3&gt;"| C["Optimized LLVM IR"]
-    C -->|LLVMTargetMachineEmitToFile| D[".o object file"]
-    D -->|"cc -shared<br>-lmlir_c_runner_utils"| E[".so shared library"]
-    E -->|dlopen + dlsym| F["Function pointer"]
-```
-
-Key details:
-
-- **Host CPU optimization**: `LLVMGetHostCPUName()` + `LLVMGetHostCPUFeatures()` enable AVX2/SSE4.2/etc. vectorization for the specific machine.
-- **LLVM O3 pipeline**: `LLVMRunPasses("default<O3>")` runs the full optimization suite — loop vectorization, SLP vectorization, inlining, unrolling, dead code elimination.
-- **Runner utils linking**: The `.so` is linked against `libmlir_c_runner_utils.so` (provides `memrefCopy` for padded convolution/pooling) with `-Wl,-rpath` baked in so it resolves at dlopen time.
-- **Compilation cache**: The `.so` is stored in `~/.cache/homura/` keyed by hash of model bytes + input shapes + compiler fingerprint (LLVM version, homura version, CPU features). Subsequent runs with matching shapes load the cached `.so` via dlopen — near instant.
-
-### 5. Execution — Running the Native Code
-
-`CompiledGraph::run(inputs)` marshals Rust data into the format the compiled function expects, calls it via the dlopen'd function pointer, and extracts the results.
-
-The native ABI uses **N-D memref descriptors** — C structs that describe a region of memory with shape and stride information. The `llvm.emit_c_interface` attribute causes MLIR to generate a C-compatible wrapper `_mlir__mlir_ciface_compute` that accepts a packed array of pointers to these descriptors. This is the symbol loaded via `dlsym`.
-
-Multiple outputs are supported: each output gets a trailing memref argument. GPT-2 produces 25 outputs (logits + 24 KV cache tensors).
-
-## TOSA Backend
-
-The compiler primarily emits TOSA dialect ops. TOSA (Tensor Operator Set Architecture) is MLIR's standard op set for ML inference, with well-tested lowering passes to linalg and LLVM.
-
-**TOSA op mapping:**
-
-| Homura op     | MLIR approach            | Notes                                  |
-|---------------|--------------------------|----------------------------------------|
-| Add           | tosa.add                 |                                        |
-| Sub           | tosa.sub                 |                                        |
-| Mul           | tosa.mul                 | shift operand: tensor<1xi8>            |
-| Neg           | tosa.negate              | zero-point operands set to 0           |
-| Relu          | tosa.clamp               | min_val=0, max_val=max_float           |
-| Exp           | tosa.exp                 |                                        |
-| Tanh          | tosa.tanh                |                                        |
-| Pow           | tosa.pow                 | FP-only, two operands                  |
-| Sqrt          | linalg.generic + math.sqrt | no tosa.sqrt exists                  |
-| Cast          | linalg.generic + arith   | tosa.cast has no I64 support           |
-| Matmul (2D f) | tosa.matmul             | 3D only; 2D wraps with tosa.reshape    |
-| Matmul (batch)| linalg.generic           | broadcast-aware affine maps for any rank |
-| Matmul (int)  | linalg.generic           | tosa.matmul is float-only              |
-| Gemm          | tosa.matmul + add        | optional transpose via tosa.transpose  |
-| Reshape       | tosa.reshape             | target shape via tosa.const_shape      |
-| Gather        | linalg.generic           | tosa.gather is 3D+I32 only             |
-| Slice         | tosa.slice / linalg.generic | tosa.slice for stride=1 only        |
-| Concat        | tosa.concat              | variadic inputs                        |
-| Transpose     | tosa.transpose           | perms as DenseI32ArrayAttr             |
-| Where         | tosa.select              | condition cast to i1 via arith.cmpi    |
-| ReduceSum     | tosa.reduce_sum          | keepdim=false adds tosa.reshape        |
-| ReduceMax     | tosa.reduce_max          | keepdim=false adds tosa.reshape        |
-| ReduceMean    | tosa.reduce_sum + reciprocal + mul | sequential single-axis      |
-| Conv2d        | tosa.conv2d              | NCHW↔NHWC transpose; pad+slice        |
-| MaxPool2d     | tosa.max_pool2d          | NCHW↔NHWC; tosa.slice for floor-div   |
-| GlobalAvgPool | tosa.avg_pool2d          | NCHW↔NHWC; kernel = spatial dims       |
-| BatchNorm     | composed                 | sub + rsqrt + mul + add                |
-| Div           | linalg.generic           | TOSA has no float div                  |
+The compiled function ABI uses **N-D memref descriptors** — C structs with
+allocated_ptr, aligned_ptr, offset, sizes[N], strides[N]. The
+`llvm.emit_c_interface` attribute generates a C-compatible wrapper
+`_mlir__mlir_ciface_compute` that accepts a packed pointer array.
 
 ## ONNX Support
 
-Homura can load and run ONNX models directly:
-
-```mermaid
-flowchart TD
-    A[".onnx file<br>(protobuf)"] -->|"prost: decode"| B["ModelProto"]
-    B -->|"parser.rs"| C["OnnxModel<br>{nodes, weights, inputs}"]
-    C -->|"mapper.rs:<br>replay via Tensor API"| D["Trace"]
-    D -->|"Compiler::compile()"| E[".so via AOT"]
-    E --> F["Model<br>{compiled, weights}"]
-    F -->|"model.run(&[input])"| G["Vec&lt;Buffer&gt;"]
+```
+.onnx file ──prost──▶ ModelProto ──parser.rs──▶ OnnxModel
+   │                                              │
+   │                              emitter.rs: partition + emit per-kernel MLIR
+   │                                              │
+   ▼                                              ▼
+Model { plan, weights } ◀── compile ◀── ExecutionPlan + kernels
+   │
+   ├── model.run(&[input])    → Vec<Buffer>  (prefill / non-KV)
+   └── model.run_kv(&[input]) → Vec<Buffer>  (KV-cached decode)
 ```
 
-The ONNX mapper walks the graph and calls Tensor API methods, replaying the graph through homura's tracing system. A general constant folding pass evaluates ops at trace time when all inputs are known constants (enabling Shape → Gather → Unsqueeze → Concat → Reshape chains for GPT-2 attention).
+The emitter walks the ONNX graph per kernel group, emitting linalg ops into
+each kernel's MLIR module. Shape-prep ops (Shape, Gather, Concat for shapes)
+are constant-folded at emit time.
 
-**Supported ONNX ops (25):** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, Pow, Sqrt, Cast, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Where, Conv, MaxPool, BatchNormalization, GlobalAveragePool, ReduceMean, ReduceSum, ReduceMax, Constant, Shape, ConstantOfShape, Range, Squeeze, Unsqueeze.
+**Supported ONNX ops:** Add, Sub, Mul, Div, Neg, Relu, Exp, Tanh, Pow, Sqrt, Cast, MatMul, Gemm, Softmax, Clip, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Where, Conv, MaxPool, BatchNormalization, GlobalAveragePool, ReduceMean, ReduceSum, ReduceMax, Constant, Shape, ConstantOfShape, Range, Squeeze, Unsqueeze, and more.
 
-**Symbolic dimensions:** Models with dynamic dimensions (like GPT-2's `batch_size`, `sequence_length`) are parsed without error. Compilation is deferred to the first `run()` call, which resolves symbolic dims from actual input tensor shapes. The model auto-recompiles when input shapes change.
+**Symbolic dimensions:** Models with dynamic dimensions (like GPT-2's `past_sequence_length`) use `SymDim` expression tracking. Compiled once with dynamic dims, resolved at runtime from actual input shapes.
 
-**Multiple outputs:** `Model::run()` returns `Vec<Buffer>`. GPT-2 produces 25 outputs (logits + 24 KV cache tensors).
-
-**NCHW / NHWC layout handling:**
-
-Homura uses NCHW internally (matching ONNX). TOSA spatial ops require NHWC. The compiler transposes at the boundary:
-
-```mermaid
-flowchart LR
-    A["NCHW input"] -->|"transpose<br>[0,2,3,1]"| B["NHWC"]
-    B --> C["tosa.conv2d /<br>tosa.max_pool2d /<br>tosa.avg_pool2d"]
-    C -->|"transpose<br>[0,3,1,2]"| D["NCHW output"]
-```
+**Multiple outputs:** `Model::run()` returns `Vec<Buffer>`. GPT-2 produces logits + 24 KV cache tensors.
 
 ## Compilation Cache
 
@@ -228,14 +131,21 @@ On cache hit, compilation is skipped entirely — the `.so` is loaded via dlopen
 
 ## Text Generation
 
-For transformer models, Homura provides a generation loop:
+Two generator modes for transformer models:
 
 ```rust
-let gen = Generator::load("tests/fixtures/").unwrap();
+// Single-model (unified): prefill + decode via one model
+let gen = UnifiedKvGenerator::load("tests/fixtures/", 1024, 50256).unwrap();
+let text = gen.generate("The meaning of life is", 50);
+
+// Two-model: separate prefill and decode models
+let gen = KvGenerator::load("tests/fixtures/", 1024, 50256).unwrap();
 let text = gen.generate("The meaning of life is", 50);
 ```
 
-Uses a byte-level BPE tokenizer (GPT-2 compatible, loads `vocab.json` + `merges.txt`). The generation loop does full-sequence recompute per token with greedy sampling (argmax). Each unique sequence length triggers one compilation (cached for subsequent use).
+Uses a byte-level BPE tokenizer (GPT-2 compatible, loads `vocab.json` + `merges.txt`).
+Generation: prefill (run) → init_kv_cache → decode loop (run_kv) with greedy argmax sampling.
+GPT-2 (124M) runs at ~50 tok/s (~20ms/token) on CPU.
 
 ## Architecture Decisions
 
@@ -268,24 +178,23 @@ Rather than building a separate ONNX-to-MLIR compiler, the ONNX mapper replays t
 
 ```
 src/
-├── lib.rs          Public API re-exports
-├── dtype.rs        DType enum (F32, F64, I32, I64)
-├── shape.rs        Shape wrapper over Vec<u64> with broadcast
-├── main.rs         CLI: homura info / run / clean-cache
-├── op.rs           NodeId and Op enum (28 variants)
-├── trace.rs        Thread-local Trace context
-├── tensor.rs       Tensor handle with operator overloads
-├── compiler.rs     Trace → MLIR → LLVM IR → .so (AOT pipeline)
-├── runtime.rs      MemRefDescriptor, Buffer, CompiledGraph (dlopen)
-├── cache.rs        Disk-based .so compilation cache
-├── tokenizer.rs    Byte-level BPE tokenizer (GPT-2)
-├── generate.rs     Autoregressive text generation loop
-├── llvm_ffi.rs     FFI for mlirTranslateModuleToLLVMIR
+├── lib.rs            Public API re-exports
+├── dtype.rs          DType enum (F32, F64, I32, I64)
+├── shape.rs          Shape wrapper over Vec<u64> with broadcast
+├── main.rs           CLI: homura info / run / clean-cache
+├── graph_builder.rs  MLIR emission (GraphBuilder, GraphContext)
+├── compiler.rs       Transform schedule, emit_object_files, link_shared_lib
+├── runtime.rs        Buffer, CompiledGraph, ExecutionPlan, KvCache
+├── cache.rs          Disk-based per-kernel compilation cache
+├── tokenizer.rs      Byte-level BPE tokenizer (GPT-2)
+├── generate.rs       Simple autoregressive generation (full recompute)
+├── kv_generate.rs    KV-cached generation (KvGenerator, UnifiedKvGenerator)
 └── onnx/
-    ├── mod.rs      Model struct (load/run), symbolic dim resolution
-    ├── proto.rs    Prost-generated protobuf types
-    ├── parser.rs   ONNX ModelProto → OnnxModel
-    └── mapper.rs   Walk ONNX graph, replay via Tensor API, constant folding
+    ├── mod.rs        Model struct (load/run/run_kv), lazy compilation
+    ├── proto.rs      Prost-generated protobuf types
+    ├── parser.rs     ONNX ModelProto → OnnxModel
+    ├── emitter.rs    Per-kernel MLIR emission, partition_nodes, split_kv_concat_groups
+    └── sym_shapes.rs Symbolic dimension expression tracking (SymDim)
 
 scripts/
 └── download_gpt2.sh  Download GPT-2 ONNX models + tokenizer
@@ -309,33 +218,34 @@ tests/fixtures/       MNIST, ResNet-18, GPT-2 model files + tokenizer data
 ## Current Limitations
 
 - **CPU only** — no GPU backend
-- **No KV cache feeding** — generation uses full-sequence recompute per token
-- **No dynamic shapes at runtime** — shapes fixed at first `run()`, auto-recompiles on change
-- **Integer division by zero** — `arith.divsi` lowers to x86 `idiv`, raises SIGFPE
+- **KV cache views copy data** — zero-copy borrowed views pending
 - **No autograd** — forward pass only
+- **F32 only for inference** — no quantization (int8/int4)
+
+## Performance
+
+| Model | Kernels | Compile time | Inference |
+|---|---|---|---|
+| MNIST | 6 | 97ms | — |
+| ResNet-18 | 41 | 467ms | — |
+| GPT-2 (124M) | 158 compiled + 24 native | ~650ms | ~50 tok/s decode |
 
 ## Roadmap
 
-### Milestone 1: Run a hand-coded MLP (complete)
+### Completed
 
-N-D tensors, matmul, broadcast, softmax, eval sugar.
+- Per-kernel MLIR compilation with parallel codegen via rayon
+- Transform dialect schedule (tile + vectorize) for matmul/conv
+- Symbolic dimension tracking (compile once, resolve at runtime)
+- KV cache with persistent pre-allocated buffers
+- Single-model and two-model generation paths
+- GPT-2 at ~50 tok/s on CPU
 
-### Milestone 2: Run real ONNX models (complete)
+### Next
 
-TOSA backend, ONNX parsing, Conv2d, MaxPool2d, BatchNorm, GlobalAvgPool. MNIST CNN and ResNet-18 run end-to-end.
-
-### Milestone 3: Run GPT-2 on CPU (complete)
-
-17 new ONNX ops, symbolic dimensions, multiple outputs, batched matmul, BPE tokenizer, generation loop, AOT compilation with native `.so` caching. GPT-2 (124M) runs end-to-end — 42s cold compile, 2.5s warm cache.
-
-### Milestone 4: GPU backend
-
-Swap `convert-linalg-to-loops` for GPU tiling/mapping passes. Target CUDA (`gpu-to-nvvm`) or Vulkan (`gpu-to-spirv`). GPU memory management.
-
-### Milestone 5: Dynamic shapes + KV cache
-
-Dynamic/symbolic dimensions in Shape, Trace, Compiler. KV cache with the `decoder_with_past_model.onnx` for incremental generation. Goal: interactive-speed token generation on GPU.
-
-### Milestone 6: Production-grade
-
-Quantization (int8/int4), graph optimizations (op fusion, constant folding), memory planning, multi-model support (LLaMA, Mistral, Phi), streaming output, multi-GPU.
+- Zero-copy KV cache views (eliminate view copies)
+- Packed GEMM layout for better cache utilization
+- AVX-512 micro-kernel tuning
+- Operator fusion (matmul + bias + relu as one kernel)
+- GPU backend (CUDA via `gpu-to-nvvm`)
+- Support for modern models (SmolLM2, Llama-family)
