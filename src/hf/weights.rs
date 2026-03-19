@@ -78,8 +78,12 @@ impl TransformerWeights {
 
         bufs.push(self.final_norm_weight.clone());
 
+        // lm_head weight: always [hidden, vocab] (transposed).
+        // For tied embeddings, transpose embed_tokens [vocab, hidden] -> [hidden, vocab].
         if let Some(lm_head) = &self.lm_head_weight {
             bufs.push(lm_head.clone());
+        } else {
+            bufs.push(transpose_2d(&self.embed_tokens_weight));
         }
 
         bufs
@@ -282,7 +286,7 @@ mod tests {
         //           + 3 biases (q, k, v) when present = 12 total with biases, 9 without.
         let has_bias = weights.layers[0].q_proj_bias.is_some();
         let per_layer = if has_bias { 12 } else { 9 };
-        let expected = 1 /* embed */ + 24 * per_layer + 1 /* final_norm */ + 0 /* no lm_head (tied) */;
+        let expected = 1 /* embed */ + 24 * per_layer + 1 /* final_norm */ + 1 /* lm_head (always present, transposed for tied) */;
         let flat = weights.to_slot_buffers();
         assert_eq!(flat.len(), expected);
     }

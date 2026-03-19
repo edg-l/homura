@@ -421,19 +421,15 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
     weight_slots.push(final_norm_w_slot);
     slot_descs_vec.push(d);
 
-    // lm_head_weight: only if not tied
-    let lm_head_weight_slot = if config.tie_word_embeddings {
-        embed_w_slot // reuse
-    } else {
-        let (s, d) = alloc(SlotDesc {
-            shape: Shape(vec![hidden, vocab]),
-            dtype: DType::F32,
-            sym_shape: None,
-        });
-        weight_slots.push(s);
-        slot_descs_vec.push(d);
-        s
-    };
+    // lm_head_weight: always [hidden, vocab] (transposed at load time).
+    // For tied embeddings, the caller provides a pre-transposed copy of embed_tokens.
+    let (lm_head_weight_slot, d) = alloc(SlotDesc {
+        shape: Shape(vec![hidden, vocab]),
+        dtype: DType::F32,
+        sym_shape: None,
+    });
+    weight_slots.push(lm_head_weight_slot);
+    slot_descs_vec.push(d);
 
     // logits output: [1, seq, vocab]
     let (logits_slot, d) = alloc(SlotDesc {
@@ -767,7 +763,6 @@ fn emit_mlp_kernel(
 /// Outputs: logits [1, seq, vocab]
 fn emit_lm_head_kernel(
     config: &TransformerConfig,
-    lm_head_is_embed: bool,
     kernel_idx: usize,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
@@ -778,26 +773,12 @@ fn emit_lm_head_kernel(
 
     let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
     let norm_w = gb.input(&[Some(hidden)], DType::F32);
-    // When tied, lm_head_w is embed_tokens [vocab, hidden] — we need to transpose.
-    // When not tied, it was already transposed at load time to [hidden, vocab].
-    let lm_head_w = if lm_head_is_embed {
-        gb.input(&[Some(vocab), Some(hidden)], DType::F32)
-    } else {
-        gb.input(&[Some(hidden), Some(vocab)], DType::F32)
-    };
+    // lm_head_w is always [hidden, vocab] -- transposed at load time
+    // (for tied embeddings, the caller pre-transposes embed_tokens)
+    let lm_head_w = gb.input(&[Some(hidden), Some(vocab)], DType::F32);
 
     let normed = gb.emit_rms_norm(&h, &norm_w, config.rms_norm_eps as f32);
-
-    // For tied embeddings, we need to emit normed @ lm_head_w^T
-    // For untied, normed @ lm_head_w (already transposed at load time)
-    let logits = if lm_head_is_embed {
-        // normed: [1, seq, hidden], lm_head_w: [vocab, hidden]
-        // We need [1, seq, hidden] @ [hidden, vocab]
-        let lm_head_t = gb.emit_transpose(&lm_head_w, &[1, 0]);
-        gb.emit_matmul(&normed, &lm_head_t)
-    } else {
-        gb.emit_matmul(&normed, &lm_head_w)
-    };
+    let logits = gb.emit_matmul(&normed, &lm_head_w);
 
     let func_name = format!("k{kernel_idx}");
     let (mlir_text, num_inputs, output_descs) =
@@ -926,11 +907,7 @@ pub fn emit_transformer_plan(
 
     // --- LM head kernel ---
     let last_hidden = layout.layers.last().unwrap().hidden_out_slot;
-    emit_results.push(emit_lm_head_kernel(
-        config,
-        config.tie_word_embeddings,
-        kernel_idx,
-    )?);
+    emit_results.push(emit_lm_head_kernel(config, kernel_idx)?);
     steps.push(KernelStep::kernel(
         kernel_idx,
         vec![
