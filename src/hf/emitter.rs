@@ -51,6 +51,8 @@ struct LayerSlots {
     k_b_slot: Option<usize>,
     v_w_slot: usize,
     v_b_slot: Option<usize>,
+    q_norm_w_slot: Option<usize>,
+    k_norm_w_slot: Option<usize>,
     o_w_slot: usize,
     post_attn_ln_w_slot: usize,
     gate_w_slot: usize,
@@ -69,7 +71,11 @@ struct LayerSlots {
     hidden_out_slot: usize,
 }
 
-fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotLayout {
+fn assign_transformer_slots(
+    config: &TransformerConfig,
+    has_bias: bool,
+    has_qk_norm: bool,
+) -> SlotLayout {
     let mut next = 0usize;
     let mut alloc = |desc: SlotDesc| -> (usize, SlotDesc) {
         let slot = next;
@@ -219,6 +225,32 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
         let v_b_slot = if has_bias {
             let (s, d) = alloc(SlotDesc {
                 shape: Shape(vec![kv_dim]),
+                dtype: DType::F32,
+                sym_shape: None,
+            });
+            weight_slots.push(s);
+            slot_descs_vec.push(d);
+            Some(s)
+        } else {
+            None
+        };
+
+        // q_norm_weight [head_dim], k_norm_weight [head_dim] (QK-norm, Qwen3-style)
+        let q_norm_w_slot = if has_qk_norm {
+            let (s, d) = alloc(SlotDesc {
+                shape: Shape(vec![head_dim]),
+                dtype: DType::F32,
+                sym_shape: None,
+            });
+            weight_slots.push(s);
+            slot_descs_vec.push(d);
+            Some(s)
+        } else {
+            None
+        };
+        let k_norm_w_slot = if has_qk_norm {
+            let (s, d) = alloc(SlotDesc {
+                shape: Shape(vec![head_dim]),
                 dtype: DType::F32,
                 sym_shape: None,
             });
@@ -395,6 +427,8 @@ fn assign_transformer_slots(config: &TransformerConfig, has_bias: bool) -> SlotL
             k_b_slot,
             v_w_slot,
             v_b_slot,
+            q_norm_w_slot,
+            k_norm_w_slot,
             o_w_slot,
             post_attn_ln_w_slot,
             gate_w_slot,
@@ -514,6 +548,7 @@ fn emit_embed_kernel(
 fn emit_qkv_kernel(
     config: &TransformerConfig,
     has_bias: bool,
+    has_qk_norm: bool,
     kernel_idx: usize,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
@@ -549,6 +584,16 @@ fn emit_qkv_kernel(
     };
     let cos = gb.input(&[None, Some(head_dim)], DType::F32);
     let sin = gb.input(&[None, Some(head_dim)], DType::F32);
+    let q_norm_w = if has_qk_norm {
+        Some(gb.input(&[Some(head_dim)], DType::F32))
+    } else {
+        None
+    };
+    let k_norm_w = if has_qk_norm {
+        Some(gb.input(&[Some(head_dim)], DType::F32))
+    } else {
+        None
+    };
 
     // RMSNorm
     let normed = gb.emit_rms_norm(&h, &ln_w, config.rms_norm_eps as f32);
@@ -579,9 +624,22 @@ fn emit_qkv_kernel(
     // V: [1, seq, kv_dim] -> [1, seq, kv_heads, head_dim]
     let v_4d = gb.emit_reshape(&v, &[1, -1, kv_heads as i64, head_dim as i64]);
 
+    // QK-norm (Qwen3-style): per-head RMSNorm on last dim before RoPE.
+    // emit_rms_norm works on arbitrary rank, normalizing on the last dimension.
+    let q_pre_rope = if let Some(w) = &q_norm_w {
+        gb.emit_rms_norm(&q_4d, w, config.rms_norm_eps as f32)
+    } else {
+        q_4d
+    };
+    let k_pre_rope = if let Some(w) = &k_norm_w {
+        gb.emit_rms_norm(&k_4d, w, config.rms_norm_eps as f32)
+    } else {
+        k_4d
+    };
+
     // RoPE on Q and K (before KV concat so cached K is already rotated)
-    let q_rope = gb.emit_rope_half(&q_4d, &cos, &sin);
-    let k_rope = gb.emit_rope_half(&k_4d, &cos, &sin);
+    let q_rope = gb.emit_rope_half(&q_pre_rope, &cos, &sin);
+    let k_rope = gb.emit_rope_half(&k_pre_rope, &cos, &sin);
 
     // Transpose K and V from BSHD [1, seq, kv_heads, head_dim]
     // to BHSD [1, kv_heads, seq, head_dim] for KV cache concat on axis=2.
@@ -589,7 +647,8 @@ fn emit_qkv_kernel(
     let v_bhsd = gb.emit_transpose(&v_4d, &[0, 2, 1, 3]);
 
     let func_name = format!("k{kernel_idx}");
-    let num_in = if has_bias { 11 } else { 8 }; // h, ln_w, q_w, [q_b], k_w, [k_b], v_w, [v_b], cos, sin
+    // h, ln_w, q_w, [q_b], k_w, [k_b], v_w, [v_b], cos, sin, [q_norm_w, k_norm_w]
+    let num_in = if has_bias { 11 } else { 8 } + if has_qk_norm { 2 } else { 0 };
     let (mlir_text, num_inputs, output_descs) = gb.finalize_to_mlir_named(
         &[&q_rope, &k_bhsd, &v_bhsd],
         TransformMode::VectorizeOnly,
@@ -603,7 +662,11 @@ fn emit_qkv_kernel(
         group_idx: kernel_idx,
         num_in,
         num_out: 3,
-        ops_label: "QKV+RoPE".into(),
+        ops_label: if has_qk_norm {
+            "QKV+QKNorm+RoPE".into()
+        } else {
+            "QKV+RoPE".into()
+        },
     })
 }
 
@@ -813,7 +876,8 @@ pub fn emit_transformer_plan(
         .first()
         .map(|l| l.q_proj_bias.is_some())
         .unwrap_or(false);
-    let layout = assign_transformer_slots(config, has_bias);
+    let has_qk_norm = weights.has_qk_norm();
+    let layout = assign_transformer_slots(config, has_bias, has_qk_norm);
 
     log_compile!(
         "hf",
@@ -840,7 +904,7 @@ pub fn emit_transformer_plan(
         let ls = &layout.layers[i];
 
         // QKV + RoPE kernel
-        emit_results.push(emit_qkv_kernel(config, has_bias, kernel_idx)?);
+        emit_results.push(emit_qkv_kernel(config, has_bias, has_qk_norm, kernel_idx)?);
         let mut qkv_inputs = vec![ls.hidden_in_slot, ls.input_ln_w_slot, ls.q_w_slot];
         if let Some(s) = ls.q_b_slot {
             qkv_inputs.push(s);
@@ -855,6 +919,12 @@ pub fn emit_transformer_plan(
         }
         qkv_inputs.push(layout.input_slots[2]); // cos
         qkv_inputs.push(layout.input_slots[3]); // sin
+        if let Some(s) = ls.q_norm_w_slot {
+            qkv_inputs.push(s);
+        }
+        if let Some(s) = ls.k_norm_w_slot {
+            qkv_inputs.push(s);
+        }
         steps.push(KernelStep::kernel(
             kernel_idx,
             qkv_inputs,

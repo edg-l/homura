@@ -13,6 +13,9 @@ pub struct LayerWeights {
     pub k_proj_bias: Option<Buffer>,
     pub v_proj_weight: Buffer, // transposed
     pub v_proj_bias: Option<Buffer>,
+    /// QK-norm weights (Qwen3-style): RMSNorm on Q/K per-head, shape [head_dim].
+    pub q_norm_weight: Option<Buffer>,
+    pub k_norm_weight: Option<Buffer>,
     pub o_proj_weight: Buffer, // transposed
     pub post_attention_layernorm_weight: Buffer,
     pub gate_proj_weight: Buffer, // transposed
@@ -30,6 +33,14 @@ pub struct TransformerWeights {
 }
 
 impl TransformerWeights {
+    /// Returns true if this model has QK-norm weights (Qwen3-style).
+    pub fn has_qk_norm(&self) -> bool {
+        self.layers
+            .first()
+            .map(|l| l.q_norm_weight.is_some())
+            .unwrap_or(false)
+    }
+
     /// Returns all weight buffers as a flat Vec<Buffer> in a deterministic order.
     ///
     /// Order:
@@ -38,19 +49,21 @@ impl TransformerWeights {
     ///     - input_layernorm_weight
     ///     - q_proj_weight, [q_proj_bias], k_proj_weight, [k_proj_bias],
     ///       v_proj_weight, [v_proj_bias]
+    ///     - [q_norm_weight, k_norm_weight] (only if has_qk_norm)
     ///     - o_proj_weight
     ///     - post_attention_layernorm_weight
     ///     - gate_proj_weight, up_proj_weight, down_proj_weight
     ///   - final_norm_weight
     ///   - [lm_head_weight] (only if not tied)
     ///
-    /// Biases are only included when they exist (inferred from the first layer).
+    /// Biases and QK-norms are only included when they exist (inferred from the first layer).
     pub fn to_slot_buffers(&self) -> Vec<Buffer> {
         let has_bias = self
             .layers
             .first()
             .map(|l| l.q_proj_bias.is_some())
             .unwrap_or(false);
+        let has_qk_norm = self.has_qk_norm();
 
         let mut bufs = Vec::new();
         bufs.push(self.embed_tokens_weight.clone());
@@ -68,6 +81,10 @@ impl TransformerWeights {
             bufs.push(layer.v_proj_weight.clone());
             if has_bias {
                 bufs.push(layer.v_proj_bias.as_ref().unwrap().clone());
+            }
+            if has_qk_norm {
+                bufs.push(layer.q_norm_weight.as_ref().unwrap().clone());
+                bufs.push(layer.k_norm_weight.as_ref().unwrap().clone());
             }
             bufs.push(layer.o_proj_weight.clone());
             bufs.push(layer.post_attention_layernorm_weight.clone());
@@ -115,6 +132,8 @@ pub fn load_transformer_weights(
 ) -> Result<TransformerWeights, Box<dyn std::error::Error>> {
     // Detect whether biases exist by checking the first layer.
     let has_bias = tensors.contains_key("model.layers.0.self_attn.q_proj.bias");
+    // Detect QK-norm (Qwen3-style) by checking for the first layer's q_norm weight.
+    let has_qk_norm = tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
 
     let take = |tensors: &mut HashMap<String, Buffer>,
                 key: &str|
@@ -172,6 +191,23 @@ pub fn load_transformer_weights(
             None
         };
 
+        let q_norm_weight = if has_qk_norm {
+            Some(take(
+                &mut tensors,
+                &format!("model.layers.{i}.self_attn.q_norm.weight"),
+            )?)
+        } else {
+            None
+        };
+        let k_norm_weight = if has_qk_norm {
+            Some(take(
+                &mut tensors,
+                &format!("model.layers.{i}.self_attn.k_norm.weight"),
+            )?)
+        } else {
+            None
+        };
+
         let o_proj_weight = transpose_2d(&take(
             &mut tensors,
             &format!("model.layers.{i}.self_attn.o_proj.weight"),
@@ -203,6 +239,8 @@ pub fn load_transformer_weights(
             k_proj_bias,
             v_proj_weight,
             v_proj_bias,
+            q_norm_weight,
+            k_norm_weight,
             o_proj_weight,
             post_attention_layernorm_weight,
             gate_proj_weight,
