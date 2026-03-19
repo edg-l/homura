@@ -499,6 +499,7 @@ impl KvCache {
             new_seq,
             self.max_len
         );
+        self.new_tokens = new_seq;
         let row_bytes = self.head_dim * self.dtype.size_bytes();
         for h in 0..self.num_heads {
             let dst = (h * self.max_len + self.current_len) * row_bytes;
@@ -1768,10 +1769,11 @@ impl ExecutionPlan {
             eprintln!("  └─");
         }
 
-        // Advance KV cache by the number of new tokens processed.
+        // Advance KV cache by the number of tokens appended during this step.
         if let Some(ref mut cache) = self.kv_cache {
-            let new_seq = inputs[0].shape().0[1] as usize;
-            cache.advance_by(new_seq);
+            if cache.new_tokens > 0 {
+                cache.advance_by(cache.new_tokens);
+            }
         }
 
         // Extract non-KV outputs only.
@@ -2173,6 +2175,77 @@ mod tests {
             vv.as_slice::<f32>(),
             &[
                 10.0, 20.0, 30.0, 70.0, 80.0, 90.0, 40.0, 50.0, 60.0, 0.4, 0.5, 0.6
+            ]
+        );
+    }
+
+    #[test]
+    fn kv_cache_multi_token_append() {
+        use super::KvCache;
+
+        // 1 layer, 2 heads, max 8 tokens, head_dim=3, f32
+        let mut cache = KvCache::new(1, 2, 8, 3, DType::F32);
+
+        // Append 3 tokens at once: shape [1, 2, 3, 3]
+        // Head 0: [[1,2,3], [4,5,6], [7,8,9]], Head 1: [[10,11,12], [13,14,15], [16,17,18]]
+        let k = Buffer::from_slice::<f32>(
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, // head 0
+                10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, // head 1
+            ],
+            &[1, 2, 3, 3],
+            DType::F32,
+        );
+        let v = Buffer::from_slice::<f32>(
+            &[
+                91.0, 92.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0, 99.0, // head 0
+                81.0, 82.0, 83.0, 84.0, 85.0, 86.0, 87.0, 88.0, 89.0, // head 1
+            ],
+            &[1, 2, 3, 3],
+            DType::F32,
+        );
+        cache.append_key(0, &k);
+        cache.append_value(0, &v);
+        cache.advance_by(3);
+        assert_eq!(cache.current_len(), 3);
+
+        // view (contiguous copy) should show all 3 tokens.
+        let (kv, vv) = cache.view(0);
+        assert_eq!(kv.shape().0, vec![1, 2, 3, 3]);
+        assert_eq!(
+            kv.as_slice::<f32>(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0, 17.0, 18.0
+            ]
+        );
+        assert_eq!(vv.shape().0, vec![1, 2, 3, 3]);
+
+        // Now append 1 more token (single-token path still works).
+        let k1 = Buffer::from_slice::<f32>(
+            &[20.0, 21.0, 22.0, 30.0, 31.0, 32.0],
+            &[1, 2, 1, 3],
+            DType::F32,
+        );
+        let v1 = Buffer::from_slice::<f32>(
+            &[40.0, 41.0, 42.0, 50.0, 51.0, 52.0],
+            &[1, 2, 1, 3],
+            DType::F32,
+        );
+        cache.append_key(0, &k1);
+        cache.append_value(0, &v1);
+        cache.advance_by(1);
+        assert_eq!(cache.current_len(), 4);
+
+        let (kv, _) = cache.view(0);
+        assert_eq!(kv.shape().0, vec![1, 2, 4, 3]);
+        // Head 0: 3 multi-token entries + 1 single = [1..9, 20..22]
+        // Head 1: 3 multi-token entries + 1 single = [10..18, 30..32]
+        assert_eq!(
+            kv.as_slice::<f32>(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 20.0, 21.0, 22.0, 10.0, 11.0, 12.0,
+                13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 30.0, 31.0, 32.0
             ]
         );
     }
