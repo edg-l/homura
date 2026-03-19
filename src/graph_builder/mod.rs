@@ -24,8 +24,8 @@ use crate::{
 };
 
 mod emit_arithmetic;
-mod emit_reshape;
 mod emit_linalg;
+mod emit_reshape;
 
 // ── Transform schedule mode ───────────────────────────────────────────────────
 
@@ -193,8 +193,7 @@ pub fn compile_to_objects(
         eprintln!("[dump] {label} pre-pass IR → /tmp/homura_kernel_pre.mlir");
     }
 
-    let mut module =
-        Module::parse(&context, mlir_text).ok_or(CompileError::Verification)?;
+    let mut module = Module::parse(&context, mlir_text).ok_or(CompileError::Verification)?;
 
     let has_schedule = mlir_text.contains("transform.with_named_sequence");
     let vectorize_only = mlir_text.contains("homura.vectorize_only");
@@ -994,15 +993,6 @@ impl<'c> GraphBuilder<'c> {
             .collect()
     }
 
-
-
-
-
-
-
-
-
-
     fn make_iterator_types(&self, count: usize) -> Attribute<'c> {
         let entries: Vec<&str> = vec!["#linalg.iterator_type<parallel>"; count];
         let attr_str = format!("[{}]", entries.join(", "));
@@ -1352,7 +1342,9 @@ impl<'c> GraphBuilder<'c> {
         if !module.as_operation().verify() {
             let ir = module.as_operation().to_string();
             let _ = std::fs::write("/tmp/homura_gb_failed.mlir", &ir);
-            log_warn!("GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir");
+            log_warn!(
+                "GraphBuilder MLIR verification failed — IR dumped to /tmp/homura_gb_failed.mlir"
+            );
             return Err(CompileError::Verification);
         }
 
@@ -1360,14 +1352,18 @@ impl<'c> GraphBuilder<'c> {
         if let Some(key) = cache_key {
             let cache = crate::cache::CompilationCache::new();
             if let Some((so_path, meta_path)) = cache.get(key)
-                && let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path) {
-                    match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
-                        Ok(graph) => return Ok(graph),
-                        Err(e) => {
-                            log_warn!("cache entry unloadable, recompiling {}: {e}", so_path.display());
-                        }
+                && let Some(meta) = crate::cache::CompilationCache::load_meta(&meta_path)
+            {
+                match CompiledGraph::load(&so_path, meta.num_inputs, meta.outputs) {
+                    Ok(graph) => return Ok(graph),
+                    Err(e) => {
+                        log_warn!(
+                            "cache entry unloadable, recompiling {}: {e}",
+                            so_path.display()
+                        );
                     }
                 }
+            }
         }
 
         // Run lowering passes: transform schedule + vectorization + bufferization.
@@ -1414,7 +1410,11 @@ impl<'c> GraphBuilder<'c> {
         .map_err(CompileError::Pass)?;
 
         pass_manager.run(&mut module).map_err(CompileError::Pass)?;
-        log_compile!("pipeline", "MLIR passes done: {}ms", pipeline_start.elapsed().as_millis());
+        log_compile!(
+            "pipeline",
+            "MLIR passes done: {}ms",
+            pipeline_start.elapsed().as_millis()
+        );
 
         if std::env::var("HOMURA_DUMP_IR").is_ok() {
             let _ = std::fs::write(

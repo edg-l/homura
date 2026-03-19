@@ -197,7 +197,11 @@ impl<'c> GraphBuilder<'c> {
     /// for same-rank size-1 broadcast dims.
     ///
     /// Returns a new `Tensor` with `target_shape`.
-    pub(super) fn broadcast_to(&mut self, input: &Tensor<'c>, target_shape: &[Option<u64>]) -> Tensor<'c> {
+    pub(super) fn broadcast_to(
+        &mut self,
+        input: &Tensor<'c>,
+        target_shape: &[Option<u64>],
+    ) -> Tensor<'c> {
         let src_shape = input.shape();
         if src_shape == target_shape {
             return *input;

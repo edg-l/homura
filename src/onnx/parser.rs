@@ -275,11 +275,7 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OnnxModel, OnnxError> {
 
     // Output edge names and shapes.
     let outputs = graph.output.iter().map(|vi| vi.name.clone()).collect();
-    let output_shapes = graph
-        .output
-        .iter()
-        .map(parse_output_dims)
-        .collect();
+    let output_shapes = graph.output.iter().map(parse_output_dims).collect();
 
     Ok(OnnxModel {
         nodes,

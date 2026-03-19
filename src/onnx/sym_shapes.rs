@@ -204,9 +204,10 @@ fn propagate_inner(
                         sym_const_i64.get(&node.inputs[0]),
                         sym_const_i64.get(&node.inputs[1]),
                     )
-                        && let Some(vals) = sym_const_i64_elementwise(va, vb, |x, y| x.div(y)) {
-                            sym_updates.insert(node.outputs[0].clone(), vals);
-                        }
+                    && let Some(vals) = sym_const_i64_elementwise(va, vb, |x, y| x.div(y))
+                {
+                    sym_updates.insert(node.outputs[0].clone(), vals);
+                }
                 vec![broadcast_sym_shapes(a, b)]
             } else if let Some(s) = get(0) {
                 vec![s.clone()]
@@ -412,22 +413,23 @@ fn propagate_inner(
                 let data_vals = sym_const_i64.get(data_name);
                 let idx_concrete = const_i64.get(indices_name);
                 if let (Some(dv), Some(iv)) = (data_vals, idx_concrete)
-                    && !dv.is_empty() {
-                        let gathered: Vec<SymDim> = iv
-                            .iter()
-                            .filter_map(|&idx| {
-                                let i = if idx < 0 {
-                                    (dv.len() as i64 + idx).max(0) as usize
-                                } else {
-                                    idx as usize
-                                };
-                                dv.get(i).cloned()
-                            })
-                            .collect();
-                        if !gathered.is_empty() {
-                            sym_updates.insert(node.outputs[0].clone(), gathered);
-                        }
+                    && !dv.is_empty()
+                {
+                    let gathered: Vec<SymDim> = iv
+                        .iter()
+                        .filter_map(|&idx| {
+                            let i = if idx < 0 {
+                                (dv.len() as i64 + idx).max(0) as usize
+                            } else {
+                                idx as usize
+                            };
+                            dv.get(i).cloned()
+                        })
+                        .collect();
+                    if !gathered.is_empty() {
+                        sym_updates.insert(node.outputs[0].clone(), gathered);
                     }
+                }
                 // Also try sym indices.
                 let idx_sym_vals = sym_const_i64.get(indices_name);
                 if let (Some(dv), Some(iv)) = (data_vals, idx_sym_vals) {
@@ -764,26 +766,28 @@ fn propagate_inner(
                     const_i64.get(node.inputs.get(1).map(|s| s.as_str()).unwrap_or("")),
                     const_i64.get(node.inputs.get(2).map(|s| s.as_str()).unwrap_or("")),
                 )
-                    && starts.len() == 1 && ends.len() == 1 {
-                        let n = data_vals.len() as i64;
-                        let s = if starts[0] < 0 {
-                            (n + starts[0]).max(0) as usize
-                        } else {
-                            (starts[0] as usize).min(data_vals.len())
-                        };
-                        let e = if ends[0] < 0 {
-                            (n + ends[0]).max(0) as usize
-                        } else {
-                            (ends[0] as usize).min(data_vals.len())
-                        };
-                        let step = const_i64
-                            .get(node.inputs.get(4).map(|s| s.as_str()).unwrap_or(""))
-                            .and_then(|v| v.first().copied())
-                            .unwrap_or(1);
-                        if step == 1 && s <= e {
-                            sym_updates.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
-                        }
-                    }
+                && starts.len() == 1
+                && ends.len() == 1
+            {
+                let n = data_vals.len() as i64;
+                let s = if starts[0] < 0 {
+                    (n + starts[0]).max(0) as usize
+                } else {
+                    (starts[0] as usize).min(data_vals.len())
+                };
+                let e = if ends[0] < 0 {
+                    (n + ends[0]).max(0) as usize
+                } else {
+                    (ends[0] as usize).min(data_vals.len())
+                };
+                let step = const_i64
+                    .get(node.inputs.get(4).map(|s| s.as_str()).unwrap_or(""))
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(1);
+                if step == 1 && s <= e {
+                    sym_updates.insert(node.outputs[0].clone(), data_vals[s..e].to_vec());
+                }
+            }
 
             vec![result]
         }
@@ -871,12 +875,13 @@ fn propagate_inner(
                 // Negative values are ONNX sentinels (-1 = infer, etc.); casting to u64 overflows.
                 if buf.shape().num_elements() <= 64
                     && let Ok(vals) = read_i64_buf(buf)
-                        && vals.iter().all(|&v| v >= 0) {
-                            sym_updates.insert(
-                                node.outputs[0].clone(),
-                                vals.iter().map(|&v| SymDim::Concrete(v as u64)).collect(),
-                            );
-                        }
+                    && vals.iter().all(|&v| v >= 0)
+                {
+                    sym_updates.insert(
+                        node.outputs[0].clone(),
+                        vals.iter().map(|&v| SymDim::Concrete(v as u64)).collect(),
+                    );
+                }
                 vec![out]
             } else {
                 vec![]

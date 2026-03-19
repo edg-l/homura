@@ -65,4 +65,3 @@ fn mnist_emitter_predicts_7_from_image() {
         "expected digit 7, got {predicted} (logits: {logits:?})"
     );
 }
-

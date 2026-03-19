@@ -448,9 +448,11 @@ fn resolve_symbolic_dims(
     for input_spec in &model.dynamic_inputs {
         for dim in &input_spec.dims {
             if let Dim::Symbolic(name) = dim
-                && !keep_dynamic.contains(name) && !sym_map.contains_key(name) {
-                    return Err(OnnxError::UnresolvedSymbolicDim(name.clone()));
-                }
+                && !keep_dynamic.contains(name)
+                && !sym_map.contains_key(name)
+            {
+                return Err(OnnxError::UnresolvedSymbolicDim(name.clone()));
+            }
         }
     }
 

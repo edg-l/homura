@@ -1,7 +1,6 @@
 use super::*;
 
 impl<'c> GraphBuilder<'c> {
-
     /// Transpose a 2D tensor `[M, N] -> [N, M]` via `linalg.transpose`.
     pub(super) fn emit_linalg_transpose_2d(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
         let in_shape = input.shape();
@@ -639,22 +638,23 @@ impl<'c> GraphBuilder<'c> {
             let cast_val = self.emit_tensor_cast(input.value(), &cast_shape);
             let cast_in_shape = cast_val.shape();
             if let Some(reassoc) = compute_reassociation(&cast_in_shape, out_shape)
-                && let ReassocResult::Expand { reassoc } = reassoc {
-                    let reassoc_str = reassoc_to_string(&reassoc);
-                    let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, d)| d.is_none())
-                        .map(|(i, _)| dim_vals[i])
-                        .collect();
-                    return self.emit_expand_shape_impl_with_dyn_vals(
-                        cast_val.value(),
-                        out_shape,
-                        input.dtype(),
-                        &reassoc_str,
-                        &dyn_vals,
-                    );
-                }
+                && let ReassocResult::Expand { reassoc } = reassoc
+            {
+                let reassoc_str = reassoc_to_string(&reassoc);
+                let dyn_vals: Vec<melior::ir::Value<'c, 'c>> = out_shape
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.is_none())
+                    .map(|(i, _)| dim_vals[i])
+                    .collect();
+                return self.emit_expand_shape_impl_with_dyn_vals(
+                    cast_val.value(),
+                    out_shape,
+                    input.dtype(),
+                    &reassoc_str,
+                    &dyn_vals,
+                );
+            }
         }
 
         // Final fallback: tensor.reshape via shape tensor.
@@ -2321,16 +2321,17 @@ impl<'c> GraphBuilder<'c> {
                 ']' => {
                     depth -= 1;
                     if depth == 0
-                        && let Some(start) = group_start {
-                            let group_content = &inner[start..i];
-                            for num_str in group_content.split(',') {
-                                let num: usize = num_str.trim().parse().unwrap();
-                                if num == out_dim {
-                                    return group_idx;
-                                }
+                        && let Some(start) = group_start
+                    {
+                        let group_content = &inner[start..i];
+                        for num_str in group_content.split(',') {
+                            let num: usize = num_str.trim().parse().unwrap();
+                            if num == out_dim {
+                                return group_idx;
                             }
-                            group_idx += 1;
                         }
+                        group_idx += 1;
+                    }
                 }
                 _ => {}
             }

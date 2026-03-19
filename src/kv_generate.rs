@@ -207,7 +207,11 @@ impl UnifiedKvGenerator {
 
         let max_prompt = self.config.max_seq_len - 1;
         if token_ids.len() > max_prompt {
-            log_warn!("truncating prompt from {} to {} tokens", token_ids.len(), max_prompt);
+            log_warn!(
+                "truncating prompt from {} to {} tokens",
+                token_ids.len(),
+                max_prompt
+            );
             token_ids.truncate(max_prompt);
         }
 
@@ -254,7 +258,10 @@ impl UnifiedKvGenerator {
         // Decode loop
         for step in 1..max_new_tokens {
             if real_pos >= self.config.max_seq_len {
-                log_warn!("context limit reached (max_seq_len={})", self.config.max_seq_len);
+                log_warn!(
+                    "context limit reached (max_seq_len={})",
+                    self.config.max_seq_len
+                );
                 break;
             }
 
@@ -288,7 +295,11 @@ impl UnifiedKvGenerator {
             // Check stop sequences against the generated text so far.
             if !sampling.stop_sequences.is_empty() {
                 let text_so_far = self.tokenizer.decode(&generated_ids);
-                if let Some(seq) = sampling.stop_sequences.iter().find(|s| text_so_far.contains(s.as_str())) {
+                if let Some(seq) = sampling
+                    .stop_sequences
+                    .iter()
+                    .find(|s| text_so_far.contains(s.as_str()))
+                {
                     log_info!("stop sequence {:?} reached", seq);
                     // Trim the generated text at the stop sequence.
                     if let Some(pos) = text_so_far.find(seq.as_str()) {
