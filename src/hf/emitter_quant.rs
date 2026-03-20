@@ -79,6 +79,14 @@ struct QuantLayerSlots {
     gate_w_slot: usize,
     up_w_slot: usize,
     down_w_slot: usize,
+    // Per-projection quantization dtypes (may differ for Q4_K_M models)
+    q_dtype: DType,
+    k_dtype: DType,
+    v_dtype: DType,
+    o_dtype: DType,
+    gate_dtype: DType,
+    up_dtype: DType,
+    down_dtype: DType,
     // KV cache slots
     past_k_slot: usize,
     past_v_slot: usize,
@@ -581,6 +589,13 @@ fn assign_transformer_slots_quant(
             gate_w_slot,
             up_w_slot,
             down_w_slot,
+            q_dtype,
+            k_dtype,
+            v_dtype,
+            o_dtype,
+            gate_dtype,
+            up_dtype,
+            down_dtype,
             past_k_slot,
             past_v_slot,
             present_k_slot,
@@ -657,10 +672,17 @@ fn assign_transformer_slots_quant(
 ///
 /// Inputs: activation [1, seq, k], weight [total_weight_bytes] i8
 /// Output: [1, seq, n] f32
-fn emit_quant_matmul_kernel(k: u64, n: u64, kernel_idx: usize, label: &str) -> KernelEmitResult {
+fn emit_quant_matmul_kernel(
+    k: u64,
+    n: u64,
+    kernel_idx: usize,
+    label: &str,
+    weight_dtype: DType,
+) -> KernelEmitResult {
     let n_tile = pick_n_tile(n);
     let func_name = format!("k{kernel_idx}");
-    let mlir_text = crate::graph_builder::emit_dequant_matmul_q8_0(k, n, &func_name, n_tile);
+    let mlir_text =
+        crate::graph_builder::emit_dequant_matmul(weight_dtype, k, n, &func_name, n_tile);
 
     let dyn_val = crate::shape::DIM_DYNAMIC;
 
@@ -1076,7 +1098,9 @@ pub(crate) fn emit_transformer_plan_quant(
         kernel_idx += 1;
 
         // Step 2: Q_proj dequant-matmul
-        emit_results.push(emit_quant_matmul_kernel(hidden, q_dim, kernel_idx, "Q"));
+        emit_results.push(emit_quant_matmul_kernel(
+            hidden, q_dim, kernel_idx, "Q", ls.q_dtype,
+        ));
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![ls.normed_slot, ls.q_w_slot],
@@ -1085,7 +1109,9 @@ pub(crate) fn emit_transformer_plan_quant(
         kernel_idx += 1;
 
         // Step 3: K_proj dequant-matmul
-        emit_results.push(emit_quant_matmul_kernel(hidden, kv_dim, kernel_idx, "K"));
+        emit_results.push(emit_quant_matmul_kernel(
+            hidden, kv_dim, kernel_idx, "K", ls.k_dtype,
+        ));
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![ls.normed_slot, ls.k_w_slot],
@@ -1094,7 +1120,9 @@ pub(crate) fn emit_transformer_plan_quant(
         kernel_idx += 1;
 
         // Step 4: V_proj dequant-matmul
-        emit_results.push(emit_quant_matmul_kernel(hidden, kv_dim, kernel_idx, "V"));
+        emit_results.push(emit_quant_matmul_kernel(
+            hidden, kv_dim, kernel_idx, "V", ls.v_dtype,
+        ));
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![ls.normed_slot, ls.v_w_slot],
@@ -1165,7 +1193,9 @@ pub(crate) fn emit_transformer_plan_quant(
         kernel_idx += 1;
 
         // Step 9: O_proj dequant-matmul
-        emit_results.push(emit_quant_matmul_kernel(q_dim, hidden, kernel_idx, "O"));
+        emit_results.push(emit_quant_matmul_kernel(
+            q_dim, hidden, kernel_idx, "O", ls.o_dtype,
+        ));
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![ls.attn_body_out_slot, ls.o_w_slot],
@@ -1188,6 +1218,7 @@ pub(crate) fn emit_transformer_plan_quant(
             intermediate,
             kernel_idx,
             "Gate",
+            ls.gate_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1202,6 +1233,7 @@ pub(crate) fn emit_transformer_plan_quant(
             intermediate,
             kernel_idx,
             "Up",
+            ls.up_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1225,6 +1257,7 @@ pub(crate) fn emit_transformer_plan_quant(
             hidden,
             kernel_idx,
             "Down",
+            ls.down_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,

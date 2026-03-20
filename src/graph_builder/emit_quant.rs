@@ -271,36 +271,28 @@ module attributes {{"homura.quant_kernel"}} {{
             %qs_base = arith.addi %blk_off, %c16 : index
             %k_block_base = arith.muli %kb, %c256 : index
 
-            // Flat loop over 256 elements in the super-block.
-            %acc_sb = scf.for %j = %c0 to %c256 step %c1
-                          iter_args(%acc_j = %c0_f32) -> (f32) {{
-
-              // Sub-block index: sb = j / 32
-              %sb = arith.divui %j, %c32 : index
-              // Scale byte offset: sb (or sb-4 for high sub-blocks)
-              %sb_i32 = arith.index_cast %sb : index to i32
+            // Loop over 8 sub-blocks, then 16 byte-pairs (32 elements) per sub-block.
+            // Outer: sub-block loop. Inner: byte loop (each byte = 2 nibbles).
+            // This structure gives LLVM a contiguous byte access pattern to vectorize.
+            %acc_sb = scf.for %sb = %c0 to %c8 step %c1
+                          iter_args(%acc_sb_in = %c0_f32) -> (f32) {{
 
               // --- Unpack sc[sb] and mn[sb] ---
-              // Both paths compute results; use safe indices to avoid OOB.
-              // sb_safe = max(sb, 4) - 4 gives 0 when sb<4 (safe for high-path loads)
+              %sb_i32 = arith.index_cast %sb : index to i32
               %sb_lt4 = arith.cmpi ult, %sb_i32, %c4_i32 : i32
               %sb_clamped = arith.maxui %sb_i32, %c4_i32 : i32
-              %sb_m4 = arith.subi %sb_clamped, %c4_i32 : i32  // safe: always >= 0
+              %sb_m4 = arith.subi %sb_clamped, %c4_i32 : i32
 
-              // Load scales_raw[sb % 4] (used by both paths)
               %sb_mod4 = arith.remui %sb, %c4 : index
               %sr_ptr = arith.addi %sc_base, %sb_mod4 : index
               %sr_raw = memref.load %weight[%sr_ptr] : memref<{twb}xi8>
               %sr_u32 = arith.extui %sr_raw : i8 to i32
-
-              // Low path: sc = sr & 0x3F
               %sc_lo = arith.andi %sr_u32, %c63_i32 : i32
-              // High path: sc = (sr >> 6) | (hi_nib << 2)
               %sr_hi6 = arith.shrui %sr_u32, %c6_i32 : i32
-              %hi_idx_half = arith.shrui %sb_m4, %c1_i32 : i32  // (sb_m4)/2
+              %hi_idx_half = arith.shrui %sb_m4, %c1_i32 : i32
               %hi_off_idx = arith.index_cast %hi_idx_half : i32 to index
               %hi_ptr = arith.addi %sc_base, %hi_off_idx : index
-              %hi_ptr2 = arith.addi %hi_ptr, %c8 : index  // scales_raw[8 + sb_m4/2]
+              %hi_ptr2 = arith.addi %hi_ptr, %c8 : index
               %hi_raw = memref.load %weight[%hi_ptr2] : memref<{twb}xi8>
               %hi_u32 = arith.extui %hi_raw : i8 to i32
               %sb_m4_mod2 = arith.remui %sb_m4, %c2_i32 : i32
@@ -311,13 +303,12 @@ module attributes {{"homura.quant_kernel"}} {{
               %sc_hi = arith.ori %sr_hi6, %hi_nib_sh : i32
               %sc_val = arith.select %sb_lt4, %sc_lo, %sc_hi : i32
 
-              // --- Unpack mn[sb] ---
-              %mn_ptr = arith.addi %sr_ptr, %c4 : index  // scales_raw[4 + sb%4]
+              %mn_ptr = arith.addi %sr_ptr, %c4 : index
               %mn_raw = memref.load %weight[%mn_ptr] : memref<{twb}xi8>
               %mn_u32 = arith.extui %mn_raw : i8 to i32
               %mn_lo = arith.andi %mn_u32, %c63_i32 : i32
               %mn_hi6 = arith.shrui %mn_u32, %c6_i32 : i32
-              %hmn_ptr = arith.addi %hi_ptr, %c10 : index  // scales_raw[10 + sb_m4/2]
+              %hmn_ptr = arith.addi %hi_ptr, %c10 : index
               %hmn_raw = memref.load %weight[%hmn_ptr] : memref<{twb}xi8>
               %hmn_u32 = arith.extui %hmn_raw : i8 to i32
               %hmn_shifted = arith.shrui %hmn_u32, %shift_amt : i32
@@ -326,34 +317,52 @@ module attributes {{"homura.quant_kernel"}} {{
               %mn_hi = arith.ori %mn_hi6, %hmn_nib_sh : i32
               %mn_val = arith.select %sb_lt4, %mn_lo, %mn_hi : i32
 
-              // Compute scale and min for this element
               %sc_f32 = arith.uitofp %sc_val : i32 to f32
               %mn_f32 = arith.uitofp %mn_val : i32 to f32
               %scale = arith.mulf %d_f32, %sc_f32 : f32
               %minv  = arith.mulf %dmin_f32, %mn_f32 : f32
 
-              // Extract nibble: qs[j/2], low or high nibble
-              %j_half = arith.divui %j, %c2 : index
-              %qb_off = arith.addi %qs_base, %j_half : index
-              %qb_raw = memref.load %weight[%qb_off] : memref<{twb}xi8>
-              %qb_u32 = arith.extui %qb_raw : i8 to i32
-              %j_mod2 = arith.remui %j, %c2 : index
-              %is_hi  = arith.cmpi ne, %j_mod2, %c0 : index
-              %nib_lo = arith.andi  %qb_u32, %c15_i32 : i32
-              %nib_hi = arith.shrui %qb_u32, %c4_i32 : i32
-              %nibble = arith.select %is_hi, %nib_hi, %nib_lo : i32
-              %nib_f32 = arith.uitofp %nibble : i32 to f32
+              // Quant byte base for this sub-block: qs_base + sb*16
+              %sb_byte_base = arith.muli %sb, %c16 : index
+              %qb_base = arith.addi %qs_base, %sb_byte_base : index
+              // K element base for this sub-block: k_block_base + sb*32
+              %sb_k_base = arith.muli %sb, %c32 : index
+              %k_sb_base = arith.addi %k_block_base, %sb_k_base : index
 
-              // dequant = nibble * scale - min
-              %val_sc = arith.mulf %nib_f32, %scale : f32
-              %val    = arith.subf %val_sc, %minv : f32
+              // Inner loop over 16 bytes (each byte = 2 nibbles = 2 elements)
+              %acc_inner = scf.for %bi = %c0 to %c16 step %c1
+                               iter_args(%acc_bi = %acc_sb_in) -> (f32) {{
 
-              // Multiply by activation and accumulate
-              %k_elem = arith.addi %k_block_base, %j : index
-              %a_val  = memref.load %act[%c0, %m, %k_elem] : memref<1x?x{k}xf32>
-              %contrib = arith.mulf %val, %a_val : f32
-              %new_acc = arith.addf %acc_j, %contrib : f32
-              scf.yield %new_acc : f32
+                %qb_off = arith.addi %qb_base, %bi : index
+                %qb_raw = memref.load %weight[%qb_off] : memref<{twb}xi8>
+                %qb_u32 = arith.extui %qb_raw : i8 to i32
+
+                // Low nibble (even element)
+                %nib_lo = arith.andi %qb_u32, %c15_i32 : i32
+                %nib_lo_f32 = arith.uitofp %nib_lo : i32 to f32
+                %val_lo_sc = arith.mulf %nib_lo_f32, %scale : f32
+                %val_lo = arith.subf %val_lo_sc, %minv : f32
+                %k_lo = arith.addi %k_sb_base, %bi : index
+                %k_lo2 = arith.addi %k_lo, %bi : index  // k_sb_base + 2*bi
+                %a_lo = memref.load %act[%c0, %m, %k_lo2] : memref<1x?x{k}xf32>
+                %c_lo = arith.mulf %val_lo, %a_lo : f32
+                %acc_lo = arith.addf %acc_bi, %c_lo : f32
+
+                // High nibble (odd element)
+                %nib_hi = arith.shrui %qb_u32, %c4_i32 : i32
+                %nib_hi_m = arith.andi %nib_hi, %c15_i32 : i32
+                %nib_hi_f32 = arith.uitofp %nib_hi_m : i32 to f32
+                %val_hi_sc = arith.mulf %nib_hi_f32, %scale : f32
+                %val_hi = arith.subf %val_hi_sc, %minv : f32
+                %k_hi = arith.addi %k_lo2, %c1 : index  // k_sb_base + 2*bi + 1
+                %a_hi = memref.load %act[%c0, %m, %k_hi] : memref<1x?x{k}xf32>
+                %c_hi = arith.mulf %val_hi, %a_hi : f32
+                %acc_hi = arith.addf %acc_lo, %c_hi : f32
+
+                scf.yield %acc_hi : f32
+              }}
+
+              scf.yield %acc_inner : f32
             }}
 
             %kb_contrib = arith.addf %acc_kb_in, %acc_sb : f32
