@@ -29,7 +29,8 @@ mod emit_quant;
 mod emit_reshape;
 
 pub use emit_quant::{
-    emit_dequant_matmul, emit_dequant_matmul_q4_k, emit_dequant_matmul_q8_0, quant_weight_bytes,
+    emit_dequant_matmul, emit_dequant_matmul_q4_k, emit_dequant_matmul_q6_k,
+    emit_dequant_matmul_q8_0, quant_weight_bytes,
 };
 
 // ── Transform schedule mode ───────────────────────────────────────────────────

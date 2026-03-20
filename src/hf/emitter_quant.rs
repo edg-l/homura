@@ -1,8 +1,10 @@
-//! Quantized (Q8_0) transformer plan emitter.
+//! Quantized transformer plan emitter (Q8_0, Q4_K, Q6_K).
 //!
 //! Emits an `ExecutionPlan` where each projection (Q/K/V/O/gate/up/down) is a
 //! separate dequant-matmul kernel, and all lightweight ops (RMSNorm, residuals,
 //! RoPE, SiLU, etc.) are grouped into tensor kernels with `TransformMode::None`.
+//! Per-tensor dtype dispatch allows mixed quant types (e.g. Q4_K_M uses Q4_K for
+//! most weights but Q6_K for sensitive layers).
 
 use crate::compiler::{CompileError, KernelEmitResult};
 use crate::graph_builder::{GraphContext, TransformMode};
@@ -79,6 +81,14 @@ struct QuantLayerSlots {
     gate_w_slot: usize,
     up_w_slot: usize,
     down_w_slot: usize,
+    // Per-projection quantization dtypes (may vary across layers, e.g. Q4_K vs Q6_K)
+    q_dtype: DType,
+    k_dtype: DType,
+    v_dtype: DType,
+    o_dtype: DType,
+    gate_dtype: DType,
+    up_dtype: DType,
+    down_dtype: DType,
     // KV cache slots
     past_k_slot: usize,
     past_v_slot: usize,
@@ -110,7 +120,7 @@ fn assign_transformer_slots_quant(
     config: &TransformerConfig,
     has_bias: bool,
     has_qk_norm: bool,
-    weight_dtype: crate::DType,
+    weights: &TransformerWeights,
 ) -> QuantSlotLayout {
     let mut next = 0usize;
     let mut alloc = |desc: SlotDesc| -> (usize, SlotDesc) {
@@ -202,7 +212,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // q_proj weight: flat I8 bytes [total_weight_bytes]
-        let q_bytes = crate::graph_builder::quant_weight_bytes(weight_dtype, hidden, q_dim);
+        let q_dtype = weights.layers[layer_i].q_proj_weight.dtype();
+        let q_bytes = crate::graph_builder::quant_weight_bytes(q_dtype, hidden, q_dim);
         let (q_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![q_bytes]),
             dtype: DType::I8,
@@ -225,7 +236,8 @@ fn assign_transformer_slots_quant(
         };
 
         // k_proj weight
-        let k_bytes = crate::graph_builder::quant_weight_bytes(weight_dtype, hidden, kv_dim);
+        let k_dtype = weights.layers[layer_i].k_proj_weight.dtype();
+        let k_bytes = crate::graph_builder::quant_weight_bytes(k_dtype, hidden, kv_dim);
         let (k_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![k_bytes]),
             dtype: DType::I8,
@@ -248,7 +260,8 @@ fn assign_transformer_slots_quant(
         };
 
         // v_proj weight
-        let v_bytes = crate::graph_builder::quant_weight_bytes(weight_dtype, hidden, kv_dim);
+        let v_dtype = weights.layers[layer_i].v_proj_weight.dtype();
+        let v_bytes = crate::graph_builder::quant_weight_bytes(v_dtype, hidden, kv_dim);
         let (v_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![v_bytes]),
             dtype: DType::I8,
@@ -297,7 +310,8 @@ fn assign_transformer_slots_quant(
         };
 
         // o_proj weight
-        let o_bytes = crate::graph_builder::quant_weight_bytes(weight_dtype, q_dim, hidden);
+        let o_dtype = weights.layers[layer_i].o_proj_weight.dtype();
+        let o_bytes = crate::graph_builder::quant_weight_bytes(o_dtype, q_dim, hidden);
         let (o_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![o_bytes]),
             dtype: DType::I8,
@@ -316,8 +330,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // gate_proj weight
-        let gate_bytes =
-            crate::graph_builder::quant_weight_bytes(weight_dtype, hidden, intermediate);
+        let gate_dtype = weights.layers[layer_i].gate_proj_weight.dtype();
+        let gate_bytes = crate::graph_builder::quant_weight_bytes(gate_dtype, hidden, intermediate);
         let (gate_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![gate_bytes]),
             dtype: DType::I8,
@@ -327,7 +341,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // up_proj weight
-        let up_bytes = crate::graph_builder::quant_weight_bytes(weight_dtype, hidden, intermediate);
+        let up_dtype = weights.layers[layer_i].up_proj_weight.dtype();
+        let up_bytes = crate::graph_builder::quant_weight_bytes(up_dtype, hidden, intermediate);
         let (up_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![up_bytes]),
             dtype: DType::I8,
@@ -337,8 +352,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // down_proj weight
-        let down_bytes =
-            crate::graph_builder::quant_weight_bytes(weight_dtype, intermediate, hidden);
+        let down_dtype = weights.layers[layer_i].down_proj_weight.dtype();
+        let down_bytes = crate::graph_builder::quant_weight_bytes(down_dtype, intermediate, hidden);
         let (down_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![down_bytes]),
             dtype: DType::I8,
@@ -575,6 +590,13 @@ fn assign_transformer_slots_quant(
             gate_w_slot,
             up_w_slot,
             down_w_slot,
+            q_dtype,
+            k_dtype,
+            v_dtype,
+            o_dtype,
+            gate_dtype,
+            up_dtype,
+            down_dtype,
             past_k_slot,
             past_v_slot,
             present_k_slot,
@@ -996,8 +1018,10 @@ fn emit_residual_add_kernel(
 
 /// Emit and compile all kernels for a quantized transformer, producing an ExecutionPlan.
 ///
-/// Supports Q8_0 and Q4_K projection weights. Lightweight tensor kernels are used for
-/// all other ops (RMSNorm, RoPE, residuals, SiLU, attention body).
+/// Supports Q8_0, Q4_K, and Q6_K projection weights, with per-tensor dtype dispatch
+/// (different projections within the same model may use different quant types).
+/// Lightweight tensor kernels are used for all other ops (RMSNorm, RoPE, residuals,
+/// SiLU, attention body).
 pub(crate) fn emit_transformer_plan_quant(
     config: &TransformerConfig,
     weights: &TransformerWeights,
@@ -1009,14 +1033,7 @@ pub(crate) fn emit_transformer_plan_quant(
         .unwrap_or(false);
     let has_qk_norm = weights.has_qk_norm();
 
-    // Determine quantization dtype from the first layer's q_proj weight.
-    let weight_dtype = weights
-        .layers
-        .first()
-        .map(|l| l.q_proj_weight.dtype())
-        .unwrap_or(DType::Q8_0);
-
-    let layout = assign_transformer_slots_quant(config, has_bias, has_qk_norm, weight_dtype);
+    let layout = assign_transformer_slots_quant(config, has_bias, has_qk_norm, weights);
 
     log_compile!(
         "hf",
@@ -1085,11 +1102,7 @@ pub(crate) fn emit_transformer_plan_quant(
 
         // Step 2: Q_proj dequant-matmul
         emit_results.push(emit_quant_matmul_kernel(
-            hidden,
-            q_dim,
-            kernel_idx,
-            "Q",
-            weight_dtype,
+            hidden, q_dim, kernel_idx, "Q", ls.q_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1100,11 +1113,7 @@ pub(crate) fn emit_transformer_plan_quant(
 
         // Step 3: K_proj dequant-matmul
         emit_results.push(emit_quant_matmul_kernel(
-            hidden,
-            kv_dim,
-            kernel_idx,
-            "K",
-            weight_dtype,
+            hidden, kv_dim, kernel_idx, "K", ls.k_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1115,11 +1124,7 @@ pub(crate) fn emit_transformer_plan_quant(
 
         // Step 4: V_proj dequant-matmul
         emit_results.push(emit_quant_matmul_kernel(
-            hidden,
-            kv_dim,
-            kernel_idx,
-            "V",
-            weight_dtype,
+            hidden, kv_dim, kernel_idx, "V", ls.v_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1192,11 +1197,7 @@ pub(crate) fn emit_transformer_plan_quant(
 
         // Step 9: O_proj dequant-matmul
         emit_results.push(emit_quant_matmul_kernel(
-            q_dim,
-            hidden,
-            kernel_idx,
-            "O",
-            weight_dtype,
+            q_dim, hidden, kernel_idx, "O", ls.o_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1220,7 +1221,7 @@ pub(crate) fn emit_transformer_plan_quant(
             intermediate,
             kernel_idx,
             "Gate",
-            weight_dtype,
+            ls.gate_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1235,7 +1236,7 @@ pub(crate) fn emit_transformer_plan_quant(
             intermediate,
             kernel_idx,
             "Up",
-            weight_dtype,
+            ls.up_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
@@ -1259,7 +1260,7 @@ pub(crate) fn emit_transformer_plan_quant(
             hidden,
             kernel_idx,
             "Down",
-            weight_dtype,
+            ls.down_dtype,
         ));
         steps.push(KernelStep::kernel(
             kernel_idx,
