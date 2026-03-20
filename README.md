@@ -1,6 +1,6 @@
 # Homura
 
-A Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation with parallel codegen via rayon. Supports ONNX and HuggingFace/safetensors models.
+A Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation with parallel codegen via rayon. BF16 mixed-precision matmul on AVX-512. Supports ONNX and HuggingFace/safetensors models.
 
 ### Quick start
 
@@ -59,7 +59,7 @@ model (ONNX, safetensors/HF)
   -> ExecutionPlan routes buffers between kernels
 ```
 
-The transform schedule tiles matmuls (3D, 4D contractions) and Conv2D with adaptive tile sizes based on available parallelism. Large matmuls use OpenMP via `tile_using_forall` for multi-threaded execution, with inner `tile_using_for` loops that LLVM auto-vectorizes to AVX-512 FMA. Untiled ops stay as scalar loops.
+The transform schedule tiles matmuls (3D, 4D, 5D contractions) and Conv2D with adaptive tile sizes based on available parallelism. Large matmuls use OpenMP via `tile_using_forall` for multi-threaded execution, with inner `tile_using_for` loops that LLVM auto-vectorizes to AVX-512 FMA/BF16. GQA attention uses zero-copy floordiv indexing to avoid materializing head expansions, with dedicated 5D tiling. Untiled ops stay as scalar loops.
 
 Models with dynamic dimensions (e.g., KV cache sequence length) are compiled once with symbolic shape tracking -- a parallel `SymDim` expression system resolves buffer shapes at runtime without recompilation.
 
@@ -67,7 +67,7 @@ Compiled kernels are cached on disk per-kernel. Subsequent runs with the same mo
 
 ## Building
 
-Requires patched LLVM 21 with MLIR C API support.
+Requires a [patched LLVM 21](https://github.com/edg-l/llvm-project/tree/edgl/llvm-21.1.8-patched) with MLIR C API support, bug fixes, and added C bindings (e.g. `LLVMSplitModule`).
 
 ```sh
 source env-llvm21-dev.sh
@@ -90,12 +90,26 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 
 ## Performance
 
+Benchmarked on AMD Ryzen 9 7900X3D (single CCD, auto-pinned).
+
 | Model | Params | Kernels | Compile time | Decode |
 |---|---|---|---|---|
-| MNIST | -- | 6 | 97ms | -- |
-| ResNet-18 | 11M | 41 | 467ms | -- |
+| MNIST | -- | 6 | 96ms | -- |
+| ResNet-18 | 11M | 41 | 422ms | -- |
 | GPT-2 | 124M | 158 compiled + 24 native | ~650ms | ~50 tok/s |
-| Qwen2.5-0.5B | 494M | 74 compiled + 48 native | ~950ms | ~10 tok/s |
+| Qwen2.5-0.5B | 494M | -- | -- | ~36 tok/s (bf16) |
+| Qwen3-0.6B | 600M | -- | -- | ~24 tok/s (bf16) |
+
+Qwen3-0.6B decode breakdown (42ms/tok):
+
+| Kernel | Time | % | Per layer | BW | % peak |
+|---|---|---|---|---|---|
+| MLP (28L) | 16.7ms | 40% | 0.60ms | 32 GB/s | 41% |
+| QKV (28L) | 7.0ms | 17% | 0.25ms | 34 GB/s | 44% |
+| Attn (28L) | 7.6ms | 18% | 0.27ms | 16 GB/s | 20% |
+| LMHead | 7.9ms | 19% | -- | 40 GB/s | 51% |
+
+Total weights: 1192 MB. Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theory minimum: 15ms/tok.
 
 ## Current status
 
@@ -105,19 +119,22 @@ Use `--verbose` / `-v` to see compilation progress (MLIR passes, kernel timing).
 - **HF architectures**: Decoder-only transformers with RoPE (Qwen2, Qwen3, and compatible architectures). QK-norm support for Qwen3. Config auto-detection from `config.json`.
 - **Chat mode**: Interactive multi-turn REPL with persistent KV cache, Jinja2 chat template rendering via minijinja, think block support for reasoning models (--think flag)
 - **Compilation**: Per-kernel MLIR (linalg dialect) -> LLVM, parallel via rayon, cached on disk
-- **Tiling**: Adaptive OpenMP-parallel tiling for matmuls, scaled to available cores
-- **Vectorization**: LLVM auto-vectorization of tiled scalar loops to AVX-512 FMA
+- **Tiling**: Adaptive OpenMP-parallel tiling for 3D/4D/5D contractions (matmul, batched matmul, GQA attention), scaled to available cores
+- **Vectorization**: LLVM auto-vectorization of tiled scalar loops to AVX-512 FMA/BF16
+- **Mixed precision**: BF16 weight storage with F32 accumulation for matmul kernels on AVX-512 BF16
+- **Zero-copy GQA**: Floordiv head indexing avoids materializing repeat_kv expansions
+- **CPU affinity**: Auto-pins to single CCD on multi-chiplet AMD CPUs (Zen 3D/4) for consistent L3 cache behavior. Disable with `HOMURA_NO_PIN=1`
 - **Dynamic shapes**: Symbolic dim tracking (`SymDim` expressions) -- compile once, resolve at runtime
-- **Dtype**: F32, F64, I32, I64
+- **Dtype**: F32, F64, I32, I64, BF16
 - **Generation**: Streaming text output, persistent KV cache, configurable sampling (temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, seed)
-- **Models tested**: MNIST CNN, ResNet-18, GPT-2 (124M), Qwen2.5-0.5B (494M)
+- **Profiling**: `make profile` runs decode profiling with per-kernel bandwidth analysis via `scripts/profile.py`
+- **Models tested**: MNIST CNN, ResNet-18, GPT-2 (124M), Qwen2.5-0.5B (494M), Qwen3-0.6B (600M)
 
 ## Roadmap
 
-- Multimodal models (vision-language: image encoder + text decoder)
-- More architectures (Llama, Mistral, Phi, Gemma)
 - Packed GEMM layout for better cache utilization
 - Flash Attention (fused softmax(QK^T)V for O(1) memory)
 - Operator fusion (matmul + bias + activation as one kernel)
 - Weight quantization (INT8/INT4)
+- More architectures (Llama, Mistral, Phi, Gemma)
 - GPU backend (CUDA via `gpu-to-nvvm`)

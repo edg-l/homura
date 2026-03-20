@@ -66,3 +66,7 @@ Each KV buffer is laid out as `[1, num_kv_heads, max_seq_len, head_dim]` in row-
 For Qwen2.5-0.5B with 2 KV heads, head_dim=64, and max_seq_len=2048:
 - Per-layer KV memory: 2 * 2 * 2048 * 64 * 4 bytes = 2 MB
 - Total KV memory (24 layers): ~48 MB
+
+For Qwen3-0.6B with 4 KV heads, head_dim=64, and max_seq_len=2048:
+- Per-layer KV memory: 2 * 4 * 2048 * 64 * 4 bytes = 4 MB
+- Total KV memory (28 layers): ~112 MB

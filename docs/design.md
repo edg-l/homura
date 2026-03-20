@@ -1,6 +1,6 @@
 # Homura Design Document
 
-Homura is a Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation (IREE-style) with parallel codegen via rayon. Supports ONNX and HuggingFace safetensors models.
+Homura is a Rust ML inference framework that compiles models through MLIR/LLVM to native shared libraries. Per-kernel compilation (IREE-style) with parallel codegen via rayon. BF16 mixed-precision matmul on AVX-512. Supports ONNX and HuggingFace safetensors models.
 
 ## The Big Picture
 
@@ -38,14 +38,22 @@ Each kernel group gets its own MLIR context and module. `GraphBuilder` emits **l
 
 ### 3. Transform Schedule (tile + vectorize)
 
-`build_transform_schedule` in compiler.rs emits transform dialect sequences:
+Two transform schedule builders in compiler.rs:
+
+**`build_transform_schedule`** (full tile + outline + vectorize):
 - Match 3D contractions (matmul), 4D contractions (batched matmul), Conv2D NCHW
 - Tile with `tile_using_forall` (cache level) + `tile_using_for` (register level) + `pad`
 - Outline the forall loop into a temporary function via `transform.loop.outline`
 - Vectorize the outlined function with `vectorize_children_and_apply_patterns`
 - LLVM inlines the outlined function during O2 codegen
 
-Kernels without tileable ops (BatchNorm, Relu, elementwise) don't match the schedule -- the transform-interpreter is a no-op, they go straight to scalar lowering with compact LLVM IR.
+**`build_tile_parallel_schedule`** (tile for parallelism only):
+- Match 3D, 4D, and 5D contractions (including GQA attention with floordiv head mapping)
+- Tile with `tile_using_forall` for OpenMP parallelism + `tile_using_for` for register blocking
+- No outline/vectorize -- relies on LLVM auto-vectorization to AVX-512 FMA/BF16
+- Used for QKV projections and attention kernels where the full schedule is not needed
+
+Kernels without tileable ops (BatchNorm, Relu, elementwise) don't match either schedule -- the transform-interpreter is a no-op, they go straight to scalar lowering with compact LLVM IR.
 
 ### 4. Bufferize and Lower to LLVM
 
@@ -103,10 +111,11 @@ HfModel
 ```
 
 Supported features:
-- Grouped-query attention (GQA) via `num_key_value_heads`
+- Grouped-query attention (GQA) via `num_key_value_heads`, zero-copy floordiv head indexing
 - Explicit `head_dim` (Qwen3-style, where head_dim != hidden_size/num_heads)
 - QK-norm (per-head RMSNorm on Q/K after projection, auto-detected from weights)
 - RoPE with configurable theta
+- BF16 mixed-precision: bf16 weight storage with f32 accumulation (auto-detected from safetensors dtype)
 - Tied/untied word embeddings
 
 Architectures tested: Qwen2.5, Qwen3 (any decoder-only transformer with standard HF config fields should work).
@@ -184,6 +193,8 @@ The original design used MLIR's ExecutionEngine (JIT). This was replaced with ah
 
 The AOT path: MLIR -> `mlirTranslateModuleToLLVMIR` -> `LLVMRunPasses("default<O3>")` -> `LLVMTargetMachineEmitToFile` -> `cc -shared` -> dlopen. Uses `llvm-sys` for LLVM C API bindings.
 
+Requires a [patched LLVM 21](https://github.com/edg-l/llvm-project/tree/edgl/llvm-21.1.8-patched) with bug fixes and added C bindings (`LLVMSplitModule`, `tile_using_forall` crash fix, etc.).
+
 ### Linalg as the primary dialect
 
 All ops are emitted directly as `linalg` dialect operations (matmul, conv, generic). No TOSA. This gives full control over tiling, vectorization, and lowering without depending on TOSA's pass pipeline.
@@ -201,13 +212,16 @@ Operations record to a trace instead of executing immediately. This lets the com
 ```
 src/
 |-- lib.rs              Public API re-exports
-|-- dtype.rs            DType enum (F32, F64, I32, I64)
+|-- dtype.rs            DType enum (F32, F64, I32, I64, BF16)
 |-- shape.rs            Shape wrapper over Vec<u64> with broadcast
 |-- main.rs             CLI: homura run / chat / info / clean-cache
 |-- compiler.rs         Transform schedule, emit_object_files, link_shared_lib
 |-- runtime.rs          Buffer, CompiledGraph, ExecutionPlan, KvCache
 |-- cache.rs            Disk-based per-kernel compilation cache
+|-- cpu_affinity.rs     Auto-pin to single CCD on multi-chiplet AMD CPUs
+|-- cpu_caps.rs         CPU feature detection (AVX-512 BF16, etc.)
 |-- generate.rs         GenerativeModel trait, generate_streaming, sampling, ThinkConfig
+|-- progress.rs         CLI progress bars for compilation and generation
 |-- kv_generate.rs      UnifiedKvGenerator (ONNX KV-cached generation)
 |-- tokenizer.rs        Byte-level BPE tokenizer (GPT-2)
 |-- llvm_ffi.rs         LLVM C API FFI helpers
@@ -260,22 +274,50 @@ scripts/
 - **rayon** -- Parallel kernel compilation.
 - **memmap2** -- Memory-mapped file I/O for safetensors.
 - **atty** -- TTY detection for streaming output vs. piped mode.
-- Requires **LLVM 21** with `libMLIR-C.so` and `libmlir_c_runner_utils.so`.
+- Requires [**patched LLVM 21**](https://github.com/edg-l/llvm-project/tree/edgl/llvm-21.1.8-patched) with `libMLIR-C.so` and `libmlir_c_runner_utils.so`.
+
+## CPU Affinity (Multi-Chiplet AMD)
+
+`cpu_affinity.rs` auto-pins the process to a single CCD on AMD Zen 3D / Zen 4 chiplet CPUs. When OS threads migrate between CCDs, L3 contents are invalidated and bandwidth-bound inference slows down 2-3x. Pinning to one CCD eliminates this variance.
+
+Reads Linux sysfs topology to discover CCDs (L3 cache domains). No-op on single-CCD CPUs. Disable with `HOMURA_NO_PIN=1`.
+
+## BF16 Mixed Precision
+
+On CPUs with AVX-512 BF16 (detected via `cpu_caps.rs`), matmul kernels use bf16 weight inputs with f32 accumulation. Weights are stored as bf16 in safetensors and loaded directly -- no F32 upcast at load time. The MLIR emission path generates `linalg.generic` with bf16 inputs and f32 output, which LLVM lowers to `vdpbf16ps` (dot product of bf16 pairs with f32 accumulate).
+
+This halves memory bandwidth for weight-bound decode kernels, giving ~49% speedup on AVX-512 BF16 hardware.
 
 ## Current Limitations
 
 - **CPU only** -- no GPU backend
 - **No autograd** -- forward pass only
-- **F32 only for inference** -- no quantization (int8/int4)
+- **No quantization** -- bf16 and f32 only, no int8/int4
 
 ## Performance
 
+Benchmarked on AMD Ryzen 9 7900X3D (single CCD, auto-pinned).
+
 | Model | Params | Kernels | Compile time | Decode |
 |---|---|---|---|---|
-| MNIST | -- | 6 | 97ms | -- |
-| ResNet-18 | 11M | 41 | 467ms | -- |
+| MNIST | -- | 6 | 96ms | -- |
+| ResNet-18 | 11M | 41 | 422ms | -- |
 | GPT-2 | 124M | 158 compiled + 24 native | ~650ms | ~50 tok/s |
-| Qwen2.5-0.5B | 494M | 74 compiled + 48 native | ~950ms | ~10 tok/s |
+| Qwen2.5-0.5B | 494M | -- | -- | ~36 tok/s (bf16) |
+| Qwen3-0.6B | 600M | -- | -- | ~24 tok/s (bf16) |
+
+Qwen3-0.6B decode breakdown (42ms/tok, 1192 MB weights):
+
+| Kernel | Time | % | Per layer | BW | % peak |
+|---|---|---|---|---|---|
+| MLP (28L) | 16.7ms | 40% | 0.60ms | 32 GB/s | 41% |
+| QKV (28L) | 7.0ms | 17% | 0.25ms | 34 GB/s | 44% |
+| Attn (28L) | 7.6ms | 18% | 0.27ms | 16 GB/s | 20% |
+| LMHead | 7.9ms | 19% | -- | 40 GB/s | 51% |
+
+Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theory minimum: 15ms/tok at peak BW.
+
+Profile with: `make profile MODEL=Qwen/Qwen3-0.6B TOKENS=300`
 
 ## Roadmap
 
@@ -283,6 +325,7 @@ scripts/
 
 - Per-kernel MLIR compilation with parallel codegen via rayon
 - Transform dialect schedule (tile + vectorize) for matmul/conv
+- TileParallel schedule for QKV/attention with 5D GQA contraction tiling
 - Symbolic dimension tracking (compile once, resolve at runtime)
 - KV cache with persistent pre-allocated buffers
 - HuggingFace model support (safetensors, auto-download from Hub)
@@ -290,13 +333,15 @@ scripts/
 - Interactive multi-turn chat mode with incremental KV cache
 - Jinja2 chat template rendering (any HF model's format)
 - Think block support for reasoning models (Qwen3)
-- GPT-2 at ~50 tok/s, Qwen2.5-0.5B at ~10 tok/s on CPU
+- BF16 mixed-precision matmul (bf16 weights, f32 accumulation)
+- Zero-copy GQA via floordiv head indexing
+- Auto CCD pinning for multi-chiplet AMD CPUs
+- CLI progress bars and decode profiling (`scripts/profile.py`)
 
 ### Next
 
 - Packed GEMM layout for better cache utilization
-- AVX-512 micro-kernel tuning
 - Operator fusion (matmul + bias + relu as one kernel)
-- GPU backend (CUDA via `gpu-to-nvvm`)
-- More architectures (Llama, Mistral, Phi, Gemma)
 - Weight quantization (INT8/INT4)
+- More architectures (Llama, Mistral, Phi, Gemma)
+- GPU backend (CUDA via `gpu-to-nvvm`)
