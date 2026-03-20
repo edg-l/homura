@@ -206,11 +206,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             if let Some(prompt_text) = prompt {
                 let sampling = sampling.to_config();
-                let weight_dtype = resolve_weight_dtype(&dtype);
-                // Resolve model path: HF repo ID, local directory, or file.
-                let model_dir = resolve_model_path(&model)?;
-                // Check for GGUF file first
-                if let Some(gguf_path) = find_gguf_file(&model_dir) {
+                // Check for GGUF before resolve_model_path strips the filename
+                if let Some(gguf_path) = find_gguf_file(&model) {
+                    let model_dir = gguf_path.parent().unwrap_or(&model).to_path_buf();
                     cmd_generate_gguf(
                         &gguf_path,
                         &model_dir,
@@ -220,6 +218,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &sampling,
                     )
                 } else {
+                    let weight_dtype = resolve_weight_dtype(&dtype);
+                    let model_dir = resolve_model_path(&model)?;
                     let has_config = model_dir.join("config.json").exists();
                     let has_weights = model_dir.join("model.safetensors").exists()
                         || model_dir.join("model.safetensors.index.json").exists();
@@ -254,9 +254,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dtype,
             sampling,
         } => {
-            let model_dir = resolve_model_path(&model)?;
-            let model_name = model.to_string_lossy();
-            if let Some(gguf_path) = find_gguf_file(&model_dir) {
+            let model_name = model.to_string_lossy().to_string();
+            if let Some(gguf_path) = find_gguf_file(&model) {
+                let model_dir = gguf_path.parent().unwrap_or(&model).to_path_buf();
                 return cmd_chat_gguf(
                     &gguf_path,
                     &model_dir,
@@ -269,6 +269,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             let weight_dtype = resolve_weight_dtype(&dtype);
+            let model_dir = resolve_model_path(&model)?;
             cmd_chat(
                 &model_dir,
                 &model_name,
