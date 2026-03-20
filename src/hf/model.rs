@@ -38,6 +38,42 @@ impl HfModel {
         Self::load_with_dtype(model_dir, DType::F32)
     }
 
+    /// Load a model from a GGUF file.
+    ///
+    /// Extracts config from GGUF metadata, loads quantized weights directly.
+    /// A separate `tokenizer.json` must be provided (GGUF tokenizer extraction
+    /// is not yet implemented).
+    pub fn load_gguf(gguf_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let sp = crate::progress::spinner("Parsing GGUF...");
+        let gguf = crate::gguf::GgufFile::load(gguf_path)?;
+        crate::progress::finish_spinner(
+            &sp,
+            &format!(
+                "GGUF v{}: {} tensors, arch={}",
+                gguf.version,
+                gguf.tensors.len(),
+                gguf.architecture().unwrap_or("unknown")
+            ),
+        );
+
+        let config = gguf.transformer_config()?;
+        let weights = gguf.load_transformer_weights(&config)?;
+
+        let (rope_cos, rope_sin) = precompute_rope_cos_sin(
+            config.head_dim(),
+            config.max_position_embeddings,
+            config.rope_theta,
+        );
+
+        Ok(HfModel {
+            config,
+            weights,
+            rope_cos,
+            rope_sin,
+            state: Mutex::new(None),
+        })
+    }
+
     /// Load with explicit weight dtype. BF16 keeps projection weights in bf16
     /// for mixed-precision matmul (bf16 inputs, f32 accumulation).
     pub fn load_with_dtype(
