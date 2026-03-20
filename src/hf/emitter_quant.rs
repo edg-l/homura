@@ -107,16 +107,11 @@ struct QuantLayerSlots {
 }
 
 /// Compute total Q8_0 weight bytes for a matrix with `k` input features and `n` output features.
-fn q8_0_weight_bytes(k: u64, n: u64) -> u64 {
-    let num_blocks_per_row = k / 32;
-    let total_blocks = n * num_blocks_per_row;
-    total_blocks * 34
-}
-
 fn assign_transformer_slots_quant(
     config: &TransformerConfig,
     has_bias: bool,
     has_qk_norm: bool,
+    weights: &TransformerWeights,
 ) -> QuantSlotLayout {
     let mut next = 0usize;
     let mut alloc = |desc: SlotDesc| -> (usize, SlotDesc) {
@@ -208,7 +203,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // q_proj weight: flat I8 bytes [total_weight_bytes]
-        let q_bytes = q8_0_weight_bytes(hidden, q_dim);
+        let q_dtype = weights.layers[layer_i].q_proj_weight.dtype();
+        let q_bytes = crate::graph_builder::quant_weight_bytes(q_dtype, hidden, q_dim);
         let (q_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![q_bytes]),
             dtype: DType::I8,
@@ -231,7 +227,8 @@ fn assign_transformer_slots_quant(
         };
 
         // k_proj weight
-        let k_bytes = q8_0_weight_bytes(hidden, kv_dim);
+        let k_dtype = weights.layers[layer_i].k_proj_weight.dtype();
+        let k_bytes = crate::graph_builder::quant_weight_bytes(k_dtype, hidden, kv_dim);
         let (k_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![k_bytes]),
             dtype: DType::I8,
@@ -254,7 +251,8 @@ fn assign_transformer_slots_quant(
         };
 
         // v_proj weight
-        let v_bytes = q8_0_weight_bytes(hidden, kv_dim);
+        let v_dtype = weights.layers[layer_i].v_proj_weight.dtype();
+        let v_bytes = crate::graph_builder::quant_weight_bytes(v_dtype, hidden, kv_dim);
         let (v_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![v_bytes]),
             dtype: DType::I8,
@@ -303,7 +301,8 @@ fn assign_transformer_slots_quant(
         };
 
         // o_proj weight
-        let o_bytes = q8_0_weight_bytes(q_dim, hidden);
+        let o_dtype = weights.layers[layer_i].o_proj_weight.dtype();
+        let o_bytes = crate::graph_builder::quant_weight_bytes(o_dtype, q_dim, hidden);
         let (o_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![o_bytes]),
             dtype: DType::I8,
@@ -322,7 +321,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // gate_proj weight
-        let gate_bytes = q8_0_weight_bytes(hidden, intermediate);
+        let gate_dtype = weights.layers[layer_i].gate_proj_weight.dtype();
+        let gate_bytes = crate::graph_builder::quant_weight_bytes(gate_dtype, hidden, intermediate);
         let (gate_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![gate_bytes]),
             dtype: DType::I8,
@@ -332,7 +332,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // up_proj weight
-        let up_bytes = q8_0_weight_bytes(hidden, intermediate);
+        let up_dtype = weights.layers[layer_i].up_proj_weight.dtype();
+        let up_bytes = crate::graph_builder::quant_weight_bytes(up_dtype, hidden, intermediate);
         let (up_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![up_bytes]),
             dtype: DType::I8,
@@ -342,7 +343,8 @@ fn assign_transformer_slots_quant(
         slot_descs_vec.push(d);
 
         // down_proj weight
-        let down_bytes = q8_0_weight_bytes(intermediate, hidden);
+        let down_dtype = weights.layers[layer_i].down_proj_weight.dtype();
+        let down_bytes = crate::graph_builder::quant_weight_bytes(down_dtype, intermediate, hidden);
         let (down_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![down_bytes]),
             dtype: DType::I8,
@@ -1006,7 +1008,7 @@ pub(crate) fn emit_transformer_plan_quant(
         .unwrap_or(false);
     let has_qk_norm = weights.has_qk_norm();
 
-    let layout = assign_transformer_slots_quant(config, has_bias, has_qk_norm);
+    let layout = assign_transformer_slots_quant(config, has_bias, has_qk_norm, weights);
 
     log_compile!(
         "hf",
@@ -1294,6 +1296,34 @@ pub(crate) fn emit_transformer_plan_quant(
     // Compile all kernels in parallel and link
     let (kernels, lib) = crate::compiler::compile_and_link_kernels(&emit_results)?;
 
+    let weight_bufs = weights.to_slot_buffers_quant();
+
+    // Validate weight buffer sizes match slot descriptors.
+    assert_eq!(
+        weight_bufs.len(),
+        layout.weight_slots.len(),
+        "weight buffer count ({}) != weight slot count ({})",
+        weight_bufs.len(),
+        layout.weight_slots.len()
+    );
+    for (i, (&slot_idx, buf)) in layout.weight_slots.iter().zip(&weight_bufs).enumerate() {
+        let desc = &layout.slot_descs[slot_idx];
+        let desc_bytes = if desc.dtype == DType::I8 {
+            desc.shape.0.iter().product::<u64>() as usize
+        } else {
+            desc.shape.num_elements() as usize * desc.dtype.size_bytes()
+        };
+        if buf.byte_len() != desc_bytes {
+            panic!(
+                "weight buf[{i}] (slot {slot_idx}): byte_len={} but slot expects {} bytes (shape={:?} dtype={:?})",
+                buf.byte_len(),
+                desc_bytes,
+                desc.shape.0,
+                desc.dtype
+            );
+        }
+    }
+
     let mut plan = ExecutionPlan::new(
         kernels,
         steps,
@@ -1305,7 +1335,6 @@ pub(crate) fn emit_transformer_plan_quant(
     );
     plan.set_shared_lib(lib);
 
-    // Attach KV cache info
     let kv_info = KvPlanInfo {
         num_layers: config.num_hidden_layers,
         num_heads: config.kv_heads(),
@@ -1315,9 +1344,7 @@ pub(crate) fn emit_transformer_plan_quant(
     };
     plan.set_kv_info(kv_info);
 
-    let weight_bufs = weights.to_slot_buffers_quant();
-
-    let _ = kernel_idx; // suppress unused warning after last increment
+    let _ = kernel_idx;
 
     Ok((plan, weight_bufs))
 }

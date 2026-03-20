@@ -1000,6 +1000,156 @@ mod tests {
         }
     }
 
+    /// Correctness check for Q4_K with realistic random-ish data.
+    /// Compares kernel output against the Rust reference dequant from gguf.rs.
+    #[test]
+    fn emit_q4_k_correctness_realistic() {
+        const K: u64 = 256;
+        const N: u64 = 2;
+        const N_TILE: usize = 1;
+        const SEQ: u64 = 1;
+
+        let mlir = emit_dequant_matmul_q4_k(K, N, "kq4r", N_TILE);
+        let tmp = tempfile_dir().unwrap();
+        let obj_paths =
+            compile_to_objects(&mlir, "real_q4k", "kq4r", &tmp).expect("compile failed");
+        let so_path = tmp.join("homura_test_q4k_real.so");
+        link_shared_lib_pub(&obj_paths, &so_path).expect("link failed");
+
+        let out_desc = OutputDesc {
+            shape: crate::shape::Shape(vec![1, SEQ, N]),
+            dtype: DType::F32,
+        };
+        let graph =
+            CompiledGraph::load_named(&so_path, 2, vec![out_desc], "kq4r").expect("dlopen failed");
+
+        // Build realistic Q4_K weight data
+        let num_blocks = N as usize; // K/256=1 block per row, N rows
+        let total_bytes = num_blocks * 144;
+        let mut weight_bytes = vec![0u8; total_bytes];
+
+        for b in 0..num_blocks {
+            let off = b * 144;
+            // d = 0.5f16 = 0x3800
+            weight_bytes[off] = 0x00;
+            weight_bytes[off + 1] = 0x38;
+            // dmin = 0.25f16 = 0x3400
+            weight_bytes[off + 2] = 0x00;
+            weight_bytes[off + 3] = 0x34;
+
+            // Scale bytes: use various values
+            // scales_raw[0..3]: sc[0..3] = val & 0x3F
+            weight_bytes[off + 4] = 5; // sc[0]=5
+            weight_bytes[off + 5] = 10; // sc[1]=10
+            weight_bytes[off + 6] = 15; // sc[2]=15
+            weight_bytes[off + 7] = 20; // sc[3]=20
+            // scales_raw[4..7]: mn[0..3] = val & 0x3F
+            weight_bytes[off + 8] = 2; // mn[0]=2
+            weight_bytes[off + 9] = 4; // mn[1]=4
+            weight_bytes[off + 10] = 6; // mn[2]=6
+            weight_bytes[off + 11] = 8; // mn[3]=8
+            // scales_raw[8..11]: high bits for sc[4..7] and mn[4..7]
+            // Leave as 0 -> sc[4..7]=0, mn[4..7]=0 (simpler to verify)
+
+            // Quant bytes: use a pattern
+            for qi in 0..128usize {
+                let lo = ((qi * 3 + b * 7) % 16) as u8;
+                let hi = ((qi * 5 + b * 11) % 16) as u8;
+                weight_bytes[off + 16 + qi] = lo | (hi << 4);
+            }
+        }
+
+        // Rust reference dequant
+        let mut ref_matrix = vec![0.0f32; (N * K) as usize];
+        for b in 0..num_blocks {
+            let off = b * 144;
+            let block = &weight_bytes[off..off + 144];
+            let d = f16_to_f32_test(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32_test(u16::from_le_bytes([block[2], block[3]]));
+            let scales_raw = &block[4..16];
+            let qs = &block[16..144];
+
+            let mut sc = [0u8; 8];
+            let mut mn = [0u8; 8];
+            for i in 0..4 {
+                sc[i] = scales_raw[i] & 0x3F;
+                mn[i] = scales_raw[4 + i] & 0x3F;
+            }
+            for i in 0..4 {
+                let high_sc = (scales_raw[8 + i / 2] >> ((i % 2) * 4)) & 0x0F;
+                sc[4 + i] = (scales_raw[i] >> 6) | (high_sc << 2);
+                let high_mn = (scales_raw[10 + i / 2] >> ((i % 2) * 4)) & 0x0F;
+                mn[4 + i] = (scales_raw[4 + i] >> 6) | (high_mn << 2);
+            }
+
+            for sb in 0..8usize {
+                let scale = d * sc[sb] as f32;
+                let min = dmin * mn[sb] as f32;
+                for j in 0..32usize {
+                    let byte_idx = sb * 16 + j / 2;
+                    let nibble = if j % 2 == 0 {
+                        qs[byte_idx] & 0x0F
+                    } else {
+                        qs[byte_idx] >> 4
+                    };
+                    ref_matrix[b * 256 + sb * 32 + j] = nibble as f32 * scale - min;
+                }
+            }
+        }
+
+        // Activation: all 1.0 (so output = sum of dequantized weights per row)
+        let act_data = vec![1.0f32; K as usize];
+        let act_buf = Buffer::from_slice(&act_data, &[1, SEQ, K], DType::F32);
+        let weight_buf = Buffer::from_slice(&weight_bytes, &[total_bytes as u64], DType::I8);
+
+        let outputs = graph.run(&[&act_buf, &weight_buf]);
+        let out_slice = outputs[0].as_slice::<f32>();
+
+        for row in 0..N as usize {
+            let ref_sum: f32 = ref_matrix[row * 256..(row + 1) * 256].iter().sum();
+            let kernel_val = out_slice[row];
+            let diff = (kernel_val - ref_sum).abs();
+            let rel = if ref_sum.abs() > 1e-6 {
+                diff / ref_sum.abs()
+            } else {
+                diff
+            };
+            eprintln!(
+                "row {row}: kernel={kernel_val:.4} ref={ref_sum:.4} diff={diff:.6} rel={rel:.6}"
+            );
+            assert!(
+                rel < 0.01 || diff < 0.1,
+                "Q4_K mismatch at row {row}: kernel={kernel_val} ref={ref_sum} diff={diff}"
+            );
+        }
+    }
+
+    fn f16_to_f32_test(bits: u16) -> f32 {
+        let sign = ((bits >> 15) & 1) as u32;
+        let exp = ((bits >> 10) & 0x1F) as u32;
+        let frac = (bits & 0x3FF) as u32;
+        if exp == 0 {
+            if frac == 0 {
+                f32::from_bits(sign << 31)
+            } else {
+                let mut e = 0i32;
+                let mut f = frac;
+                while (f & 0x400) == 0 {
+                    f <<= 1;
+                    e -= 1;
+                }
+                f &= 0x3FF;
+                let exp32 = (127 - 15 + 1 + e) as u32;
+                f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13))
+            }
+        } else if exp == 31 {
+            f32::from_bits((sign << 31) | (0xFF << 23) | (frac << 13))
+        } else {
+            let exp32 = (exp as i32 - 15 + 127) as u32;
+            f32::from_bits((sign << 31) | (exp32 << 23) | (frac << 13))
+        }
+    }
+
     /// Parse the emitted Q6_K MLIR and verify it compiles through the quant pipeline.
     #[test]
     fn emit_q6_k_parse_and_compile() {
