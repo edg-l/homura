@@ -22,6 +22,8 @@ pub enum Level {
     Warn = 1,
     Info = 2,
     Debug = 3,
+    /// Trace: memref dumps, per-kernel shapes. Enabled with `-vv`.
+    Trace = 4,
 }
 
 /// Override the log level at runtime (e.g. from a `--verbose` CLI flag).
@@ -43,6 +45,7 @@ pub fn max_level() -> Level {
             "error" => Level::Error,
             "warn" => Level::Warn,
             "debug" => Level::Debug,
+            "trace" => Level::Trace,
             _ => Level::Info,
         }
     })
@@ -148,8 +151,25 @@ macro_rules! log_compile {
     };
 }
 
+/// Trace-level logging for memref dumps and per-kernel shapes.
+/// Only shown with `-vv` or `HOMURA_LOG=trace`.
+#[macro_export]
+macro_rules! log_trace {
+    ($($arg:tt)*) => {
+        if $crate::log::enabled($crate::log::Level::Trace) {
+            eprintln!(
+                "{}{}{}",
+                $crate::log::DIM,
+                format_args!($($arg)*),
+                $crate::log::RESET,
+            );
+        }
+    };
+}
+
 pub use crate::log_compile as compile;
 pub use crate::log_debug as debug;
 pub use crate::log_error as error;
 pub use crate::log_info as info;
+pub use crate::log_trace as trace;
 pub use crate::log_warn as warn;

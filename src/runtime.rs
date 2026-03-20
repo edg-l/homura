@@ -948,7 +948,7 @@ impl CompiledGraph {
         }
 
         {
-            log_debug!("memref inputs: count={}", inputs.len());
+            log_trace!("memref inputs: count={}", inputs.len());
             for (i, buf) in inputs.iter().enumerate() {
                 let data_ptr = buf.as_ptr();
                 match buf.dtype() {
@@ -996,7 +996,7 @@ impl CompiledGraph {
                     }
                 }
             }
-            log_debug!("memref outputs: count={}", output_bufs.len());
+            log_trace!("memref outputs: count={}", output_bufs.len());
             for (i, buf) in output_bufs.iter().enumerate() {
                 let data_ptr = buf.as_ptr();
                 log_debug!(

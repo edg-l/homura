@@ -34,9 +34,9 @@ const SUPPORTED_OPS: &[&str] = &[
 #[derive(Parser)]
 #[command(name = "homura", about = "Rust ML inference engine")]
 struct Cli {
-    /// Show compilation progress (MLIR passes, kernel timing)
-    #[arg(long, short, global = true)]
-    verbose: bool,
+    /// Show compilation progress (-v) or full memref dumps (-vv)
+    #[arg(long, short, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Commands,
@@ -165,8 +165,10 @@ fn main() {
     unsafe { libc::atexit(force_exit) };
 
     let cli = Cli::parse();
-    if cli.verbose {
-        log::set_level(log::Level::Debug);
+    match cli.verbose {
+        1 => log::set_level(log::Level::Debug),
+        2.. => log::set_level(log::Level::Trace),
+        _ => {}
     }
     let code = match run(cli) {
         Ok(()) => 0,
@@ -665,7 +667,25 @@ fn cmd_chat(
         // Encode only the new text (after the cursor) to get delta tokens.
         // The split always falls at a special token boundary (<|im_end|>, <|im_start|>)
         // so BPE merges cannot cross the split point.
-        let new_text = &full_text[text_cursor..];
+        let new_text = if text_cursor <= full_text.len() {
+            &full_text[text_cursor..]
+        } else {
+            log::info!(
+                "text cursor past rendered text ({} > {}), re-prefilling",
+                text_cursor,
+                full_text.len()
+            );
+            model.reset_kv_cache();
+            all_token_ids.clear();
+            text_cursor = 0;
+            &full_text[..]
+        };
+        eprintln!(
+            "\x1b[2mdelta: cursor={}, new_text={} chars, cached={} ids\x1b[0m",
+            text_cursor,
+            new_text.len(),
+            all_token_ids.len()
+        );
         let new_tokens = tokenizer.encode_with_special(new_text);
 
         // Check context window -- if nearly full, reset and re-prefill from scratch.
