@@ -1194,4 +1194,109 @@ mod tests {
             );
         }
     }
+
+    /// Test Q6_K kernel against Rust reference dequant using real GGUF weight data.
+    #[test]
+    fn emit_q6_k_real_weight() {
+        let path =
+            std::path::Path::new("models/Qwen2.5-3B-Instruct-GGUF/Qwen2.5-3B-Instruct-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: Q4_K_M GGUF not found");
+            return;
+        }
+        let gguf = crate::gguf::GgufFile::load(path).unwrap();
+        // blk.0.attn_v.weight is Q6_K in Q4_K_M models
+        let info = gguf.tensor_info("blk.0.attn_v.weight").unwrap();
+        eprintln!("tensor: {:?} shape={:?}", info.ggml_type, info.shape);
+        let raw = gguf.tensor_data(info);
+        // shape [N=256, K=2048], first row: 2048/256 = 8 blocks * 210 = 1680 bytes
+        let row_bytes = (2048 / 256) * 210;
+        let first_row = &raw[0..row_bytes];
+
+        let mut ref_vals = vec![0.0f32; 2048];
+        crate::gguf::dequant_q6_k(first_row, &mut ref_vals);
+        eprintln!("ref first 8: {:?}", &ref_vals[..8]);
+
+        let mlir = emit_dequant_matmul_q6_k(2048, 1, "kq6r", 1);
+        let tmp = tempfile_dir().unwrap();
+        let obj_paths = compile_to_objects(&mlir, "real_q6k", "kq6r", &tmp).unwrap();
+        let so_path = tmp.join("test_real_q6k.so");
+        link_shared_lib_pub(&obj_paths, &so_path).unwrap();
+
+        let out_desc = OutputDesc {
+            shape: crate::shape::Shape(vec![1, 1, 1]),
+            dtype: DType::F32,
+        };
+        let graph = CompiledGraph::load_named(&so_path, 2, vec![out_desc], "kq6r").unwrap();
+
+        let act_data = vec![1.0f32; 2048];
+        let act_buf = Buffer::from_slice(&act_data, &[1, 1, 2048u64], DType::F32);
+        let weight_buf = Buffer::from_slice::<u8>(first_row, &[row_bytes as u64], DType::I8);
+
+        let outputs = graph.run(&[&act_buf, &weight_buf]);
+        let kernel_val = outputs[0].as_slice::<f32>()[0];
+        let ref_sum: f32 = ref_vals.iter().sum();
+
+        eprintln!(
+            "Q6_K: kernel={kernel_val:.4} ref={ref_sum:.4} diff={:.6}",
+            (kernel_val - ref_sum).abs()
+        );
+        assert!(
+            (kernel_val - ref_sum).abs() < 1.0,
+            "Q6_K real weight mismatch: kernel={kernel_val} ref={ref_sum}"
+        );
+    }
+
+    /// Test Q4_K kernel against Rust reference dequant using real GGUF weight data.
+    #[test]
+    fn emit_q4_k_real_weight() {
+        let path =
+            std::path::Path::new("models/Qwen2.5-3B-Instruct-GGUF/Qwen2.5-3B-Instruct-Q4_K_M.gguf");
+        if !path.exists() {
+            eprintln!("skipping: Q4_K_M GGUF not found");
+            return;
+        }
+        let gguf = crate::gguf::GgufFile::load(path).unwrap();
+        let info = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
+        let raw = gguf.tensor_data(info);
+        // First row: N=1, K=2048, 8 super-blocks = 1152 bytes
+        let row_bytes = (2048 / 256) * 144;
+        let first_row = &raw[0..row_bytes];
+
+        // Rust reference dequant
+        let mut ref_vals = vec![0.0f32; 2048];
+        crate::gguf::dequant_q4_k(first_row, &mut ref_vals);
+        eprintln!("ref first 8: {:?}", &ref_vals[..8]);
+
+        // MLIR kernel: K=2048, N=1
+        let mlir = emit_dequant_matmul_q4_k(2048, 1, "kreal", 1);
+        let tmp = tempfile_dir().unwrap();
+        let obj_paths = compile_to_objects(&mlir, "real_q4k", "kreal", &tmp).unwrap();
+        let so_path = tmp.join("test_real_q4k.so");
+        link_shared_lib_pub(&obj_paths, &so_path).unwrap();
+
+        let out_desc = OutputDesc {
+            shape: crate::shape::Shape(vec![1, 1, 1]),
+            dtype: DType::F32,
+        };
+        let graph = CompiledGraph::load_named(&so_path, 2, vec![out_desc], "kreal").unwrap();
+
+        // All-ones activation: output = sum of dequantized weights
+        let act_data = vec![1.0f32; 2048];
+        let act_buf = Buffer::from_slice(&act_data, &[1, 1, 2048u64], DType::F32);
+        let weight_buf = Buffer::from_slice::<u8>(first_row, &[row_bytes as u64], DType::I8);
+
+        let outputs = graph.run(&[&act_buf, &weight_buf]);
+        let kernel_val = outputs[0].as_slice::<f32>()[0];
+        let ref_sum: f32 = ref_vals.iter().sum();
+
+        eprintln!(
+            "kernel={kernel_val:.4} ref={ref_sum:.4} diff={:.6}",
+            (kernel_val - ref_sum).abs()
+        );
+        assert!(
+            (kernel_val - ref_sum).abs() < 1.0,
+            "Q4_K real weight mismatch: kernel={kernel_val} ref={ref_sum}"
+        );
+    }
 }

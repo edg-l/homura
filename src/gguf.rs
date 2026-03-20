@@ -820,7 +820,7 @@ fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
 
 /// Dequantize Q4_K blocks to f32.
 /// Q4_K: 256-element super-blocks (144 bytes). 8 sub-blocks of 32 elements.
-fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
+pub(crate) fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 144;
     let num_blocks = src.len() / BLOCK_BYTES;
@@ -866,7 +866,7 @@ fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
 
 /// Dequantize Q6_K blocks to f32.
 /// Q6_K: 256-element super-blocks (210 bytes). 16 sub-blocks of 16 elements.
-fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
+pub(crate) fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 210;
     let num_blocks = src.len() / BLOCK_BYTES;
