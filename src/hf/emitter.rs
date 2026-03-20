@@ -874,6 +874,12 @@ pub fn emit_transformer_plan(
         .first()
         .map(|l| l.q_proj_weight.dtype())
         .unwrap_or(DType::F32);
+
+    // Dispatch to the quantized emitter when weights are block-quantized.
+    if weight_dtype.is_quantized() {
+        return crate::hf::emitter_quant::emit_transformer_plan_quant(config, weights);
+    }
+
     let has_bias = weights
         .layers
         .first()

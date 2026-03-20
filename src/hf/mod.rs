@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod config;
 pub mod emitter;
+pub(crate) mod emitter_quant;
 pub mod model;
 pub mod precompute;
 pub mod safetensors;

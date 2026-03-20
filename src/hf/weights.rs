@@ -114,6 +114,84 @@ impl TransformerWeights {
 
         bufs
     }
+
+    /// Returns all weight buffers for the quantized execution plan.
+    ///
+    /// Quantized projection weights are passed as flat 1D I8 byte buffers (no transpose).
+    /// Norms and biases remain f32. Embedding is f32. Tied lm_head is transposed f32.
+    ///
+    /// Order matches `assign_transformer_slots_quant()` exactly:
+    ///   - embed_tokens_weight (f32, as-is)
+    ///   - For each layer i (0..num_layers):
+    ///     - input_layernorm_weight (f32)
+    ///     - q_proj_weight (I8 flat), [q_proj_bias (f32)]
+    ///     - k_proj_weight (I8 flat), [k_proj_bias (f32)]
+    ///     - v_proj_weight (I8 flat), [v_proj_bias (f32)]
+    ///     - [q_norm_weight (f32), k_norm_weight (f32)] (only if has_qk_norm)
+    ///     - o_proj_weight (I8 flat)
+    ///     - post_attention_layernorm_weight (f32)
+    ///     - gate_proj_weight (I8 flat), up_proj_weight (I8 flat), down_proj_weight (I8 flat)
+    ///   - final_norm_weight (f32)
+    ///   - lm_head_weight: transposed f32 (from embed_tokens if tied, else f32 copy of lm_head)
+    pub fn to_slot_buffers_quant(&self) -> Vec<Buffer> {
+        let has_bias = self
+            .layers
+            .first()
+            .map(|l| l.q_proj_bias.is_some())
+            .unwrap_or(false);
+        let has_qk_norm = self.has_qk_norm();
+
+        let mut bufs = Vec::new();
+        bufs.push(self.embed_tokens_weight.clone());
+
+        for layer in &self.layers {
+            bufs.push(layer.input_layernorm_weight.clone());
+            bufs.push(reinterpret_as_flat_i8(&layer.q_proj_weight));
+            if has_bias {
+                bufs.push(layer.q_proj_bias.as_ref().unwrap().clone());
+            }
+            bufs.push(reinterpret_as_flat_i8(&layer.k_proj_weight));
+            if has_bias {
+                bufs.push(layer.k_proj_bias.as_ref().unwrap().clone());
+            }
+            bufs.push(reinterpret_as_flat_i8(&layer.v_proj_weight));
+            if has_bias {
+                bufs.push(layer.v_proj_bias.as_ref().unwrap().clone());
+            }
+            if has_qk_norm {
+                bufs.push(layer.q_norm_weight.as_ref().unwrap().clone());
+                bufs.push(layer.k_norm_weight.as_ref().unwrap().clone());
+            }
+            bufs.push(reinterpret_as_flat_i8(&layer.o_proj_weight));
+            bufs.push(layer.post_attention_layernorm_weight.clone());
+            bufs.push(reinterpret_as_flat_i8(&layer.gate_proj_weight));
+            bufs.push(reinterpret_as_flat_i8(&layer.up_proj_weight));
+            bufs.push(reinterpret_as_flat_i8(&layer.down_proj_weight));
+        }
+
+        bufs.push(self.final_norm_weight.clone());
+
+        // lm_head: always f32 [hidden, vocab] for the quant path.
+        // If tied, transpose embed_tokens (already f32) to [hidden, vocab].
+        // If untied, ensure f32 (dequant for simplicity in this first pass).
+        if let Some(lm_head) = &self.lm_head_weight {
+            bufs.push(ensure_f32(lm_head.clone()));
+        } else {
+            bufs.push(transpose_2d(&self.embed_tokens_weight));
+        }
+
+        bufs
+    }
+}
+
+/// Reinterpret a weight buffer's raw bytes as a flat 1D I8 buffer.
+///
+/// Used for quantized projection weights: the raw quantized bytes are kept
+/// as-is and presented to the dequant-matmul kernel as a flat byte array.
+fn reinterpret_as_flat_i8(buf: &Buffer) -> Buffer {
+    let bytes = buf.as_bytes().to_vec();
+    let len = bytes.len() as u64;
+    Buffer::from_raw_bytes(bytes, &[len], DType::I8)
 }
 
 /// Convert a bf16 buffer to f32.
