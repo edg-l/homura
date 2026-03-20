@@ -265,11 +265,7 @@ impl Buffer {
         let s = Shape(shape.to_vec());
         let num_bytes = s.num_elements() as usize * dtype.size_bytes();
         v.clear();
-        v.reserve(num_bytes);
-        // SAFETY: the compiled kernel writes every output byte before any read.
-        unsafe {
-            v.set_len(num_bytes);
-        }
+        v.resize(num_bytes, 0);
         self.shape = s;
         self.strides = row_major_strides(shape);
         self.dtype = dtype;

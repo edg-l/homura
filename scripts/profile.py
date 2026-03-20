@@ -196,9 +196,32 @@ def get_model_config(model: str) -> dict | None:
     return None
 
 
-def compute_bandwidth(config: dict, kernel_type: str, ms: float) -> tuple[float, float]:
+def get_weight_dtype(model: str) -> str:
+    """Detect weight dtype from safetensors header. Returns 'BF16' or 'F32'."""
+    import struct
+
+    cache = Path.home() / ".cache/huggingface/hub"
+    model_dir = cache / f"models--{model.replace('/', '--')}"
+    if not model_dir.exists():
+        return "F32"
+    for st_path in model_dir.rglob("model.safetensors"):
+        try:
+            with open(st_path, "rb") as f:
+                hdr_len = struct.unpack("<Q", f.read(8))[0]
+                hdr = json.loads(f.read(hdr_len))
+            for k, v in hdr.items():
+                if k == "__metadata__":
+                    continue
+                if "proj" in k or "lm_head" in k:
+                    return v.get("dtype", "F32")
+        except (OSError, json.JSONDecodeError, struct.error):
+            continue
+    return "F32"
+
+
+def compute_bandwidth(config: dict, kernel_type: str, ms: float, bytes_per_weight: int = 4) -> tuple[float, float]:
     """Return (weight_mb, effective_gb_s) for a kernel type per layer."""
-    B = 4  # f32
+    B = bytes_per_weight
     h = config.get("hidden_size", 0)
     heads = config.get("num_attention_heads", 0)
     kv_heads = config.get("num_key_value_heads", heads)
@@ -231,6 +254,8 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
     profiles = data["profiles"]
     summary = data["summary"]
     config = get_model_config(model)
+    weight_dtype = get_weight_dtype(model)
+    bpw = 2 if weight_dtype == "BF16" else 4
 
     if not profiles:
         print("No decode profiles found in output.")
@@ -278,8 +303,9 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
 
         # Header
         console.print()
+        dtype_tag = f" [dim]({weight_dtype.lower()})[/dim]" if weight_dtype != "F32" else ""
         console.print(
-            f"  [bold]{model}[/bold] decode profile "
+            f"  [bold]{model}[/bold]{dtype_tag} decode profile "
             f"([cyan]{summary.get('avg_tok_s', 0):.1f} tok/s[/cyan], "
             f"[cyan]{wall:.0f}ms/tok[/cyan])"
         )
@@ -304,7 +330,7 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
 
             if config and ktype in ("QKV", "Attn", "MLP", "LMHead"):
                 per_layer = ms / layers if ktype != "LMHead" else ms
-                weight_mb, eff_bw = compute_bandwidth(config, ktype, per_layer)
+                weight_mb, eff_bw = compute_bandwidth(config, ktype, per_layer, bpw)
                 bw_pct = eff_bw / peak_bw * 100
                 bw_color = "green" if bw_pct > 50 else "yellow" if bw_pct > 25 else "red"
                 per_l_str = f"{per_layer:.2f}ms" if ktype != "LMHead" else ""
@@ -346,10 +372,10 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
         # Summary bar
         if config:
             total_weight = sum(
-                compute_bandwidth(config, kt, type_median.get(kt, 1))[0]
+                compute_bandwidth(config, kt, type_median.get(kt, 1), bpw)[0]
                 for kt in ("QKV", "Attn", "MLP")
             ) * layers
-            lm_weight = compute_bandwidth(config, "LMHead", 1)[0]
+            lm_weight = compute_bandwidth(config, "LMHead", 1, bpw)[0]
             total_weight += lm_weight
             theory_ms = total_weight * 1e6 / peak_bw / 1e9 * 1000
             eff_bw = total_weight * 1e6 / (wall / 1000) / 1e9

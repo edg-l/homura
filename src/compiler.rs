@@ -1476,7 +1476,7 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
             .expect("build transform.named_sequence @tile_parallel_contraction_Nd")
     };
 
-    // ── @match_contraction_3d / @match_contraction_4d ─────────────────────────
+    // ── @match_contraction_3d / 4d / 5d ────────────────────────────────────────
     module.body().append_operation(build_match_contraction_seq(
         context,
         location,
@@ -1492,6 +1492,14 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         param_i64_type,
         "match_contraction_4d",
         4,
+    ));
+    module.body().append_operation(build_match_contraction_seq(
+        context,
+        location,
+        any_op_type,
+        param_i64_type,
+        "match_contraction_5d",
+        5,
     ));
 
     // ── @tile_parallel_contraction_3d ─────────────────────────────────────────
@@ -1517,16 +1525,31 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         "array<i1: false, false, false, false>",
         1, // 1 non-zero for-tile dim (K)
     ));
+    // ── @tile_parallel_contraction_5d ─────────────────────────────────────────
+    // 5D GQA attention (B, H, M, N, K): forall N=n_tile (parallel), for K=16.
+    // Matches GQA QK^T and AV contractions that use floordiv head mapping.
+    let forall_5d = format!("array<i64: 0, 0, 0, {n_tile}, 0>");
+    module.body().append_operation(build_tile_parallel_seq(
+        "tile_parallel_contraction_5d",
+        &forall_5d, // forall: tile N=n_tile, skip B, H, M, K
+        "array<i1: false, false, false, false, false>",
+        "array<i64: 0, 0, 0, 0, 16>", // for: tile K=16 only
+        "array<i1: false, false, false, false, false>",
+        1, // 1 non-zero for-tile dim (K)
+    ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
     let main_block = Block::new(&[(any_op_type, location)]);
     let module_handle: melior::ir::Value = main_block.argument(0).unwrap().into();
 
-    let matchers_attr = Attribute::parse(context, "[@match_contraction_3d, @match_contraction_4d]")
-        .expect("parse matchers attr");
+    let matchers_attr = Attribute::parse(
+        context,
+        "[@match_contraction_3d, @match_contraction_4d, @match_contraction_5d]",
+    )
+    .expect("parse matchers attr");
     let actions_attr = Attribute::parse(
         context,
-        "[@tile_parallel_contraction_3d, @tile_parallel_contraction_4d]",
+        "[@tile_parallel_contraction_3d, @tile_parallel_contraction_4d, @tile_parallel_contraction_5d]",
     )
     .expect("parse actions attr");
 
