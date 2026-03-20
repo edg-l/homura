@@ -1378,7 +1378,8 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
                                    scalable_forall: &str,
                                    for_sizes: &str,
                                    scalable_for: &str,
-                                   n_for_loops: usize| {
+                                   n_for_loops: usize,
+                                   interchange: &str| {
         let action_block = Block::new(&[(any_op_type, location)]);
         let op_handle: melior::ir::Value = action_block.argument(0).unwrap().into();
 
@@ -1441,7 +1442,23 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
             .add_results(&for_results)
             .build()
             .expect("build structured.tile_using_for (tile-parallel register)");
-        action_block.append_operation(for_tile_op);
+        let for_tile_ref = action_block.append_operation(for_tile_op);
+        let for_tiled_op: melior::ir::Value = for_tile_ref.result(0).unwrap().into();
+
+        // Interchange N and K dims so N is the innermost loop.
+        // This gives contiguous bf16 weight access along N, enabling LLVM
+        // to vectorize the fpext+fma pattern (strided K access prevented it).
+        let interchange_attr = Attribute::parse(context, interchange).expect("parse interchange");
+        let interchange_op = OperationBuilder::new("transform.structured.interchange", location)
+            .add_operands(&[for_tiled_op])
+            .add_attributes(&[(
+                Identifier::new(context, "iterator_interchange"),
+                interchange_attr,
+            )])
+            .add_results(&[any_op_type])
+            .build()
+            .expect("build transform.structured.interchange (tile-parallel)");
+        action_block.append_operation(interchange_op);
 
         let action_yield_op = OperationBuilder::new("transform.yield", location)
             .build()
@@ -1512,7 +1529,8 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         "array<i1: false, false, false>",
         "array<i64: 0, 0, 16>", // for: tile K=16 only, N streams freely
         "array<i1: false, false, false>",
-        1, // 1 non-zero for-tile dim (K)
+        1,                     // 1 non-zero for-tile dim (K)
+        "array<i64: 0, 2, 1>", // interchange: M, K, N → N innermost
     ));
     // ── @tile_parallel_contraction_4d ─────────────────────────────────────────
     // 4D batched matmul (B, M, N, K): forall N=n_tile (parallel), for K=16.
@@ -1523,7 +1541,8 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         "array<i1: false, false, false, false>",
         "array<i64: 0, 0, 0, 16>", // for: tile K=16 only
         "array<i1: false, false, false, false>",
-        1, // 1 non-zero for-tile dim (K)
+        1,                        // 1 non-zero for-tile dim (K)
+        "array<i64: 0, 1, 3, 2>", // interchange: B, M, K, N → N innermost
     ));
     // ── @tile_parallel_contraction_5d ─────────────────────────────────────────
     // 5D GQA attention (B, H, M, N, K): forall N=n_tile (parallel), for K=16.
@@ -1535,7 +1554,8 @@ pub(crate) fn build_tile_parallel_schedule<'c>(
         "array<i1: false, false, false, false, false>",
         "array<i64: 0, 0, 0, 0, 16>", // for: tile K=16 only
         "array<i1: false, false, false, false, false>",
-        1, // 1 non-zero for-tile dim (K)
+        1,                           // 1 non-zero for-tile dim (K)
+        "array<i64: 0, 1, 2, 4, 3>", // interchange: B, H, M, K, N → N innermost
     ));
 
     // ── @__transform_main ─────────────────────────────────────────────────────
@@ -1718,8 +1738,11 @@ pub(crate) fn compile_and_link_kernels(
         link_start.elapsed().as_millis()
     );
 
-    for p in &all_objs {
-        std::fs::remove_file(p).ok();
+    let keep_artifacts = std::env::var("HOMURA_DUMP_KERNEL").is_ok();
+    if !keep_artifacts {
+        for p in &all_objs {
+            std::fs::remove_file(p).ok();
+        }
     }
 
     // dlopen once, dlsym each kernel.
@@ -1757,7 +1780,11 @@ pub(crate) fn compile_and_link_kernels(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    std::fs::remove_file(&unified_so).ok();
+    if !keep_artifacts {
+        std::fs::remove_file(&unified_so).ok();
+    } else {
+        eprintln!("[dump] unified .so → {}", unified_so.display());
+    }
 
     log_compile!(
         "plan",
