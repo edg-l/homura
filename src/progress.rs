@@ -167,21 +167,29 @@ fn build_stats_lines(stats: &GenerationStats) -> Vec<(String, String)> {
     lines
 }
 
-/// Count how many terminal lines a string occupies, accounting for line wrapping.
-fn count_display_lines(text: &str, term_width: usize) -> usize {
-    if term_width == 0 {
-        return text.lines().count().max(1);
+/// Compute the display width of each terminal line, accounting for wrapping.
+///
+/// Returns a Vec where each entry is the width of one terminal row. A logical
+/// line that wraps produces multiple entries (all `term_width` except the last).
+fn line_widths(text: &str, term_width: usize) -> Vec<usize> {
+    let mut widths = Vec::new();
+    if text.is_empty() {
+        widths.push(0);
+        return widths;
     }
-    let mut total = 0;
     for line in text.split('\n') {
         let len = console::measure_text_width(line);
-        if len == 0 {
-            total += 1;
+        if len == 0 || term_width == 0 {
+            widths.push(len);
         } else {
-            total += (len + term_width - 1) / term_width;
+            let rows = (len + term_width - 1) / term_width;
+            for r in 0..rows {
+                let row_width = if r < rows - 1 { term_width } else { len % term_width };
+                widths.push(if row_width == 0 { term_width } else { row_width });
+            }
         }
     }
-    total.max(1)
+    widths
 }
 
 /// Print stats as a right-aligned overlay on the generated text.
@@ -204,21 +212,31 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str, overhead_lines
 
     let term_width = if is_tty { term.size().1 as usize } else { 0 };
 
-    // Need: terminal wide enough for text + box, and enough output lines to overlay on.
-    // overhead_lines accounts for log/info lines on stderr above the generated text.
+    // Need: terminal wide enough, enough output lines, and text must not extend
+    // into the box area on the lines the box would overlay.
     let min_width = box_outer + 20; // at least 20 chars for text on the left
-    let output_lines = if is_tty && !generated_text.is_empty() {
-        count_display_lines(generated_text, term_width) + overhead_lines
-    } else {
-        overhead_lines
-    };
     let box_height = stats_lines.len() + 2; // top border + content + bottom border
+    let col = term_width.saturating_sub(box_outer); // column where box starts
 
-    let use_side = is_tty && term_width >= min_width && output_lines >= box_height;
+    let (output_lines, text_fits) = if is_tty && term_width >= min_width {
+        // Compute display lines and check that the last box_height lines
+        // (the ones the box would overlay) don't extend into the box column.
+        let lines = line_widths(generated_text, term_width);
+        let total = lines.len() + overhead_lines;
+        // The box overlays the last box_height lines. The first overhead_lines
+        // are log lines (short), so only check generated text lines that fall
+        // in the overlay region.
+        let text_lines_in_box = box_height.saturating_sub(overhead_lines);
+        let start = lines.len().saturating_sub(text_lines_in_box);
+        let fits = lines[start..].iter().all(|&w| w < col.saturating_sub(1));
+        (total, fits)
+    } else {
+        (overhead_lines, false)
+    };
+
+    let use_side = is_tty && term_width >= min_width && output_lines >= box_height && text_fits;
 
     if use_side {
-        let col = term_width - box_outer; // 0-indexed column where box starts
-
         // Position box at the bottom of the output.
         // Cursor is on the line after the trailing println!(), so move up
         // by box_height to align the box with the last few lines of output.

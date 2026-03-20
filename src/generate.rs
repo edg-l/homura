@@ -145,6 +145,9 @@ fn generate_streaming_core(
     let mut in_think_block = false;
     let mut skip_ws_after_think = false;
     let think_tokens = think.token_ids;
+    // Buffer for byte-level BPE tokens (e.g. emoji bytes). Single-byte tokens
+    // decode to U+FFFD; we accumulate them until the decode is clean.
+    let mut byte_buf: Vec<u32> = Vec::new();
 
     // Print prompt to stdout after all log lines, before tokens stream.
     if use_stdout && show_prompt {
@@ -159,8 +162,8 @@ fn generate_streaming_core(
         return Ok((String::new(), Vec::new()));
     }
     generated_ids.push(first_token);
-    let token_text = model.decode_tokens(&[first_token]);
-    if use_stdout {
+    let token_text = decode_streaming_token(model, first_token, &mut byte_buf);
+    if use_stdout && !token_text.is_empty() {
         print_token_styled(
             first_token,
             &token_text,
@@ -199,8 +202,8 @@ fn generate_streaming_core(
         let step_elapsed = step_start.elapsed();
         decode_times.push(step_elapsed);
 
-        let token_text = model.decode_tokens(&[current_token]);
-        if use_stdout {
+        let token_text = decode_streaming_token(model, current_token, &mut byte_buf);
+        if use_stdout && !token_text.is_empty() {
             print_token_styled(
                 current_token,
                 &token_text,
@@ -226,6 +229,19 @@ fn generate_streaming_core(
         }
 
         if current_token == model.eos_token_id() {
+            // Flush any remaining buffered bytes.
+            if !byte_buf.is_empty() && use_stdout {
+                let flush = model.decode_tokens(&byte_buf);
+                print_token_styled(
+                    0,
+                    &flush,
+                    think_tokens,
+                    think.style_content,
+                    &mut in_think_block,
+                    &mut skip_ws_after_think,
+                );
+                byte_buf.clear();
+            }
             break;
         }
         generated_ids.push(current_token);
@@ -254,6 +270,18 @@ fn generate_streaming_core(
     }
 
     if use_stdout {
+        // Flush any remaining buffered byte tokens (e.g. incomplete emoji at end).
+        if !byte_buf.is_empty() {
+            let flush = model.decode_tokens(&byte_buf);
+            print_token_styled(
+                0,
+                &flush,
+                think_tokens,
+                think.style_content,
+                &mut in_think_block,
+                &mut skip_ws_after_think,
+            );
+        }
         // Reset style if we ended mid-think-block.
         if in_think_block {
             print!("\x1b[0m");
@@ -433,6 +461,38 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
+}
+
+/// Decode a single token for streaming display, buffering byte-level BPE tokens.
+///
+/// Byte-level fallback tokens (used for emoji, rare Unicode) decode individually
+/// to U+FFFD because a single byte isn't valid UTF-8. This function accumulates
+/// such tokens in `byte_buf` and returns the decoded text only when the buffer
+/// forms a complete character. Returns an empty string while buffering.
+fn decode_streaming_token(
+    model: &impl GenerativeModel,
+    token: u32,
+    byte_buf: &mut Vec<u32>,
+) -> String {
+    if byte_buf.is_empty() {
+        let text = model.decode_tokens(&[token]);
+        if text.contains('\u{FFFD}') {
+            byte_buf.push(token);
+            String::new()
+        } else {
+            text
+        }
+    } else {
+        byte_buf.push(token);
+        let text = model.decode_tokens(byte_buf);
+        if text.contains('\u{FFFD}') {
+            // Still incomplete — keep buffering.
+            String::new()
+        } else {
+            byte_buf.clear();
+            text
+        }
+    }
 }
 
 // ── Think token styling ──────────────────────────────────────────────────────
