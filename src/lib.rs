@@ -3,6 +3,7 @@ pub mod log;
 
 pub mod cache;
 pub(crate) mod compiler;
+pub mod cpu_caps;
 pub mod dtype;
 pub mod generate;
 pub mod graph_builder;

@@ -9,8 +9,8 @@ pub enum DType {
     F64,
     I32,
     I64,
-    /// BFloat16 — used for loading weights from safetensors.
-    /// Compute stays in f32; bf16 buffers are converted on load.
+    /// BFloat16 — used for mixed-precision matmul: bf16 weight inputs with
+    /// f32 accumulation. Also used for native bf16 weight storage.
     BF16,
 }
 

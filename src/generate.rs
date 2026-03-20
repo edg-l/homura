@@ -304,7 +304,11 @@ fn generate_streaming_core(
     };
     let output_text = model.decode_tokens(&generated_ids);
     // Overhead: log lines ("starting generation", "prefill complete") + trailing newline.
-    let overhead = if crate::log::enabled(crate::log::Level::Info) { 3 } else { 1 };
+    let overhead = if crate::log::enabled(crate::log::Level::Info) {
+        3
+    } else {
+        1
+    };
     crate::progress::print_stats(&stats, &output_text, overhead);
 
     Ok((output_text, generated_ids))

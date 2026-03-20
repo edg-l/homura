@@ -1394,7 +1394,13 @@ impl<'c> GraphBuilder<'c> {
         let m = lhs_shape[0];
         let n = rhs_shape[1];
         let out_shape = vec![m, n];
-        let dtype = self.value_dtype(lhs_val);
+        let lhs_dtype = self.value_dtype(lhs_val);
+        let rhs_dtype = self.value_dtype(rhs_val);
+
+        // Mixed-precision: if either input is bf16, accumulate in f32.
+        let mixed =
+            lhs_dtype != rhs_dtype && (lhs_dtype == DType::BF16 || rhs_dtype == DType::BF16);
+        let out_dtype = if mixed { DType::F32 } else { lhs_dtype };
 
         let mut dyn_sources = Vec::new();
         if m.is_none() {
@@ -1403,12 +1409,16 @@ impl<'c> GraphBuilder<'c> {
         if n.is_none() {
             dyn_sources.push((rhs_val, 1)); // N from rhs dim 1
         }
-        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+        let filled = self.emit_zero_filled_tensor(&out_shape, out_dtype, &dyn_sources);
 
-        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let out_type = self.make_tensor_type(&out_shape, out_dtype);
         let segment =
             Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
-        let matmul_region = self.make_matmul_region(dtype);
+        let matmul_region = if mixed {
+            self.make_mixed_matmul_region(lhs_dtype, rhs_dtype)
+        } else {
+            self.make_matmul_region(lhs_dtype)
+        };
 
         // 3 iteration dims: d0=M, d1=N, d2=K
         let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
@@ -1464,9 +1474,12 @@ impl<'c> GraphBuilder<'c> {
         let m = lhs_shape[1];
         let n = rhs_shape[2];
         let out_shape = vec![b, m, n];
-        let dtype = self.value_dtype(lhs_val);
+        let lhs_dtype = self.value_dtype(lhs_val);
+        let rhs_dtype = self.value_dtype(rhs_val);
+        let mixed =
+            lhs_dtype != rhs_dtype && (lhs_dtype == DType::BF16 || rhs_dtype == DType::BF16);
+        let out_dtype = if mixed { DType::F32 } else { lhs_dtype };
 
-        // Only include dyn_sources for dims that are actually dynamic (None).
         let mut dyn_sources = Vec::new();
         if b.is_none() {
             dyn_sources.push((lhs_val, 0)); // B from lhs dim 0
@@ -1477,12 +1490,16 @@ impl<'c> GraphBuilder<'c> {
         if n.is_none() {
             dyn_sources.push((rhs_val, 2)); // N from rhs dim 2
         }
-        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+        let filled = self.emit_zero_filled_tensor(&out_shape, out_dtype, &dyn_sources);
 
-        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let out_type = self.make_tensor_type(&out_shape, out_dtype);
         let segment =
             Attribute::parse(self.context, "array<i32: 2, 1>").expect("batch_matmul segment sizes");
-        let matmul_region = self.make_matmul_region(dtype);
+        let matmul_region = if mixed {
+            self.make_mixed_matmul_region(lhs_dtype, rhs_dtype)
+        } else {
+            self.make_matmul_region(lhs_dtype)
+        };
 
         // 4 iteration dims: d0=B, d1=M, d2=N, d3=K
         let lhs_map = "affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>";
@@ -1612,10 +1629,21 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         // Now emit the matmul using the bias-filled tensor as accumulator.
+        // The accumulator is always f32 (from bias broadcast above).
+        // If either matmul input is bf16, use mixed-precision region.
+        let lhs_dtype = self.value_dtype(lhs_val);
+        let rhs_dtype = self.value_dtype(rhs_val);
+        let mixed =
+            lhs_dtype != rhs_dtype && (lhs_dtype == DType::BF16 || rhs_dtype == DType::BF16);
+
         let out_type2 = self.make_tensor_type(&out_shape, dtype);
         let segment =
             Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
-        let matmul_region = self.make_matmul_region(dtype);
+        let matmul_region = if mixed {
+            self.make_mixed_matmul_region(lhs_dtype, rhs_dtype)
+        } else {
+            self.make_matmul_region(dtype)
+        };
 
         let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
         let rhs_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
@@ -1761,10 +1789,19 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         // Now emit the matmul with the fused init as accumulator.
+        let lhs_dtype = self.value_dtype(lhs_val);
+        let rhs_dtype = self.value_dtype(rhs_val);
+        let mixed =
+            lhs_dtype != rhs_dtype && (lhs_dtype == DType::BF16 || rhs_dtype == DType::BF16);
+
         let out_type2 = self.make_tensor_type(&out_shape, dtype);
         let segment =
             Attribute::parse(self.context, "array<i32: 2, 1>").expect("matmul segment sizes");
-        let matmul_region = self.make_matmul_region(dtype);
+        let matmul_region = if mixed {
+            self.make_mixed_matmul_region(lhs_dtype, rhs_dtype)
+        } else {
+            self.make_matmul_region(dtype)
+        };
 
         let lhs_map = "affine_map<(d0, d1, d2) -> (d0, d2)>";
         let rhs_matmul_map = "affine_map<(d0, d1, d2) -> (d2, d1)>";
@@ -1826,7 +1863,11 @@ impl<'c> GraphBuilder<'c> {
         let m = lhs_shape[1];
         let n = _rhs_shape[2];
         let out_shape = vec![b, m, n];
-        let dtype = self.value_dtype(lhs_val);
+        let lhs_dtype = self.value_dtype(lhs_val);
+        let rhs_dtype = self.value_dtype(rhs_val);
+        let mixed =
+            lhs_dtype != rhs_dtype && (lhs_dtype == DType::BF16 || rhs_dtype == DType::BF16);
+        let out_dtype = if mixed { DType::F32 } else { lhs_dtype };
 
         // Build dyn_sources for each None dim in out_shape [B, M, N].
         let mut dyn_sources = Vec::new();
@@ -1839,12 +1880,16 @@ impl<'c> GraphBuilder<'c> {
         if n.is_none() {
             dyn_sources.push((rhs_val, 2)); // N from rhs dim 2
         }
-        let filled = self.emit_zero_filled_tensor(&out_shape, dtype, &dyn_sources);
+        let filled = self.emit_zero_filled_tensor(&out_shape, out_dtype, &dyn_sources);
 
-        let out_type = self.make_tensor_type(&out_shape, dtype);
+        let out_type = self.make_tensor_type(&out_shape, out_dtype);
         let segment =
             Attribute::parse(self.context, "array<i32: 2, 1>").expect("batch_matmul segment sizes");
-        let matmul_region = self.make_matmul_region(dtype);
+        let matmul_region = if mixed {
+            self.make_mixed_matmul_region(lhs_dtype, rhs_dtype)
+        } else {
+            self.make_matmul_region(lhs_dtype)
+        };
 
         // 4 iteration dims: d0=B, d1=M, d2=N, d3=K
         // rhs uses 0 for batch dim instead of d0 (broadcast from batch=1).
@@ -2092,6 +2137,96 @@ impl<'c> GraphBuilder<'c> {
         region.append_block(block);
         region
     }
+    /// Build a mixed-precision matmul body for `linalg.generic`.
+    ///
+    /// Block args: `(lhs_elem: lhs_dtype, rhs_elem: rhs_dtype, acc: f32)`.
+    /// Body casts any bf16 input to f32 via `arith.extf`, then `mulf + addf` in f32.
+    /// Used for Strategy A: bf16 weights with f32 activations.
+    fn make_mixed_matmul_region(&self, lhs_dtype: DType, rhs_dtype: DType) -> Region<'c> {
+        let lhs_type = lhs_dtype.to_mlir_type(self.context);
+        let rhs_type = rhs_dtype.to_mlir_type(self.context);
+        let f32_type = DType::F32.to_mlir_type(self.context);
+
+        let block = Block::new(&[
+            (lhs_type, self.location),
+            (rhs_type, self.location),
+            (f32_type, self.location),
+        ]);
+        let lhs_e: melior::ir::Value = block.argument(0).unwrap().into();
+        let rhs_e: melior::ir::Value = block.argument(1).unwrap().into();
+        let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
+
+        // Cast bf16 inputs to f32 (f32 inputs pass through as identity).
+        let lhs_f32: melior::ir::Value = if lhs_dtype == DType::BF16 {
+            block
+                .append_operation(
+                    OperationBuilder::new("arith.extf", self.location)
+                        .add_operands(&[lhs_e])
+                        .add_results(&[f32_type])
+                        .build()
+                        .expect("arith.extf lhs bf16->f32"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            lhs_e
+        };
+        let rhs_f32: melior::ir::Value = if rhs_dtype == DType::BF16 {
+            block
+                .append_operation(
+                    OperationBuilder::new("arith.extf", self.location)
+                        .add_operands(&[rhs_e])
+                        .add_results(&[f32_type])
+                        .build()
+                        .expect("arith.extf rhs bf16->f32"),
+                )
+                .result(0)
+                .unwrap()
+                .into()
+        } else {
+            rhs_e
+        };
+
+        let (fmid, fmval) = self.fastmath_contract_attr();
+        let mul: melior::ir::Value = block
+            .append_operation(
+                OperationBuilder::new("arith.mulf", self.location)
+                    .add_operands(&[lhs_f32, rhs_f32])
+                    .add_results(&[f32_type])
+                    .add_attributes(&[(fmid, fmval)])
+                    .build()
+                    .expect("arith.mulf"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        let (fmid2, fmval2) = self.fastmath_contract_attr();
+        let add: melior::ir::Value = block
+            .append_operation(
+                OperationBuilder::new("arith.addf", self.location)
+                    .add_operands(&[acc_e, mul])
+                    .add_results(&[f32_type])
+                    .add_attributes(&[(fmid2, fmval2)])
+                    .build()
+                    .expect("arith.addf"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        block.append_operation(
+            OperationBuilder::new("linalg.yield", self.location)
+                .add_operands(&[add])
+                .build()
+                .expect("linalg.yield mixed matmul"),
+        );
+        let region = Region::new();
+        region.append_block(block);
+        region
+    }
+
     /// Emit `linalg.conv_2d_nchw_fchw` with optional padding and bias.
     ///
     /// `pads`: `[pad_top, pad_left, pad_bottom, pad_right]` in ONNX order.

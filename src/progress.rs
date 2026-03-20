@@ -184,8 +184,16 @@ fn line_widths(text: &str, term_width: usize) -> Vec<usize> {
         } else {
             let rows = (len + term_width - 1) / term_width;
             for r in 0..rows {
-                let row_width = if r < rows - 1 { term_width } else { len % term_width };
-                widths.push(if row_width == 0 { term_width } else { row_width });
+                let row_width = if r < rows - 1 {
+                    term_width
+                } else {
+                    len % term_width
+                };
+                widths.push(if row_width == 0 {
+                    term_width
+                } else {
+                    row_width
+                });
             }
         }
     }

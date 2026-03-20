@@ -75,6 +75,7 @@ fn assign_transformer_slots(
     config: &TransformerConfig,
     has_bias: bool,
     has_qk_norm: bool,
+    weight_dtype: DType,
 ) -> SlotLayout {
     let mut next = 0usize;
     let mut alloc = |desc: SlotDesc| -> (usize, SlotDesc) {
@@ -172,7 +173,7 @@ fn assign_transformer_slots(
         // q_proj_weight [hidden, hidden] (transposed)
         let (q_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, hidden]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(q_w_slot);
@@ -194,7 +195,7 @@ fn assign_transformer_slots(
         // k_proj_weight [hidden, kv_dim] (transposed)
         let (k_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, kv_dim]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(k_w_slot);
@@ -216,7 +217,7 @@ fn assign_transformer_slots(
         // v_proj_weight [hidden, kv_dim] (transposed)
         let (v_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, kv_dim]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(v_w_slot);
@@ -264,7 +265,7 @@ fn assign_transformer_slots(
         // o_proj_weight [hidden, hidden] (transposed)
         let (o_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, hidden]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(o_w_slot);
@@ -282,7 +283,7 @@ fn assign_transformer_slots(
         // gate_proj_weight [hidden, intermediate] (transposed)
         let (gate_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, intermediate]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(gate_w_slot);
@@ -291,7 +292,7 @@ fn assign_transformer_slots(
         // up_proj_weight [hidden, intermediate] (transposed)
         let (up_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![hidden, intermediate]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(up_w_slot);
@@ -300,7 +301,7 @@ fn assign_transformer_slots(
         // down_proj_weight [intermediate, hidden] (transposed)
         let (down_w_slot, d) = alloc(SlotDesc {
             shape: Shape(vec![intermediate, hidden]),
-            dtype: DType::F32,
+            dtype: weight_dtype,
             sym_shape: None,
         });
         weight_slots.push(down_w_slot);
@@ -459,7 +460,7 @@ fn assign_transformer_slots(
     // For tied embeddings, the caller provides a pre-transposed copy of embed_tokens.
     let (lm_head_weight_slot, d) = alloc(SlotDesc {
         shape: Shape(vec![hidden, vocab]),
-        dtype: DType::F32,
+        dtype: weight_dtype,
         sym_shape: None,
     });
     weight_slots.push(lm_head_weight_slot);
@@ -550,6 +551,7 @@ fn emit_qkv_kernel(
     has_bias: bool,
     has_qk_norm: bool,
     kernel_idx: usize,
+    weight_dtype: DType,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
     let kv_dim = (config.kv_heads() * config.head_dim()) as u64;
@@ -561,22 +563,22 @@ fn emit_qkv_kernel(
     let ctx = GraphContext::new();
     let mut gb = ctx.builder();
 
-    // Inputs
+    // Inputs: activations are f32, projection weights use weight_dtype
     let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
-    let ln_w = gb.input(&[Some(hidden)], DType::F32);
-    let q_w = gb.input(&[Some(hidden), Some(q_dim)], DType::F32);
+    let ln_w = gb.input(&[Some(hidden)], DType::F32); // layernorm always f32
+    let q_w = gb.input(&[Some(hidden), Some(q_dim)], weight_dtype);
     let q_b = if has_bias {
-        Some(gb.input(&[Some(q_dim)], DType::F32))
+        Some(gb.input(&[Some(q_dim)], DType::F32)) // biases always f32
     } else {
         None
     };
-    let k_w = gb.input(&[Some(hidden), Some(kv_dim)], DType::F32);
+    let k_w = gb.input(&[Some(hidden), Some(kv_dim)], weight_dtype);
     let k_b = if has_bias {
         Some(gb.input(&[Some(kv_dim)], DType::F32))
     } else {
         None
     };
-    let v_w = gb.input(&[Some(hidden), Some(kv_dim)], DType::F32);
+    let v_w = gb.input(&[Some(hidden), Some(kv_dim)], weight_dtype);
     let v_b = if has_bias {
         Some(gb.input(&[Some(kv_dim)], DType::F32))
     } else {
@@ -681,6 +683,7 @@ fn emit_qkv_kernel(
 fn emit_attention_kernel(
     config: &TransformerConfig,
     kernel_idx: usize,
+    weight_dtype: DType,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
     let num_heads = config.num_attention_heads as u64;
@@ -692,19 +695,16 @@ fn emit_attention_kernel(
     let ctx = GraphContext::new();
     let mut gb = ctx.builder();
 
-    // Q: [1, seq, num_heads, head_dim]
+    // All activations (Q, K, V, mask) are f32.
     let q = gb.input(
         &[Some(1), None, Some(num_heads), Some(head_dim)],
         DType::F32,
     );
-    // K from KV cache: [1, kv_heads, total_seq, head_dim] (BHSD layout)
     let k = gb.input(&[Some(1), Some(kv_heads), None, Some(head_dim)], DType::F32);
-    // V from KV cache: [1, kv_heads, total_seq, head_dim]
     let v = gb.input(&[Some(1), Some(kv_heads), None, Some(head_dim)], DType::F32);
-    // Mask: [1, 1, seq, total_seq]
     let mask = gb.input(&[Some(1), Some(1), None, None], DType::F32);
-    // O projection weight: [q_dim, hidden]
-    let o_w = gb.input(&[Some(q_dim), Some(hidden)], DType::F32);
+    // O projection weight uses weight_dtype
+    let o_w = gb.input(&[Some(q_dim), Some(hidden)], weight_dtype);
 
     // Transpose Q from BSHD to BHSD: [1, seq, num_heads, head_dim] -> [1, num_heads, seq, head_dim]
     let q_bhsd = gb.emit_transpose(&q, &[0, 2, 1, 3]);
@@ -767,6 +767,7 @@ fn emit_attention_kernel(
 fn emit_mlp_kernel(
     config: &TransformerConfig,
     kernel_idx: usize,
+    weight_dtype: DType,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
     let intermediate = config.intermediate_size as u64;
@@ -774,12 +775,13 @@ fn emit_mlp_kernel(
     let ctx = GraphContext::new();
     let mut gb = ctx.builder();
 
+    // Activations f32, layernorm f32, projection weights use weight_dtype
     let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
     let attn_out = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
     let ln_w = gb.input(&[Some(hidden)], DType::F32);
-    let gate_w = gb.input(&[Some(hidden), Some(intermediate)], DType::F32);
-    let up_w = gb.input(&[Some(hidden), Some(intermediate)], DType::F32);
-    let down_w = gb.input(&[Some(intermediate), Some(hidden)], DType::F32);
+    let gate_w = gb.input(&[Some(hidden), Some(intermediate)], weight_dtype);
+    let up_w = gb.input(&[Some(hidden), Some(intermediate)], weight_dtype);
+    let down_w = gb.input(&[Some(intermediate), Some(hidden)], weight_dtype);
 
     // First residual: hidden + attn_out
     let residual = gb.emit_add(&h, &attn_out);
@@ -826,6 +828,7 @@ fn emit_mlp_kernel(
 fn emit_lm_head_kernel(
     config: &TransformerConfig,
     kernel_idx: usize,
+    weight_dtype: DType,
 ) -> Result<KernelEmitResult, CompileError> {
     let hidden = config.hidden_size as u64;
     let vocab = config.vocab_size as u64;
@@ -837,7 +840,7 @@ fn emit_lm_head_kernel(
     let norm_w = gb.input(&[Some(hidden)], DType::F32);
     // lm_head_w is always [hidden, vocab] -- transposed at load time
     // (for tied embeddings, the caller pre-transposes embed_tokens)
-    let lm_head_w = gb.input(&[Some(hidden), Some(vocab)], DType::F32);
+    let lm_head_w = gb.input(&[Some(hidden), Some(vocab)], weight_dtype);
 
     let normed = gb.emit_rms_norm(&h, &norm_w, config.rms_norm_eps as f32);
     let logits = gb.emit_matmul(&normed, &lm_head_w);
@@ -865,13 +868,19 @@ pub fn emit_transformer_plan(
     config: &TransformerConfig,
     weights: &TransformerWeights,
 ) -> Result<(ExecutionPlan, Vec<crate::runtime::Buffer>), CompileError> {
+    // Infer weight dtype from the first projection weight.
+    let weight_dtype = weights
+        .layers
+        .first()
+        .map(|l| l.q_proj_weight.dtype())
+        .unwrap_or(DType::F32);
     let has_bias = weights
         .layers
         .first()
         .map(|l| l.q_proj_bias.is_some())
         .unwrap_or(false);
     let has_qk_norm = weights.has_qk_norm();
-    let layout = assign_transformer_slots(config, has_bias, has_qk_norm);
+    let layout = assign_transformer_slots(config, has_bias, has_qk_norm, weight_dtype);
 
     log_compile!(
         "hf",
@@ -898,7 +907,13 @@ pub fn emit_transformer_plan(
         let ls = &layout.layers[i];
 
         // QKV + RoPE kernel
-        emit_results.push(emit_qkv_kernel(config, has_bias, has_qk_norm, kernel_idx)?);
+        emit_results.push(emit_qkv_kernel(
+            config,
+            has_bias,
+            has_qk_norm,
+            kernel_idx,
+            weight_dtype,
+        )?);
         let mut qkv_inputs = vec![ls.hidden_in_slot, ls.input_ln_w_slot, ls.q_w_slot];
         if let Some(s) = ls.q_b_slot {
             qkv_inputs.push(s);
@@ -944,7 +959,7 @@ pub fn emit_transformer_plan(
         });
 
         // Attention kernel
-        emit_results.push(emit_attention_kernel(config, kernel_idx)?);
+        emit_results.push(emit_attention_kernel(config, kernel_idx, weight_dtype)?);
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![
@@ -959,7 +974,7 @@ pub fn emit_transformer_plan(
         kernel_idx += 1;
 
         // MLP kernel
-        emit_results.push(emit_mlp_kernel(config, kernel_idx)?);
+        emit_results.push(emit_mlp_kernel(config, kernel_idx, weight_dtype)?);
         steps.push(KernelStep::kernel(
             kernel_idx,
             vec![
@@ -981,7 +996,7 @@ pub fn emit_transformer_plan(
         .last()
         .ok_or_else(|| CompileError::Shape("transformer has no layers".into()))?
         .hidden_out_slot;
-    emit_results.push(emit_lm_head_kernel(config, kernel_idx)?);
+    emit_results.push(emit_lm_head_kernel(config, kernel_idx, weight_dtype)?);
     steps.push(KernelStep::kernel(
         kernel_idx,
         vec![
@@ -1023,7 +1038,7 @@ pub fn emit_transformer_plan(
     };
     plan.set_kv_info(kv_info);
 
-    let weight_bufs = weights.to_slot_buffers();
+    let weight_bufs = weights.to_slot_buffers(weight_dtype);
 
     Ok((plan, weight_bufs))
 }

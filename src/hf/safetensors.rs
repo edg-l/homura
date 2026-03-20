@@ -21,6 +21,23 @@ struct TensorInfo {
 pub fn load_safetensors(
     path: &Path,
 ) -> Result<HashMap<String, Buffer>, Box<dyn std::error::Error>> {
+    load_safetensors_impl(path, false)
+}
+
+/// Load tensors, keeping bf16 weights in native bf16 format.
+///
+/// bf16 tensors stay as `DType::BF16` (2 bytes/element). f16 is converted to f32.
+/// f32/f64/i32/i64 are loaded as usual.
+pub fn load_safetensors_bf16(
+    path: &Path,
+) -> Result<HashMap<String, Buffer>, Box<dyn std::error::Error>> {
+    load_safetensors_impl(path, true)
+}
+
+fn load_safetensors_impl(
+    path: &Path,
+    keep_bf16: bool,
+) -> Result<HashMap<String, Buffer>, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
 
@@ -55,7 +72,13 @@ pub fn load_safetensors(
         let raw = &mmap[data_base + start..data_base + end];
 
         let buf = match info.dtype.as_str() {
-            "BF16" => bf16_to_f32_buffer(raw, &info.shape),
+            "BF16" => {
+                if keep_bf16 {
+                    bf16_native_buffer(raw, &info.shape)
+                } else {
+                    bf16_to_f32_buffer(raw, &info.shape)
+                }
+            }
             "F16" => f16_to_f32_buffer(raw, &info.shape),
             "F32" => f32_buffer(raw, &info.shape),
             "F64" => f64_to_f32_buffer(raw, &info.shape),
@@ -70,6 +93,13 @@ pub fn load_safetensors(
     }
 
     Ok(tensors)
+}
+
+/// Keep bf16 raw bytes as a native bf16 buffer (no conversion).
+fn bf16_native_buffer(raw: &[u8], shape: &[u64]) -> Buffer {
+    let mut buf = Buffer::new(shape, DType::BF16);
+    buf.data_mut().copy_from_slice(raw);
+    buf
 }
 
 /// Convert bf16 raw bytes to f32 buffer.

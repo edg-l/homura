@@ -980,8 +980,12 @@ impl<'c> GraphBuilder<'c> {
         }
 
         let cast_op = match (src_dtype, target_dtype) {
-            (DType::F32, DType::F64) => "arith.extf",
-            (DType::F64, DType::F32) => "arith.truncf",
+            (DType::BF16, DType::F32) | (DType::BF16, DType::F64) | (DType::F32, DType::F64) => {
+                "arith.extf"
+            }
+            (DType::F32, DType::BF16) | (DType::F64, DType::BF16) | (DType::F64, DType::F32) => {
+                "arith.truncf"
+            }
             (DType::I32, DType::I64) => "arith.extsi",
             (DType::I64, DType::I32) => "arith.trunci",
             (DType::I32, DType::F32)

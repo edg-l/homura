@@ -33,10 +33,23 @@ impl HfModel {
     /// Load a model from a HuggingFace model directory.
     ///
     /// Expects: `config.json`, `model.safetensors`, `tokenizer.json`.
+    /// When `weight_dtype` is `BF16`, projection weights stay in native bf16.
     pub fn load(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_dtype(model_dir, DType::F32)
+    }
+
+    /// Load with explicit weight dtype. BF16 keeps projection weights in bf16
+    /// for mixed-precision matmul (bf16 inputs, f32 accumulation).
+    pub fn load_with_dtype(
+        model_dir: &Path,
+        weight_dtype: DType,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = TransformerConfig::load(&model_dir.join("config.json"))?;
-        let tensors =
-            crate::hf::safetensors::load_safetensors(&model_dir.join("model.safetensors"))?;
+        let tensors = if weight_dtype == DType::BF16 {
+            crate::hf::safetensors::load_safetensors_bf16(&model_dir.join("model.safetensors"))?
+        } else {
+            crate::hf::safetensors::load_safetensors(&model_dir.join("model.safetensors"))?
+        };
 
         log_compile!("hf", "loaded {} tensors from safetensors", tensors.len());
 

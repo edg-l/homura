@@ -126,6 +126,9 @@ enum Commands {
         /// Maximum context length for KV cache (default: 2048, capped by model limit)
         #[arg(long = "ctx", default_value = "2048")]
         context_len: usize,
+        /// Weight dtype: auto (detect CPU), f32, bf16
+        #[arg(long, default_value = "auto")]
+        dtype: String,
         #[command(flatten)]
         sampling: SamplingArgs,
     },
@@ -145,6 +148,9 @@ enum Commands {
         /// Enable thinking/reasoning output (for models like Qwen3 that support it)
         #[arg(long)]
         think: bool,
+        /// Weight dtype: auto (detect CPU), f32, bf16
+        #[arg(long, default_value = "auto")]
+        dtype: String,
         #[command(flatten)]
         sampling: SamplingArgs,
     },
@@ -194,17 +200,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             max_tokens,
             context_len,
+            dtype,
             sampling,
         } => {
             if let Some(prompt_text) = prompt {
                 let sampling = sampling.to_config();
+                let weight_dtype = resolve_weight_dtype(&dtype);
                 // Resolve model path: HF repo ID, local directory, or file.
                 let model_dir = resolve_model_path(&model)?;
                 let has_config = model_dir.join("config.json").exists();
                 let has_weights = model_dir.join("model.safetensors").exists()
                     || model_dir.join("model.safetensors.index.json").exists();
                 if has_config && has_weights {
-                    cmd_generate_hf(&model_dir, &prompt_text, max_tokens, context_len, &sampling)
+                    cmd_generate_hf(
+                        &model_dir,
+                        &prompt_text,
+                        max_tokens,
+                        context_len,
+                        weight_dtype,
+                        &sampling,
+                    )
                 } else {
                     cmd_generate(&model_dir, &prompt_text, max_tokens, &sampling)
                 }
@@ -223,10 +238,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_tokens,
             context_len,
             think,
+            dtype,
             sampling,
         } => {
             let model_dir = resolve_model_path(&model)?;
             let model_name = model.to_string_lossy();
+            let weight_dtype = resolve_weight_dtype(&dtype);
             cmd_chat(
                 &model_dir,
                 &model_name,
@@ -234,8 +251,41 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 max_tokens,
                 context_len,
                 think,
+                weight_dtype,
                 &sampling,
             )
+        }
+    }
+}
+
+// ── dtype resolution ─────────────────────────────────────────────────────────
+
+fn resolve_weight_dtype(s: &str) -> DType {
+    match s {
+        "auto" => {
+            let caps = homura::cpu_caps::CpuCaps::get();
+            if caps.supports_bf16_compute() {
+                log::info!("auto-detected bf16 support ({})", caps);
+                DType::BF16
+            } else {
+                log::info!("no bf16 hardware support, using f32 ({})", caps);
+                DType::F32
+            }
+        }
+        "bf16" => {
+            let caps = homura::cpu_caps::CpuCaps::get();
+            if !caps.supports_bf16_compute() {
+                log::warn!(
+                    "bf16 requested but CPU lacks AVX-512 BF16 ({}); performance may be poor",
+                    caps
+                );
+            }
+            DType::BF16
+        }
+        "f32" => DType::F32,
+        other => {
+            log::error!("unsupported --dtype: {other}");
+            std::process::exit(1);
         }
     }
 }
@@ -475,13 +525,19 @@ fn cmd_generate_hf(
     prompt: &str,
     max_tokens: usize,
     context_len: usize,
+    weight_dtype: DType,
     sampling: &homura::generate::SamplingConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
 
-    let sp = homura::progress::spinner("Loading model...");
-    let model = homura::hf::model::HfModel::load(model_dir)?;
+    let dtype_label = if weight_dtype == DType::BF16 {
+        "bf16"
+    } else {
+        "f32"
+    };
+    let sp = homura::progress::spinner(&format!("Loading model ({dtype_label})..."));
+    let model = homura::hf::model::HfModel::load_with_dtype(model_dir, weight_dtype)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     homura::progress::finish_spinner(
@@ -542,6 +598,7 @@ fn cmd_chat(
     max_tokens_per_turn: usize,
     context_len: usize,
     enable_thinking: bool,
+    weight_dtype: DType,
     sampling_args: &SamplingArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use homura::generate::generate_streaming_from_ids;
@@ -552,8 +609,13 @@ fn cmd_chat(
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
 
-    let sp = homura::progress::spinner("Loading model...");
-    let model = homura::hf::model::HfModel::load(model_dir)?;
+    let dtype_label = if weight_dtype == DType::BF16 {
+        "bf16"
+    } else {
+        "f32"
+    };
+    let sp = homura::progress::spinner(&format!("Loading model ({dtype_label})..."));
+    let model = homura::hf::model::HfModel::load_with_dtype(model_dir, weight_dtype)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let chat_template = ChatTemplate::load(model_dir)?;

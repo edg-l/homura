@@ -43,6 +43,9 @@ impl TransformerWeights {
 
     /// Returns all weight buffers as a flat Vec<Buffer> in a deterministic order.
     ///
+    /// `weight_dtype` controls the dtype for tied lm_head: when BF16, the
+    /// transposed embed_tokens copy is truncated to bf16 for the LM head matmul.
+    ///
     /// Order:
     ///   - embed_tokens_weight
     ///   - For each layer i (0..num_layers):
@@ -57,7 +60,7 @@ impl TransformerWeights {
     ///   - [lm_head_weight] (only if not tied)
     ///
     /// Biases and QK-norms are only included when they exist (inferred from the first layer).
-    pub fn to_slot_buffers(&self) -> Vec<Buffer> {
+    pub fn to_slot_buffers(&self, weight_dtype: DType) -> Vec<Buffer> {
         let has_bias = self
             .layers
             .first()
@@ -97,18 +100,61 @@ impl TransformerWeights {
 
         // lm_head weight: always [hidden, vocab] (transposed).
         // For tied embeddings, transpose embed_tokens [vocab, hidden] -> [hidden, vocab].
+        // When using bf16 weights, convert tied lm_head to bf16 for bandwidth savings.
         if let Some(lm_head) = &self.lm_head_weight {
             bufs.push(lm_head.clone());
         } else {
-            bufs.push(transpose_2d(&self.embed_tokens_weight));
+            let transposed = transpose_2d(&self.embed_tokens_weight);
+            if weight_dtype == DType::BF16 && transposed.dtype() == DType::F32 {
+                bufs.push(f32_buf_to_bf16(&transposed));
+            } else {
+                bufs.push(transposed);
+            }
         }
 
         bufs
     }
 }
 
+/// Convert a bf16 buffer to f32.
+fn bf16_buf_to_f32(buf: &Buffer) -> Buffer {
+    let src = buf.as_slice::<u16>();
+    let mut f32_data = Vec::with_capacity(src.len());
+    for &bits in src {
+        f32_data.push(f32::from_bits((bits as u32) << 16));
+    }
+    Buffer::from_slice::<f32>(&f32_data, &buf.shape().0, DType::F32)
+}
+
+/// Convert an f32 buffer to bf16 (truncate).
+fn f32_buf_to_bf16(buf: &Buffer) -> Buffer {
+    let src = buf.as_slice::<f32>();
+    let mut bf16_data = Vec::with_capacity(src.len());
+    for &val in src {
+        bf16_data.push((val.to_bits() >> 16) as u16);
+    }
+    Buffer::from_slice::<u16>(&bf16_data, &buf.shape().0, DType::BF16)
+}
+
+/// Ensure a buffer is f32 (convert from bf16 if needed).
+fn ensure_f32(buf: Buffer) -> Buffer {
+    if buf.dtype() == DType::BF16 {
+        bf16_buf_to_f32(&buf)
+    } else {
+        buf
+    }
+}
+
 /// Transpose a 2D buffer from [rows, cols] to [cols, rows].
 fn transpose_2d(buf: &Buffer) -> Buffer {
+    match buf.dtype() {
+        DType::F32 => transpose_2d_f32(buf),
+        DType::BF16 => transpose_2d_u16(buf, DType::BF16),
+        _ => panic!("transpose_2d: unsupported dtype {:?}", buf.dtype()),
+    }
+}
+
+fn transpose_2d_f32(buf: &Buffer) -> Buffer {
     let shape = buf.shape().0.clone();
     let rows = shape[0] as usize;
     let cols = shape[1] as usize;
@@ -120,6 +166,21 @@ fn transpose_2d(buf: &Buffer) -> Buffer {
         }
     }
     Buffer::from_slice::<f32>(&dst, &[cols as u64, rows as u64], DType::F32)
+}
+
+/// Transpose 2D for 2-byte element types (bf16). Works on raw u16 values.
+fn transpose_2d_u16(buf: &Buffer, dtype: DType) -> Buffer {
+    let shape = buf.shape().0.clone();
+    let rows = shape[0] as usize;
+    let cols = shape[1] as usize;
+    let src = buf.as_slice::<u16>();
+    let mut dst = vec![0u16; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            dst[c * rows + r] = src[r * cols + c];
+        }
+    }
+    Buffer::from_slice::<u16>(&dst, &[cols as u64, rows as u64], dtype)
 }
 
 /// Load and organize transformer weights from a flat safetensors map.
@@ -143,24 +204,34 @@ pub fn load_transformer_weights(
             .ok_or_else(|| format!("missing weight: {key}").into())
     };
 
-    let embed_tokens_weight = take(&mut tensors, "model.embed_tokens.weight")?;
+    let embed_tokens_weight = {
+        let w = take(&mut tensors, "model.embed_tokens.weight")?;
+        // Embedding is a gather (not matmul), must be f32.
+        if w.dtype() == DType::BF16 {
+            bf16_buf_to_f32(&w)
+        } else {
+            w
+        }
+    };
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
-        let input_layernorm_weight = take(
+        // Layernorm, biases, QK-norm must be f32 (elementwise ops, not matmul).
+        let input_layernorm_weight = ensure_f32(take(
             &mut tensors,
             &format!("model.layers.{i}.input_layernorm.weight"),
-        )?;
+        )?);
 
+        // Projection weights: keep whatever dtype they are (f32 or bf16).
         let q_proj_weight = transpose_2d(&take(
             &mut tensors,
             &format!("model.layers.{i}.self_attn.q_proj.weight"),
         )?);
         let q_proj_bias = if has_bias {
-            Some(take(
+            Some(ensure_f32(take(
                 &mut tensors,
                 &format!("model.layers.{i}.self_attn.q_proj.bias"),
-            )?)
+            )?))
         } else {
             None
         };
@@ -170,10 +241,10 @@ pub fn load_transformer_weights(
             &format!("model.layers.{i}.self_attn.k_proj.weight"),
         )?);
         let k_proj_bias = if has_bias {
-            Some(take(
+            Some(ensure_f32(take(
                 &mut tensors,
                 &format!("model.layers.{i}.self_attn.k_proj.bias"),
-            )?)
+            )?))
         } else {
             None
         };
@@ -183,27 +254,27 @@ pub fn load_transformer_weights(
             &format!("model.layers.{i}.self_attn.v_proj.weight"),
         )?);
         let v_proj_bias = if has_bias {
-            Some(take(
+            Some(ensure_f32(take(
                 &mut tensors,
                 &format!("model.layers.{i}.self_attn.v_proj.bias"),
-            )?)
+            )?))
         } else {
             None
         };
 
         let q_norm_weight = if has_qk_norm {
-            Some(take(
+            Some(ensure_f32(take(
                 &mut tensors,
                 &format!("model.layers.{i}.self_attn.q_norm.weight"),
-            )?)
+            )?))
         } else {
             None
         };
         let k_norm_weight = if has_qk_norm {
-            Some(take(
+            Some(ensure_f32(take(
                 &mut tensors,
                 &format!("model.layers.{i}.self_attn.k_norm.weight"),
-            )?)
+            )?))
         } else {
             None
         };
@@ -213,10 +284,10 @@ pub fn load_transformer_weights(
             &format!("model.layers.{i}.self_attn.o_proj.weight"),
         )?);
 
-        let post_attention_layernorm_weight = take(
+        let post_attention_layernorm_weight = ensure_f32(take(
             &mut tensors,
             &format!("model.layers.{i}.post_attention_layernorm.weight"),
-        )?;
+        )?);
 
         let gate_proj_weight = transpose_2d(&take(
             &mut tensors,
@@ -249,7 +320,7 @@ pub fn load_transformer_weights(
         });
     }
 
-    let final_norm_weight = take(&mut tensors, "model.norm.weight")?;
+    let final_norm_weight = ensure_f32(take(&mut tensors, "model.norm.weight")?);
 
     let lm_head_weight = if config.tie_word_embeddings {
         None
@@ -325,7 +396,7 @@ mod tests {
         let has_bias = weights.layers[0].q_proj_bias.is_some();
         let per_layer = if has_bias { 12 } else { 9 };
         let expected = 1 /* embed */ + 24 * per_layer + 1 /* final_norm */ + 1 /* lm_head (always present, transposed for tied) */;
-        let flat = weights.to_slot_buffers();
+        let flat = weights.to_slot_buffers(DType::F32);
         assert_eq!(flat.len(), expected);
     }
 }
