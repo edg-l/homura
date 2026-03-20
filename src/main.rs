@@ -586,8 +586,11 @@ fn cmd_chat(
         prefill_start.elapsed().as_secs_f64()
     );
 
-    // Track how many tokens have been fed to the KV cache so far.
-    let mut tokens_in_cache = system_token_ids.len();
+    // Track raw token IDs fed to the KV cache (never re-encoded).
+    let mut all_token_ids: Vec<u32> = system_tokens.clone();
+    // Text cursor: byte offset into the rendered conversation corresponding
+    // to the end of all_token_ids. Deltas are computed as full_text[text_cursor..].
+    let mut text_cursor: usize = system_text.len();
 
     eprintln!("\x1b[1m{model_name}\x1b[0m -- type /help for commands.\n");
 
@@ -617,23 +620,23 @@ fn cmd_chat(
                 model.reset_kv_cache();
                 messages.truncate(1); // keep system prompt
                 // Re-prefill system prompt.
-                let system_text = chat_template.render(
+                let sys_text = chat_template.render(
                     &messages,
                     false,
                     if enable_thinking { Some(true) } else { None },
                 )?;
-                let system_tokens = tokenizer.encode_with_special(&system_text);
-                let system_token_ids: Vec<i64> =
-                    system_tokens.iter().map(|&id| id as i64).collect();
+                let sys_toks = tokenizer.encode_with_special(&sys_text);
+                let sys_ids: Vec<i64> = sys_toks.iter().map(|&id| id as i64).collect();
                 let input_buf = homura::Buffer::from_slice::<i64>(
-                    &system_token_ids,
-                    &[1, system_token_ids.len() as u64],
+                    &sys_ids,
+                    &[1, sys_ids.len() as u64],
                     homura::DType::I64,
                 );
                 let outputs = model.run(&input_buf)?;
                 let kv_cache: Vec<homura::Buffer> = outputs[1..1 + num_kv].to_vec();
                 model.init_kv_cache(&kv_cache, max_seq_len)?;
-                tokens_in_cache = system_token_ids.len();
+                all_token_ids = sys_toks;
+                text_cursor = sys_text.len();
                 eprintln!("Conversation cleared.\n");
                 continue;
             }
@@ -652,20 +655,24 @@ fn cmd_chat(
             content: input.to_string(),
         });
 
-        // Render the full conversation with generation prompt, then extract
-        // only the new tokens (delta) that haven't been fed to the KV cache.
+        // Render full conversation + generation prompt, extract delta via text cursor.
         let full_text = chat_template.render(
             &messages,
             true,
             if enable_thinking { Some(true) } else { None },
         )?;
-        let full_tokens = tokenizer.encode_with_special(&full_text);
+
+        // Encode only the new text (after the cursor) to get delta tokens.
+        // The split always falls at a special token boundary (<|im_end|>, <|im_start|>)
+        // so BPE merges cannot cross the split point.
+        let new_text = &full_text[text_cursor..];
+        let new_tokens = tokenizer.encode_with_special(new_text);
 
         // Check context window -- if nearly full, reset and re-prefill from scratch.
-        if full_tokens.len() + max_tokens_per_turn > max_seq_len {
+        if all_token_ids.len() + new_tokens.len() + max_tokens_per_turn > max_seq_len {
             eprintln!(
                 "Warning: context nearly full ({}/{} tokens). Clearing conversation.\n",
-                full_tokens.len(),
+                all_token_ids.len() + new_tokens.len(),
                 max_seq_len
             );
             model.reset_kv_cache();
@@ -675,77 +682,96 @@ fn cmd_chat(
                 role: "user".into(),
                 content: input.to_string(),
             });
-            tokens_in_cache = 0;
+            all_token_ids.clear();
+            text_cursor = 0;
 
-            // Revalidate: if even this single message exceeds the context, skip it.
-            let check_text = chat_template.render(
+            // Re-render and encode from scratch.
+            let fresh_text = chat_template.render(
                 &messages,
                 true,
                 if enable_thinking { Some(true) } else { None },
             )?;
-            let check_tokens = tokenizer.encode_with_special(&check_text);
-            if check_tokens.len() + max_tokens_per_turn > max_seq_len {
+            let fresh_tokens = tokenizer.encode_with_special(&fresh_text);
+            if fresh_tokens.len() + max_tokens_per_turn > max_seq_len {
                 eprintln!(
                     "Error: message too long ({} tokens, max context {}).\n",
-                    check_tokens.len(),
+                    fresh_tokens.len(),
                     max_seq_len
                 );
-                messages.pop(); // remove the oversized user message
+                messages.pop();
                 continue;
             }
+            // The entire fresh render becomes the delta (re-prefill everything).
+            let delta_ids: Vec<i64> = fresh_tokens.iter().map(|&id| id as i64).collect();
+            let think_cfg = homura::generate::ThinkConfig {
+                token_ids: think_tokens,
+                style_content: enable_thinking,
+            };
+            let (_clean_text, gen_ids) = generate_streaming_from_ids(
+                &mut ctx,
+                &delta_ids,
+                max_tokens_per_turn,
+                &sampling,
+                false,
+                think_cfg,
+            )?;
+
+            // Store raw assistant text (with think tags) for accurate cursor tracking.
+            let raw_text = tokenizer.decode_raw(&gen_ids);
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: raw_text.clone(),
+            });
+
+            // Update state: all prefilled tokens + generated tokens.
+            all_token_ids.extend(&fresh_tokens);
+            all_token_ids.extend(&gen_ids);
+
+            // Render without generation prompt to get the cursor past assistant content.
+            let post_text = chat_template.render(
+                &messages,
+                false,
+                if enable_thinking { Some(true) } else { None },
+            )?;
+            text_cursor = post_text.len();
+
+            eprintln!();
+            continue;
         }
 
-        // Render (possibly updated after overflow) and compute delta.
-        let full_text = chat_template.render(
-            &messages,
-            true,
-            if enable_thinking { Some(true) } else { None },
-        )?;
-        let full_tokens = tokenizer.encode_with_special(&full_text);
-        // If re-encoding shifted token boundaries (full_tokens shorter than
-        // cache position), the KV cache is misaligned. Reset and re-prefill.
-        if tokens_in_cache > full_tokens.len() {
-            log::info!(
-                "token boundary shift ({} cached > {} rendered), re-prefilling",
-                tokens_in_cache,
-                full_tokens.len()
-            );
-            model.reset_kv_cache();
-            tokens_in_cache = 0;
-        }
-        let delta_tokens = &full_tokens[tokens_in_cache..];
-        let delta_token_ids: Vec<i64> = delta_tokens.iter().map(|&id| id as i64).collect();
-
-        // Pass token IDs directly to avoid decode→re-encode round-trip
-        // that would lose special tokens (<|im_start|>, <|im_end|>, etc.).
+        let delta_ids: Vec<i64> = new_tokens.iter().map(|&id| id as i64).collect();
         let think_cfg = homura::generate::ThinkConfig {
             token_ids: think_tokens,
             style_content: enable_thinking,
         };
-        let generated = generate_streaming_from_ids(
+        let (_clean_text, gen_ids) = generate_streaming_from_ids(
             &mut ctx,
-            &delta_token_ids,
+            &delta_ids,
             max_tokens_per_turn,
             &sampling,
             false,
             think_cfg,
         )?;
 
-        // Add assistant response to history.
+        // Store raw assistant text (with think tags) for accurate cursor tracking.
+        let raw_text = tokenizer.decode_raw(&gen_ids);
         messages.push(ChatMessage {
             role: "assistant".into(),
-            content: generated.clone(),
+            content: raw_text.clone(),
         });
 
-        // Update token count: delta tokens + the tokens generated.
-        // Re-render to get exact count including the assistant response + im_end.
-        let updated_text = chat_template.render(
+        // Extend tracked token IDs: delta (user turn wrapper) + generated.
+        all_token_ids.extend(&new_tokens);
+        all_token_ids.extend(&gen_ids);
+
+        // Advance text cursor: render without generation prompt to include
+        // the assistant response + <|im_end|>\n in the cursor position.
+        let post_text = chat_template.render(
             &messages,
             false,
             if enable_thinking { Some(true) } else { None },
         )?;
-        let updated_tokens = tokenizer.encode_with_special(&updated_text);
-        tokens_in_cache = updated_tokens.len();
+        text_cursor = post_text.len();
 
         eprintln!();
     }

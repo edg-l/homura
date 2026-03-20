@@ -29,6 +29,14 @@ impl HfTokenizer {
             .expect("tokenizer decode failed")
     }
 
+    /// Decode token IDs without stripping special tokens.
+    /// Returns the raw text including `<think>`, `</think>`, etc.
+    pub fn decode_raw(&self, ids: &[u32]) -> String {
+        self.inner
+            .decode(ids, false)
+            .expect("tokenizer decode failed")
+    }
+
     /// Encode text with special tokens recognized (e.g. `<|im_end|>`).
     pub fn encode_with_special(&self, text: &str) -> Vec<u32> {
         let encoding = self

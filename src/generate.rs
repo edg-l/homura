@@ -47,7 +47,9 @@ pub fn generate_streaming(
         style_content: false,
     };
     let token_ids = model.encode(prompt);
-    generate_streaming_core(model, &token_ids, max_new_tokens, sampling, true, think)
+    let (text, _ids) =
+        generate_streaming_core(model, &token_ids, max_new_tokens, sampling, true, think)?;
+    Ok(text)
 }
 
 /// Configuration for think-block handling during generation.
@@ -70,7 +72,9 @@ pub fn generate_streaming_no_echo(
     think: ThinkConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let token_ids = model.encode(prompt);
-    generate_streaming_from_ids(model, &token_ids, max_new_tokens, sampling, false, think)
+    let (text, _ids) =
+        generate_streaming_from_ids(model, &token_ids, max_new_tokens, sampling, false, think)?;
+    Ok(text)
 }
 
 /// Like `generate_streaming_no_echo` but takes pre-tokenized IDs directly,
@@ -82,7 +86,7 @@ pub fn generate_streaming_from_ids(
     sampling: &SamplingConfig,
     show_prompt: bool,
     think: ThinkConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Vec<u32>), Box<dyn std::error::Error>> {
     generate_streaming_core(
         model,
         token_ids,
@@ -100,12 +104,12 @@ fn generate_streaming_core(
     sampling: &SamplingConfig,
     show_prompt: bool,
     think: ThinkConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(String, Vec<u32>), Box<dyn std::error::Error>> {
     use crate::log::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
     use std::io::Write;
 
     if token_ids.is_empty() || max_new_tokens == 0 {
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
 
     log_info!(
@@ -152,7 +156,7 @@ fn generate_streaming_core(
 
     if first_token == model.eos_token_id() {
         log_info!("EOS after prefill");
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
     generated_ids.push(first_token);
     let token_text = model.decode_tokens(&[first_token]);
@@ -273,7 +277,7 @@ fn generate_streaming_core(
     let output_text = model.decode_tokens(&generated_ids);
     crate::progress::print_stats(&stats, &output_text);
 
-    Ok(output_text)
+    Ok((output_text, generated_ids))
 }
 
 /// GPT-2 text generator using a single decoder ONNX model (full-recompute per step).
