@@ -422,21 +422,24 @@ fn tensor_proto_to_buffer(t: &proto::TensorProto) -> Result<Buffer, OnnxError> {
                 expected: expected_bytes,
             });
         }
-        Buffer::from_raw_bytes(&t.raw_data, &shape, dtype)
+        Buffer::from_raw_bytes(t.raw_data.clone(), &shape, dtype)
     } else {
         match dtype {
             DType::F32 => Buffer::from_slice::<f32>(&t.float_data, &shape, dtype),
             DType::F64 => Buffer::from_slice::<f64>(&t.double_data, &shape, dtype),
-            DType::BF16 => {
-                // BF16 tensors are always stored in raw_data per the ONNX spec;
+            DType::BF16 | DType::F16 => {
+                // BF16/F16 tensors are always stored in raw_data per the ONNX spec;
                 // if raw_data is absent the tensor is effectively empty.
-                Buffer::from_raw_bytes(&[], &shape, dtype)
+                Buffer::from_raw_bytes(vec![], &shape, dtype)
             }
+            DType::I8 => Buffer::from_raw_bytes(vec![], &shape, dtype),
+            DType::I16 => Buffer::from_raw_bytes(vec![], &shape, dtype),
             DType::I32 => {
                 // prost represents int32_data as Vec<i32>
                 Buffer::from_slice::<i32>(&t.int32_data, &shape, dtype)
             }
             DType::I64 => Buffer::from_slice::<i64>(&t.int64_data, &shape, dtype),
+            dt => unreachable!("unsupported dtype {:?} for ONNX tensor parsing", dt),
         }
     };
 

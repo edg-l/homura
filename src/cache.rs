@@ -117,9 +117,15 @@ fn dtype_to_str(d: DType) -> &'static str {
     match d {
         DType::F32 => "f32",
         DType::F64 => "f64",
+        DType::I8 => "i8",
+        DType::I16 => "i16",
         DType::I32 => "i32",
         DType::I64 => "i64",
         DType::BF16 => "bf16",
+        DType::F16 => "f16",
+        DType::Q8_0 => "q8_0",
+        DType::Q4_K => "q4_k",
+        DType::Q6_K => "q6_k",
     }
 }
 
@@ -127,8 +133,15 @@ fn dtype_from_str(s: &str) -> Option<DType> {
     match s {
         "f32" => Some(DType::F32),
         "f64" => Some(DType::F64),
+        "i8" => Some(DType::I8),
+        "i16" => Some(DType::I16),
         "i32" => Some(DType::I32),
         "i64" => Some(DType::I64),
+        "bf16" => Some(DType::BF16),
+        "f16" => Some(DType::F16),
+        "q8_0" => Some(DType::Q8_0),
+        "q4_k" => Some(DType::Q4_K),
+        "q6_k" => Some(DType::Q6_K),
         _ => None,
     }
 }

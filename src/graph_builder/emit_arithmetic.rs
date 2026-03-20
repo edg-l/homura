@@ -6,8 +6,9 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise addition (F32/F64: arith.addf; I32/I64: arith.addi).
     pub fn emit_add(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
-            DType::I32 | DType::I64 => "arith.addi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.addf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.addi",
+            dt => unreachable!("unsupported dtype {:?} for emit_add", dt),
         };
         self.emit_linalg_binary(op, lhs, rhs)
     }
@@ -15,8 +16,9 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise subtraction (F32/F64: arith.subf; I32/I64: arith.subi).
     pub fn emit_sub(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.subf",
-            DType::I32 | DType::I64 => "arith.subi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.subf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.subi",
+            dt => unreachable!("unsupported dtype {:?} for emit_sub", dt),
         };
         self.emit_linalg_binary(op, lhs, rhs)
     }
@@ -24,8 +26,9 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise multiplication (F32/F64: arith.mulf; I32/I64: arith.muli).
     pub fn emit_mul(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.mulf",
-            DType::I32 | DType::I64 => "arith.muli",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.mulf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.muli",
+            dt => unreachable!("unsupported dtype {:?} for emit_mul", dt),
         };
         self.emit_linalg_binary(op, lhs, rhs)
     }
@@ -33,8 +36,9 @@ impl<'c> GraphBuilder<'c> {
     /// Element-wise division (F32/F64: arith.divf; I32/I64: arith.divsi).
     pub fn emit_div(&mut self, lhs: &Tensor<'c>, rhs: &Tensor<'c>) -> Tensor<'c> {
         let op = match lhs.dtype() {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.divf",
-            DType::I32 | DType::I64 => "arith.divsi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.divf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.divsi",
+            dt => unreachable!("unsupported dtype {:?} for emit_div", dt),
         };
         self.emit_linalg_binary(op, lhs, rhs)
     }
@@ -50,11 +54,14 @@ impl<'c> GraphBuilder<'c> {
     /// use arith.subi(0, x) for integers via a special path).
     pub fn emit_neg(&mut self, input: &Tensor<'c>) -> Tensor<'c> {
         match input.dtype() {
-            DType::F32 | DType::F64 | DType::BF16 => self.emit_linalg_unary("arith.negf", input),
-            DType::I32 | DType::I64 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
+                self.emit_linalg_unary("arith.negf", input)
+            }
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
                 // Emit 0 - x via linalg.generic with arith.subi where lhs is a zero constant.
                 self.emit_linalg_unary_int_neg(input)
             }
+            dt => unreachable!("unsupported dtype {:?} for emit_neg", dt),
         }
     }
 
@@ -684,8 +691,12 @@ impl<'c> GraphBuilder<'c> {
                 DType::F32 => Attribute::parse(ctx, "0.0 : f32"),
                 DType::F64 => Attribute::parse(ctx, "0.0 : f64"),
                 DType::BF16 => Attribute::parse(ctx, "0.0 : bf16"),
+                DType::F16 => Attribute::parse(ctx, "0.0 : f16"),
+                DType::I8 => Attribute::parse(ctx, "0 : i8"),
+                DType::I16 => Attribute::parse(ctx, "0 : i16"),
                 DType::I32 => Attribute::parse(ctx, "0 : i32"),
                 DType::I64 => Attribute::parse(ctx, "0 : i64"),
+                dt => unreachable!("unsupported dtype {:?} for relu", dt),
             }
             .expect("zero for relu");
             let zero: melior::ir::Value = block
@@ -700,8 +711,9 @@ impl<'c> GraphBuilder<'c> {
                 .unwrap()
                 .into();
             let relu_op = match dtype {
-                DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
-                DType::I32 | DType::I64 => "arith.maxsi",
+                DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.maximumf",
+                DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.maxsi",
+                dt => unreachable!("unsupported dtype {:?} for relu", dt),
             };
             let relu_val: melior::ir::Value = block
                 .append_operation(
@@ -840,7 +852,7 @@ impl<'c> GraphBuilder<'c> {
 
         // Convert cond to i1 if needed.
         let cond_i1: melior::ir::Value = match cond_dtype {
-            DType::I32 | DType::I64 => {
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => {
                 let zero_attr = match cond_dtype {
                     DType::I32 => Attribute::parse(self.context, "0 : i32"),
                     DType::I64 => Attribute::parse(self.context, "0 : i64"),
@@ -876,12 +888,13 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::F32 | DType::F64 | DType::BF16 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
                 // Compare float != 0.0.
                 let zero_attr = match cond_dtype {
                     DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
                     DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
                     DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
+                    DType::F16 => Attribute::parse(self.context, "0.0 : f16"),
                     _ => unreachable!(),
                 }
                 .expect("zero float cond");
@@ -914,6 +927,7 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
+            dt => unreachable!("unsupported cond dtype {:?} for where", dt),
         };
 
         let selected: melior::ir::Value = body_block

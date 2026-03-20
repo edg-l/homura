@@ -1853,7 +1853,7 @@ impl<'c> GraphBuilder<'c> {
             .into();
         match dtype {
             DType::I64 => as_i64,
-            DType::I32 => self
+            DType::I8 | DType::I16 | DType::I32 => self
                 .block
                 .append_operation(
                     OperationBuilder::new("arith.trunci", self.location)
@@ -1865,7 +1865,7 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
-            DType::F32 | DType::F64 | DType::BF16 => self
+            DType::F16 | DType::F32 | DType::F64 | DType::BF16 => self
                 .block
                 .append_operation(
                     OperationBuilder::new("arith.sitofp", self.location)
@@ -1877,6 +1877,7 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for emit_index_to_elem", dt),
         }
     }
 
@@ -1902,7 +1903,7 @@ impl<'c> GraphBuilder<'c> {
             .into();
         match dtype {
             DType::I64 => as_i64,
-            DType::I32 => block
+            DType::I8 | DType::I16 | DType::I32 => block
                 .append_operation(
                     OperationBuilder::new("arith.trunci", self.location)
                         .add_operands(&[as_i64])
@@ -1913,7 +1914,7 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
-            DType::F32 | DType::F64 | DType::BF16 => block
+            DType::F16 | DType::F32 | DType::F64 | DType::BF16 => block
                 .append_operation(
                     OperationBuilder::new("arith.sitofp", self.location)
                         .add_operands(&[as_i64])
@@ -1924,17 +1925,22 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for emit_index_to_elem_in_block", dt),
         }
     }
 
     /// Emit an `arith.constant` scalar tensor value.
     pub fn emit_arith_constant(&mut self, value: f64, dtype: DType) -> Tensor<'c> {
         let dense_str = match dtype {
+            DType::F16 => format!("dense<{:.6e}> : tensor<f16>", value),
             DType::F32 => format!("dense<{:.6e}> : tensor<f32>", value),
             DType::F64 => format!("dense<{:.15e}> : tensor<f64>", value),
             DType::BF16 => format!("dense<{:.6e}> : tensor<bf16>", value),
+            DType::I8 => format!("dense<{}> : tensor<i8>", value as i8),
+            DType::I16 => format!("dense<{}> : tensor<i16>", value as i16),
             DType::I32 => format!("dense<{}> : tensor<i32>", value as i32),
             DType::I64 => format!("dense<{}> : tensor<i64>", value as i64),
+            dt => unreachable!("unsupported dtype {:?} for emit_arith_constant", dt),
         };
         let dense_attr = Attribute::parse(self.context, &dense_str).expect("dense constant attr");
         let tensor_type = self.make_tensor_type(&[], dtype);
@@ -1987,11 +1993,15 @@ impl<'c> GraphBuilder<'c> {
     /// Build a scalar attribute for the given value and dtype.
     fn make_scalar_attr(&self, value: f64, dtype: DType) -> Attribute<'c> {
         let s = match dtype {
+            DType::F16 => format!("{:.6e} : f16", value),
             DType::F32 => format!("{:.6e} : f32", value),
             DType::F64 => format!("{:.15e} : f64", value),
             DType::BF16 => format!("{:.6e} : bf16", value),
+            DType::I8 => format!("{} : i8", value as i8),
+            DType::I16 => format!("{} : i16", value as i16),
             DType::I32 => format!("{} : i32", value as i32),
             DType::I64 => format!("{} : i64", value as i64),
+            dt => unreachable!("unsupported dtype {:?} for make_scalar_attr", dt),
         };
         Attribute::parse(self.context, &s).expect("scalar attr")
     }

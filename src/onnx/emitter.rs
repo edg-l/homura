@@ -991,8 +991,12 @@ fn emit_node<'c>(
                         DType::F32 => val_buf.as_slice::<f32>()[0] as f64,
                         DType::F64 => val_buf.as_slice::<f64>()[0],
                         DType::BF16 => val_buf.as_slice::<u16>()[0] as f64,
+                        DType::F16 => val_buf.as_slice::<u16>()[0] as f64,
+                        DType::I8 => val_buf.as_slice::<i8>()[0] as f64,
+                        DType::I16 => val_buf.as_slice::<i16>()[0] as f64,
                         DType::I32 => val_buf.as_slice::<i32>()[0] as f64,
                         DType::I64 => val_buf.as_slice::<i64>()[0] as f64,
+                        dt => unreachable!("unsupported dtype {:?} for ConstantOfShape value", dt),
                     };
                     (fv, val_buf.dtype())
                 } else {
@@ -1094,6 +1098,18 @@ fn buffer_to_dense_str(buf: &Buffer) -> String {
             let vals = buf.as_slice::<u16>();
             format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
         }
+        DType::F16 => {
+            let vals = buf.as_slice::<u16>();
+            format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
+        }
+        DType::I8 => {
+            let vals = buf.as_slice::<i8>();
+            format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
+        }
+        DType::I16 => {
+            let vals = buf.as_slice::<i16>();
+            format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
+        }
         DType::I32 => {
             let vals = buf.as_slice::<i32>();
             format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
@@ -1102,6 +1118,7 @@ fn buffer_to_dense_str(buf: &Buffer) -> String {
             let vals = buf.as_slice::<i64>();
             format_dense_nd(vals.iter().map(|&v| format!("{v}")), shape)
         }
+        dt => unreachable!("unsupported dtype {:?} for buffer_to_dense_str", dt),
     }
 }
 

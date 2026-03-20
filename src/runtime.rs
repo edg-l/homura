@@ -197,6 +197,32 @@ impl Buffer {
         unsafe { slice::from_raw_parts(self.as_ptr() as *const T, self.byte_len() / elem_size) }
     }
 
+    /// Create a buffer from pre-packed raw bytes (for quantized weights).
+    ///
+    /// `shape` is the **logical** shape (dequantized dimensions, e.g. [K, N]).
+    /// The byte length is validated against `dtype.bytes_for_elements()`.
+    pub fn from_raw_bytes(data: Vec<u8>, shape: &[u64], dtype: DType) -> Self {
+        let num_elements: u64 = shape.iter().product();
+        let expected_bytes = dtype.bytes_for_elements(num_elements as usize);
+        assert_eq!(
+            data.len(),
+            expected_bytes,
+            "from_raw_bytes: data length {} does not match expected {} for shape {:?} dtype {:?}",
+            data.len(),
+            expected_bytes,
+            shape,
+            dtype,
+        );
+        let s = Shape(shape.to_vec());
+        let strides = row_major_strides(shape);
+        Self {
+            data: BufferData::Owned(data),
+            shape: s,
+            strides,
+            dtype,
+        }
+    }
+
     pub fn shape(&self) -> &Shape {
         &self.shape
     }

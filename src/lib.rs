@@ -7,6 +7,7 @@ pub mod cpu_affinity;
 pub mod cpu_caps;
 pub mod dtype;
 pub mod generate;
+pub mod gguf;
 pub mod graph_builder;
 pub mod hf;
 pub mod kv_generate;

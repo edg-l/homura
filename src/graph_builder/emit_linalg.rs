@@ -320,8 +320,9 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_reduce_sum(&mut self, input: &Tensor<'c>, axis: i64, keepdim: bool) -> Tensor<'c> {
         let dtype = input.dtype();
         let combiner_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
-            DType::I32 | DType::I64 => "arith.addi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.addf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.addi",
+            dt => unreachable!("unsupported dtype {:?} for reduce_sum", dt),
         };
         let init_val = self.make_zero_scalar_attr(dtype);
         self.emit_linalg_reduce_single_axis(input, axis, keepdim, combiner_op, init_val)
@@ -333,8 +334,9 @@ impl<'c> GraphBuilder<'c> {
     pub fn emit_reduce_max(&mut self, input: &Tensor<'c>, axis: i64, keepdim: bool) -> Tensor<'c> {
         let dtype = input.dtype();
         let combiner_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
-            DType::I32 | DType::I64 => "arith.maxsi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.maximumf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.maxsi",
+            dt => unreachable!("unsupported dtype {:?} for reduce_max", dt),
         };
         let init_val = self.make_min_scalar_attr(dtype);
         self.emit_linalg_reduce_single_axis(input, axis, keepdim, combiner_op, init_val)
@@ -407,8 +409,9 @@ impl<'c> GraphBuilder<'c> {
         let in_e: melior::ir::Value = body_block.argument(0).unwrap().into();
         let acc_e: melior::ir::Value = body_block.argument(1).unwrap().into();
         let add_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.addf",
-            DType::I32 | DType::I64 => "arith.addi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.addf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.addi",
+            dt => unreachable!("unsupported dtype {:?} for reduce_mean", dt),
         };
         let sum_val: melior::ir::Value = body_block
             .append_operation(
@@ -747,11 +750,15 @@ impl<'c> GraphBuilder<'c> {
 
         // Fill with zero (or given value).
         let fill_attr = match dtype {
+            DType::F16 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : f16")),
             DType::F32 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : f32")),
             DType::F64 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : f64")),
             DType::BF16 => Attribute::parse(self.context, &format!("{fill_f64:.6e} : bf16")),
+            DType::I8 => Attribute::parse(self.context, &format!("{} : i8", fill_f64 as i8)),
+            DType::I16 => Attribute::parse(self.context, &format!("{} : i16", fill_f64 as i16)),
             DType::I32 => Attribute::parse(self.context, &format!("{} : i32", fill_f64 as i64)),
             DType::I64 => Attribute::parse(self.context, &format!("{} : i64", fill_f64 as i64)),
+            dt => unreachable!("unsupported dtype {:?} for fill", dt),
         }
         .expect("fill attr");
 
@@ -907,8 +914,8 @@ impl<'c> GraphBuilder<'c> {
             .into();
 
         let float_convert_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.sitofp",
-            DType::I32 | DType::I64 => panic!("emit_div_by_index_scalar: float types only"),
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.sitofp",
+            _ => panic!("emit_div_by_index_scalar: float types only"),
         };
         let count_f: melior::ir::Value = self
             .block
@@ -1142,11 +1149,15 @@ impl<'c> GraphBuilder<'c> {
     /// Build a zero scalar `Attribute` for the given dtype.
     fn make_zero_scalar_attr(&self, dtype: DType) -> Attribute<'c> {
         match dtype {
+            DType::F16 => Attribute::parse(self.context, "0.0 : f16"),
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
             DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
+            DType::I8 => Attribute::parse(self.context, "0 : i8"),
+            DType::I16 => Attribute::parse(self.context, "0 : i16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
+            dt => unreachable!("unsupported dtype {:?} for make_zero_scalar_attr", dt),
         }
         .expect("zero scalar attr")
     }
@@ -1155,13 +1166,18 @@ impl<'c> GraphBuilder<'c> {
     /// For float: -infinity (IEEE 754). For int: MIN_VALUE.
     fn make_min_scalar_attr(&self, dtype: DType) -> Attribute<'c> {
         match dtype {
+            // 0xFC00 is -inf for f16.
+            DType::F16 => Attribute::parse(self.context, "0xFC00 : f16"),
             // 0xFF800000 is -inf for f32; 0xFFF0000000000000 is -inf for f64.
             DType::F32 => Attribute::parse(self.context, "0xFF800000 : f32"),
             DType::F64 => Attribute::parse(self.context, "0xFFF0000000000000 : f64"),
             // 0xFF80 is -inf for bf16.
             DType::BF16 => Attribute::parse(self.context, "0xFF80 : bf16"),
+            DType::I8 => Attribute::parse(self.context, "-128 : i8"),
+            DType::I16 => Attribute::parse(self.context, "-32768 : i16"),
             DType::I32 => Attribute::parse(self.context, "-2147483648 : i32"),
             DType::I64 => Attribute::parse(self.context, "-9223372036854775808 : i64"),
+            dt => unreachable!("unsupported dtype {:?} for make_min_scalar_attr", dt),
         }
         .expect("min scalar attr")
     }
@@ -2004,11 +2020,15 @@ impl<'c> GraphBuilder<'c> {
 
         // Zero constant.
         let zero_attr = match dtype {
+            DType::F16 => Attribute::parse(self.context, "0.0 : f16"),
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
             DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
+            DType::I8 => Attribute::parse(self.context, "0 : i8"),
+            DType::I16 => Attribute::parse(self.context, "0 : i16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
+            dt => unreachable!("unsupported dtype {:?} for matmul zero fill", dt),
         }
         .expect("zero constant attr");
         let zero: melior::ir::Value = self
@@ -2072,7 +2092,7 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let mul: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -2087,7 +2107,7 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::I32 | DType::I64 => block
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.muli", self.location)
                         .add_operands(&[lhs_e, rhs_e])
@@ -2098,9 +2118,10 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for matmul region", dt),
         };
         let add: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -2115,7 +2136,7 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::I32 | DType::I64 => block
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.addi", self.location)
                         .add_operands(&[acc_e, mul])
@@ -2126,6 +2147,7 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for matmul region", dt),
         };
         block.append_operation(
             OperationBuilder::new("linalg.yield", self.location)
@@ -2257,11 +2279,15 @@ impl<'c> GraphBuilder<'c> {
             let pad_low = [0i64, 0, pad_top as i64, pad_left as i64];
             let pad_high = [0i64, 0, pad_bottom as i64, pad_right as i64];
             let zero_attr = match dtype {
+                DType::F16 => Attribute::parse(self.context, "0.0 : f16"),
                 DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
                 DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
                 DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
+                DType::I8 => Attribute::parse(self.context, "0 : i8"),
+                DType::I16 => Attribute::parse(self.context, "0 : i16"),
                 DType::I32 => Attribute::parse(self.context, "0 : i32"),
                 DType::I64 => Attribute::parse(self.context, "0 : i64"),
+                dt => unreachable!("unsupported dtype {:?} for conv2d pad", dt),
             }
             .expect("conv2d pad zero");
             self.emit_tensor_pad(input.value(), &pad_low, &pad_high, zero_attr)
@@ -2306,11 +2332,15 @@ impl<'c> GraphBuilder<'c> {
         // For dynamic dims, we read from padded input or weight.
         let elem_type = dtype.to_mlir_type(self.context);
         let zero_attr = match dtype {
+            DType::F16 => Attribute::parse(self.context, "0.0 : f16"),
             DType::F32 => Attribute::parse(self.context, "0.0 : f32"),
             DType::F64 => Attribute::parse(self.context, "0.0 : f64"),
             DType::BF16 => Attribute::parse(self.context, "0.0 : bf16"),
+            DType::I8 => Attribute::parse(self.context, "0 : i8"),
+            DType::I16 => Attribute::parse(self.context, "0 : i16"),
             DType::I32 => Attribute::parse(self.context, "0 : i32"),
             DType::I64 => Attribute::parse(self.context, "0 : i64"),
+            dt => unreachable!("unsupported dtype {:?} for conv2d output zero", dt),
         }
         .expect("conv2d output zero");
         let zero_scalar: melior::ir::Value = self
@@ -2507,7 +2537,7 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let prod: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -2522,7 +2552,7 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::I32 | DType::I64 => block
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.muli", self.location)
                         .add_operands(&[in_e, filter_e])
@@ -2533,9 +2563,10 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for conv2d body", dt),
         };
         let sum: melior::ir::Value = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => {
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => {
                 let (fmid, fmval) = self.fastmath_contract_attr();
                 block
                     .append_operation(
@@ -2550,7 +2581,7 @@ impl<'c> GraphBuilder<'c> {
                     .unwrap()
                     .into()
             }
-            DType::I32 | DType::I64 => block
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => block
                 .append_operation(
                     OperationBuilder::new("arith.addi", self.location)
                         .add_operands(&[acc_e, prod])
@@ -2561,6 +2592,7 @@ impl<'c> GraphBuilder<'c> {
                 .result(0)
                 .unwrap()
                 .into(),
+            dt => unreachable!("unsupported dtype {:?} for conv2d body", dt),
         };
         block.append_operation(
             OperationBuilder::new("linalg.yield", self.location)
@@ -2783,8 +2815,9 @@ impl<'c> GraphBuilder<'c> {
         let acc_e: melior::ir::Value = block.argument(2).unwrap().into();
 
         let max_op = match dtype {
-            DType::F32 | DType::F64 | DType::BF16 => "arith.maximumf",
-            DType::I32 | DType::I64 => "arith.maxsi",
+            DType::F32 | DType::F64 | DType::BF16 | DType::F16 => "arith.maximumf",
+            DType::I8 | DType::I16 | DType::I32 | DType::I64 => "arith.maxsi",
+            dt => unreachable!("unsupported dtype {:?} for pool max", dt),
         };
         let max_val: melior::ir::Value = block
             .append_operation(
