@@ -209,20 +209,32 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let weight_dtype = resolve_weight_dtype(&dtype);
                 // Resolve model path: HF repo ID, local directory, or file.
                 let model_dir = resolve_model_path(&model)?;
-                let has_config = model_dir.join("config.json").exists();
-                let has_weights = model_dir.join("model.safetensors").exists()
-                    || model_dir.join("model.safetensors.index.json").exists();
-                if has_config && has_weights {
-                    cmd_generate_hf(
+                // Check for GGUF file first
+                if let Some(gguf_path) = find_gguf_file(&model_dir) {
+                    cmd_generate_gguf(
+                        &gguf_path,
                         &model_dir,
                         &prompt_text,
                         max_tokens,
                         context_len,
-                        weight_dtype,
                         &sampling,
                     )
                 } else {
-                    cmd_generate(&model_dir, &prompt_text, max_tokens, &sampling)
+                    let has_config = model_dir.join("config.json").exists();
+                    let has_weights = model_dir.join("model.safetensors").exists()
+                        || model_dir.join("model.safetensors.index.json").exists();
+                    if has_config && has_weights {
+                        cmd_generate_hf(
+                            &model_dir,
+                            &prompt_text,
+                            max_tokens,
+                            context_len,
+                            weight_dtype,
+                            &sampling,
+                        )
+                    } else {
+                        cmd_generate(&model_dir, &prompt_text, max_tokens, &sampling)
+                    }
                 }
             } else {
                 cmd_run(
@@ -244,6 +256,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let model_dir = resolve_model_path(&model)?;
             let model_name = model.to_string_lossy();
+            if let Some(gguf_path) = find_gguf_file(&model_dir) {
+                return cmd_chat_gguf(
+                    &gguf_path,
+                    &model_dir,
+                    &model_name,
+                    &system,
+                    max_tokens,
+                    context_len,
+                    think,
+                    &sampling.to_config(),
+                );
+            }
             let weight_dtype = resolve_weight_dtype(&dtype);
             cmd_chat(
                 &model_dir,
@@ -289,6 +313,53 @@ fn resolve_weight_dtype(s: &str) -> DType {
             std::process::exit(1);
         }
     }
+}
+
+// ── GGUF detection ──────────────────────────────────────────────────────────
+
+/// Find a GGUF file in a directory. If the path itself is a .gguf file, returns it.
+/// If it's a directory, looks for any .gguf file inside.
+fn find_gguf_file(path: &std::path::Path) -> Option<PathBuf> {
+    if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
+        return Some(path.to_path_buf());
+    }
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "gguf") {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find tokenizer.json for a GGUF model. Checks:
+/// 1. Same directory as the GGUF file
+/// 2. model_dir (if different from GGUF file's parent)
+fn find_tokenizer_for_gguf(
+    gguf_path: &std::path::Path,
+    model_dir: &std::path::Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // Check same directory as GGUF file
+    if let Some(parent) = gguf_path.parent() {
+        let tok = parent.join("tokenizer.json");
+        if tok.exists() {
+            return Ok(tok);
+        }
+    }
+    // Check model_dir
+    let tok = model_dir.join("tokenizer.json");
+    if tok.exists() {
+        return Ok(tok);
+    }
+    Err(format!(
+        "tokenizer.json not found near {} -- place it alongside the GGUF file",
+        gguf_path.display()
+    )
+    .into())
 }
 
 // ── model resolution ─────────────────────────────────────────────────────────
@@ -571,6 +642,188 @@ fn cmd_generate_hf(
     if !atty::is(atty::Stream::Stdout) {
         println!("{}{}", prompt, generated);
     }
+    Ok(())
+}
+
+fn cmd_generate_gguf(
+    gguf_path: &std::path::Path,
+    model_dir: &std::path::Path,
+    prompt: &str,
+    max_tokens: usize,
+    context_len: usize,
+    sampling: &homura::generate::SamplingConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use homura::hf::chat::{ChatMessage, ChatTemplate};
+
+    log::info!("loading GGUF model from {}", gguf_path.display());
+    let t_load = Instant::now();
+    let model = homura::hf::model::HfModel::load_gguf(gguf_path)?;
+    let tok_path = find_tokenizer_for_gguf(gguf_path, model_dir)?;
+    let tokenizer = homura::hf::tokenizer::HfTokenizer::from_file(&tok_path)?;
+    log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+
+    let formatted_prompt = if let Ok(template) = ChatTemplate::load(model_dir) {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: prompt.to_string(),
+        }];
+        match template.render(&messages, true, None) {
+            Ok(text) => {
+                log::info!("applied chat template (instruct model)");
+                text
+            }
+            Err(_) => prompt.to_string(),
+        }
+    } else {
+        prompt.to_string()
+    };
+
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);
+    log::info!("generating (max_tokens={max_tokens}, max_seq_len={max_seq_len})");
+
+    let generated = model.generate(
+        &tokenizer,
+        &formatted_prompt,
+        max_tokens,
+        max_seq_len,
+        sampling,
+    )?;
+
+    if !atty::is(atty::Stream::Stdout) {
+        println!("{}{}", prompt, generated);
+    }
+    Ok(())
+}
+
+fn cmd_chat_gguf(
+    gguf_path: &std::path::Path,
+    model_dir: &std::path::Path,
+    model_name: &str,
+    system_prompt: &str,
+    max_tokens_per_turn: usize,
+    context_len: usize,
+    enable_thinking: bool,
+    sampling: &homura::generate::SamplingConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use homura::generate::{GenerativeModel, generate_streaming_from_ids};
+    use homura::hf::chat::{ChatMessage, ChatTemplate, find_chat_stop_token, find_think_tokens};
+    use homura::hf::model::HfGenerationContext;
+    use std::io::BufRead;
+
+    log::info!("loading GGUF model from {}", gguf_path.display());
+    let t_load = Instant::now();
+    let model = homura::hf::model::HfModel::load_gguf(gguf_path)?;
+    let tok_path = find_tokenizer_for_gguf(gguf_path, model_dir)?;
+    let tokenizer = homura::hf::tokenizer::HfTokenizer::from_file(&tok_path)?;
+    // Try loading chat template from model_dir (tokenizer_config.json)
+    let chat_template = ChatTemplate::load(model_dir)?;
+    log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+
+    let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);
+    let stop_token = find_chat_stop_token(model_dir, &tokenizer);
+    let think_tokens = find_think_tokens(&tokenizer);
+    log::info!(
+        "max_seq_len={max_seq_len}, stop_token={:?}, think_tokens={:?}",
+        stop_token,
+        think_tokens
+    );
+
+    let mut ctx = HfGenerationContext::new_chat(&model, &tokenizer, max_seq_len, stop_token);
+
+    let system_content = if !enable_thinking && think_tokens.is_some() {
+        format!("{system_prompt} /no_think")
+    } else {
+        system_prompt.to_string()
+    };
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+        role: "system".into(),
+        content: system_content,
+    }];
+
+    // Prefill system prompt
+    let system_text = chat_template.render(
+        &messages,
+        false,
+        if enable_thinking { Some(true) } else { None },
+    )?;
+    let system_tokens = tokenizer.encode_with_special(&system_text);
+    let system_token_ids: Vec<i64> = system_tokens.iter().map(|&id| id as i64).collect();
+
+    log::info!(
+        "prefilling system prompt ({} tokens)",
+        system_token_ids.len()
+    );
+    ctx.prefill(&system_token_ids)?;
+
+    let sampling_config = sampling.clone();
+
+    // Interactive chat loop
+    println!("Chat with {model_name} (type 'quit' to exit)");
+    println!();
+
+    let stdin = io::stdin();
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+
+        let mut user_input = String::new();
+        stdin.lock().read_line(&mut user_input)?;
+        let user_input = user_input.trim();
+
+        if user_input.is_empty() {
+            continue;
+        }
+        if user_input == "quit" || user_input == "exit" {
+            break;
+        }
+
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: user_input.to_string(),
+        });
+
+        // Render the new turn
+        let full_text = chat_template.render(
+            &messages,
+            true,
+            if enable_thinking { Some(true) } else { None },
+        )?;
+        let full_tokens = tokenizer.encode_with_special(&full_text);
+        let prev_len = model.kv_cache_len();
+        let new_tokens: Vec<i64> = full_tokens[prev_len..]
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+
+        if new_tokens.is_empty() {
+            continue;
+        }
+
+        let think_cfg = homura::generate::ThinkConfig {
+            token_ids: think_tokens,
+            style_content: enable_thinking,
+        };
+        let (clean_text, _gen_ids) = generate_streaming_from_ids(
+            &mut ctx,
+            &new_tokens,
+            max_tokens_per_turn,
+            &sampling_config,
+            false,
+            think_cfg,
+        )?;
+
+        let content = strip_think_block(&clean_text);
+        if !content.ends_with('\n') {
+            println!();
+        }
+        println!();
+
+        messages.push(ChatMessage {
+            role: "assistant".into(),
+            content,
+        });
+    }
+
     Ok(())
 }
 
