@@ -176,6 +176,7 @@ fn main() {
         2.. => log::set_level(log::Level::Trace),
         _ => {}
     }
+    homura::cpu_affinity::pin_to_single_ccd();
     let code = match run(cli) {
         Ok(()) => 0,
         Err(e) => {
