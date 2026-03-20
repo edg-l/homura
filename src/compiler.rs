@@ -9,6 +9,42 @@ use melior::{
     },
 };
 
+/// Hint LLVM's loop vectorizer to use the right VF for the host ISA.
+///
+/// Without this, LLVM fails to vectorize bf16 mixed-precision matmul loops
+/// (fpext bfloat + fmul + fadd reduction) and leaves them fully scalar.
+/// Forcing VF=16 (AVX-512) or VF=8 (AVX2) makes the inner N-loop vectorize:
+/// vpslld (bf16→f32) + vfmaddps.
+fn init_llvm_vectorizer_opts() {
+    use std::ffi::CString;
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let caps = crate::cpu_caps::CpuCaps::get();
+        let vf_flag = if caps.avx512f {
+            Some("--force-vector-width=16")
+        } else if caps.avx2 {
+            Some("--force-vector-width=8")
+        } else {
+            None
+        };
+        if let Some(flag) = vf_flag {
+            let argv: Vec<CString> = ["homura", flag]
+                .iter()
+                .map(|s| CString::new(*s).unwrap())
+                .collect();
+            let ptrs: Vec<*const std::ffi::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
+            unsafe {
+                llvm_sys::support::LLVMParseCommandLineOptions(
+                    ptrs.len() as i32,
+                    ptrs.as_ptr(),
+                    std::ptr::null(),
+                );
+            }
+        }
+    });
+}
+
 /// Error type for compilation failures.
 #[derive(Debug)]
 pub enum CompileError {
@@ -91,6 +127,8 @@ unsafe fn optimise_and_emit(
     use llvm_sys::target_machine::*;
     use llvm_sys::transforms::pass_builder::*;
     use std::ffi::{CStr, CString};
+
+    init_llvm_vectorizer_opts();
 
     unsafe {
         let cpu = LLVMGetHostCPUName();
