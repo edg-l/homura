@@ -215,6 +215,7 @@ pub fn load_transformer_weights(
     };
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    let pb = crate::progress::load_progress(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         // Layernorm, biases, QK-norm must be f32 (elementwise ops, not matmul).
         let input_layernorm_weight = ensure_f32(take(
@@ -302,6 +303,7 @@ pub fn load_transformer_weights(
             &format!("model.layers.{i}.mlp.down_proj.weight"),
         )?);
 
+        crate::progress::update_load(&pb, i + 1, &format!("layer {i}"));
         layers.push(LayerWeights {
             input_layernorm_weight,
             q_proj_weight,
@@ -319,6 +321,7 @@ pub fn load_transformer_weights(
             down_proj_weight,
         });
     }
+    crate::progress::finish_load(&pb);
 
     let final_norm_weight = ensure_f32(take(&mut tensors, "model.norm.weight")?);
 

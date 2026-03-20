@@ -132,9 +132,20 @@ Total weights: 1192 MB. Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theo
 
 ## Roadmap
 
+### Phase 1: Quantized model support
+- Load pre-quantized INT4/INT8 weights (GGUF, AWQ, GPTQ)
+- Mixed-precision dequant-during-matmul kernels
 - Packed GEMM layout for better cache utilization
-- Flash Attention (fused softmax(QK^T)V for O(1) memory)
+
+### Phase 2: More architectures
+- Llama 3/3.1 (8B quantized, 1B/3B native)
+- SmolLM2 (135M/360M/1.7B -- good small test targets)
+- Phi-4-mini (3.8B quantized)
+- Gemma 3n (E2B/E4B -- efficient mobile-first models)
 - Operator fusion (matmul + bias + activation as one kernel)
-- Weight quantization (INT8/INT4)
-- More architectures (Llama, Mistral, Phi, Gemma)
-- GPU backend (CUDA via `gpu-to-nvvm`)
+
+### Phase 3: GPU backend
+- GPU dialect emission (`gpu-to-nvvm` for CUDA, `gpu-to-rocdl` for ROCm)
+- Device memory management and host/device transfers
+- GPU-specific tiling and scheduling
+- Flash Attention (fused softmax(QK^T)V for O(n) memory)

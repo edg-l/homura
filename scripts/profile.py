@@ -153,33 +153,51 @@ def parse_output(output: str) -> dict:
     return {"profiles": decode_profiles, "summary": summary}
 
 
-def classify_kernel(kid: int, shapes: str, total_kernels: int) -> str:
-    """Classify kernel by type based on shapes."""
-    if kid == total_kernels - 1:
-        # Last compiled kernel is usually LM head
-        if "151936" in shapes or "32000" in shapes or "128256" in shapes:
-            return "LMHead"
+def classify_kernel(kid: int, shapes: str, total_kernels: int, config: dict | None = None) -> str:
+    """Classify kernel by type based on shapes and model config dimensions."""
     if kid >= 2**63:
         return "KVConcat"
 
-    # Count weight matrices by shape pattern
     shape_list = shapes.split(" × ")
-    num_shapes = len(shape_list)
 
-    if num_shapes >= 8:
-        return "QKV"
-    elif num_shapes == 5:
-        return "Attn"
-    elif num_shapes == 6:
-        return "MLP"
-    elif num_shapes == 3 and any(
-        s
-        for s in shape_list
-        if re.match(r"\[\d+, \d+\]", s.strip()) and "1024" not in s
-    ):
-        return "LMHead"
-    elif num_shapes == 3:
-        return "LMHead"
+    # Extract all dimension values from shapes
+    dims = set()
+    for s in shape_list:
+        for m in re.findall(r"\d+", s):
+            dims.add(int(m))
+
+    if config:
+        vocab = config.get("vocab_size", 0)
+        inter = config.get("intermediate_size", 0)
+        hidden = config.get("hidden_size", 0)
+        heads = config.get("num_attention_heads", 0)
+        kv_heads = config.get("num_key_value_heads", heads)
+        head_dim = config.get("head_dim", hidden // heads if heads else 0)
+
+        # LMHead: contains vocab_size dimension
+        if vocab > 0 and vocab in dims:
+            return "LMHead"
+
+        # MLP: contains intermediate_size dimension
+        if inter > 0 and inter in dims:
+            return "MLP"
+
+        # QKV vs Attn: both have head structure. QKV has cos/sin tables
+        # (2D shapes [seq, head_dim]) and projection weights. Attn has
+        # 4D tensors [1, heads, seq, head_dim] and a mask.
+        has_4d_head = any(
+            re.search(rf"\[1, ({heads}|{kv_heads}), \d+, {head_dim}\]", s)
+            for s in shape_list
+        )
+        has_cos_sin = any(
+            re.match(rf"^\[\d+, {head_dim}\]$", s.strip())
+            for s in shape_list
+        )
+
+        if has_cos_sin:
+            return "QKV"
+        if has_4d_head:
+            return "Attn"
 
     return "Other"
 
@@ -282,7 +300,7 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
     for p in warm_profiles:
         step_by_type = defaultdict(float)
         for s in p["steps"]:
-            ktype = classify_kernel(s["kid"], s["shapes"], total_kernels)
+            ktype = classify_kernel(s["kid"], s["shapes"], total_kernels, config)
             step_by_type[ktype] += s["ms"]
         for ktype, ms in step_by_type.items():
             type_times[ktype].append(ms)
@@ -421,7 +439,7 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
         print("  Raw per-kernel (last decode step):")
         for s in p["steps"]:
             if s["ms"] >= 0.3:
-                ktype = classify_kernel(s["kid"], s["shapes"], total_kernels)
+                ktype = classify_kernel(s["kid"], s["shapes"], total_kernels, config)
                 print(f"    k{s['kid']:<4d} {s['ms']:6.2f}ms  {ktype:8s}  {s['shapes']}")
         print()
 
@@ -445,6 +463,11 @@ def main():
     data = parse_output(output)
 
     if not data["summary"]:
+        # Check if model hit EOS immediately (0 decode tokens)
+        if "EOS after prefill" in output:
+            print(f"Model hit EOS immediately after prefill (0 decode tokens).")
+            print(f"Try a different prompt with --prompt or use a longer prompt.")
+            sys.exit(1)
         print("Failed to parse output. Raw stderr:")
         print(output[-2000:])
         sys.exit(1)

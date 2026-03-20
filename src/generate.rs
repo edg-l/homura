@@ -162,7 +162,7 @@ fn generate_streaming_core(
         return Ok((String::new(), Vec::new()));
     }
     generated_ids.push(first_token);
-    let token_text = decode_streaming_token(model, first_token, &mut byte_buf);
+    let token_text = decode_streaming_token(model, first_token, &mut byte_buf, None);
     if use_stdout && !token_text.is_empty() {
         print_token_styled(
             first_token,
@@ -202,7 +202,8 @@ fn generate_streaming_core(
         let step_elapsed = step_start.elapsed();
         decode_times.push(step_elapsed);
 
-        let token_text = decode_streaming_token(model, current_token, &mut byte_buf);
+        let prev = generated_ids.last().copied();
+        let token_text = decode_streaming_token(model, current_token, &mut byte_buf, prev);
         if use_stdout && !token_text.is_empty() {
             print_token_styled(
                 current_token,
@@ -469,6 +470,10 @@ pub fn argmax_at_position(logits: &Buffer, pos: usize, vocab_size: usize) -> u32
 
 /// Decode a single token for streaming display, buffering byte-level BPE tokens.
 ///
+/// Uses the previous token as context so SentencePiece tokenizers (Llama, TinyLlama)
+/// correctly produce leading spaces. Decodes `[prev, new]` and strips the prefix
+/// that `[prev]` would produce.
+///
 /// Byte-level fallback tokens (used for emoji, rare Unicode) decode individually
 /// to U+FFFD because a single byte isn't valid UTF-8. This function accumulates
 /// such tokens in `byte_buf` and returns the decoded text only when the buffer
@@ -477,9 +482,21 @@ fn decode_streaming_token(
     model: &impl GenerativeModel,
     token: u32,
     byte_buf: &mut Vec<u32>,
+    prev_token: Option<u32>,
 ) -> String {
     if byte_buf.is_empty() {
-        let text = model.decode_tokens(&[token]);
+        let text = if let Some(prev) = prev_token {
+            // Decode [prev, token] together to preserve SentencePiece spacing,
+            // then strip the prefix that [prev] alone would produce.
+            let combined = model.decode_tokens(&[prev, token]);
+            let prefix = model.decode_tokens(&[prev]);
+            combined
+                .strip_prefix(&prefix)
+                .unwrap_or(&combined)
+                .to_string()
+        } else {
+            model.decode_tokens(&[token])
+        };
         if text.contains('\u{FFFD}') {
             byte_buf.push(token);
             String::new()

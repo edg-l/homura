@@ -17,6 +17,8 @@ pub struct ChatMessage {
 /// Chat template loaded from tokenizer_config.json.
 pub struct ChatTemplate {
     template_source: String,
+    /// Special tokens passed as template variables (eos_token, bos_token, etc.)
+    special_tokens: std::collections::HashMap<String, String>,
 }
 
 impl ChatTemplate {
@@ -33,7 +35,27 @@ impl ChatTemplate {
             .ok_or("no chat_template field in tokenizer_config.json")?
             .to_string();
 
-        Ok(ChatTemplate { template_source })
+        // Collect special token strings that templates may reference.
+        let token_keys = ["eos_token", "bos_token", "unk_token", "pad_token"];
+        let mut special_tokens = std::collections::HashMap::new();
+        for key in &token_keys {
+            if let Some(val) = config.get(*key) {
+                // Some configs store tokens as strings, others as {"content": "..."} objects.
+                let token_str = val.as_str().map(|s| s.to_string()).or_else(|| {
+                    val.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
+                });
+                if let Some(s) = token_str {
+                    special_tokens.insert(key.to_string(), s);
+                }
+            }
+        }
+
+        Ok(ChatTemplate {
+            template_source,
+            special_tokens,
+        })
     }
 
     /// Render the full conversation to a string.
@@ -70,17 +92,22 @@ impl ChatTemplate {
         env.add_template("chat", &self.template_source)?;
 
         let tmpl = env.get_template("chat")?;
-        let rendered = match enable_thinking {
-            Some(val) => tmpl.render(minijinja::context! {
-                messages => messages,
-                add_generation_prompt => add_generation_prompt,
-                enable_thinking => val,
-            })?,
-            None => tmpl.render(minijinja::context! {
-                messages => messages,
-                add_generation_prompt => add_generation_prompt,
-            })?,
-        };
+
+        // Build context map with messages, flags, and special tokens.
+        let mut ctx = std::collections::BTreeMap::<String, minijinja::value::Value>::new();
+        ctx.insert(
+            "messages".into(),
+            minijinja::value::Value::from_serialize(messages),
+        );
+        ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
+        for (key, val) in &self.special_tokens {
+            ctx.insert(key.clone(), val.as_str().into());
+        }
+        if let Some(val) = enable_thinking {
+            ctx.insert("enable_thinking".into(), val.into());
+        }
+
+        let rendered = tmpl.render(ctx)?;
 
         Ok(rendered)
     }
@@ -153,6 +180,7 @@ mod tests {
                 "{%- endif %}",
             )
             .to_string(),
+            special_tokens: std::collections::HashMap::new(),
         };
 
         let messages = vec![
@@ -184,6 +212,7 @@ mod tests {
                 "{%- endif %}",
             )
             .to_string(),
+            special_tokens: std::collections::HashMap::new(),
         };
 
         let messages = vec![ChatMessage {

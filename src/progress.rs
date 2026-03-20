@@ -56,6 +56,33 @@ pub fn finish_compile(pb: &ProgressBar, ms: u64) {
     ));
 }
 
+// ── Load progress ────────────────────────────────────────────────────────────
+
+/// Create a progress bar for weight loading.
+pub fn load_progress(total: usize) -> ProgressBar {
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{bar:30.cyan/dim}] {pos}/{len}")
+            .expect("valid bar template")
+            .progress_chars("=>-"),
+    );
+    pb.set_message("Loading weights");
+    pb
+}
+
+/// Update the load progress bar with the current layer name.
+pub fn update_load(pb: &ProgressBar, step: usize, layer_name: &str) {
+    pb.set_position(step as u64);
+    pb.set_message(format!("Loading {layer_name}"));
+}
+
+/// Finish the load progress bar.
+pub fn finish_load(pb: &ProgressBar) {
+    let total = pb.length().unwrap_or(0);
+    pb.finish_with_message(format!("{} Loaded {} layers", style("✓").green(), total,));
+}
+
 // ── Decode progress ───────────────────────────────────────────────────────────
 
 /// Create a progress bar for autoregressive decoding.

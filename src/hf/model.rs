@@ -45,13 +45,17 @@ impl HfModel {
         weight_dtype: DType,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = TransformerConfig::load(&model_dir.join("config.json"))?;
+
+        let sp = crate::progress::spinner("Reading safetensors...");
         let tensors = if weight_dtype == DType::BF16 {
             crate::hf::safetensors::load_safetensors_bf16(&model_dir.join("model.safetensors"))?
         } else {
             crate::hf::safetensors::load_safetensors(&model_dir.join("model.safetensors"))?
         };
-
-        log_compile!("hf", "loaded {} tensors from safetensors", tensors.len());
+        crate::progress::finish_spinner(
+            &sp,
+            &format!("Read {} tensors from safetensors", tensors.len()),
+        );
 
         let weights = load_transformer_weights(&config, tensors)?;
 

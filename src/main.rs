@@ -529,29 +529,43 @@ fn cmd_generate_hf(
     weight_dtype: DType,
     sampling: &homura::generate::SamplingConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use homura::hf::chat::{ChatMessage, ChatTemplate};
+
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
-
-    let dtype_label = if weight_dtype == DType::BF16 {
-        "bf16"
-    } else {
-        "f32"
-    };
-    let sp = homura::progress::spinner(&format!("Loading model ({dtype_label})..."));
     let model = homura::hf::model::HfModel::load_with_dtype(model_dir, weight_dtype)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
-    homura::progress::finish_spinner(
-        &sp,
-        &format!("Model loaded in {:.2}s", t_load.elapsed().as_secs_f64()),
-    );
-
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
+
+    // For instruct models, wrap the prompt in the chat template so the model
+    // sees properly formatted input instead of raw text.
+    let formatted_prompt = if let Ok(template) = ChatTemplate::load(model_dir) {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: prompt.to_string(),
+        }];
+        match template.render(&messages, true, None) {
+            Ok(text) => {
+                log::info!("applied chat template (instruct model)");
+                text
+            }
+            Err(_) => prompt.to_string(),
+        }
+    } else {
+        prompt.to_string()
+    };
 
     let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);
     log::info!("generating (max_tokens={max_tokens}, max_seq_len={max_seq_len})");
 
-    let generated = model.generate(&tokenizer, prompt, max_tokens, max_seq_len, sampling)?;
+    let generated = model.generate(
+        &tokenizer,
+        &formatted_prompt,
+        max_tokens,
+        max_seq_len,
+        sampling,
+    )?;
 
     // If stdout is piped, print the full text at the end.
     if !atty::is(atty::Stream::Stdout) {
@@ -610,21 +624,10 @@ fn cmd_chat(
     log::info!("loading HF model from {}", model_dir.display());
     let t_load = Instant::now();
 
-    let dtype_label = if weight_dtype == DType::BF16 {
-        "bf16"
-    } else {
-        "f32"
-    };
-    let sp = homura::progress::spinner(&format!("Loading model ({dtype_label})..."));
     let model = homura::hf::model::HfModel::load_with_dtype(model_dir, weight_dtype)?;
     let tokenizer =
         homura::hf::tokenizer::HfTokenizer::from_file(&model_dir.join("tokenizer.json"))?;
     let chat_template = ChatTemplate::load(model_dir)?;
-    homura::progress::finish_spinner(
-        &sp,
-        &format!("Model loaded in {:.2}s", t_load.elapsed().as_secs_f64()),
-    );
-
     log::info!("loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let max_seq_len = std::cmp::min(model.config().max_position_embeddings, context_len);

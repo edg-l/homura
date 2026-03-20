@@ -130,7 +130,32 @@ unsafe fn optimise_and_emit(
 
     init_llvm_vectorizer_opts();
 
+    // Suppress LLVM optimization remarks (e.g. "loop not vectorized").
+    // Only errors, warnings, and notes are printed to stderr.
+    extern "C" fn diag_handler(
+        info: llvm_sys::prelude::LLVMDiagnosticInfoRef,
+        _ctx: *mut std::ffi::c_void,
+    ) {
+        unsafe {
+            use llvm_sys::core::{
+                LLVMDisposeMessage, LLVMGetDiagInfoDescription, LLVMGetDiagInfoSeverity,
+            };
+            let severity = LLVMGetDiagInfoSeverity(info);
+            if severity == llvm_sys::LLVMDiagnosticSeverity::LLVMDSRemark {
+                return;
+            }
+            let msg = LLVMGetDiagInfoDescription(info);
+            if !msg.is_null() {
+                let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
+                eprintln!("[llvm] {s}");
+                LLVMDisposeMessage(msg);
+            }
+        }
+    }
+
     unsafe {
+        LLVMContextSetDiagnosticHandler(llvm_ctx, Some(diag_handler), std::ptr::null_mut());
+
         let cpu = LLVMGetHostCPUName();
         let features = LLVMGetHostCPUFeatures();
         let triple = LLVMGetDefaultTargetTriple();
