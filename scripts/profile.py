@@ -116,6 +116,9 @@ def parse_output(output: str) -> dict:
             m = re.search(r"prefill\s+([\d.]+)s\s+\((\d+) tokens?\)", line)
             if m:
                 prefill_s = float(m.group(1))
+            m = re.search(r"prefill complete in ([\d.]+)s", line)
+            if m:
+                prefill_s = float(m.group(1))
             m = re.search(r"decode\s+(\d+) tok\s+in ([\d.]+)s", line)
             if m:
                 decode_tokens = int(m.group(1))
@@ -390,10 +393,13 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
 
         # Decode stats
         if summary:
+            min_s = summary.get('min_tok_s', 0)
+            max_s = summary.get('max_tok_s', 0)
+            range_str = f"  Range: {min_s:.1f}-{max_s:.1f} tok/s" if min_s > 0 else ""
             console.print(
                 f"  Prefill: {summary.get('prefill_s', 0):.2f}s  "
-                f"Decode: {summary.get('decode_tokens', 0)} tok  "
-                f"Range: {summary.get('min_tok_s', 0):.1f}-{summary.get('max_tok_s', 0):.1f} tok/s"
+                f"Decode: {summary.get('decode_tokens', 0)} tok"
+                f"{range_str}"
             )
         console.print()
 
