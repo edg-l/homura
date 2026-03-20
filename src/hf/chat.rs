@@ -126,10 +126,11 @@ pub fn find_think_tokens(tokenizer: &super::tokenizer::HfTokenizer) -> Option<(u
     }
 }
 
-/// Find the token ID for the chat turn-end token (e.g. `<|im_end|>`).
+/// Find the token ID for the chat turn-end token.
 ///
-/// Reads `eos_token` from tokenizer_config.json, then looks it up in the
-/// tokenizer's vocabulary. Returns None if not found.
+/// Tries `eos_token` from tokenizer_config.json first (handles both string
+/// and `{"content": "..."}` formats). Falls back to `<|im_end|>` for models
+/// that use ChatML but set eos_token to something else (e.g. `<|endoftext|>`).
 pub fn find_chat_stop_token(
     model_dir: &Path,
     tokenizer: &super::tokenizer::HfTokenizer,
@@ -138,29 +139,27 @@ pub fn find_chat_stop_token(
     let text = std::fs::read_to_string(&config_path).ok()?;
     let config: serde_json::Value = serde_json::from_str(&text).ok()?;
 
-    // For chat models, the eos_token is typically the turn-end marker.
-    // Qwen3: <|im_end|> (151645), Qwen2.5: <|endoftext|> (151643)
-    // For Qwen2.5 base models, we also want to try <|im_end|> explicitly.
-    let eos = config.get("eos_token").and_then(|v| v.as_str())?;
+    let resolve = |token: &str| -> Option<u32> {
+        let ids = tokenizer.encode_with_special(token);
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    };
 
-    // If eos_token is already <|im_end|>, use it directly.
-    if eos == "<|im_end|>" {
-        let ids = tokenizer.encode_with_special(eos);
-        if ids.len() == 1 {
-            return Some(ids[0]);
+    // Read eos_token (string or {"content": "..."} object).
+    let eos = config.get("eos_token").and_then(|v| {
+        v.as_str()
+            .map(|s| s.to_string())
+            .or_else(|| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+    });
+
+    // Use eos_token directly -- this covers </s>, <|im_end|>, <|endoftext|>, etc.
+    if let Some(ref eos) = eos {
+        if let Some(id) = resolve(eos) {
+            return Some(id);
         }
     }
 
-    // Otherwise try <|im_end|> as a separate stop token (for base models
-    // where eos is <|endoftext|> but we still want to stop on turn end).
-    let ids = tokenizer.encode_with_special("<|im_end|>");
-    if ids.len() == 1 {
-        return Some(ids[0]);
-    }
-
-    // Fall back to whatever eos_token is.
-    let ids = tokenizer.encode_with_special(eos);
-    if ids.len() == 1 { Some(ids[0]) } else { None }
+    // Fallback: try <|im_end|> for ChatML models where eos_token is different.
+    resolve("<|im_end|>")
 }
 
 #[cfg(test)]

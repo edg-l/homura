@@ -99,6 +99,9 @@ Benchmarked on AMD Ryzen 9 7900X3D (single CCD, auto-pinned).
 | GPT-2 | 124M | 158 compiled + 24 native | ~650ms | ~50 tok/s |
 | Qwen2.5-0.5B | 494M | -- | -- | ~36 tok/s (bf16) |
 | Qwen3-0.6B | 600M | -- | -- | ~24 tok/s (bf16) |
+| TinyLlama-1.1B | 1.1B | 68 | ~1s | ~20 tok/s (bf16) |
+| Qwen2.5-1.5B | 1.5B | 86 | ~1.6s | ~13 tok/s (bf16) |
+| SmolLM2-1.7B | 1.7B | 74 | ~1s | ~11 tok/s (bf16) |
 
 Qwen3-0.6B decode breakdown (42ms/tok):
 
@@ -116,7 +119,7 @@ Total weights: 1192 MB. Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theo
 - **Model formats**: ONNX, HuggingFace safetensors (auto-detected)
 - **HuggingFace Hub**: Download models by name (`Qwen/Qwen2.5-0.5B`), cached locally
 - **ONNX ops**: Conv2d, MatMul, Gemm, BatchNorm, Add, Sub, Mul, Div, Relu, Sigmoid, Tanh, Softmax, MaxPool, GlobalAvgPool, Reshape, Flatten, Gather, Slice, Concat, Split, Transpose, Squeeze, Unsqueeze, Where, Cast, Shape, ConstantOfShape, Range, and more
-- **HF architectures**: Decoder-only transformers with RoPE (Qwen2, Qwen3, and compatible architectures). QK-norm support for Qwen3. Config auto-detection from `config.json`.
+- **HF architectures**: Decoder-only transformers with RoPE (Qwen2, Qwen3, Llama, and compatible architectures). QK-norm support for Qwen3. Config auto-detection from `config.json`. Instruct models auto-detected via chat template.
 - **Chat mode**: Interactive multi-turn REPL with persistent KV cache, Jinja2 chat template rendering via minijinja, think block support for reasoning models (--think flag)
 - **Compilation**: Per-kernel MLIR (linalg dialect) -> LLVM, parallel via rayon, cached on disk
 - **Tiling**: Adaptive OpenMP-parallel tiling for 3D/4D/5D contractions (matmul, batched matmul, GQA attention), scaled to available cores
@@ -128,7 +131,7 @@ Total weights: 1192 MB. Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theo
 - **Dtype**: F32, F64, I32, I64, BF16
 - **Generation**: Streaming text output, persistent KV cache, configurable sampling (temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, seed)
 - **Profiling**: `make profile` runs decode profiling with per-kernel bandwidth analysis via `scripts/profile.py`
-- **Models tested**: MNIST CNN, ResNet-18, GPT-2 (124M), Qwen2.5-0.5B (494M), Qwen3-0.6B (600M)
+- **Models tested**: MNIST CNN, ResNet-18, GPT-2 (124M), Qwen2.5-0.5B (494M), Qwen2.5-1.5B (1.5B), Qwen3-0.6B (600M), SmolLM2-1.7B (1.7B), TinyLlama-1.1B (1.1B)
 
 ## Roadmap
 
@@ -139,7 +142,6 @@ Total weights: 1192 MB. Effective bandwidth: 28 GB/s (37% of 77 GB/s peak). Theo
 
 ### Phase 2: More architectures
 - Llama 3/3.1 (8B quantized, 1B/3B native)
-- SmolLM2 (135M/360M/1.7B -- good small test targets)
 - Phi-4-mini (3.8B quantized)
 - Gemma 3n (E2B/E4B -- efficient mobile-first models)
 - Operator fusion (matmul + bias + activation as one kernel)
