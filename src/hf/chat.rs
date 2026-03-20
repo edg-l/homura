@@ -146,9 +146,11 @@ pub fn find_chat_stop_token(
 
     // Read eos_token (string or {"content": "..."} object).
     let eos = config.get("eos_token").and_then(|v| {
-        v.as_str()
-            .map(|s| s.to_string())
-            .or_else(|| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
+        v.as_str().map(|s| s.to_string()).or_else(|| {
+            v.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        })
     });
 
     // Use eos_token directly -- this covers </s>, <|im_end|>, <|endoftext|>, etc.

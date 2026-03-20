@@ -25,7 +25,10 @@ use crate::{
 
 mod emit_arithmetic;
 mod emit_linalg;
+mod emit_quant;
 mod emit_reshape;
+
+pub use emit_quant::emit_dequant_matmul_q8_0;
 
 // ── Transform schedule mode ───────────────────────────────────────────────────
 
@@ -223,10 +226,38 @@ pub fn compile_to_objects(
 
     let has_schedule = mlir_text.contains("transform.with_named_sequence");
     let vectorize_only = mlir_text.contains("homura.vectorize_only");
+    let is_quant_kernel = mlir_text.contains("homura.quant_kernel");
     register_all_passes();
     let pass_manager = pass::PassManager::new(&context);
 
-    let pipeline = if has_schedule && !vectorize_only {
+    let pipeline = if is_quant_kernel {
+        // Quant kernels operate on memref arguments with explicit vector ops.
+        // No bufferization, no linalg, no transform-interpreter needed.
+        "builtin.module(\
+            func.func(lower-vector-multi-reduction,lower-vector-mask),\
+            func.func(convert-vector-to-scf),\
+            func.func(lower-affine),\
+            scf-forall-to-parallel,\
+            convert-scf-to-openmp,\
+            convert-openmp-to-llvm,\
+            convert-scf-to-cf,\
+            canonicalize,\
+            cse,\
+            sccp,\
+            convert-vector-to-llvm{vector-contract-lowering=outerproduct},\
+            convert-ub-to-llvm,\
+            convert-math-to-llvm,\
+            expand-strided-metadata,\
+            lower-affine,\
+            finalize-memref-to-llvm,\
+            convert-arith-to-llvm,\
+            convert-index-to-llvm,\
+            convert-cf-to-llvm,\
+            convert-func-to-llvm,\
+            convert-openmp-to-llvm,\
+            reconcile-unrealized-casts\
+        )"
+    } else if has_schedule && !vectorize_only {
         "builtin.module(\
             func.func(canonicalize,cse),\
             transform-interpreter,\
@@ -2259,6 +2290,12 @@ fn create_context() -> Context {
     context.load_all_available_dialects();
     register_all_llvm_translations(&context);
     context
+}
+
+/// Public-to-crate wrapper for `create_context`, used by sub-module tests.
+#[cfg(test)]
+pub(crate) fn create_context_pub() -> Context {
+    create_context()
 }
 
 pub(super) fn identity_map_str(rank: usize) -> String {
