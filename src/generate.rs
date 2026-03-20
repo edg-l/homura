@@ -275,7 +275,9 @@ fn generate_streaming_core(
         seed: sampling.seed,
     };
     let output_text = model.decode_tokens(&generated_ids);
-    crate::progress::print_stats(&stats, &output_text);
+    // Overhead: log lines ("starting generation", "prefill complete") + trailing newline.
+    let overhead = if crate::log::enabled(crate::log::Level::Info) { 3 } else { 1 };
+    crate::progress::print_stats(&stats, &output_text, overhead);
 
     Ok((output_text, generated_ids))
 }
@@ -478,9 +480,13 @@ fn print_token_styled(
             let _ = std::io::stdout().flush();
             return;
         }
-        // Inside think block: show styled or hide entirely.
+        // Inside think block: show styled or show non-whitespace content.
+        // Small models may ignore /no_think and put the actual response inside
+        // a think block. Hiding everything would produce blank output.
         if *in_think && !style_content {
-            return;
+            if token_text.trim().is_empty() {
+                return;
+            }
         }
     }
 

@@ -189,7 +189,7 @@ fn count_display_lines(text: &str, term_width: usize) -> usize {
 /// Uses ANSI cursor movement to go back up and write the stats box
 /// on the right side of the already-printed text. Falls back to the
 /// block-below style if the terminal is too narrow or not a TTY.
-pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
+pub fn print_stats(stats: &GenerationStats, generated_text: &str, overhead_lines: usize) {
     let term = Term::stderr();
     let is_tty = atty::is(atty::Stream::Stderr) && atty::is(atty::Stream::Stdout);
 
@@ -204,14 +204,14 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
 
     let term_width = if is_tty { term.size().1 as usize } else { 0 };
 
-    // Need: terminal wide enough for text + box, and enough output lines to overlay on
+    // Need: terminal wide enough for text + box, and enough output lines to overlay on.
+    // overhead_lines accounts for log/info lines on stderr above the generated text.
     let min_width = box_outer + 20; // at least 20 chars for text on the left
     let output_lines = if is_tty && !generated_text.is_empty() {
-        count_display_lines(generated_text, term_width)
+        count_display_lines(generated_text, term_width) + overhead_lines
     } else {
-        0
+        overhead_lines
     };
-    // +1 for the trailing newline after output
     let box_height = stats_lines.len() + 2; // top border + content + bottom border
 
     let use_side = is_tty && term_width >= min_width && output_lines >= box_height;
@@ -229,9 +229,10 @@ pub fn print_stats(stats: &GenerationStats, generated_text: &str) {
         eprint!("\n");
 
         // Content lines
-        for (plain, colored) in &stats_lines {
+        for (_plain, colored) in &stats_lines {
             let content_width = box_inner.saturating_sub(2); // space for padding inside │ │
-            let padding = content_width.saturating_sub(plain.len());
+            let visible_width = console::measure_text_width(colored);
+            let padding = content_width.saturating_sub(visible_width);
             eprint!(
                 "\x1b[{}G\x1b[2m│\x1b[0m {colored}{} \x1b[2m│\x1b[0m",
                 col + 1,
