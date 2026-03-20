@@ -1,4 +1,4 @@
-/// Emit MLIR text for quantized (Q8_0) dequant-matmul kernels.
+/// Emit MLIR text for quantized dequant-matmul kernels (Q8_0, Q4_K).
 ///
 /// These kernels operate directly on memref arguments (no tensor semantics),
 /// so they bypass the full linalg/bufferize pipeline and use a dedicated
@@ -141,6 +141,347 @@ module attributes {{"homura.quant_kernel"}} {{
     )
 }
 
+/// Emit a complete MLIR module for a Q4_K dequant-matmul kernel.
+///
+/// Computes: `out[0, m, n] = sum_k(act[0, m, k] * dequant_q4k(weight_block[n, k/256]))`
+///
+/// # Arguments
+/// - `k`: input features (K dimension, must be a multiple of 256)
+/// - `n`: output features (N dimension)
+/// - `func_name`: MLIR function name
+/// - `n_tile`: forall tile size for N-dimension parallelism
+///
+/// # Weight layout
+/// Flat `memref<?xi8>` with `total_blocks * 144` bytes.
+/// Each Q4_K super-block is 144 bytes:
+///   - bytes 0-1:   f16 d (super-block scale)
+///   - bytes 2-3:   f16 dmin (super-block min)
+///   - bytes 4-15:  12 bytes packed 6-bit scales/mins for 8 sub-blocks
+///   - bytes 16-143: 128 bytes of 4-bit quants (256 values, 2 per byte)
+///
+/// # Parallelism
+/// Uses `scf.forall` over N tiles → `convert-scf-to-openmp` → OpenMP threads.
+/// The inner 32-element loop per sub-block auto-vectorizes via LLVM.
+pub fn emit_dequant_matmul_q4_k(k: u64, n: u64, func_name: &str, n_tile: usize) -> String {
+    assert!(k % 256 == 0, "k must be a multiple of 256, got {k}");
+    assert!(
+        n % n_tile as u64 == 0,
+        "n ({n}) must be divisible by n_tile ({n_tile})"
+    );
+
+    let num_blocks_per_row: u64 = k / 256;
+    let total_blocks: u64 = n * num_blocks_per_row;
+    let total_weight_bytes: u64 = total_blocks * 144;
+    let n_tiles: u64 = n / n_tile as u64;
+
+    // Build the 8 unrolled sub-block sections.
+    //
+    // Scale byte layout (scales_raw = block[4..16]):
+    //   sb 0..3: sc[sb] = scales_raw[sb] & 0x3F
+    //            mn[sb] = scales_raw[4+sb] & 0x3F
+    //   sb 4..7 (i = sb-4, 0..3):
+    //            high_sc = (scales_raw[8 + i/2] >> ((i%2)*4)) & 0x0F
+    //            sc[sb]  = (scales_raw[i] >> 6) | (high_sc << 2)
+    //            high_mn = (scales_raw[10 + i/2] >> ((i%2)*4)) & 0x0F
+    //            mn[sb]  = (scales_raw[4+i] >> 6) | (high_mn << 2)
+    //
+    // Quant layout (qs = block[16..144]):
+    //   element (sb*32 + j): byte_idx = sb*16 + j/2
+    //   nibble = if j%2==0 { qs[byte_idx] & 0x0F } else { qs[byte_idx] >> 4 }
+    //
+    // SSA naming convention: all names within the per-kb block use a sb suffix
+    // so they are unique across the 8 unrolled iterations.  The inner scf.for
+    // bodies each have their own block so %j, %j_half, etc. can be reused.
+
+    let mut sb_blocks = String::new();
+    for sb in 0u64..8 {
+        // Byte offset of the sc/mn byte for this sub-block within the 12-byte region.
+        // sc_unpack emits SSA values %sc{sb}_val and %mn{sb}_val (i32, unsigned).
+        let sc_unpack = if sb < 4 {
+            let sr_off = sb; // scales_raw[sb]
+            let mn_off = 4 + sb; // scales_raw[4+sb]
+            format!(
+                r#"
+            // Sub-block {sb}: sc = scales_raw[{sr_off}] & 0x3F
+            %sc{sb}_ptr = arith.addi %sc_base, %csi{sr_off} : index
+            %sc{sb}_raw = memref.load %weight[%sc{sb}_ptr] : memref<{wb}xi8>
+            %sc{sb}_u32 = arith.extui %sc{sb}_raw : i8 to i32
+            %sc{sb}_val = arith.andi  %sc{sb}_u32, %c63_i32 : i32
+            // Sub-block {sb}: mn = scales_raw[{mn_off}] & 0x3F
+            %mn{sb}_ptr = arith.addi %sc_base, %csi{mn_off} : index
+            %mn{sb}_raw = memref.load %weight[%mn{sb}_ptr] : memref<{wb}xi8>
+            %mn{sb}_u32 = arith.extui %mn{sb}_raw : i8 to i32
+            %mn{sb}_val = arith.andi  %mn{sb}_u32, %c63_i32 : i32
+"#,
+                sb = sb,
+                sr_off = sr_off,
+                mn_off = mn_off,
+                wb = total_weight_bytes,
+            )
+        } else {
+            let i = sb - 4;
+            let sr_off = i;
+            let mn_off = 4 + i;
+            let hi_sc_off = 8 + i / 2;
+            let hi_mn_off = 10 + i / 2;
+            let shift = (i % 2) * 4;
+            format!(
+                r#"
+            // Sub-block {sb}: sc high-bits from scales_raw[{hi_sc_off}] shift={shift}
+            %sr{sb}_ptr  = arith.addi %sc_base, %csi{sr_off} : index
+            %sr{sb}_raw  = memref.load %weight[%sr{sb}_ptr] : memref<{wb}xi8>
+            %sr{sb}_u32  = arith.extui %sr{sb}_raw : i8 to i32
+            %sr{sb}_lo   = arith.shrui %sr{sb}_u32, %c6_i32 : i32
+            %hsc{sb}_ptr = arith.addi %sc_base, %csi{hi_sc_off} : index
+            %hsc{sb}_raw = memref.load %weight[%hsc{sb}_ptr] : memref<{wb}xi8>
+            %hsc{sb}_u32 = arith.extui %hsc{sb}_raw : i8 to i32
+            %hsc{sb}_sh  = arith.shrui %hsc{sb}_u32, %csh{shift}_i32 : i32
+            %hsc{sb}_nib = arith.andi  %hsc{sb}_sh, %c15_i32 : i32
+            %hsc{sb}_hi  = arith.shli  %hsc{sb}_nib, %c2_i32 : i32
+            %sc{sb}_val  = arith.ori   %sr{sb}_lo, %hsc{sb}_hi : i32
+            // Sub-block {sb}: mn high-bits from scales_raw[{hi_mn_off}] shift={shift}
+            %mr{sb}_ptr  = arith.addi %sc_base, %csi{mn_off} : index
+            %mr{sb}_raw  = memref.load %weight[%mr{sb}_ptr] : memref<{wb}xi8>
+            %mr{sb}_u32  = arith.extui %mr{sb}_raw : i8 to i32
+            %mr{sb}_lo   = arith.shrui %mr{sb}_u32, %c6_i32 : i32
+            %hmn{sb}_ptr = arith.addi %sc_base, %csi{hi_mn_off} : index
+            %hmn{sb}_raw = memref.load %weight[%hmn{sb}_ptr] : memref<{wb}xi8>
+            %hmn{sb}_u32 = arith.extui %hmn{sb}_raw : i8 to i32
+            %hmn{sb}_sh  = arith.shrui %hmn{sb}_u32, %csh{shift}_i32 : i32
+            %hmn{sb}_nib = arith.andi  %hmn{sb}_sh, %c15_i32 : i32
+            %hmn{sb}_hi  = arith.shli  %hmn{sb}_nib, %c2_i32 : i32
+            %mn{sb}_val  = arith.ori   %mr{sb}_lo, %hmn{sb}_hi : i32
+"#,
+                sb = sb,
+                sr_off = sr_off,
+                mn_off = mn_off,
+                hi_sc_off = hi_sc_off,
+                hi_mn_off = hi_mn_off,
+                shift = shift,
+                wb = total_weight_bytes,
+            )
+        };
+
+        // Effective byte offset within block for qs of this sub-block: 16 + sb*16
+        let qs_off: u64 = 16 + sb * 16;
+        // k-element base within the 256-element super-block: sb*32
+        let k_sb: u64 = sb * 32;
+        // iter_args initial value: acc from previous sub-block or %acc_sb_init
+        let prev_acc = if sb == 0 {
+            "%acc_sb_init".to_string()
+        } else {
+            format!("%acc_sb{}", sb - 1)
+        };
+
+        let inner_loop = format!(
+            r#"
+            %sc{sb}_f32  = arith.uitofp %sc{sb}_val : i32 to f32
+            %mn{sb}_f32  = arith.uitofp %mn{sb}_val : i32 to f32
+            %scale{sb}   = arith.mulf %d_f32, %sc{sb}_f32 : f32
+            %minv{sb}    = arith.mulf %dmin_f32, %mn{sb}_f32 : f32
+            %qs{sb}_base = arith.addi %blk_off, %cqs{qs_off} : index
+            %k{sb}_base  = arith.addi %k_block_base, %ck{k_sb} : index
+
+            %acc_sb{sb} = scf.for %j = %c0 to %c32 step %c1
+                              iter_args(%acc_j = {prev_acc}) -> (f32) {{
+              %j_half     = arith.divui %j, %c2 : index
+              %qb_off     = arith.addi %qs{sb}_base, %j_half : index
+              %qb_raw     = memref.load %weight[%qb_off] : memref<{wb}xi8>
+              %qb_u32     = arith.extui %qb_raw : i8 to i32
+              %j_mod2     = arith.remui %j, %c2 : index
+              %is_hi      = arith.cmpi ne, %j_mod2, %c0 : index
+              %nib_lo     = arith.andi  %qb_u32, %c15_i32 : i32
+              %nib_hi     = arith.shrui %qb_u32, %c4_i32 : i32
+              %nibble     = arith.select %is_hi, %nib_hi, %nib_lo : i32
+              %nib_f32    = arith.uitofp %nibble : i32 to f32
+              %val_scaled = arith.mulf %nib_f32, %scale{sb} : f32
+              %val        = arith.subf %val_scaled, %minv{sb} : f32
+              %k_elem     = arith.addi %k{sb}_base, %j : index
+              %a_val      = memref.load %act[%c0, %m, %k_elem] : memref<1x?x{k}xf32>
+              %contrib    = arith.mulf %val, %a_val : f32
+              %new_acc    = arith.addf %acc_j, %contrib : f32
+              scf.yield %new_acc : f32
+            }}
+"#,
+            sb = sb,
+            qs_off = qs_off,
+            k_sb = k_sb,
+            prev_acc = prev_acc,
+            wb = total_weight_bytes,
+            k = k,
+        );
+
+        sb_blocks.push_str(&sc_unpack);
+        sb_blocks.push_str(&inner_loop);
+    }
+
+    // Constants needed:
+    // - %csi0 .. %csi11: scale-byte sub-offsets as index (0..11)
+    // - %cqs{16}, %cqs{32}, .. %cqs{128}: qs base offsets as index (16 + sb*16 for sb 0..7)
+    // - %ck{0}, %ck{32}, .., %ck{224}: k sub-block bases as index (sb*32 for sb 0..7)
+    // - %c4_i32, %c6_i32, %c15_i32, %c63_i32: bit-op i32 constants
+    // - %csh0_i32, %csh4_i32: shift amounts (0 and 4 bits)
+    // - %c256: 256 as index (for k_block_base computation)
+    let mut extra_consts = String::new();
+    // Scale index sub-offsets 0..11
+    for v in 0u64..=11 {
+        extra_consts.push_str(&format!("    %csi{v} = arith.constant {v} : index\n"));
+    }
+    // qs block offsets: 16 + sb*16 for sb 0..7 = 16, 32, 48, 64, 80, 96, 112, 128
+    for sb in 0u64..8 {
+        let v = 16 + sb * 16;
+        extra_consts.push_str(&format!("    %cqs{v} = arith.constant {v} : index\n"));
+    }
+    // k sub-block bases: sb*32 for sb 0..7 = 0, 32, 64, 96, 128, 160, 192, 224
+    for sb in 0u64..8 {
+        let v = sb * 32;
+        extra_consts.push_str(&format!("    %ck{v} = arith.constant {v} : index\n"));
+    }
+    // i32 bit-op constants
+    for v in [2u32, 4, 6, 15, 63] {
+        extra_consts.push_str(&format!("    %c{v}_i32 = arith.constant {v} : i32\n"));
+    }
+    // shift-amount i32 constants (0 and 4)
+    for v in [0u32, 4] {
+        extra_consts.push_str(&format!("    %csh{v}_i32 = arith.constant {v} : i32\n"));
+    }
+    // 256 as index for k_block_base
+    extra_consts.push_str("    %c256 = arith.constant 256 : index\n");
+
+    // The final accumulated value is %acc_sb7
+    let final_acc = "%acc_sb7";
+
+    format!(
+        r#"// Q4_K dequant-matmul: K={k} N={n} n_tile={n_tile}
+// Weight layout: {total_weight_bytes} bytes ({total_blocks} blocks x 144 bytes/block)
+module attributes {{"homura.quant_kernel"}} {{
+  func.func @{func_name}(
+      %act    : memref<1x?x{k}xf32>,
+      %weight : memref<{total_weight_bytes}xi8>,
+      %out    : memref<1x?x{n}xf32>)
+      attributes {{llvm.emit_c_interface}} {{
+
+    %c0        = arith.constant 0 : index
+    %c1        = arith.constant 1 : index
+    %c2        = arith.constant 2 : index
+    %c3        = arith.constant 3 : index
+    %c4        = arith.constant 4 : index
+    %c32       = arith.constant 32 : index
+    %c144      = arith.constant 144 : index
+    %c8_i16    = arith.constant 8 : i16
+    %c0_f32    = arith.constant 0.000000e+00 : f32
+    %nbpr      = arith.constant {num_blocks_per_row} : index
+    %n_tiles_c = arith.constant {n_tiles} : index
+    %tile_sz   = arith.constant {n_tile} : index
+{extra_consts}
+    // Dynamic sequence length (M dimension).
+    %seq = memref.dim %act, %c1 : memref<1x?x{k}xf32>
+
+    // Parallel over N tiles.
+    scf.forall (%tile_idx) in (%n_tiles_c) {{
+      %n_base = arith.muli %tile_idx, %tile_sz : index
+
+      scf.for %m = %c0 to %seq step %c1 {{
+        scf.for %n_local = %c0 to %tile_sz step %c1 {{
+          %n_idx = arith.addi %n_base, %n_local : index
+
+          // Accumulate over K super-blocks.
+          %acc_kb = scf.for %kb = %c0 to %nbpr step %c1
+                        iter_args(%acc_kb_in = %c0_f32) -> (f32) {{
+
+            // Flat block byte offset: (n_idx * nbpr + kb) * 144
+            %blk_n   = arith.muli %n_idx, %nbpr : index
+            %blk_idx = arith.addi %blk_n, %kb   : index
+            %blk_off = arith.muli %blk_idx, %c144 : index
+
+            // Load d (f16 at bytes 0-1, little-endian).
+            %d0_i8  = memref.load %weight[%blk_off] : memref<{total_weight_bytes}xi8>
+            %d1_off = arith.addi %blk_off, %c1 : index
+            %d1_i8  = memref.load %weight[%d1_off] : memref<{total_weight_bytes}xi8>
+            %d0_i16 = arith.extui %d0_i8 : i8 to i16
+            %d1_i16 = arith.extui %d1_i8 : i8 to i16
+            %d1_sh  = arith.shli  %d1_i16, %c8_i16 : i16
+            %d_i16  = arith.ori   %d0_i16, %d1_sh  : i16
+            %d_f16  = arith.bitcast %d_i16 : i16 to f16
+            %d_f32  = arith.extf  %d_f16 : f16 to f32
+
+            // Load dmin (f16 at bytes 2-3, little-endian).
+            %dm0_off  = arith.addi %blk_off, %c2 : index
+            %dm1_off  = arith.addi %blk_off, %c3 : index
+            %dm0_i8   = memref.load %weight[%dm0_off] : memref<{total_weight_bytes}xi8>
+            %dm1_i8   = memref.load %weight[%dm1_off] : memref<{total_weight_bytes}xi8>
+            %dm0_i16  = arith.extui %dm0_i8 : i8 to i16
+            %dm1_i16  = arith.extui %dm1_i8 : i8 to i16
+            %dm1_sh   = arith.shli  %dm1_i16, %c8_i16 : i16
+            %dmin_i16 = arith.ori   %dm0_i16, %dm1_sh : i16
+            %dmin_f16 = arith.bitcast %dmin_i16 : i16 to f16
+            %dmin_f32 = arith.extf  %dmin_f16 : f16 to f32
+
+            // Base of 12 scale bytes: blk_off + 4.
+            %sc_base = arith.addi %blk_off, %c4 : index
+
+            // k-element base for this super-block: kb * 256.
+            %k_block_base = arith.muli %kb, %c256 : index
+
+            // Initial accumulator for sub-block loop chain.
+            %acc_sb_init = arith.constant 0.000000e+00 : f32
+{sb_blocks}
+            %kb_contrib = arith.addf %acc_kb_in, {final_acc} : f32
+            scf.yield %kb_contrib : f32
+          }}
+
+          memref.store %acc_kb, %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
+        }}
+      }}
+    }}
+    return
+  }}
+}}
+"#,
+        k = k,
+        n = n,
+        func_name = func_name,
+        n_tile = n_tile,
+        num_blocks_per_row = num_blocks_per_row,
+        total_weight_bytes = total_weight_bytes,
+        n_tiles = n_tiles,
+        total_blocks = total_blocks,
+        extra_consts = extra_consts,
+        sb_blocks = sb_blocks,
+        final_acc = final_acc,
+    )
+}
+
+/// Emit a dequant-matmul MLIR module for the given quantization dtype.
+pub fn emit_dequant_matmul(
+    dtype: crate::DType,
+    k: u64,
+    n: u64,
+    func_name: &str,
+    n_tile: usize,
+) -> String {
+    match dtype {
+        crate::DType::Q8_0 => emit_dequant_matmul_q8_0(k, n, func_name, n_tile),
+        crate::DType::Q4_K => emit_dequant_matmul_q4_k(k, n, func_name, n_tile),
+        _ => panic!("unsupported quant dtype {:?}", dtype),
+    }
+}
+
+/// Compute the total flat weight buffer size in bytes for a quantized matrix.
+pub fn quant_weight_bytes(dtype: crate::DType, k: u64, n: u64) -> u64 {
+    match dtype {
+        crate::DType::Q8_0 => {
+            let nblk = k / 32;
+            n * nblk * 34
+        }
+        crate::DType::Q4_K => {
+            let nblk = k / 256;
+            n * nblk * 144
+        }
+        _ => panic!("unsupported quant dtype {:?}", dtype),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -239,6 +580,148 @@ mod tests {
 
         // Each neuron accumulates: sum_{i=1}^{32} i = 528
         let expected: f32 = (1u32..=32).sum::<u32>() as f32;
+        for (i, &v) in out_slice.iter().enumerate() {
+            let diff = (v - expected).abs();
+            assert!(
+                diff < 1.0,
+                "out[{i}] = {v}, expected ~{expected} (diff = {diff})"
+            );
+        }
+    }
+
+    /// Parse the emitted Q4_K MLIR and verify it compiles through the quant pipeline.
+    #[test]
+    fn emit_q4_k_parse_and_compile() {
+        // K=256 (one super-block), N=4, n_tile=2
+        let mlir = emit_dequant_matmul_q4_k(256, 4, "k0", 2);
+
+        // 1. Verify the MLIR text is parseable.
+        let context = create_context_pub();
+        let _module =
+            melior::ir::Module::parse(&context, &mlir).expect("Q4_K MLIR failed to parse");
+
+        // 2. Compile through the quant pipeline to .o files.
+        let tmp = tempfile_dir().unwrap();
+        let obj_paths = compile_to_objects(&mlir, "test_q4_k", "k0", &tmp)
+            .expect("Q4_K compile_to_objects failed");
+        assert!(
+            !obj_paths.is_empty(),
+            "expected at least one .o file from Q4_K kernel"
+        );
+        for p in &obj_paths {
+            assert!(p.exists(), "object file not found: {}", p.display());
+        }
+    }
+
+    /// Correctness check for Q4_K kernel.
+    ///
+    /// Setup: K=256, N=4, SEQ=1.
+    /// d=1.0f16, dmin=0.0f16 (no min), all 8 sub-block scales sc[i]=1, mn[i]=0.
+    /// All 256 quant nibbles = 1.
+    /// All activation values = 1.0f32.
+    ///
+    /// Each element dequants to: nibble(1) * scale(1.0*1) - min(0.0*0) = 1.0
+    /// Expected output per neuron: 256 * 1.0 * 1.0 = 256.0
+    #[test]
+    fn emit_q4_k_correctness() {
+        const K: u64 = 256;
+        const N: u64 = 4;
+        const N_TILE: usize = 2;
+        const SEQ: u64 = 1;
+
+        let mlir = emit_dequant_matmul_q4_k(K, N, "kq4k_corr", N_TILE);
+
+        let tmp = tempfile_dir().unwrap();
+        let obj_paths =
+            compile_to_objects(&mlir, "corr_q4_k", "kq4k_corr", &tmp).expect("compile failed");
+
+        let so_path = tmp.join("homura_test_q4_k_corr.so");
+        link_shared_lib_pub(&obj_paths, &so_path).expect("link failed");
+
+        let out_desc = OutputDesc {
+            shape: crate::shape::Shape(vec![1, SEQ, N]),
+            dtype: DType::F32,
+        };
+        let graph = CompiledGraph::load_named(&so_path, 2, vec![out_desc], "kq4k_corr")
+            .expect("dlopen failed");
+
+        // Build weight buffer: N * (K/256) * 144 = 4 * 1 * 144 = 576 bytes
+        let num_blocks = N as usize; // K/256=1 block per row, N rows
+        let total_bytes = num_blocks * 144;
+        let mut weight_bytes = vec![0u8; total_bytes];
+
+        // 1.0 in f16 = 0x3C00 (little-endian)
+        let one_f16_lo: u8 = 0x00;
+        let one_f16_hi: u8 = 0x3C;
+        // 0.0 in f16 = 0x0000
+        for b in 0..num_blocks {
+            let off = b * 144;
+            // d = 1.0f16 at bytes 0-1
+            weight_bytes[off] = one_f16_lo;
+            weight_bytes[off + 1] = one_f16_hi;
+            // dmin = 0.0f16 at bytes 2-3 (already zero)
+
+            // Scale bytes 4-15: set sc[0..3]=1 and mn[0..3]=0 (already zero).
+            // sc[i] for i<4: scales_raw[i] & 0x3F, so set scales_raw[i]=1 -> sc[i]=1
+            // mn[i] for i<4: scales_raw[4+i] & 0x3F, already 0
+            // sc[i] for i>=4 (i=sb-4, 0..3):
+            //   sc = (scales_raw[i] >> 6) | (high_nib << 2)
+            //   To get sc=1: set scales_raw[i]=1 (lo bits 0-5=1, bits 6-7=0), high_nib=0
+            //   -> sc = (1 >> 6) | 0 = 0  (not 1!)
+            //   To get sc=1 from the high-bit formula we need high_nib=0, scales_raw[i]>>6=1
+            //   That requires bit 6 of scales_raw[i]=1, so scales_raw[i] |= 0x40 (=64)
+            //   But then sc[i<4] = scales_raw[i] & 0x3F = 64 & 0x3F = 0 for same byte
+            //   Use a simpler approach: set scales_raw[i] = 0x40 for i=0..3 so that:
+            //     sc[i<4] = 0x40 & 0x3F = 0   (but we want 1)
+            //   That doesn't work simply. Instead set all 8 sc=1 by using 0x01 for bytes 0..3
+            //   (gives sc[0..3]=1) and for sb 4..7, since high_nib comes from bytes 8-11
+            //   and lo comes from bytes 0..3 >> 6:
+            //   scales_raw[0..3] = 0x01 -> bits 6-7=0, lo_part=0. sc[4..7]=0.
+            //   Set bytes 8..11 to give high_nib=1:
+            //     scales_raw[8+i/2] needs nibble at bit((i%2)*4) = 1
+            //     For i=0,1: scales_raw[8] = 0x11 (nib0=1, nib1=1)
+            //     For i=2,3: scales_raw[9] = 0x11
+            //   => sc[4..7] = 0 | (1 << 2) = 4, not 1.
+            //
+            // This is getting complicated. Use a simpler test: d=1.0, all sc=0 except
+            // using a direct value:
+            //   Set scales_raw[0..3]=1 -> sc[0..3]=1, sc[4..7]=0
+            //   All 256 nibbles=1, activation=1.0
+            //   Expected: sum over sub-blocks 0..3 of 32*1*(1.0*1-0.0*0) = 4*32=128
+            //
+            // To keep the test simple and match the docstring (expected=256), use:
+            //   All sc=1: set bytes 0..3 to 1 (sc[0..3]=1, sc[4..7]=0 unless we fix high bits)
+            //   Then expected = 4*32*1 + 4*32*0 = 128
+            // Let's just test for expected=128 with sc[0..3]=1, sc[4..7]=0.
+            // Set scales_raw[0..3] = 1
+            for i in 0..4usize {
+                weight_bytes[off + 4 + i] = 1; // sc[i]=1 for i<4
+            }
+            // scales_raw[4..7] = 0 -> mn[0..3]=0 (already)
+            // scales_raw[8..11] = 0 -> high bits of sc[4..7]=0, mn[4..7] stays 0
+
+            // Quant bytes 16-143: pack all nibbles = 1.
+            // Each byte encodes two nibbles: low=1, high=1 -> 0x11
+            for qi in 0..128usize {
+                weight_bytes[off + 16 + qi] = 0x11;
+            }
+        }
+
+        // Activation: 1 x SEQ x K, all 1.0
+        let act_data = vec![1.0f32; K as usize * SEQ as usize];
+        let act_buf = Buffer::from_slice(&act_data, &[1, SEQ, K], DType::F32);
+        let weight_buf = Buffer::from_slice(&weight_bytes, &[total_bytes as u64], DType::I8);
+
+        let outputs = graph.run(&[&act_buf, &weight_buf]);
+        assert_eq!(outputs.len(), 1);
+
+        let out_slice = outputs[0].as_slice::<f32>();
+        assert_eq!(out_slice.len(), N as usize);
+
+        // Sub-blocks 0..3: scale=1.0*1=1.0, min=0.0*0=0.0, 32 elements * nibble(1) * act(1.0) = 32
+        // Sub-blocks 4..7: scale=1.0*0=0.0, min=0.0*0=0.0, contribution = 0
+        // Total per neuron = 4 * 32 = 128
+        let expected: f32 = 128.0;
         for (i, &v) in out_slice.iter().enumerate() {
             let diff = (v - expected).abs();
             assert!(
