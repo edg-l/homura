@@ -170,13 +170,6 @@ fn main() {
     }
     unsafe { libc::atexit(force_exit) };
 
-    // Ensure OpenMP worker threads have enough stack for deep quant kernels
-    // (Q4_K/Q6_K have 8-16 unrolled sub-blocks with nested loops).
-    if std::env::var("OMP_STACKSIZE").is_err() {
-        // SAFETY: called at program start before any threads are spawned.
-        unsafe { std::env::set_var("OMP_STACKSIZE", "8M") };
-    }
-
     let cli = Cli::parse();
     match cli.verbose {
         1 => log::set_level(log::Level::Debug),
