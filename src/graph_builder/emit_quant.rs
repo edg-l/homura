@@ -226,25 +226,19 @@ module attributes {{"homura.quant_kernel"}} {{
     scf.forall (%tile_idx) in (%n_tiles_c) {{
       %n_base = arith.muli %tile_idx, %tile_sz : index
 
-      // Allocate Q8_K buffers (stack, reused each iteration).
-      %q8_buf   = memref.alloca() : memref<256xi8>
-      %bsums    = memref.alloca() : memref<16xi32>
+      // Allocate Q8_K buffers for ALL K blocks (stack, reused each M iteration).
+      // q8_all: [nbpr, 256] = K bytes total; bsums_all: [nbpr, 16]; act_d_all: [nbpr]
+      %q8_all   = memref.alloca() : memref<{k}xi8>
+      %bsums_all = memref.alloca() : memref<{nbpr_x_16}xi32>
+      %act_d_all = memref.alloca() : memref<{nbpr}xf32>
       %sc_arr   = memref.alloca() : memref<8xi32>
       %mn_arr   = memref.alloca() : memref<8xi32>
 
       scf.for %m = %c0 to %seq step %c1 {{
-        // Zero output accumulators for this tile.
-        scf.for %n_z = %c0 to %tile_sz step %c1 {{
-          %n_z_idx = arith.addi %n_base, %n_z : index
-          memref.store %c0_f32, %out[%c0, %m, %n_z_idx] : memref<1x?x{n}xf32>
-        }}
-
-        // KB is outer, N is inner: quantize activation ONCE per (m, kb).
+        // ── Pre-quantize ALL K blocks for this M position ──
         scf.for %kb = %c0 to %nbpr step %c1 {{
-
           %k_block_base = arith.muli %kb, %c256 : index
 
-          // ── Q8_K quantization of 256 activation elements (once per K block) ──
           // Pass 1: find amax = max(|act[k_block_base..+256]|)
           %amax = scf.for %qi = %c0 to %c256 step %c1
                       iter_args(%mx = %c0_f32) -> (f32) {{
@@ -260,11 +254,13 @@ module attributes {{"homura.quant_kernel"}} {{
           %is_zero = arith.cmpf oeq, %amax, %c0_f32 : f32
           %iscale_raw = arith.divf %c127_f32, %amax : f32
           %iscale  = arith.select %is_zero, %c0_f32, %iscale_raw : f32
+          memref.store %act_d, %act_d_all[%kb] : memref<{nbpr}xf32>
 
           // Pass 2: quantize and store q8, compute bsums
-          // Zero bsums first
+          %bsums_kb_base = arith.muli %kb, %c16 : index
           scf.for %gi = %c0 to %c16 step %c1 {{
-            memref.store %c0_i32, %bsums[%gi] : memref<16xi32>
+            %gi_off = arith.addi %bsums_kb_base, %gi : index
+            memref.store %c0_i32, %bsums_all[%gi_off] : memref<{nbpr_x_16}xi32>
           }}
           scf.for %qi = %c0 to %c256 step %c1 {{
             %ki2 = arith.addi %k_block_base, %qi : index
@@ -277,18 +273,26 @@ module attributes {{"homura.quant_kernel"}} {{
             %clamped = arith.maximumf %clamped_hi, %neg127 : f32
             %qi8_i32 = arith.fptosi %clamped : f32 to i32
             %qi8 = arith.trunci %qi8_i32 : i32 to i8
-            memref.store %qi8, %q8_buf[%qi] : memref<256xi8>
-            // Accumulate bsums[qi / 16]
+            memref.store %qi8, %q8_all[%ki2] : memref<{k}xi8>
+            // Accumulate bsums
             %grp = arith.divui %qi, %c16 : index
-            %old_bs = memref.load %bsums[%grp] : memref<16xi32>
+            %grp_off = arith.addi %bsums_kb_base, %grp : index
+            %old_bs = memref.load %bsums_all[%grp_off] : memref<{nbpr_x_16}xi32>
             %qi_ext = arith.extsi %qi8 : i8 to i32
             %new_bs = arith.addi %old_bs, %qi_ext : i32
-            memref.store %new_bs, %bsums[%grp] : memref<16xi32>
+            memref.store %new_bs, %bsums_all[%grp_off] : memref<{nbpr_x_16}xi32>
           }}
+        }}
 
-          // ── Inner N loop: weight decode + dot for all columns in tile ──
-          scf.for %n_local = %c0 to %tile_sz step %c1 {{
-            %n_idx = arith.addi %n_base, %n_local : index
+        // ── N-outer loop: sequential weight access per column ──
+        scf.for %n_local = %c0 to %tile_sz step %c1 {{
+          %n_idx = arith.addi %n_base, %n_local : index
+          %acc_kb = scf.for %kb = %c0 to %nbpr step %c1
+                        iter_args(%acc_kb_in = %c0_f32) -> (f32) {{
+
+            %k_block_base2 = arith.muli %kb, %c256 : index
+            %act_d2 = memref.load %act_d_all[%kb] : memref<{nbpr}xf32>
+            %bsums_kb_base2 = arith.muli %kb, %c16 : index
 
             // ── Weight block header ──
             %blk_n   = arith.muli %n_idx, %nbpr : index
@@ -383,7 +387,8 @@ module attributes {{"homura.quant_kernel"}} {{
               %sb_half = arith.divui %sb, %c2 : index
               %sb_byte_base = arith.muli %sb_half, %c32 : index
               %qb_base = arith.addi %qs_base, %sb_byte_base : index
-              %sb_q8_base = arith.muli %sb, %c32 : index
+              %sb_q8_off = arith.muli %sb, %c32 : index
+              %sb_q8_base = arith.addi %k_block_base2, %sb_q8_off : index
               // sb_is_odd = sb % 2
               %sb_rem = arith.remui %sb, %c2 : index
               %sb_is_odd = arith.cmpi ne, %sb_rem, %c0 : index
@@ -391,8 +396,8 @@ module attributes {{"homura.quant_kernel"}} {{
               // Vector load 32 weight bytes and 32 q8 bytes
               %w_v = vector.load %weight[%qb_base]
                          : memref<{twb}xi8>, vector<32xi8>
-              %q8_v = vector.load %q8_buf[%sb_q8_base]
-                          : memref<256xi8>, vector<32xi8>
+              %q8_v = vector.load %q8_all[%sb_q8_base]
+                          : memref<{k}xi8>, vector<32xi8>
 
               // Extract nibbles: compute both lo and hi, then select
               %w_u32 = arith.extui %w_v : vector<32xi8> to vector<32xi32>
@@ -424,26 +429,28 @@ module attributes {{"homura.quant_kernel"}} {{
                              iter_args(%mi_in = %c0_i32) -> (i32) {{
               %mn_idx = arith.divui %gi, %c2 : index
               %mn_g = memref.load %mn_arr[%mn_idx] : memref<8xi32>
-              %bs_g = memref.load %bsums[%gi] : memref<16xi32>
+              %bs_gi = arith.addi %bsums_kb_base2, %gi : index
+              %bs_g = memref.load %bsums_all[%bs_gi] : memref<{nbpr_x_16}xi32>
               %mn_bs = arith.muli %mn_g, %bs_g : i32
               %mi_out = arith.addi %mi_in, %mn_bs : i32
               scf.yield %mi_out : i32
             }}
 
-            // ── Float combine + accumulate into output ──
-            %d_combined = arith.mulf %d_f32, %act_d : f32
+            // ── Float combine ──
+            %d_combined = arith.mulf %d_f32, %act_d2 : f32
             %scale_f32  = arith.sitofp %scale_accum : i32 to f32
             %scale_part = arith.mulf %d_combined, %scale_f32 : f32
 
-            %dmin_combined = arith.mulf %dmin_f32, %act_d : f32
+            %dmin_combined = arith.mulf %dmin_f32, %act_d2 : f32
             %min_f32  = arith.sitofp %min_accum : i32 to f32
             %min_part = arith.mulf %dmin_combined, %min_f32 : f32
 
             %kb_val = arith.subf %scale_part, %min_part : f32
-            %old_out = memref.load %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
-            %new_out = arith.addf %old_out, %kb_val : f32
-            memref.store %new_out, %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
+            %kb_contrib = arith.addf %acc_kb_in, %kb_val : f32
+            scf.yield %kb_contrib : f32
           }}
+
+          memref.store %acc_kb, %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
         }}
       }}
     }}
@@ -456,6 +463,7 @@ module attributes {{"homura.quant_kernel"}} {{
         func_name = func_name,
         n_tile = n_tile,
         nbpr = num_blocks_per_row,
+        nbpr_x_16 = num_blocks_per_row * 16,
         twb = total_weight_bytes,
         nt = n_tiles,
         tb = total_blocks,
@@ -535,22 +543,15 @@ module attributes {{"homura.quant_kernel"}} {{
     scf.forall (%tile_idx) in (%n_tiles_c) {{
       %n_base = arith.muli %tile_idx, %tile_sz : index
 
-      // Stack buffers for Q8_K quantized activation.
-      %q8_buf = memref.alloca() : memref<256xi8>
+      // Stack buffers for Q8_K quantized activation (all K blocks).
+      %q8_all = memref.alloca() : memref<{k}xi8>
+      %act_d_all = memref.alloca() : memref<{num_blocks_per_row}xf32>
 
       scf.for %m = %c0 to %seq step %c1 {{
-        // Zero output accumulators for this tile.
-        scf.for %n_z = %c0 to %tile_sz step %c1 {{
-          %n_z_idx = arith.addi %n_base, %n_z : index
-          memref.store %c0_f32, %out[%c0, %m, %n_z_idx] : memref<1x?x{n}xf32>
-        }}
-
-        // KB is outer, N is inner: quantize activation ONCE per (m, kb).
+        // ── Pre-quantize ALL K blocks for this M position ──
         scf.for %kb = %c0 to %nbpr step %c1 {{
-
           %k_block_base = arith.muli %kb, %c256 : index
 
-          // ── Q8_K quantization of 256 activation elements (once per K block) ──
           %amax = scf.for %qi = %c0 to %c256 step %c1
                       iter_args(%mx = %c0_f32) -> (f32) {{
             %ki = arith.addi %k_block_base, %qi : index
@@ -564,6 +565,7 @@ module attributes {{"homura.quant_kernel"}} {{
           %is_zero = arith.cmpf oeq, %amax, %c0_f32 : f32
           %iscale_raw = arith.divf %c127_f32, %amax : f32
           %iscale  = arith.select %is_zero, %c0_f32, %iscale_raw : f32
+          memref.store %act_d, %act_d_all[%kb] : memref<{num_blocks_per_row}xf32>
 
           scf.for %qi = %c0 to %c256 step %c1 {{
             %ki2 = arith.addi %k_block_base, %qi : index
@@ -575,12 +577,18 @@ module attributes {{"homura.quant_kernel"}} {{
             %clamped = arith.maximumf %clamped_hi, %neg127 : f32
             %qi8_i32 = arith.fptosi %clamped : f32 to i32
             %qi8 = arith.trunci %qi8_i32 : i32 to i8
-            memref.store %qi8, %q8_buf[%qi] : memref<256xi8>
+            memref.store %qi8, %q8_all[%ki2] : memref<{k}xi8>
           }}
+        }}
 
-          // ── Inner N loop: weight decode + dot for all columns in tile ──
-          scf.for %n_local = %c0 to %tile_sz step %c1 {{
-            %n_idx = arith.addi %n_base, %n_local : index
+        // ── N-outer loop: sequential weight access per column ──
+        scf.for %n_local = %c0 to %tile_sz step %c1 {{
+          %n_idx = arith.addi %n_base, %n_local : index
+          %acc_kb = scf.for %kb = %c0 to %nbpr step %c1
+                        iter_args(%acc_kb_in = %c0_f32) -> (f32) {{
+
+            %k_block_base2 = arith.muli %kb, %c256 : index
+            %act_d2 = memref.load %act_d_all[%kb] : memref<{num_blocks_per_row}xf32>
 
             // ── Weight block header ──
             %blk_n   = arith.muli %n_idx, %nbpr : index
@@ -648,8 +656,9 @@ module attributes {{"homura.quant_kernel"}} {{
               // l_offset = parity * 16 (first half or second half of 32-element group)
               %l_offset = arith.muli %parity, %c16 : index
 
-              // q8 base: sb * 16
-              %q8_sb_base = arith.muli %sb, %c16 : index
+              // q8 base: k_block_base2 + sb * 16
+              %q8_sb_off = arith.muli %sb, %c16 : index
+              %q8_sb_base = arith.addi %k_block_base2, %q8_sb_off : index
 
               // Vectorized 16-element dot product per sub-block
               // ql_load_off = ql_base2 + l_offset
@@ -687,8 +696,8 @@ module attributes {{"homura.quant_kernel"}} {{
               %q_v = arith.subi %combined_v, %bias_v : vector<16xi32>
 
               // Load q8 quantized activation
-              %q8_v = vector.load %q8_buf[%q8_sb_base]
-                          : memref<256xi8>, vector<16xi8>
+              %q8_v = vector.load %q8_all[%q8_sb_base]
+                          : memref<{k}xi8>, vector<16xi8>
               %q8_i32_v = arith.extsi %q8_v : vector<16xi8> to vector<16xi32>
 
               // Integer multiply + horizontal reduce
@@ -701,14 +710,15 @@ module attributes {{"homura.quant_kernel"}} {{
               scf.yield %sa_out : i32
             }}
 
-            // ── Float combine + accumulate into output ──
-            %d_combined = arith.mulf %d_f32, %act_d : f32
+            // ── Float combine ──
+            %d_combined = arith.mulf %d_f32, %act_d2 : f32
             %scale_f32 = arith.sitofp %scale_accum : i32 to f32
             %kb_val = arith.mulf %d_combined, %scale_f32 : f32
-            %old_out = memref.load %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
-            %new_out = arith.addf %old_out, %kb_val : f32
-            memref.store %new_out, %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
+            %kb_contrib = arith.addf %acc_kb_in, %kb_val : f32
+            scf.yield %kb_contrib : f32
           }}
+
+          memref.store %acc_kb, %out[%c0, %m, %n_idx] : memref<1x?x{n}xf32>
         }}
       }}
     }}
