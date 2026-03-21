@@ -56,7 +56,7 @@ impl TransformMode {
     ///
     /// Given the smallest N dimension across matmuls in the kernel, picks
     /// a tile size that produces at least `available_parallelism` tiles,
-    /// rounded down to a power of two (for clean division), clamped to [16, 256].
+    /// rounded down to a power of two (for clean division), clamped to min 16.
     pub fn tile_parallel_adaptive(min_n: usize) -> Self {
         let num_cores = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -64,13 +64,13 @@ impl TransformMode {
         // Target at least 1.5× cores worth of tiles for good load balancing.
         let target_tiles = num_cores + num_cores / 2;
         let ideal = min_n / target_tiles;
-        // Round down to power of two, clamp to [16, 256].
+        // Round down to power of two, clamp to min 16.
         let n_tile = if ideal <= 1 {
             1
         } else {
             1usize << (usize::BITS - 1 - ideal.leading_zeros())
         };
-        let n_tile = n_tile.max(16).min(256);
+        let n_tile = n_tile.max(16);
         TransformMode::TileParallel { n_tile }
     }
 }
