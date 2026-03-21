@@ -1136,6 +1136,22 @@ pub struct ExecutionPlan {
     pub(crate) kv_info: Option<KvPlanInfo>,
     /// Persistent KV cache, created on first `run_kv` call.
     kv_cache: Option<KvCache>,
+    /// Pre-computed KV decode metadata (built once on first run_kv call).
+    kv_decode_cache: Option<KvDecodeCache>,
+}
+
+/// Pre-computed lookup tables for run_kv(), built once and reused every token.
+struct KvDecodeCache {
+    /// Bit set of past_kv input slots (for O(1) contains checks).
+    past_kv_slots: Vec<bool>,
+    /// Non-KV input slot indices (in input_slots order).
+    non_kv_input_slots: Vec<usize>,
+    /// For each input_slot: true = KV, false = external.
+    input_is_kv: Vec<bool>,
+    /// present_kv output slot → (layer, is_value).
+    kv_output_meta: Vec<(usize, usize, bool)>, // (out_slot, layer, is_value)
+    /// Non-KV output slot indices.
+    non_kv_output_slots: Vec<usize>,
 }
 
 /// A buffer pool entry: either borrowed (inputs/weights) or owned (intermediates/outputs).
@@ -1212,6 +1228,7 @@ impl ExecutionPlan {
             slot_last_read: last_read,
             kv_info: None,
             kv_cache: None,
+            kv_decode_cache: None,
         }
     }
 
@@ -1569,8 +1586,7 @@ impl ExecutionPlan {
         let kv_info = self
             .kv_info
             .as_ref()
-            .expect("run_kv called but plan has no KV cache info")
-            .clone();
+            .expect("run_kv called but plan has no KV cache info");
 
         // Initialize KV cache on first call.
         if self.kv_cache.is_none() {
@@ -1583,39 +1599,72 @@ impl ExecutionPlan {
             ));
         }
 
-        // The external inputs exclude past_kv slots. Map them to the
-        // non-KV input slots (those not in past_kv_input_slots).
-        let past_kv_set: std::collections::HashSet<usize> =
-            kv_info.past_kv_input_slots.iter().copied().collect();
-        let non_kv_input_slots: Vec<usize> = self
-            .input_slots
-            .iter()
-            .copied()
-            .filter(|s| !past_kv_set.contains(s))
-            .collect();
+        // Build decode cache on first call (pre-computes all KV slot lookups).
+        if self.kv_decode_cache.is_none() {
+            let mut past_kv_slots = vec![false; self.num_slots];
+            for &s in &kv_info.past_kv_input_slots {
+                past_kv_slots[s] = true;
+            }
+            let non_kv_input_slots: Vec<usize> = self
+                .input_slots
+                .iter()
+                .copied()
+                .filter(|s| !past_kv_slots[*s])
+                .collect();
+            let input_is_kv: Vec<bool> = self
+                .input_slots
+                .iter()
+                .map(|s| past_kv_slots[*s])
+                .collect();
+            let kv_output_meta: Vec<(usize, usize, bool)> = kv_info
+                .present_kv_output_slots
+                .iter()
+                .enumerate()
+                .map(|(i, &slot)| (slot, i / 2, (i % 2) == 1))
+                .collect();
+            let present_kv_slots: Vec<bool> = {
+                let mut v = vec![false; self.num_slots];
+                for &s in &kv_info.present_kv_output_slots {
+                    v[s] = true;
+                }
+                v
+            };
+            let non_kv_output_slots: Vec<usize> = self
+                .output_slots
+                .iter()
+                .copied()
+                .filter(|s| !present_kv_slots[*s])
+                .collect();
+            self.kv_decode_cache = Some(KvDecodeCache {
+                past_kv_slots,
+                non_kv_input_slots,
+                input_is_kv,
+                kv_output_meta,
+                non_kv_output_slots,
+            });
+        }
+        let dc = self.kv_decode_cache.as_ref().unwrap();
+
         assert_eq!(
             inputs.len(),
-            non_kv_input_slots.len(),
+            dc.non_kv_input_slots.len(),
             "run_kv: expected {} non-KV inputs, got {}",
-            non_kv_input_slots.len(),
+            dc.non_kv_input_slots.len(),
             inputs.len()
         );
 
         // Resolve shapes using the KV cache shape (no data copy needed).
         let cache = self.kv_cache.as_ref().unwrap();
         let (shape_k, shape_v) = cache.view_shape();
-        let kv_views: Vec<&Buffer> = (0..kv_info.num_layers)
-            .flat_map(|_| vec![&shape_k, &shape_v])
-            .collect();
 
-        // Build the full input list matching input_slots order.
+        // Build the full input list using pre-computed is_kv flags.
         let mut full_inputs: Vec<&Buffer> = Vec::with_capacity(self.input_slots.len());
         let mut ext_idx = 0;
-        let mut kv_idx = 0;
-        for &slot in &self.input_slots {
-            if past_kv_set.contains(&slot) {
-                full_inputs.push(kv_views[kv_idx]);
-                kv_idx += 1;
+        let mut kv_layer = 0usize;
+        for &is_kv in &dc.input_is_kv {
+            if is_kv {
+                full_inputs.push(if kv_layer % 2 == 0 { &shape_k } else { &shape_v });
+                kv_layer += 1;
             } else {
                 full_inputs.push(inputs[ext_idx]);
                 ext_idx += 1;
@@ -1625,7 +1674,11 @@ impl ExecutionPlan {
         let resolved_shapes = self.resolve_slot_shapes(&full_inputs);
 
         let profile = std::env::var("HOMURA_PROFILE").is_ok_and(|v| v == "1");
-        let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = Vec::new();
+        let mut step_times: Vec<(usize, std::time::Duration, Vec<Vec<u64>>)> = if profile {
+            Vec::with_capacity(self.steps.len())
+        } else {
+            Vec::new()
+        };
 
         // Initialize pool.
         let mut pool: Vec<Option<PoolEntry<'_>>> = (0..self.num_slots).map(|_| None).collect();
@@ -1637,15 +1690,6 @@ impl ExecutionPlan {
         }
 
         let mut free_list: Vec<Buffer> = Vec::new();
-
-        // Build KV concat lookup: present_kv output slot → (layer, is_value).
-        let mut kv_output_meta: std::collections::HashMap<usize, (usize, bool)> =
-            std::collections::HashMap::new();
-        if let Some(ref info) = self.kv_info {
-            for (i, &slot) in info.present_kv_output_slots.iter().enumerate() {
-                kv_output_meta.insert(slot, (i / 2, (i % 2) == 1));
-            }
-        }
 
         // Execute steps — same as run(), but KV Concat steps use cache.append+view.
         for (step_idx, step) in self.steps.iter().enumerate() {
@@ -1684,14 +1728,18 @@ impl ExecutionPlan {
                 let (buf, out_slot) = match native_op {
                     NativeOp::Concat { axis } => {
                         let out_slot = step.output_slots[0];
-                        // Check if this Concat is a KV concat.
-                        if let Some(&(layer, is_value)) = kv_output_meta.get(&out_slot) {
+                        // Check if this Concat is a KV concat (O(1) lookup).
+                        let kv_meta = dc
+                            .kv_output_meta
+                            .iter()
+                            .find(|(s, _, _)| *s == out_slot);
+                        if let Some(&(_, layer, is_value)) = kv_meta {
                             let cache = self.kv_cache.as_mut().expect("KV concat but no KvCache");
                             let new_data = step
                                 .input_slots
                                 .iter()
                                 .zip(step_inputs.iter())
-                                .find(|(slot, _)| !past_kv_set.contains(slot))
+                                .find(|(slot, _)| !dc.past_kv_slots[**slot])
                                 .expect("KV concat has no non-past input")
                                 .1;
                             if is_value {
@@ -1832,11 +1880,8 @@ impl ExecutionPlan {
         }
 
         // Extract non-KV outputs only.
-        let present_kv_set: std::collections::HashSet<usize> =
-            kv_info.present_kv_output_slots.iter().copied().collect();
-        self.output_slots
+        dc.non_kv_output_slots
             .iter()
-            .filter(|s| !present_kv_set.contains(s))
             .map(|&s| {
                 pool[s]
                     .take()
