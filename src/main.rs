@@ -255,8 +255,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             sampling,
         } => {
             let model_name = model.to_string_lossy().to_string();
+            // Check local GGUF file first
             if let Some(gguf_path) = find_gguf_file(&model) {
                 let model_dir = gguf_path.parent().unwrap_or(&model).to_path_buf();
+                return cmd_chat_gguf(
+                    &gguf_path,
+                    &model_dir,
+                    &model_name,
+                    &system,
+                    max_tokens,
+                    context_len,
+                    think,
+                    &sampling.to_config(),
+                );
+            }
+            // Try HF Hub for GGUF if the path looks like a GGUF repo or has .gguf component
+            let is_gguf_hub = !model.exists()
+                && (model_name.contains("GGUF")
+                    || model_name.contains("gguf")
+                    || model_name.ends_with(".gguf"));
+            if is_gguf_hub {
+                let (gguf_path, model_dir) = resolve_gguf_from_hub(&model_name)?;
                 return cmd_chat_gguf(
                     &gguf_path,
                     &model_dir,
@@ -335,6 +354,105 @@ fn find_gguf_file(path: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Download a GGUF model from HuggingFace Hub.
+///
+/// Accepts repo IDs like "Qwen/Qwen2.5-3B-Instruct-GGUF" and optionally a
+/// specific filename as a third path component (e.g.
+/// "Qwen/Qwen2.5-3B-Instruct-GGUF/Qwen2.5-3B-Instruct-Q4_K_M.gguf").
+///
+/// If no filename is given, lists .gguf files in the repo and picks the first
+/// Q4_K_M, then Q4_K_S, then any .gguf file found.
+///
+/// Returns (gguf_path, model_dir) where model_dir contains the tokenizer files.
+fn resolve_gguf_from_hub(
+    model_str: &str,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = model_str.split('/').collect();
+    if parts.len() < 2 {
+        return Err(format!("not a valid HF repo ID: {model_str}").into());
+    }
+
+    let repo_id = format!("{}/{}", parts[0], parts[1]);
+    let explicit_file = if parts.len() >= 3 && parts[2].ends_with(".gguf") {
+        Some(parts[2].to_string())
+    } else {
+        None
+    };
+
+    log::info!("fetching GGUF from HuggingFace Hub: {repo_id}");
+
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_progress(true)
+        .build()?;
+    let repo = api.repo(hf_hub::Repo::new(
+        repo_id.clone(),
+        hf_hub::RepoType::Model,
+    ));
+
+    // List repo files to find the right .gguf filename (HF is case-sensitive)
+    let siblings = repo.info()?.siblings;
+    let gguf_files: Vec<&str> = siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .filter(|f| f.ends_with(".gguf"))
+        .collect();
+
+    if gguf_files.is_empty() {
+        return Err(format!("no .gguf files found in {repo_id}").into());
+    }
+
+    let gguf_filename = if let Some(wanted) = explicit_file {
+        // Match case-insensitively against actual repo filenames
+        let wanted_lower = wanted.to_lowercase();
+        gguf_files
+            .iter()
+            .find(|f| f.to_lowercase() == wanted_lower)
+            .map(|f| f.to_string())
+            .ok_or_else(|| format!("{wanted} not found in {repo_id}"))?
+    } else {
+        // Prefer Q4_K_M > Q4_K_S > first available (case-insensitive)
+        let pick = gguf_files
+            .iter()
+            .find(|f| f.to_lowercase().contains("q4_k_m"))
+            .or_else(|| gguf_files.iter().find(|f| f.to_lowercase().contains("q4_k_s")))
+            .unwrap_or(&gguf_files[0]);
+        log::info!("selected {pick} (from {} GGUF files)", gguf_files.len());
+        pick.to_string()
+    };
+
+    let gguf_path = repo.get(&gguf_filename)?;
+    let model_dir = gguf_path.parent().unwrap().to_path_buf();
+
+    // Download tokenizer files. GGUF repos often don't have them,
+    // so fall back to the base model repo (strip "-GGUF" suffix).
+    let tok_downloaded = repo.get("tokenizer.json").is_ok();
+    let _ = repo.get("tokenizer_config.json");
+
+    if !tok_downloaded {
+        // Try base model repo (e.g. "Qwen/Qwen2.5-3B-Instruct" from "Qwen/Qwen2.5-3B-Instruct-GGUF")
+        let base_repo_id = repo_id
+            .strip_suffix("-GGUF")
+            .or_else(|| repo_id.strip_suffix("-gguf"))
+            .unwrap_or(&repo_id);
+        log::info!("tokenizer not in GGUF repo, fetching from {base_repo_id}");
+        let base_repo = api.repo(hf_hub::Repo::new(
+            base_repo_id.to_string(),
+            hf_hub::RepoType::Model,
+        ));
+        for file in &["tokenizer.json", "tokenizer_config.json"] {
+            if let Ok(path) = base_repo.get(file) {
+                // Copy/symlink to model_dir so find_tokenizer_for_gguf can find it
+                let dst = model_dir.join(file);
+                if !dst.exists() {
+                    let _ = std::os::unix::fs::symlink(&path, &dst);
+                }
+            }
+        }
+    }
+
+    Ok((gguf_path, model_dir))
 }
 
 /// Find tokenizer.json for a GGUF model. Checks:

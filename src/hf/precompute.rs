@@ -19,6 +19,8 @@ pub fn precompute_rope_cos_sin(
 
     for pos in 0..max_seq_len {
         for i in 0..half_dim {
+            // HuggingFace convention: inv_freq = 1 / theta^(arange(0, dim, 2) / dim)
+            // arange(0, dim, 2)/dim = [0, 2, 4, ..., dim-2]/dim = 2*i/head_dim
             let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
             let angle = pos as f64 * freq;
             let c = angle.cos() as f32;

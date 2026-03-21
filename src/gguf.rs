@@ -684,7 +684,8 @@ impl GgufFile {
         let lm_head_weight = if config.tie_word_embeddings {
             None
         } else {
-            Some(take("output.weight")?)
+            // Always dequant to f32 — the LM head uses a standard matmul, not a quant kernel
+            Some(take_f32("output.weight")?)
         };
 
         Ok(TransformerWeights {

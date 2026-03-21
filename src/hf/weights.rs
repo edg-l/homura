@@ -172,10 +172,9 @@ impl TransformerWeights {
         bufs.push(self.final_norm_weight.clone());
 
         // lm_head: always f32 [hidden, vocab] for the quant path.
-        // If tied, transpose embed_tokens (already f32) to [hidden, vocab].
-        // If untied, ensure f32 (dequant for simplicity in this first pass).
+        // Both tied and untied weights are [vocab, hidden] and need transposing.
         if let Some(lm_head) = &self.lm_head_weight {
-            bufs.push(ensure_f32(lm_head.clone()));
+            bufs.push(transpose_2d(&ensure_f32(lm_head.clone())));
         } else {
             bufs.push(transpose_2d(&self.embed_tokens_weight));
         }
