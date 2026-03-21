@@ -357,8 +357,9 @@ def compute_bandwidth(config: dict, kernel_type: str, ms: float, bytes_per_weigh
     elif kernel_type == "MLP":
         weight_bytes = (h * inter * 2 + inter * h) * B
     elif kernel_type == "LMHead":
-        # LMHead always uses f32 weights (even in GGUF quant models)
-        weight_bytes = h * vocab * 4
+        # LMHead uses f32 in GGUF quant models, otherwise same dtype as projections
+        lm_bpw = 4 if B < 2 else B  # quantized → f32, bf16/f32 → same as projections
+        weight_bytes = h * vocab * lm_bpw
     else:
         return 0, 0
 
