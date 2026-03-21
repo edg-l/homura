@@ -186,6 +186,181 @@ pub fn emit_dequant_matmul_q4_k(k: u64, n: u64, func_name: &str, n_tile: usize) 
     // This matches llama.cpp's numerical behavior: integer accumulation + activation
     // quantization prevents the mean bias drift that the f32 path suffered from.
 
+    // ── Generate fully unrolled scale unpack + dot product + min ──
+    // Eliminates: 3 scf.for loops, select branches, sc_arr/mn_arr allocas, divui/remui.
+    let unrolled_body = {
+        let twb = total_weight_bytes;
+        let bsums_sz = num_blocks_per_row * 16;
+        let mut body = String::new();
+        for i in 0..12 {
+            body += &format!(
+                "            %sc_b_{i} = arith.addi %sc_base, %c{i}_idx : index\n"
+            );
+        }
+        for i in 0..12 {
+            body += &format!(
+                "            %sc_raw_{i} = memref.load %weight[%sc_b_{i}] : memref<{twb}xi8>\n\
+                 %sc_u_{i} = arith.extui %sc_raw_{i} : i8 to i32\n"
+            );
+        }
+
+        // Extract 8 scales and 8 mins
+        for sb in 0..8usize {
+            if sb < 4 {
+                // scale = q[sb] & 63
+                body += &format!(
+                    "            %sc_{sb} = arith.andi %sc_u_{sb}, %c63_i32 : i32\n"
+                );
+                // min = q[sb+4] & 63
+                let mn_byte = sb + 4;
+                body += &format!(
+                    "            %mn_{sb} = arith.andi %sc_u_{mn_byte}, %c63_i32 : i32\n"
+                );
+            } else {
+                // hi_byte = q[sb+4] (byte indices 8..11)
+                let hi_byte = sb + 4;  // 8,9,10,11
+                let lo_byte = sb - 4;  // 0,1,2,3
+                let mn_byte = sb;      // 4,5,6,7 (for q[sb])
+
+                // scale = (q[sb+4] & 0xF) | ((q[sb-4] >> 6) << 4)
+                body += &format!(
+                    "            %sc_hi_lo_{sb} = arith.andi %sc_u_{hi_byte}, %c15_i32 : i32\n\
+                     %sc_2b_{sb} = arith.shrui %sc_u_{lo_byte}, %c6_i32 : i32\n\
+                     %sc_2bs_{sb} = arith.shli %sc_2b_{sb}, %c4_i32 : i32\n\
+                     %sc_{sb} = arith.ori %sc_hi_lo_{sb}, %sc_2bs_{sb} : i32\n"
+                );
+                // min = (q[sb+4] >> 4) | ((q[sb] >> 6) << 4)
+                body += &format!(
+                    "            %mn_hi_{sb} = arith.shrui %sc_u_{hi_byte}, %c4_i32 : i32\n\
+                     %mn_him_{sb} = arith.andi %mn_hi_{sb}, %c15_i32 : i32\n\
+                     %mn_2b_{sb} = arith.shrui %sc_u_{mn_byte}, %c6_i32 : i32\n\
+                     %mn_2bs_{sb} = arith.shli %mn_2b_{sb}, %c4_i32 : i32\n\
+                     %mn_{sb} = arith.ori %mn_him_{sb}, %mn_2bs_{sb} : i32\n"
+                );
+            }
+        }
+
+        // Unrolled dot product: 8 sub-blocks, each a 32-wide vector dot.
+        // Sub-blocks come in pairs sharing 32 qs bytes:
+        //   even sb: low nibbles, odd sb: high nibbles
+        for sb in 0..8usize {
+            let qs_byte_off = (sb / 2) * 32; // offset from qs_base
+            let q8_off = sb * 32;            // offset into q8_all from k_block_base2
+            let is_odd = sb % 2 == 1;
+
+            // Compute byte offsets
+            body += &format!(
+                "            %qb_off_{sb} = arith.addi %qs_base, %c{qs_byte_off}_idx : index\n\
+                 %q8_off_{sb} = arith.addi %k_block_base2, %c{q8_off}_idx : index\n"
+            );
+            // Vector loads
+            body += &format!(
+                "            %w_v_{sb} = vector.load %weight[%qb_off_{sb}] : memref<{twb}xi8>, vector<32xi8>\n\
+                 %q8_v_{sb} = vector.load %q8_all[%q8_off_{sb}] : memref<{k}xi8>, vector<32xi8>\n"
+            );
+            // Nibble extraction (no select -- known at emit time)
+            body += &format!(
+                "            %w_u32_{sb} = arith.extui %w_v_{sb} : vector<32xi8> to vector<32xi32>\n"
+            );
+            if !is_odd {
+                // Even: low nibble = w & 0xF
+                body += &format!(
+                    "            %nib_{sb} = arith.andi %w_u32_{sb}, %mask15_v : vector<32xi32>\n"
+                );
+            } else {
+                // Odd: high nibble = (w >> 4) & 0xF
+                body += &format!(
+                    "            %nib_raw_{sb} = arith.shrui %w_u32_{sb}, %shift4_v : vector<32xi32>\n\
+                     %nib_{sb} = arith.andi %nib_raw_{sb}, %mask15_v : vector<32xi32>\n"
+                );
+            }
+            // Dot product
+            body += &format!(
+                "            %q8_i32_{sb} = arith.extsi %q8_v_{sb} : vector<32xi8> to vector<32xi32>\n\
+                 %prod_{sb} = arith.muli %nib_{sb}, %q8_i32_{sb} : vector<32xi32>\n\
+                 %isum_{sb} = vector.reduction <add>, %prod_{sb} : vector<32xi32> into i32\n\
+                 %scisum_{sb} = arith.muli %sc_{sb}, %isum_{sb} : i32\n"
+            );
+        }
+
+        // Sum all 8 scaled isums
+        body += "            %sa_01 = arith.addi %scisum_0, %scisum_1 : i32\n\
+                 %sa_23 = arith.addi %scisum_2, %scisum_3 : i32\n\
+                 %sa_45 = arith.addi %scisum_4, %scisum_5 : i32\n\
+                 %sa_67 = arith.addi %scisum_6, %scisum_7 : i32\n\
+                 %sa_03 = arith.addi %sa_01, %sa_23 : i32\n\
+                 %sa_47 = arith.addi %sa_45, %sa_67 : i32\n\
+                 %scale_accum = arith.addi %sa_03, %sa_47 : i32\n";
+
+        // Unrolled MIN part: sum over g=0..15 of (mn[g/2] * bsums[g])
+        for g in 0..16usize {
+            let mn_idx = g / 2;
+            body += &format!(
+                "            %bs_off_{g} = arith.addi %bsums_kb_base2, %c{g}_idx : index\n\
+                 %bs_{g} = memref.load %bsums_all[%bs_off_{g}] : memref<{bsums_sz}xi32>\n\
+                 %mnbs_{g} = arith.muli %mn_{mn_idx}, %bs_{g} : i32\n"
+            );
+        }
+        // Tree-reduce 16 min terms
+        body += "            %mi_01 = arith.addi %mnbs_0, %mnbs_1 : i32\n\
+                 %mi_23 = arith.addi %mnbs_2, %mnbs_3 : i32\n\
+                 %mi_45 = arith.addi %mnbs_4, %mnbs_5 : i32\n\
+                 %mi_67 = arith.addi %mnbs_6, %mnbs_7 : i32\n\
+                 %mi_89 = arith.addi %mnbs_8, %mnbs_9 : i32\n\
+                 %mi_ab = arith.addi %mnbs_10, %mnbs_11 : i32\n\
+                 %mi_cd = arith.addi %mnbs_12, %mnbs_13 : i32\n\
+                 %mi_ef = arith.addi %mnbs_14, %mnbs_15 : i32\n\
+                 %mi_03 = arith.addi %mi_01, %mi_23 : i32\n\
+                 %mi_47 = arith.addi %mi_45, %mi_67 : i32\n\
+                 %mi_8b = arith.addi %mi_89, %mi_ab : i32\n\
+                 %mi_cf = arith.addi %mi_cd, %mi_ef : i32\n\
+                 %mi_07 = arith.addi %mi_03, %mi_47 : i32\n\
+                 %mi_8f = arith.addi %mi_8b, %mi_cf : i32\n\
+                 %min_accum = arith.addi %mi_07, %mi_8f : i32\n";
+
+        body
+    };
+
+    // Collect all index constants needed by the unrolled body
+    let mut extra_idx_consts = std::collections::BTreeSet::new();
+    for i in 0..12 { extra_idx_consts.insert(i); }
+    for sb in 0..8usize {
+        extra_idx_consts.insert((sb / 2) * 32);
+        extra_idx_consts.insert(sb * 32);
+    }
+    for g in 0..16 { extra_idx_consts.insert(g); }
+    // Map each value to its SSA name (reuse existing constants for common values)
+    let idx_name = |v: usize| -> String {
+        match v {
+            0 => "%c0".into(),
+            1 => "%c1".into(),
+            2 => "%c2".into(),
+            3 => "%c3".into(),
+            4 => "%c4".into(),
+            8 => "%c8".into(),
+            16 => "%c16".into(),
+            32 => "%c32".into(),
+            _ => format!("%c{v}_idx"),
+        }
+    };
+    // Fix up the unrolled body to use proper constant names
+    let unrolled_body = {
+        let mut fixed = unrolled_body.clone();
+        for &v in &extra_idx_consts {
+            let generic = format!("%c{v}_idx");
+            let proper = idx_name(v);
+            if generic != proper {
+                fixed = fixed.replace(&generic, &proper);
+            }
+        }
+        fixed
+    };
+    let extra_consts: String = extra_idx_consts
+        .iter()
+        .filter(|&&v| !matches!(v, 0 | 1 | 2 | 3 | 4 | 8 | 16 | 32))
+        .map(|v| format!("    %c{v}_idx = arith.constant {v} : index\n"))
+        .collect();
+
     format!(
         r#"// Q4_K×Q8_K dequant-matmul: K={k} N={n} n_tile={n_tile}
 // Weight layout: {twb} bytes ({tb} blocks x 144 bytes/block)
@@ -217,6 +392,11 @@ module attributes {{"homura.quant_kernel"}} {{
     %c15_i32 = arith.constant 15 : i32
     %c63_i32 = arith.constant 63 : i32
     %c127_f32 = arith.constant 127.0 : f32
+    // Vector constants for unrolled dot product
+    %mask15_v = arith.constant dense<15> : vector<32xi32>
+    %shift4_v = arith.constant dense<4> : vector<32xi32>
+    // Index constants for unrolled body
+{extra_consts}
     %nbpr      = arith.constant {nbpr} : index
     %n_tiles_c = arith.constant {nt} : index
     %tile_sz   = arith.constant {n_tile} : index
@@ -231,8 +411,6 @@ module attributes {{"homura.quant_kernel"}} {{
       %q8_all   = memref.alloca() : memref<{k}xi8>
       %bsums_all = memref.alloca() : memref<{nbpr_x_16}xi32>
       %act_d_all = memref.alloca() : memref<{nbpr}xf32>
-      %sc_arr   = memref.alloca() : memref<8xi32>
-      %mn_arr   = memref.alloca() : memref<8xi32>
 
       scf.for %m = %c0 to %seq step %c1 {{
         // ── Pre-quantize ALL K blocks for this M position ──
@@ -325,116 +503,9 @@ module attributes {{"homura.quant_kernel"}} {{
             %sc_base = arith.addi %blk_off, %c4 : index
             %qs_base = arith.addi %blk_off, %c16 : index
 
-            // ── Unpack scales/mins into flat arrays (8 each) ──
-            // Unpack 6-bit scales/mins for 8 sub-blocks.
-            // Matches llama.cpp get_scale_min_k4:
-            //   j < 4: scale = q[j] & 63,          min = q[j+4] & 63
-            //   j >= 4: scale = (q[j+4]&0xF) | ((q[j-4]>>6)<<4)
-            //           min   = (q[j+4]>>4)  | ((q[j]>>6)<<4)
-            // where q = 12-byte scales array at sc_base.
-            scf.for %sb = %c0 to %c8 step %c1 {{
-              %sb_i32 = arith.index_cast %sb : index to i32
-              %sb_lt4 = arith.cmpi ult, %sb_i32, %c4_i32 : i32
-
-              // ── Low sub-blocks (sb < 4): 6-bit from bytes 0-3 / 4-7 ──
-              %sb_mod4 = arith.remui %sb, %c4 : index
-              %lo_sc_ptr = arith.addi %sc_base, %sb_mod4 : index
-              %lo_sc_raw = memref.load %weight[%lo_sc_ptr] : memref<{twb}xi8>
-              %lo_sc_u32 = arith.extui %lo_sc_raw : i8 to i32
-              %sc_lo = arith.andi %lo_sc_u32, %c63_i32 : i32
-
-              %lo_mn_ptr = arith.addi %lo_sc_ptr, %c4 : index
-              %lo_mn_raw = memref.load %weight[%lo_mn_ptr] : memref<{twb}xi8>
-              %lo_mn_u32 = arith.extui %lo_mn_raw : i8 to i32
-              %mn_lo = arith.andi %lo_mn_u32, %c63_i32 : i32
-
-              // ── High sub-blocks (sb >= 4): 6-bit from bytes 8+i, 0+i, 4+i ──
-              // hi_byte = scales_raw[8 + (sb-4)] = q[sb+4]
-              %sb_clamped = arith.maxui %sb_i32, %c4_i32 : i32
-              %sb_m4 = arith.subi %sb_clamped, %c4_i32 : i32
-              %sb_m4_idx = arith.index_cast %sb_m4 : i32 to index
-              %hi_byte_ptr = arith.addi %sc_base, %sb_m4_idx : index
-              %hi_byte_ptr2 = arith.addi %hi_byte_ptr, %c8 : index
-              %hi_byte_raw = memref.load %weight[%hi_byte_ptr2] : memref<{twb}xi8>
-              %hi_byte_u32 = arith.extui %hi_byte_raw : i8 to i32
-
-              // scale = (hi_byte & 0xF) | ((scales_raw[sb-4] >> 6) << 4)
-              %hi_lo_nib = arith.andi %hi_byte_u32, %c15_i32 : i32
-              %sc_2bit = arith.shrui %lo_sc_u32, %c6_i32 : i32
-              %sc_2bit_sh = arith.shli %sc_2bit, %c4_i32 : i32
-              %sc_hi = arith.ori %hi_lo_nib, %sc_2bit_sh : i32
-              %sc_val = arith.select %sb_lt4, %sc_lo, %sc_hi : i32
-              memref.store %sc_val, %sc_arr[%sb] : memref<8xi32>
-
-              // min = (hi_byte >> 4) | ((scales_raw[sb] >> 6) << 4)
-              %hi_hi_nib = arith.shrui %hi_byte_u32, %c4_i32 : i32
-              %hi_hi_nib_m = arith.andi %hi_hi_nib, %c15_i32 : i32
-              %mn_2bit = arith.shrui %lo_mn_u32, %c6_i32 : i32
-              %mn_2bit_sh = arith.shli %mn_2bit, %c4_i32 : i32
-              %mn_hi = arith.ori %hi_hi_nib_m, %mn_2bit_sh : i32
-              %mn_val = arith.select %sb_lt4, %mn_lo, %mn_hi : i32
-              memref.store %mn_val, %mn_arr[%sb] : memref<8xi32>
-            }}
-
-            // ── SCALE part: vectorized integer dot per sub-block ──
-            // Sub-blocks come in pairs sharing 32 qs bytes:
-            //   even sb: low nibbles of 32 bytes × q8[sb*32 .. sb*32+31]
-            //   odd sb:  high nibbles of same 32 bytes × q8[sb*32 .. sb*32+31]
-            // Matches llama.cpp ggml_vec_dot_q4_K_q8_K layout.
-            %scale_accum = scf.for %sb = %c0 to %c8 step %c1
-                               iter_args(%sa_in = %c0_i32) -> (i32) {{
-              // qs byte base = (sb / 2) * 32
-              %sb_half = arith.divui %sb, %c2 : index
-              %sb_byte_base = arith.muli %sb_half, %c32 : index
-              %qb_base = arith.addi %qs_base, %sb_byte_base : index
-              %sb_q8_off = arith.muli %sb, %c32 : index
-              %sb_q8_base = arith.addi %k_block_base2, %sb_q8_off : index
-              // sb_is_odd = sb % 2
-              %sb_rem = arith.remui %sb, %c2 : index
-              %sb_is_odd = arith.cmpi ne, %sb_rem, %c0 : index
-
-              // Vector load 32 weight bytes and 32 q8 bytes
-              %w_v = vector.load %weight[%qb_base]
-                         : memref<{twb}xi8>, vector<32xi8>
-              %q8_v = vector.load %q8_all[%sb_q8_base]
-                          : memref<{k}xi8>, vector<32xi8>
-
-              // Extract nibbles: compute both lo and hi, then select
-              %w_u32 = arith.extui %w_v : vector<32xi8> to vector<32xi32>
-              %mask_v = vector.splat %c15_i32 : vector<32xi32>
-              %shift_v = vector.splat %c4_i32 : vector<32xi32>
-              %nib_lo_v = arith.andi %w_u32, %mask_v : vector<32xi32>
-              %nib_hi_raw_v = arith.shrui %w_u32, %shift_v : vector<32xi32>
-              %nib_hi_v = arith.andi %nib_hi_raw_v, %mask_v : vector<32xi32>
-
-              // Select: odd sub-blocks use high nibble, even use low
-              %odd_splat = vector.splat %sb_is_odd : vector<32xi1>
-              %nib_v = arith.select %odd_splat, %nib_hi_v, %nib_lo_v : vector<32xi1>, vector<32xi32>
-
-              // Widen q8 to i32 (signed) and multiply
-              %q8_i32_v = arith.extsi %q8_v : vector<32xi8> to vector<32xi32>
-              %prod_v = arith.muli %nib_v, %q8_i32_v : vector<32xi32>
-              %isum = vector.reduction <add>, %prod_v : vector<32xi32> into i32
-
-              // scale_accum += sc[sb] * isum
-              %sc_sb = memref.load %sc_arr[%sb] : memref<8xi32>
-              %sc_isum = arith.muli %sc_sb, %isum : i32
-              %sa_out = arith.addi %sa_in, %sc_isum : i32
-              scf.yield %sa_out : i32
-            }}
-
-            // ── MIN part: bsums-based offset ──
-            // sumi = sum over g=0..15 of (mn[g/2] * bsums[g]), in i32.
-            %min_accum = scf.for %gi = %c0 to %c16 step %c1
-                             iter_args(%mi_in = %c0_i32) -> (i32) {{
-              %mn_idx = arith.divui %gi, %c2 : index
-              %mn_g = memref.load %mn_arr[%mn_idx] : memref<8xi32>
-              %bs_gi = arith.addi %bsums_kb_base2, %gi : index
-              %bs_g = memref.load %bsums_all[%bs_gi] : memref<{nbpr_x_16}xi32>
-              %mn_bs = arith.muli %mn_g, %bs_g : i32
-              %mi_out = arith.addi %mi_in, %mn_bs : i32
-              scf.yield %mi_out : i32
-            }}
+            // ── Fully unrolled scale/min unpack + vectorized dot product ──
+            // Generated at emit time: no loops, no branches, no alloca arrays.
+{unrolled_body}
 
             // ── Float combine ──
             %d_combined = arith.mulf %d_f32, %act_d2 : f32
@@ -467,6 +538,8 @@ module attributes {{"homura.quant_kernel"}} {{
         twb = total_weight_bytes,
         nt = n_tiles,
         tb = total_blocks,
+        unrolled_body = unrolled_body,
+        extra_consts = extra_consts,
     )
 }
 
