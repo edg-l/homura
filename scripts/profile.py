@@ -150,7 +150,15 @@ def parse_output(output: str) -> dict:
                 "ms_per_tok": ms_tok,
             }
 
-    return {"profiles": decode_profiles, "summary": summary}
+    # Detect runtime weight dtype from log output
+    runtime_dtype = None
+    for line in lines:
+        if "auto-detected bf16" in line:
+            runtime_dtype = "BF16"
+        elif "no bf16 hardware" in line or "using f32" in line:
+            runtime_dtype = "F32"
+
+    return {"profiles": decode_profiles, "summary": summary, "runtime_dtype": runtime_dtype}
 
 
 def _infer_n_from_quant_weight(weight_bytes: int, k: int, block_sizes=(144, 210, 34)) -> int | None:
@@ -311,18 +319,20 @@ def get_weight_dtype(model: str) -> str:
     model_dir = cache / f"models--{repo_id.replace('/', '--')}"
     if not model_dir.exists():
         return "F32"
-    for st_path in model_dir.rglob("model.safetensors"):
-        try:
-            with open(st_path, "rb") as f:
-                hdr_len = struct.unpack("<Q", f.read(8))[0]
-                hdr = json.loads(f.read(hdr_len))
-            for k, v in hdr.items():
-                if k == "__metadata__":
-                    continue
-                if "proj" in k or "lm_head" in k:
-                    return v.get("dtype", "F32")
-        except (OSError, json.JSONDecodeError, struct.error):
-            continue
+    # Check both single and sharded safetensors files
+    for pattern in ["model.safetensors", "model-*.safetensors"]:
+        for st_path in model_dir.rglob(pattern):
+            try:
+                with open(st_path, "rb") as f:
+                    hdr_len = struct.unpack("<Q", f.read(8))[0]
+                    hdr = json.loads(f.read(hdr_len))
+                for k, v in hdr.items():
+                    if k == "__metadata__":
+                        continue
+                    if "proj" in k or "lm_head" in k:
+                        return v.get("dtype", "F32")
+            except (OSError, json.JSONDecodeError, struct.error):
+                continue
     return "F32"
 
 
@@ -363,6 +373,10 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
     summary = data["summary"]
     config = get_model_config(model)
     weight_dtype = get_weight_dtype(model)
+    # Override with runtime-detected dtype (e.g. auto bf16 on capable CPUs)
+    runtime_dtype = data.get("runtime_dtype")
+    if runtime_dtype and not weight_dtype.startswith("Q"):
+        weight_dtype = runtime_dtype
     # Bytes per weight for bandwidth estimation
     if weight_dtype == "BF16":
         bpw = 2
