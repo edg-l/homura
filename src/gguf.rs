@@ -841,10 +841,12 @@ pub(crate) fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
             mn[i] = scales_raw[4 + i] & 0x3F;
         }
         for i in 0..4 {
-            let high_sc = (scales_raw[8 + i / 2] >> ((i % 2) * 4)) & 0x0F;
-            sc[4 + i] = (scales_raw[i] >> 6) | (high_sc << 2);
-            let high_mn = (scales_raw[10 + i / 2] >> ((i % 2) * 4)) & 0x0F;
-            mn[4 + i] = (scales_raw[4 + i] >> 6) | (high_mn << 2);
+            // Match llama.cpp get_scale_min_k4: for j>=4,
+            //   scale = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4)
+            //   min   = (q[j+4] >> 4)  | ((q[j]   >> 6) << 4)
+            // q[j+4] = scales_raw[8+i], low nibble=scale, high nibble=min
+            sc[4 + i] = (scales_raw[8 + i] & 0x0F) | ((scales_raw[i] >> 6) << 4);
+            mn[4 + i] = (scales_raw[8 + i] >> 4) | ((scales_raw[4 + i] >> 6) << 4);
         }
 
         for sb in 0..8 {

@@ -313,50 +313,54 @@ module attributes {{"homura.quant_kernel"}} {{
             %qs_base = arith.addi %blk_off, %c16 : index
 
             // ── Unpack scales/mins into flat arrays (8 each) ──
-            // Uses the same 6-bit unpacking as before, but we extract all 8
-            // sc[] and mn[] values and store them in small allocas so the
-            // integer dot loop can index them.
+            // Unpack 6-bit scales/mins for 8 sub-blocks.
+            // Matches llama.cpp get_scale_min_k4:
+            //   j < 4: scale = q[j] & 63,          min = q[j+4] & 63
+            //   j >= 4: scale = (q[j+4]&0xF) | ((q[j-4]>>6)<<4)
+            //           min   = (q[j+4]>>4)  | ((q[j]>>6)<<4)
+            // where q = 12-byte scales array at sc_base.
             %sc_arr = memref.alloca() : memref<8xi32>
             %mn_arr = memref.alloca() : memref<8xi32>
             scf.for %sb = %c0 to %c8 step %c1 {{
               %sb_i32 = arith.index_cast %sb : index to i32
               %sb_lt4 = arith.cmpi ult, %sb_i32, %c4_i32 : i32
+
+              // ── Low sub-blocks (sb < 4): 6-bit from bytes 0-3 / 4-7 ──
+              %sb_mod4 = arith.remui %sb, %c4 : index
+              %lo_sc_ptr = arith.addi %sc_base, %sb_mod4 : index
+              %lo_sc_raw = memref.load %weight[%lo_sc_ptr] : memref<{twb}xi8>
+              %lo_sc_u32 = arith.extui %lo_sc_raw : i8 to i32
+              %sc_lo = arith.andi %lo_sc_u32, %c63_i32 : i32
+
+              %lo_mn_ptr = arith.addi %lo_sc_ptr, %c4 : index
+              %lo_mn_raw = memref.load %weight[%lo_mn_ptr] : memref<{twb}xi8>
+              %lo_mn_u32 = arith.extui %lo_mn_raw : i8 to i32
+              %mn_lo = arith.andi %lo_mn_u32, %c63_i32 : i32
+
+              // ── High sub-blocks (sb >= 4): 6-bit from bytes 8+i, 0+i, 4+i ──
+              // hi_byte = scales_raw[8 + (sb-4)] = q[sb+4]
               %sb_clamped = arith.maxui %sb_i32, %c4_i32 : i32
               %sb_m4 = arith.subi %sb_clamped, %c4_i32 : i32
+              %sb_m4_idx = arith.index_cast %sb_m4 : i32 to index
+              %hi_byte_ptr = arith.addi %sc_base, %sb_m4_idx : index
+              %hi_byte_ptr2 = arith.addi %hi_byte_ptr, %c8 : index
+              %hi_byte_raw = memref.load %weight[%hi_byte_ptr2] : memref<{twb}xi8>
+              %hi_byte_u32 = arith.extui %hi_byte_raw : i8 to i32
 
-              %sb_mod4 = arith.remui %sb, %c4 : index
-              %sr_ptr = arith.addi %sc_base, %sb_mod4 : index
-              %sr_raw = memref.load %weight[%sr_ptr] : memref<{twb}xi8>
-              %sr_u32 = arith.extui %sr_raw : i8 to i32
-              %sc_lo = arith.andi %sr_u32, %c63_i32 : i32
-              %sr_hi6 = arith.shrui %sr_u32, %c6_i32 : i32
-              %hi_idx_half = arith.shrui %sb_m4, %c1_i32 : i32
-              %hi_off_idx = arith.index_cast %hi_idx_half : i32 to index
-              %hi_ptr = arith.addi %sc_base, %hi_off_idx : index
-              %hi_ptr2 = arith.addi %hi_ptr, %c8 : index
-              %hi_raw = memref.load %weight[%hi_ptr2] : memref<{twb}xi8>
-              %hi_u32 = arith.extui %hi_raw : i8 to i32
-              %sb_m4_mod2 = arith.remui %sb_m4, %c2_i32 : i32
-              %shift_amt = arith.muli %sb_m4_mod2, %c4_i32 : i32
-              %hi_shifted = arith.shrui %hi_u32, %shift_amt : i32
-              %hi_nib = arith.andi %hi_shifted, %c15_i32 : i32
-              %hi_nib_sh = arith.shli %hi_nib, %c2_i32 : i32
-              %sc_hi = arith.ori %sr_hi6, %hi_nib_sh : i32
+              // scale = (hi_byte & 0xF) | ((scales_raw[sb-4] >> 6) << 4)
+              %hi_lo_nib = arith.andi %hi_byte_u32, %c15_i32 : i32
+              %sc_2bit = arith.shrui %lo_sc_u32, %c6_i32 : i32
+              %sc_2bit_sh = arith.shli %sc_2bit, %c4_i32 : i32
+              %sc_hi = arith.ori %hi_lo_nib, %sc_2bit_sh : i32
               %sc_val = arith.select %sb_lt4, %sc_lo, %sc_hi : i32
               memref.store %sc_val, %sc_arr[%sb] : memref<8xi32>
 
-              %mn_ptr = arith.addi %sr_ptr, %c4 : index
-              %mn_raw = memref.load %weight[%mn_ptr] : memref<{twb}xi8>
-              %mn_u32 = arith.extui %mn_raw : i8 to i32
-              %mn_lo = arith.andi %mn_u32, %c63_i32 : i32
-              %mn_hi6 = arith.shrui %mn_u32, %c6_i32 : i32
-              %hmn_ptr = arith.addi %hi_ptr, %c10 : index
-              %hmn_raw = memref.load %weight[%hmn_ptr] : memref<{twb}xi8>
-              %hmn_u32 = arith.extui %hmn_raw : i8 to i32
-              %hmn_shifted = arith.shrui %hmn_u32, %shift_amt : i32
-              %hmn_nib = arith.andi %hmn_shifted, %c15_i32 : i32
-              %hmn_nib_sh = arith.shli %hmn_nib, %c2_i32 : i32
-              %mn_hi = arith.ori %mn_hi6, %hmn_nib_sh : i32
+              // min = (hi_byte >> 4) | ((scales_raw[sb] >> 6) << 4)
+              %hi_hi_nib = arith.shrui %hi_byte_u32, %c4_i32 : i32
+              %hi_hi_nib_m = arith.andi %hi_hi_nib, %c15_i32 : i32
+              %mn_2bit = arith.shrui %lo_mn_u32, %c6_i32 : i32
+              %mn_2bit_sh = arith.shli %mn_2bit, %c4_i32 : i32
+              %mn_hi = arith.ori %hi_hi_nib_m, %mn_2bit_sh : i32
               %mn_val = arith.select %sb_lt4, %mn_lo, %mn_hi : i32
               memref.store %mn_val, %mn_arr[%sb] : memref<8xi32>
             }}
