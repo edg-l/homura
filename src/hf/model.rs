@@ -83,10 +83,44 @@ impl HfModel {
         let config = TransformerConfig::load(&model_dir.join("config.json"))?;
 
         let sp = crate::progress::spinner("Reading safetensors...");
-        let tensors = if weight_dtype == DType::BF16 {
-            crate::hf::safetensors::load_safetensors_bf16(&model_dir.join("model.safetensors"))?
+        let single = model_dir.join("model.safetensors");
+        let index = model_dir.join("model.safetensors.index.json");
+        let tensors = if single.exists() {
+            if weight_dtype == DType::BF16 {
+                crate::hf::safetensors::load_safetensors_bf16(&single)?
+            } else {
+                crate::hf::safetensors::load_safetensors(&single)?
+            }
+        } else if index.exists() {
+            // Sharded model: load index, then each shard file.
+            let index_text = std::fs::read_to_string(&index)?;
+            let index_json: serde_json::Value = serde_json::from_str(&index_text)?;
+            let weight_map = index_json
+                .get("weight_map")
+                .and_then(|m| m.as_object())
+                .ok_or("model.safetensors.index.json missing weight_map")?;
+            let mut shard_files: Vec<String> =
+                weight_map.values().filter_map(|v| v.as_str().map(String::from)).collect();
+            shard_files.sort();
+            shard_files.dedup();
+
+            let mut all_tensors = std::collections::HashMap::new();
+            for shard in &shard_files {
+                let shard_path = model_dir.join(shard);
+                let shard_tensors = if weight_dtype == DType::BF16 {
+                    crate::hf::safetensors::load_safetensors_bf16(&shard_path)?
+                } else {
+                    crate::hf::safetensors::load_safetensors(&shard_path)?
+                };
+                all_tensors.extend(shard_tensors);
+            }
+            all_tensors
         } else {
-            crate::hf::safetensors::load_safetensors(&model_dir.join("model.safetensors"))?
+            return Err(format!(
+                "no model.safetensors or index found in {}",
+                model_dir.display()
+            )
+            .into());
         };
         crate::progress::finish_spinner(
             &sp,
