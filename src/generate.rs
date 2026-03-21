@@ -117,7 +117,6 @@ fn generate_streaming_core(
         token_ids.len(),
         max_new_tokens,
     );
-
     let prefill_out = model.prefill(token_ids)?;
     log_info!(
         "prefill complete in {:.2}s",

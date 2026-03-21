@@ -174,29 +174,20 @@ pub fn emit_dequant_matmul_q4_k(k: u64, n: u64, func_name: &str, n_tile: usize) 
     let total_weight_bytes: u64 = total_blocks * 144;
     let n_tiles: u64 = n / n_tile as u64;
 
-    // Q4_K: 256-element super-blocks, 144 bytes each.
-    // Layout per block: d(2) + dmin(2) + scales_raw(12) + qs(128)
+    // Q4_K × Q8_K dot product, matching llama.cpp's ggml_vec_dot_q4_K_q8_K.
     //
-    // This kernel uses a flat element loop (0..256) per super-block instead of
-    // unrolling 8 sub-blocks, keeping the generated IR compact. The sub-block
-    // index and scale/min are computed at runtime.
+    // For each super-block (256 elements):
+    //   1. Quantize the f32 activation to Q8_K: find amax, scale = amax/127,
+    //      q8[j] = round(act[j] * 127/amax), bsums[g] = sum(q8[g*16..g*16+16])
+    //   2. Integer dot product per sub-block: isum = sum(q4_nibble * q8_quant) in i32
+    //   3. Scale contribution: d * act_d * sum(sc[sb] * isum_sb)
+    //   4. Min contribution:   dmin * act_d * sum(mn[g/2] * bsums[g]) (via precomputed bsums)
     //
-    // For each element j in 0..255:
-    //   sb = j / 32          (sub-block index 0..7)
-    //   j_in_sb = j % 32     (element within sub-block)
-    //   byte_idx = j / 2     (quant byte in the 128-byte qs region)
-    //   nibble = if j%2==0 { qs[byte_idx] & 0xF } else { qs[byte_idx] >> 4 }
-    //
-    //   Scale unpacking (6-bit packed):
-    //     if sb < 4: sc = scales_raw[sb] & 0x3F, mn = scales_raw[4+sb] & 0x3F
-    //     if sb >= 4: i = sb-4
-    //       sc = (scales_raw[i] >> 6) | (((scales_raw[8+i/2] >> ((i%2)*4)) & 0xF) << 2)
-    //       mn = (scales_raw[4+i] >> 6) | (((scales_raw[10+i/2] >> ((i%2)*4)) & 0xF) << 2)
-    //
-    //   dequant = nibble * (d * sc) - (dmin * mn)
+    // This matches llama.cpp's numerical behavior: integer accumulation + activation
+    // quantization prevents the mean bias drift that the f32 path suffered from.
 
     format!(
-        r#"// Q4_K dequant-matmul: K={k} N={n} n_tile={n_tile}
+        r#"// Q4_K×Q8_K dequant-matmul: K={k} N={n} n_tile={n_tile}
 // Weight layout: {twb} bytes ({tb} blocks x 144 bytes/block)
 module attributes {{"homura.quant_kernel"}} {{
   func.func @{func_name}(
@@ -217,6 +208,7 @@ module attributes {{"homura.quant_kernel"}} {{
     %c144   = arith.constant 144 : index
     %c256   = arith.constant 256 : index
     %c8_i16 = arith.constant 8 : i16
+    %c0_i32 = arith.constant 0 : i32
     %c0_f32 = arith.constant 0.000000e+00 : f32
     %c1_i32 = arith.constant 1 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -224,6 +216,7 @@ module attributes {{"homura.quant_kernel"}} {{
     %c6_i32 = arith.constant 6 : i32
     %c15_i32 = arith.constant 15 : i32
     %c63_i32 = arith.constant 63 : i32
+    %c127_f32 = arith.constant 127.0 : f32
     %nbpr      = arith.constant {nbpr} : index
     %n_tiles_c = arith.constant {nt} : index
     %tile_sz   = arith.constant {n_tile} : index
@@ -233,6 +226,10 @@ module attributes {{"homura.quant_kernel"}} {{
     scf.forall (%tile_idx) in (%n_tiles_c) {{
       %n_base = arith.muli %tile_idx, %tile_sz : index
 
+      // Allocate Q8_K buffers (stack, reused each iteration).
+      %q8_buf   = memref.alloca() : memref<256xi8>
+      %bsums    = memref.alloca() : memref<16xi32>
+
       scf.for %m = %c0 to %seq step %c1 {{
         scf.for %n_local = %c0 to %tile_sz step %c1 {{
           %n_idx = arith.addi %n_base, %n_local : index
@@ -240,6 +237,51 @@ module attributes {{"homura.quant_kernel"}} {{
           %acc_kb = scf.for %kb = %c0 to %nbpr step %c1
                         iter_args(%acc_kb_in = %c0_f32) -> (f32) {{
 
+            %k_block_base = arith.muli %kb, %c256 : index
+
+            // ── Q8_K quantization of 256 activation elements ──
+            // Pass 1: find amax = max(|act[k_block_base..+256]|)
+            %amax = scf.for %qi = %c0 to %c256 step %c1
+                        iter_args(%mx = %c0_f32) -> (f32) {{
+              %ki = arith.addi %k_block_base, %qi : index
+              %av = memref.load %act[%c0, %m, %ki] : memref<1x?x{k}xf32>
+              %ab = math.absf %av : f32
+              %nx = arith.maximumf %mx, %ab : f32
+              scf.yield %nx : f32
+            }}
+
+            // act_d = amax / 127;  iscale = (amax != 0) ? 127 / amax : 0
+            %act_d   = arith.divf %amax, %c127_f32 : f32
+            %is_zero = arith.cmpf oeq, %amax, %c0_f32 : f32
+            %iscale_raw = arith.divf %c127_f32, %amax : f32
+            %iscale  = arith.select %is_zero, %c0_f32, %iscale_raw : f32
+
+            // Pass 2: quantize and store q8, compute bsums
+            // Zero bsums first
+            scf.for %gi = %c0 to %c16 step %c1 {{
+              memref.store %c0_i32, %bsums[%gi] : memref<16xi32>
+            }}
+            scf.for %qi = %c0 to %c256 step %c1 {{
+              %ki2 = arith.addi %k_block_base, %qi : index
+              %av2 = memref.load %act[%c0, %m, %ki2] : memref<1x?x{k}xf32>
+              %scaled = arith.mulf %av2, %iscale : f32
+              // round to nearest (match llama.cpp nearest_int: round half away from zero)
+              %rounded = math.roundeven %scaled : f32
+              %clamped_hi = arith.minimumf %rounded, %c127_f32 : f32
+              %neg127 = arith.negf %c127_f32 : f32
+              %clamped = arith.maximumf %clamped_hi, %neg127 : f32
+              %qi8_i32 = arith.fptosi %clamped : f32 to i32
+              %qi8 = arith.trunci %qi8_i32 : i32 to i8
+              memref.store %qi8, %q8_buf[%qi] : memref<256xi8>
+              // Accumulate bsums[qi / 16]
+              %grp = arith.divui %qi, %c16 : index
+              %old_bs = memref.load %bsums[%grp] : memref<16xi32>
+              %qi_ext = arith.extsi %qi8 : i8 to i32
+              %new_bs = arith.addi %old_bs, %qi_ext : i32
+              memref.store %new_bs, %bsums[%grp] : memref<16xi32>
+            }}
+
+            // ── Weight block header ──
             %blk_n   = arith.muli %n_idx, %nbpr : index
             %blk_idx = arith.addi %blk_n, %kb   : index
             %blk_off = arith.muli %blk_idx, %c144 : index
@@ -269,15 +311,14 @@ module attributes {{"homura.quant_kernel"}} {{
 
             %sc_base = arith.addi %blk_off, %c4 : index
             %qs_base = arith.addi %blk_off, %c16 : index
-            %k_block_base = arith.muli %kb, %c256 : index
 
-            // Loop over 8 sub-blocks, then 16 byte-pairs (32 elements) per sub-block.
-            // Outer: sub-block loop. Inner: byte loop (each byte = 2 nibbles).
-            // This structure gives LLVM a contiguous byte access pattern to vectorize.
-            %acc_sb = scf.for %sb = %c0 to %c8 step %c1
-                          iter_args(%acc_sb_in = %c0_f32) -> (f32) {{
-
-              // --- Unpack sc[sb] and mn[sb] ---
+            // ── Unpack scales/mins into flat arrays (8 each) ──
+            // Uses the same 6-bit unpacking as before, but we extract all 8
+            // sc[] and mn[] values and store them in small allocas so the
+            // integer dot loop can index them.
+            %sc_arr = memref.alloca() : memref<8xi32>
+            %mn_arr = memref.alloca() : memref<8xi32>
+            scf.for %sb = %c0 to %c8 step %c1 {{
               %sb_i32 = arith.index_cast %sb : index to i32
               %sb_lt4 = arith.cmpi ult, %sb_i32, %c4_i32 : i32
               %sb_clamped = arith.maxui %sb_i32, %c4_i32 : i32
@@ -302,6 +343,7 @@ module attributes {{"homura.quant_kernel"}} {{
               %hi_nib_sh = arith.shli %hi_nib, %c2_i32 : i32
               %sc_hi = arith.ori %sr_hi6, %hi_nib_sh : i32
               %sc_val = arith.select %sb_lt4, %sc_lo, %sc_hi : i32
+              memref.store %sc_val, %sc_arr[%sb] : memref<8xi32>
 
               %mn_ptr = arith.addi %sr_ptr, %c4 : index
               %mn_raw = memref.load %weight[%mn_ptr] : memref<{twb}xi8>
@@ -316,56 +358,76 @@ module attributes {{"homura.quant_kernel"}} {{
               %hmn_nib_sh = arith.shli %hmn_nib, %c2_i32 : i32
               %mn_hi = arith.ori %mn_hi6, %hmn_nib_sh : i32
               %mn_val = arith.select %sb_lt4, %mn_lo, %mn_hi : i32
+              memref.store %mn_val, %mn_arr[%sb] : memref<8xi32>
+            }}
 
-              %sc_f32 = arith.uitofp %sc_val : i32 to f32
-              %mn_f32 = arith.uitofp %mn_val : i32 to f32
-              %scale = arith.mulf %d_f32, %sc_f32 : f32
-              %minv  = arith.mulf %dmin_f32, %mn_f32 : f32
-
-              // Quant byte base for this sub-block: qs_base + sb*16
+            // ── SCALE part: integer dot per sub-block ──
+            // For each sub-block sb: isum = sum(q4_nibble[j] * q8[sb*32+j]) in i32
+            // Accumulate sc[sb] * isum across all 8 sub-blocks in i32.
+            %scale_accum = scf.for %sb = %c0 to %c8 step %c1
+                               iter_args(%sa_in = %c0_i32) -> (i32) {{
               %sb_byte_base = arith.muli %sb, %c16 : index
               %qb_base = arith.addi %qs_base, %sb_byte_base : index
-              // K element base for this sub-block: k_block_base + sb*32
-              %sb_k_base = arith.muli %sb, %c32 : index
-              %k_sb_base = arith.addi %k_block_base, %sb_k_base : index
+              %sb_q8_base = arith.muli %sb, %c32 : index
 
-              // Inner loop over 16 bytes (each byte = 2 nibbles = 2 elements)
-              %acc_inner = scf.for %bi = %c0 to %c16 step %c1
-                               iter_args(%acc_bi = %acc_sb_in) -> (f32) {{
-
+              // Inner loop: 16 bytes = 32 elements
+              %isum = scf.for %bi = %c0 to %c16 step %c1
+                          iter_args(%is_in = %c0_i32) -> (i32) {{
                 %qb_off = arith.addi %qb_base, %bi : index
                 %qb_raw = memref.load %weight[%qb_off] : memref<{twb}xi8>
                 %qb_u32 = arith.extui %qb_raw : i8 to i32
 
-                // Low nibble (even element)
+                // Low nibble × q8[sb*32 + 2*bi]
                 %nib_lo = arith.andi %qb_u32, %c15_i32 : i32
-                %nib_lo_f32 = arith.uitofp %nib_lo : i32 to f32
-                %val_lo_sc = arith.mulf %nib_lo_f32, %scale : f32
-                %val_lo = arith.subf %val_lo_sc, %minv : f32
-                %k_lo = arith.addi %k_sb_base, %bi : index
-                %k_lo2 = arith.addi %k_lo, %bi : index  // k_sb_base + 2*bi
-                %a_lo = memref.load %act[%c0, %m, %k_lo2] : memref<1x?x{k}xf32>
-                %c_lo = arith.mulf %val_lo, %a_lo : f32
-                %acc_lo = arith.addf %acc_bi, %c_lo : f32
+                %q8_lo_idx = arith.addi %sb_q8_base, %bi : index
+                %q8_lo_idx2 = arith.addi %q8_lo_idx, %bi : index
+                %q8_lo_raw = memref.load %q8_buf[%q8_lo_idx2] : memref<256xi8>
+                %q8_lo = arith.extsi %q8_lo_raw : i8 to i32
+                %prod_lo = arith.muli %nib_lo, %q8_lo : i32
+                %is1 = arith.addi %is_in, %prod_lo : i32
 
-                // High nibble (odd element)
+                // High nibble × q8[sb*32 + 2*bi + 1]
                 %nib_hi = arith.shrui %qb_u32, %c4_i32 : i32
                 %nib_hi_m = arith.andi %nib_hi, %c15_i32 : i32
-                %nib_hi_f32 = arith.uitofp %nib_hi_m : i32 to f32
-                %val_hi_sc = arith.mulf %nib_hi_f32, %scale : f32
-                %val_hi = arith.subf %val_hi_sc, %minv : f32
-                %k_hi = arith.addi %k_lo2, %c1 : index  // k_sb_base + 2*bi + 1
-                %a_hi = memref.load %act[%c0, %m, %k_hi] : memref<1x?x{k}xf32>
-                %c_hi = arith.mulf %val_hi, %a_hi : f32
-                %acc_hi = arith.addf %acc_lo, %c_hi : f32
+                %q8_hi_idx = arith.addi %q8_lo_idx2, %c1 : index
+                %q8_hi_raw = memref.load %q8_buf[%q8_hi_idx] : memref<256xi8>
+                %q8_hi = arith.extsi %q8_hi_raw : i8 to i32
+                %prod_hi = arith.muli %nib_hi_m, %q8_hi : i32
+                %is2 = arith.addi %is1, %prod_hi : i32
 
-                scf.yield %acc_hi : f32
+                scf.yield %is2 : i32
               }}
 
-              scf.yield %acc_inner : f32
+              // scale_accum += sc[sb] * isum
+              %sc_sb = memref.load %sc_arr[%sb] : memref<8xi32>
+              %sc_isum = arith.muli %sc_sb, %isum : i32
+              %sa_out = arith.addi %sa_in, %sc_isum : i32
+              scf.yield %sa_out : i32
             }}
 
-            %kb_contrib = arith.addf %acc_kb_in, %acc_sb : f32
+            // ── MIN part: bsums-based offset ──
+            // sumi = sum over g=0..15 of (mn[g/2] * bsums[g]), in i32.
+            %min_accum = scf.for %gi = %c0 to %c16 step %c1
+                             iter_args(%mi_in = %c0_i32) -> (i32) {{
+              %mn_idx = arith.divui %gi, %c2 : index
+              %mn_g = memref.load %mn_arr[%mn_idx] : memref<8xi32>
+              %bs_g = memref.load %bsums[%gi] : memref<16xi32>
+              %mn_bs = arith.muli %mn_g, %bs_g : i32
+              %mi_out = arith.addi %mi_in, %mn_bs : i32
+              scf.yield %mi_out : i32
+            }}
+
+            // ── Float combine (once per super-block) ──
+            %d_combined = arith.mulf %d_f32, %act_d : f32
+            %scale_f32  = arith.sitofp %scale_accum : i32 to f32
+            %scale_part = arith.mulf %d_combined, %scale_f32 : f32
+
+            %dmin_combined = arith.mulf %dmin_f32, %act_d : f32
+            %min_f32  = arith.sitofp %min_accum : i32 to f32
+            %min_part = arith.mulf %dmin_combined, %min_f32 : f32
+
+            %kb_val = arith.subf %scale_part, %min_part : f32
+            %kb_contrib = arith.addf %acc_kb_in, %kb_val : f32
             scf.yield %kb_contrib : f32
           }}
 
@@ -388,19 +450,12 @@ module attributes {{"homura.quant_kernel"}} {{
     )
 }
 
-/// Emit a complete MLIR module for a Q6_K dequant-matmul kernel.
+/// Emit a complete MLIR module for a Q6_K×Q8_K dequant-matmul kernel.
 ///
-/// Computes: `out[0, m, n] = sum_k(act[0, m, k] * dequant_q6k(weight_block[n, k/256]))`
+/// Matches llama.cpp's `ggml_vec_dot_q6_K_q8_K`: quantizes the f32 activation
+/// to Q8_K on-the-fly, then performs an integer dot product with the Q6_K weights.
 ///
-/// # Arguments
-/// - `k`: input features (K dimension, must be a multiple of 256)
-/// - `n`: output features (N dimension)
-/// - `func_name`: MLIR function name
-/// - `n_tile`: forall tile size for N-dimension parallelism
-///
-/// # Weight layout
-/// Flat `memref<?xi8>` with `total_blocks * 210` bytes.
-/// Each Q6_K super-block is 210 bytes:
+/// Q6_K layout (210 bytes per 256-element super-block):
 ///   - bytes   0-127: ql[128]  — low 4 bits of 256 quant values (2 per byte)
 ///   - bytes 128-191: qh[64]   — high 2 bits of 256 quant values (4 per byte)
 ///   - bytes 192-207: sc[16]   — i8 sub-block scales (16 sub-blocks of 16 elements)
@@ -409,12 +464,10 @@ module attributes {{"homura.quant_kernel"}} {{
 /// For sub-block `sb`, element `j` (idx = sb*16 + j):
 ///   lo = (ql[idx/2] >> ((idx%2)*4)) & 0x0F
 ///   hi = (qh[idx/4] >> ((idx%4)*2)) & 0x03
-///   q  = (lo | (hi << 4)) as i8 - 32
-///   dequant = q * d * sc[sb]
-///
-/// # Parallelism
-/// Uses `scf.forall` over N tiles → `convert-scf-to-openmp` → OpenMP threads.
-/// The inner 16-element loop per sub-block auto-vectorizes via LLVM.
+///   q  = (lo | (hi << 4)) - 32          (signed 6-bit, range -32..31)
+///   dot contribution = q * q8[idx]       (integer, accumulated in i32)
+///   per sub-block:  sc[sb] * isum_sb     (i32)
+///   per super-block: d * act_d * total   (f32)
 pub fn emit_dequant_matmul_q6_k(k: u64, n: u64, func_name: &str, n_tile: usize) -> String {
     assert!(k % 256 == 0, "k must be a multiple of 256, got {k}");
     assert!(
@@ -427,147 +480,8 @@ pub fn emit_dequant_matmul_q6_k(k: u64, n: u64, func_name: &str, n_tile: usize) 
     let total_weight_bytes: u64 = total_blocks * 210;
     let n_tiles: u64 = n / n_tile as u64;
 
-    // Build the 16 unrolled sub-block sections.
-    //
-    // For sub-block sb (0..16), element j (0..16):
-    //   idx = sb*16 + j
-    //   ql offset within block: idx/2  (0..127)
-    //   ql shift: (idx%2)*4  (0 or 4)
-    //   qh offset within block: idx/4  (0..63) -> absolute block offset = 128 + idx/4
-    //   qh shift: (idx%4)*2  (0, 2, 4, or 6)
-    //   sc byte: block[192 + sb] as i8
-    //
-    // SSA naming: all names use sb suffix to be unique across iterations.
-    // The inner scf.for bodies each have their own block so %j etc. can be reused.
-
-    let mut sb_blocks = String::new();
-    for sb in 0u64..16 {
-        // Precomputed offsets for this sub-block at the block level.
-        // All elements in this sub-block: idx in [sb*16 .. sb*16+15]
-        // ql base byte index: sb*16/2 = sb*8
-        let ql_base: u64 = sb * 8; // ql[idx/2] when idx = sb*16+j: (sb*16+j)/2 = sb*8 + j/2
-        // qh base byte: 128 + sb*16/4 = 128 + sb*4
-        let qh_base: u64 = 128 + sb * 4;
-        // sc byte: 192 + sb
-        let sc_off: u64 = 192 + sb;
-        // k-element base within the 256-element super-block: sb*16
-        let k_sb: u64 = sb * 16;
-
-        let prev_acc = if sb == 0 {
-            "%acc_sb_init".to_string()
-        } else {
-            format!("%acc_sb{}", sb - 1)
-        };
-
-        sb_blocks.push_str(&format!(
-            r#"
-            // Sub-block {sb}: sc = block[{sc_off}] as i8, then dequant d * sc
-            %sc{sb}_ptr   = arith.addi %blk_off, %csc{sc_off} : index
-            %sc{sb}_raw   = memref.load %weight[%sc{sb}_ptr] : memref<{wb}xi8>
-            %sc{sb}_i32   = arith.extsi %sc{sb}_raw : i8 to i32
-            %sc{sb}_f32   = arith.sitofp %sc{sb}_i32 : i32 to f32
-            %scale{sb}    = arith.mulf %d_f32, %sc{sb}_f32 : f32
-            %ql{sb}_base  = arith.addi %blk_off, %cql{ql_base} : index
-            %qh{sb}_base  = arith.addi %blk_off, %cqh{qh_base} : index
-            %k{sb}_base   = arith.addi %k_block_base, %ck{k_sb} : index
-
-            %acc_sb{sb} = scf.for %j = %c0 to %c16 step %c1
-                              iter_args(%acc_j = {prev_acc}) -> (f32) {{
-              // ql byte: ql_base + j/2
-              %j_half_ql  = arith.divui %j, %c2 : index
-              %ql_off     = arith.addi %ql{sb}_base, %j_half_ql : index
-              %ql_raw     = memref.load %weight[%ql_off] : memref<{wb}xi8>
-              %ql_u32     = arith.extui %ql_raw : i8 to i32
-              %j_mod2     = arith.remui %j, %c2 : index
-              %ql_shift   = arith.muli %j_mod2, %c4_idx : index
-              %ql_shift32 = arith.index_cast %ql_shift : index to i32
-              %ql_sh      = arith.shrui %ql_u32, %ql_shift32 : i32
-              %lo         = arith.andi  %ql_sh, %c15_i32 : i32
-
-              // qh byte: qh_base + j/4
-              %j_half_qh  = arith.divui %j, %c4 : index
-              %qh_off     = arith.addi %qh{sb}_base, %j_half_qh : index
-              %qh_raw     = memref.load %weight[%qh_off] : memref<{wb}xi8>
-              %qh_u32     = arith.extui %qh_raw : i8 to i32
-              %j_mod4     = arith.remui %j, %c4 : index
-              %qh_shift   = arith.muli %j_mod4, %c2_idx : index
-              %qh_shift32 = arith.index_cast %qh_shift : index to i32
-              %qh_sh      = arith.shrui %qh_u32, %qh_shift32 : i32
-              %hi         = arith.andi  %qh_sh, %c3_i32 : i32
-
-              // q = (lo | (hi << 4)) as i8 - 32
-              %hi_sh      = arith.shli  %hi, %c4_i32 : i32
-              %combined   = arith.ori   %lo, %hi_sh : i32
-              // Interpret as signed i8: truncate to i8 then sign-extend back to i32
-              %comb_i8    = arith.trunci %combined : i32 to i8
-              %q_i32      = arith.extsi  %comb_i8  : i8 to i32
-              %q_sub      = arith.subi   %q_i32, %c32_i32 : i32
-              %q_f32      = arith.sitofp %q_sub : i32 to f32
-              %val        = arith.mulf   %q_f32, %scale{sb} : f32
-
-              // Load activation element
-              %k_elem     = arith.addi %k{sb}_base, %j : index
-              %a_val      = memref.load %act[%c0, %m, %k_elem] : memref<1x?x{k}xf32>
-              %contrib    = arith.mulf %val, %a_val : f32
-              %new_acc    = arith.addf %acc_j, %contrib : f32
-              scf.yield %new_acc : f32
-            }}
-"#,
-            sb = sb,
-            sc_off = sc_off,
-            ql_base = ql_base,
-            qh_base = qh_base,
-            k_sb = k_sb,
-            prev_acc = prev_acc,
-            wb = total_weight_bytes,
-            k = k,
-        ));
-    }
-
-    // Build extra constants.
-    // sc byte offsets: 192..207
-    // ql base offsets: 0, 8, 16, .., 120 (sb*8 for sb 0..16)
-    // qh base offsets: 128, 132, 136, .., 188 (128+sb*4 for sb 0..16)
-    // k base offsets: 0, 16, 32, .., 240 (sb*16 for sb 0..16)
-    let mut extra_consts = String::new();
-
-    // sc byte offsets 192..207
-    for sb in 0u64..16 {
-        let v = 192 + sb;
-        extra_consts.push_str(&format!("    %csc{v} = arith.constant {v} : index\n"));
-    }
-    // ql base offsets: sb*8 for sb 0..16 = 0,8,16,...,120
-    for sb in 0u64..16 {
-        let v = sb * 8;
-        extra_consts.push_str(&format!("    %cql{v} = arith.constant {v} : index\n"));
-    }
-    // qh base offsets: 128+sb*4 for sb 0..16 = 128,132,...,188
-    for sb in 0u64..16 {
-        let v = 128 + sb * 4;
-        extra_consts.push_str(&format!("    %cqh{v} = arith.constant {v} : index\n"));
-    }
-    // k base offsets: sb*16 for sb 0..16 = 0,16,32,...,240
-    for sb in 0u64..16 {
-        let v = sb * 16;
-        extra_consts.push_str(&format!("    %ck{v} = arith.constant {v} : index\n"));
-    }
-    // i32 bit-op constants
-    for v in [3u32, 4, 15, 32] {
-        extra_consts.push_str(&format!("    %c{v}_i32 = arith.constant {v} : i32\n"));
-    }
-    // index constants used as multipliers
-    extra_consts.push_str("    %c2_idx = arith.constant 2 : index\n");
-    extra_consts.push_str("    %c4_idx = arith.constant 4 : index\n");
-    // 256 as index for k_block_base
-    extra_consts.push_str("    %c256 = arith.constant 256 : index\n");
-    // f16 scale byte offsets (208, 209)
-    extra_consts.push_str("    %cd208 = arith.constant 208 : index\n");
-    extra_consts.push_str("    %cd209 = arith.constant 209 : index\n");
-
-    let final_acc = "%acc_sb15";
-
     format!(
-        r#"// Q6_K dequant-matmul: K={k} N={n} n_tile={n_tile}
+        r#"// Q6_K×Q8_K dequant-matmul: K={k} N={n} n_tile={n_tile}
 // Weight layout: {total_weight_bytes} bytes ({total_blocks} blocks x 210 bytes/block)
 module attributes {{"homura.quant_kernel"}} {{
   func.func @{func_name}(
@@ -581,36 +495,78 @@ module attributes {{"homura.quant_kernel"}} {{
     %c2        = arith.constant 2 : index
     %c4        = arith.constant 4 : index
     %c16       = arith.constant 16 : index
+    %c128      = arith.constant 128 : index
+    %c192      = arith.constant 192 : index
+    %c208      = arith.constant 208 : index
+    %c209      = arith.constant 209 : index
     %c210      = arith.constant 210 : index
+    %c256      = arith.constant 256 : index
     %c8_i16    = arith.constant 8 : i16
+    %c0_i32    = arith.constant 0 : i32
+    %c2_i32    = arith.constant 2 : i32
+    %c3_i32    = arith.constant 3 : i32
+    %c4_i32    = arith.constant 4 : i32
+    %c15_i32   = arith.constant 15 : i32
+    %c32_i32   = arith.constant 32 : i32
     %c0_f32    = arith.constant 0.000000e+00 : f32
+    %c127_f32  = arith.constant 127.0 : f32
     %nbpr      = arith.constant {num_blocks_per_row} : index
     %n_tiles_c = arith.constant {n_tiles} : index
     %tile_sz   = arith.constant {n_tile} : index
-{extra_consts}
-    // Dynamic sequence length (M dimension).
+
     %seq = memref.dim %act, %c1 : memref<1x?x{k}xf32>
 
-    // Parallel over N tiles.
     scf.forall (%tile_idx) in (%n_tiles_c) {{
       %n_base = arith.muli %tile_idx, %tile_sz : index
+
+      // Stack buffers for Q8_K quantized activation.
+      %q8_buf = memref.alloca() : memref<256xi8>
 
       scf.for %m = %c0 to %seq step %c1 {{
         scf.for %n_local = %c0 to %tile_sz step %c1 {{
           %n_idx = arith.addi %n_base, %n_local : index
 
-          // Accumulate over K super-blocks.
           %acc_kb = scf.for %kb = %c0 to %nbpr step %c1
                         iter_args(%acc_kb_in = %c0_f32) -> (f32) {{
 
-            // Flat block byte offset: (n_idx * nbpr + kb) * 210
+            %k_block_base = arith.muli %kb, %c256 : index
+
+            // ── Q8_K quantization of 256 activation elements ──
+            %amax = scf.for %qi = %c0 to %c256 step %c1
+                        iter_args(%mx = %c0_f32) -> (f32) {{
+              %ki = arith.addi %k_block_base, %qi : index
+              %av = memref.load %act[%c0, %m, %ki] : memref<1x?x{k}xf32>
+              %ab = math.absf %av : f32
+              %nx = arith.maximumf %mx, %ab : f32
+              scf.yield %nx : f32
+            }}
+
+            %act_d   = arith.divf %amax, %c127_f32 : f32
+            %is_zero = arith.cmpf oeq, %amax, %c0_f32 : f32
+            %iscale_raw = arith.divf %c127_f32, %amax : f32
+            %iscale  = arith.select %is_zero, %c0_f32, %iscale_raw : f32
+
+            scf.for %qi = %c0 to %c256 step %c1 {{
+              %ki2 = arith.addi %k_block_base, %qi : index
+              %av2 = memref.load %act[%c0, %m, %ki2] : memref<1x?x{k}xf32>
+              %scaled = arith.mulf %av2, %iscale : f32
+              %rounded = math.roundeven %scaled : f32
+              %clamped_hi = arith.minimumf %rounded, %c127_f32 : f32
+              %neg127 = arith.negf %c127_f32 : f32
+              %clamped = arith.maximumf %clamped_hi, %neg127 : f32
+              %qi8_i32 = arith.fptosi %clamped : f32 to i32
+              %qi8 = arith.trunci %qi8_i32 : i32 to i8
+              memref.store %qi8, %q8_buf[%qi] : memref<256xi8>
+            }}
+
+            // ── Weight block header ──
             %blk_n   = arith.muli %n_idx, %nbpr : index
             %blk_idx = arith.addi %blk_n, %kb   : index
             %blk_off = arith.muli %blk_idx, %c210 : index
 
-            // Load d (f16 at bytes 208-209, little-endian).
-            %d0_off = arith.addi %blk_off, %cd208 : index
-            %d1_off = arith.addi %blk_off, %cd209 : index
+            // Load d (f16 at bytes 208-209)
+            %d0_off = arith.addi %blk_off, %c208 : index
+            %d1_off = arith.addi %blk_off, %c209 : index
             %d0_i8  = memref.load %weight[%d0_off] : memref<{total_weight_bytes}xi8>
             %d1_i8  = memref.load %weight[%d1_off] : memref<{total_weight_bytes}xi8>
             %d0_i16 = arith.extui %d0_i8 : i8 to i16
@@ -620,13 +576,85 @@ module attributes {{"homura.quant_kernel"}} {{
             %d_f16  = arith.bitcast %d_i16 : i16 to f16
             %d_f32  = arith.extf  %d_f16 : f16 to f32
 
-            // k-element base for this super-block: kb * 256.
-            %k_block_base = arith.muli %kb, %c256 : index
+            // ql starts at byte 0 of block (= blk_off), qh at 128, sc at 192
+            %qh_base_blk = arith.addi %blk_off, %c128 : index
+            %sc_base_blk = arith.addi %blk_off, %c192 : index
 
-            // Initial accumulator for sub-block loop chain.
-            %acc_sb_init = arith.constant 0.000000e+00 : f32
-{sb_blocks}
-            %kb_contrib = arith.addf %acc_kb_in, {final_acc} : f32
+            // ── Integer dot product over 16 sub-blocks of 16 elements ──
+            // For each sub-block: isum = sum(q6_val * q8_quant) in i32
+            // Accumulate: sc_i8[sb] * isum across sub-blocks in i32
+            %scale_accum = scf.for %sb = %c0 to %c16 step %c1
+                               iter_args(%sa_in = %c0_i32) -> (i32) {{
+
+              // Load scale for this sub-block: sc[sb] as signed i8
+              %sc_off = arith.addi %sc_base_blk, %sb : index
+              %sc_raw = memref.load %weight[%sc_off] : memref<{total_weight_bytes}xi8>
+              %sc_i32 = arith.extsi %sc_raw : i8 to i32
+
+              // Bases for ql, qh within this sub-block
+              // ql base: blk_off + sb*8  (each sub-block has 16 elements, 2 per byte = 8 bytes)
+              %sb_times_8 = arith.muli %sb, %c4 : index  // sb*4 pairs... wait
+              // Actually: idx = sb*16+j, ql byte = idx/2 = sb*8 + j/2
+              %ql_sb_off = arith.muli %sb, %c4 : index
+              %ql_sb_off2 = arith.addi %ql_sb_off, %ql_sb_off : index  // sb*8
+              %ql_sb_base = arith.addi %blk_off, %ql_sb_off2 : index
+              // qh base: blk_off + 128 + sb*4  (idx/4 = sb*4 + j/4)
+              %qh_sb_off = arith.muli %sb, %c4 : index
+              %qh_sb_base = arith.addi %qh_base_blk, %qh_sb_off : index
+              // q8 base within the 256-element block: sb*16
+              %q8_sb_base = arith.muli %sb, %c16 : index
+
+              // Inner loop: 16 elements per sub-block
+              %isum = scf.for %j = %c0 to %c16 step %c1
+                          iter_args(%is_in = %c0_i32) -> (i32) {{
+
+                // Unpack q6 value: lo | (hi << 4) - 32
+                %j_half = arith.divui %j, %c2 : index
+                %ql_off = arith.addi %ql_sb_base, %j_half : index
+                %ql_raw = memref.load %weight[%ql_off] : memref<{total_weight_bytes}xi8>
+                %ql_u32 = arith.extui %ql_raw : i8 to i32
+                %j_mod2 = arith.remui %j, %c2 : index
+                %j_mod2_i32 = arith.index_cast %j_mod2 : index to i32
+                %ql_shift = arith.muli %j_mod2_i32, %c4_i32 : i32
+                %ql_sh = arith.shrui %ql_u32, %ql_shift : i32
+                %lo = arith.andi %ql_sh, %c15_i32 : i32
+
+                %j_quarter = arith.divui %j, %c4 : index
+                %qh_off = arith.addi %qh_sb_base, %j_quarter : index
+                %qh_raw = memref.load %weight[%qh_off] : memref<{total_weight_bytes}xi8>
+                %qh_u32 = arith.extui %qh_raw : i8 to i32
+                %j_mod4 = arith.remui %j, %c4 : index
+                %j_mod4_i32 = arith.index_cast %j_mod4 : index to i32
+                %qh_shift = arith.muli %j_mod4_i32, %c2_i32 : i32
+                %qh_sh = arith.shrui %qh_u32, %qh_shift : i32
+                %hi = arith.andi %qh_sh, %c3_i32 : i32
+
+                %hi_sh = arith.shli %hi, %c4_i32 : i32
+                %combined = arith.ori %lo, %hi_sh : i32
+                %q_val = arith.subi %combined, %c32_i32 : i32
+
+                // Load q8 quantized activation
+                %q8_idx = arith.addi %q8_sb_base, %j : index
+                %q8_raw = memref.load %q8_buf[%q8_idx] : memref<256xi8>
+                %q8_i32 = arith.extsi %q8_raw : i8 to i32
+
+                // Integer multiply-accumulate
+                %prod = arith.muli %q_val, %q8_i32 : i32
+                %is_out = arith.addi %is_in, %prod : i32
+                scf.yield %is_out : i32
+              }}
+
+              // scale_accum += sc[sb] * isum
+              %sc_isum = arith.muli %sc_i32, %isum : i32
+              %sa_out = arith.addi %sa_in, %sc_isum : i32
+              scf.yield %sa_out : i32
+            }}
+
+            // ── Float combine (once per super-block) ──
+            %d_combined = arith.mulf %d_f32, %act_d : f32
+            %scale_f32 = arith.sitofp %scale_accum : i32 to f32
+            %kb_val = arith.mulf %d_combined, %scale_f32 : f32
+            %kb_contrib = arith.addf %acc_kb_in, %kb_val : f32
             scf.yield %kb_contrib : f32
           }}
 
@@ -646,9 +674,6 @@ module attributes {{"homura.quant_kernel"}} {{
         total_weight_bytes = total_weight_bytes,
         n_tiles = n_tiles,
         total_blocks = total_blocks,
-        extra_consts = extra_consts,
-        sb_blocks = sb_blocks,
-        final_acc = final_acc,
     )
 }
 
@@ -1259,44 +1284,64 @@ mod tests {
         let gguf = crate::gguf::GgufFile::load(path).unwrap();
         let info = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
         let raw = gguf.tensor_data(info);
-        // First row: N=1, K=2048, 8 super-blocks = 1152 bytes
-        let row_bytes = (2048 / 256) * 144;
-        let first_row = &raw[0..row_bytes];
 
-        // Rust reference dequant
-        let mut ref_vals = vec![0.0f32; 2048];
-        crate::gguf::dequant_q4_k(first_row, &mut ref_vals);
-        eprintln!("ref first 8: {:?}", &ref_vals[..8]);
+        // Test at full model scale: K=2048, N=2048
+        let k: u64 = 2048;
+        let n: u64 = 2048;
+        let row_bytes = (k as usize / 256) * 144;
+        let total_bytes = n as usize * row_bytes;
+        let weight_data = &raw[0..total_bytes];
 
-        // MLIR kernel: K=2048, N=1
-        let mlir = emit_dequant_matmul_q4_k(2048, 1, "kreal", 1);
+        // Rust reference: dequant all rows, compute dot product with all-ones
+        let mut ref_sums = vec![0.0f32; n as usize];
+        for row in 0..n as usize {
+            let row_data = &weight_data[row * row_bytes..(row + 1) * row_bytes];
+            let mut ref_vals = vec![0.0f32; k as usize];
+            crate::gguf::dequant_q4_k(row_data, &mut ref_vals);
+            ref_sums[row] = ref_vals.iter().sum();
+        }
+
+        // MLIR kernel: K=2048, N=8
+        let mlir = emit_dequant_matmul_q4_k(k, n, "kreal", 1);
         let tmp = tempfile_dir().unwrap();
         let obj_paths = compile_to_objects(&mlir, "real_q4k", "kreal", &tmp).unwrap();
         let so_path = tmp.join("test_real_q4k.so");
         link_shared_lib_pub(&obj_paths, &so_path).unwrap();
 
         let out_desc = OutputDesc {
-            shape: crate::shape::Shape(vec![1, 1, 1]),
+            shape: crate::shape::Shape(vec![1, 1, n]),
             dtype: DType::F32,
         };
         let graph = CompiledGraph::load_named(&so_path, 2, vec![out_desc], "kreal").unwrap();
 
-        // All-ones activation: output = sum of dequantized weights
-        let act_data = vec![1.0f32; 2048];
-        let act_buf = Buffer::from_slice(&act_data, &[1, 1, 2048u64], DType::F32);
-        let weight_buf = Buffer::from_slice::<u8>(first_row, &[row_bytes as u64], DType::I8);
+        let act_data = vec![1.0f32; k as usize];
+        let act_buf = Buffer::from_slice(&act_data, &[1, 1, k], DType::F32);
+        let weight_buf = Buffer::from_slice::<u8>(weight_data, &[total_bytes as u64], DType::I8);
 
         let outputs = graph.run(&[&act_buf, &weight_buf]);
-        let kernel_val = outputs[0].as_slice::<f32>()[0];
-        let ref_sum: f32 = ref_vals.iter().sum();
+        let out_slice = outputs[0].as_slice::<f32>();
 
-        eprintln!(
-            "kernel={kernel_val:.4} ref={ref_sum:.4} diff={:.6}",
-            (kernel_val - ref_sum).abs()
-        );
-        assert!(
-            (kernel_val - ref_sum).abs() < 1.0,
-            "Q4_K real weight mismatch: kernel={kernel_val} ref={ref_sum}"
-        );
+        // Also compute per-row mean of dequantized weights
+        let mut all_dequant = vec![0.0f32; (n * k) as usize];
+        for row in 0..n as usize {
+            let row_data = &weight_data[row * row_bytes..(row + 1) * row_bytes];
+            crate::gguf::dequant_q4_k(row_data, &mut all_dequant[row * k as usize..(row + 1) * k as usize]);
+        }
+        let global_mean: f32 = all_dequant.iter().sum::<f32>() / all_dequant.len() as f32;
+        eprintln!("dequant global mean = {global_mean:.6}");
+
+        for row in 0..n as usize {
+            let kernel_val = out_slice[row];
+            let ref_sum = ref_sums[row];
+            let row_mean: f32 = all_dequant[row * k as usize..(row + 1) * k as usize].iter().sum::<f32>() / k as f32;
+            let diff = (kernel_val - ref_sum).abs();
+            eprintln!(
+                "row {row}: kernel={kernel_val:.4} ref={ref_sum:.4} diff={diff:.6} row_mean={row_mean:.6}"
+            );
+            assert!(
+                diff < 1.0,
+                "Q4_K real weight mismatch at row {row}: kernel={kernel_val} ref={ref_sum}"
+            );
+        }
     }
 }

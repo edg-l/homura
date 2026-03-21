@@ -1780,74 +1780,78 @@ pub(crate) fn compile_and_link_kernels(
 
     // Link all .o files into a single .so.
     let link_start = std::time::Instant::now();
-    let all_objs: Vec<std::path::PathBuf> = all_obj_paths
-        .iter()
-        .flat_map(|(_, paths)| paths.iter().cloned())
-        .collect();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let unified_so = tmp_dir.join(format!(
-        "homura_unified_{}_{:08x}.so",
-        std::process::id(),
-        nanos
-    ));
-    link_shared_lib(&all_objs, &unified_so)?;
-    log_compile!(
-        "plan",
-        "unified link ({} .o files): {}ms",
-        all_objs.len(),
-        link_start.elapsed().as_millis()
-    );
-
     let keep_artifacts = std::env::var("HOMURA_DUMP_KERNEL").is_ok();
-    if !keep_artifacts {
-        for p in &all_objs {
-            std::fs::remove_file(p).ok();
-        }
-    }
 
-    // dlopen once, dlsym each kernel.
-    let lib = {
-        use std::ffi::CString;
-        let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
-        let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
-        if lib.is_null() {
-            let err = unsafe {
-                let msg = libc::dlerror();
-                if msg.is_null() {
-                    "unknown dlopen error".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
-                }
-            };
-            return Err(CompileError::Link(format!(
-                "dlopen unified .so failed: {err}"
-            )));
+    let (kernels, lib) = {
+        let all_objs: Vec<std::path::PathBuf> = all_obj_paths
+            .iter()
+            .flat_map(|(_, paths)| paths.iter().cloned())
+            .collect();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let unified_so = tmp_dir.join(format!(
+            "homura_unified_{}_{:08x}.so",
+            std::process::id(),
+            nanos
+        ));
+        link_shared_lib(&all_objs, &unified_so)?;
+        log_compile!(
+            "plan",
+            "unified link ({} .o files): {}ms",
+            all_objs.len(),
+            link_start.elapsed().as_millis()
+        );
+
+        if !keep_artifacts {
+            for p in &all_objs {
+                std::fs::remove_file(p).ok();
+            }
         }
-        lib
+
+        let lib = {
+            use std::ffi::CString;
+            let path_cstr = CString::new(unified_so.to_str().unwrap()).unwrap();
+            let lib = unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW) };
+            if lib.is_null() {
+                let err = unsafe {
+                    let msg = libc::dlerror();
+                    if msg.is_null() {
+                        "unknown dlopen error".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(CompileError::Link(format!(
+                    "dlopen unified .so failed: {err}"
+                )));
+            }
+            lib
+        };
+
+        let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
+            .iter()
+            .map(|er| {
+                let func_name = format!("k{}", er.group_idx);
+                crate::runtime::CompiledGraph::load_from_handle(
+                    lib,
+                    er.num_inputs,
+                    er.output_descs.clone(),
+                    &func_name,
+                )
+                .map_err(|e| CompileError::Link(format!("kernel {}: {e}", er.group_idx)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !keep_artifacts {
+            std::fs::remove_file(&unified_so).ok();
+        } else {
+            eprintln!("[dump] unified .so → {}", unified_so.display());
+        }
+
+        (kernels, lib)
     };
-
-    let kernels: Vec<crate::runtime::CompiledGraph> = emit_results
-        .iter()
-        .map(|er| {
-            let func_name = format!("k{}", er.group_idx);
-            crate::runtime::CompiledGraph::load_from_handle(
-                lib,
-                er.num_inputs,
-                er.output_descs.clone(),
-                &func_name,
-            )
-            .map_err(|e| CompileError::Link(format!("kernel {}: {e}", er.group_idx)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if !keep_artifacts {
-        std::fs::remove_file(&unified_so).ok();
-    } else {
-        eprintln!("[dump] unified .so → {}", unified_so.display());
-    }
 
     log_compile!(
         "plan",

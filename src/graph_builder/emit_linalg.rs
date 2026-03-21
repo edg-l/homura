@@ -25,6 +25,36 @@ impl<'c> GraphBuilder<'c> {
         self.emit_mul(&normalized, weight)
     }
 
+    /// RMSNorm with f64 accumulation for the sum-of-squares reduction.
+    ///
+    /// Matches llama.cpp's `ggml_compute_forward_rms_norm_f32` which uses
+    /// `ggml_float` (= double) for the sum accumulation. This prevents
+    /// numerical drift when used with low-precision quantized weights (Q4_K).
+    pub fn emit_rms_norm_f64_accum(
+        &mut self,
+        input: &Tensor<'c>,
+        weight: &Tensor<'c>,
+        eps: f32,
+    ) -> Tensor<'c> {
+        // x² = x * x (f32)
+        let x_sq = self.emit_mul(input, input);
+        // Cast x² to f64 for high-precision accumulation
+        let x_sq_f64 = self.emit_cast(&x_sq, DType::F64);
+        // variance = mean(x², axis=-1, keepdim=true) in f64
+        let variance_f64 = self.emit_reduce_mean(&x_sq_f64, &[-1], true);
+        // Cast back to f32
+        let variance = self.emit_cast(&variance_f64, DType::F32);
+        // variance + eps
+        let eps_tensor = self.emit_arith_constant(eps as f64, DType::F32);
+        let var_eps = self.emit_add(&variance, &eps_tensor);
+        // rsqrt(variance + eps)
+        let inv_rms = self.emit_rsqrt(&var_eps);
+        // x * inv_rms
+        let normalized = self.emit_mul(input, &inv_rms);
+        // normalized * weight
+        self.emit_mul(&normalized, weight)
+    }
+
     /// GQA head expansion: repeat each KV head `repeats` times along the heads axis.
     ///
     /// Input shape:  `[batch, seq, kv_heads, head_dim]`
@@ -494,6 +524,33 @@ impl<'c> GraphBuilder<'c> {
         // Step 4: sum of exp with keepdim.
         let sum_exp = self.emit_reduce_sum(&exp_shifted, axis, true);
         // Step 5: divide.
+        self.emit_div(&exp_shifted, &sum_exp)
+    }
+
+    /// Softmax with f64 accumulation for the sum-of-exp reduction.
+    ///
+    /// Matches llama.cpp's `ggml_vec_soft_max_f32` which uses `ggml_float`
+    /// (= double) for the sum accumulation.
+    pub fn emit_softmax_f64_accum(&mut self, input: &Tensor<'c>, axis: i64) -> Tensor<'c> {
+        let shape = input.shape();
+        let rank = shape.len() as i64;
+        let axis = if axis < 0 { axis + rank } else { axis };
+        assert!(
+            axis >= 0 && axis < rank,
+            "softmax axis {axis} out of bounds for rank {rank}"
+        );
+
+        // Step 1: max along axis with keepdim (f32 is fine for max)
+        let max_val = self.emit_reduce_max(input, axis, true);
+        // Step 2: subtract max
+        let shifted = self.emit_sub(input, &max_val);
+        // Step 3: exp
+        let exp_shifted = self.emit_exp(&shifted);
+        // Step 4: cast to f64, sum, cast back
+        let exp_f64 = self.emit_cast(&exp_shifted, DType::F64);
+        let sum_exp_f64 = self.emit_reduce_sum(&exp_f64, axis, true);
+        let sum_exp = self.emit_cast(&sum_exp_f64, DType::F32);
+        // Step 5: divide
         self.emit_div(&exp_shifted, &sum_exp)
     }
 

@@ -701,7 +701,12 @@ fn emit_quant_matmul_kernel(
     }
 }
 
-/// Emit RMSNorm-only kernel.
+/// Emit hand-coded RMSNorm kernel using the quant pipeline.
+///
+/// Uses f64 accumulation for sum-of-squares, matching llama.cpp's
+/// `ggml_compute_forward_rms_norm_f32` which uses `ggml_float` (= double).
+/// Goes through the quant compilation pipeline (no bufferize/linalg passes)
+/// to ensure the f64 accumulation is preserved exactly.
 ///
 /// Inputs: hidden [1, seq, hidden], ln_w [hidden]
 /// Output: normed [1, seq, hidden]
@@ -710,21 +715,74 @@ fn emit_rms_norm_kernel(
     eps: f32,
     kernel_idx: usize,
 ) -> Result<KernelEmitResult, CompileError> {
-    let ctx = GraphContext::new();
-    let mut gb = ctx.builder();
-
-    let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
-    let ln_w = gb.input(&[Some(hidden)], DType::F32);
-    let normed = gb.emit_rms_norm(&h, &ln_w, eps);
-
     let func_name = format!("k{kernel_idx}");
-    let (mlir_text, num_inputs, output_descs) =
-        gb.finalize_to_mlir_named(&[&normed], TransformMode::None, &func_name)?;
+    let dyn_val = crate::shape::DIM_DYNAMIC;
+
+    let mlir_text = format!(
+        r#"// RMSNorm (f64 accum): hidden={hidden}
+module attributes {{"homura.quant_kernel"}} {{
+  func.func @{func_name}(
+      %input : memref<1x?x{hidden}xf32>,
+      %weight : memref<{hidden}xf32>,
+      %out   : memref<1x?x{hidden}xf32>)
+      attributes {{llvm.emit_c_interface}} {{
+
+    %c0     = arith.constant 0 : index
+    %c1     = arith.constant 1 : index
+    %hidden = arith.constant {hidden} : index
+    %c0_f64 = arith.constant 0.000000e+00 : f64
+    %eps    = arith.constant {eps} : f32
+    %inv_n  = arith.constant {inv_n} : f64
+
+    %seq = memref.dim %input, %c1 : memref<1x?x{hidden}xf32>
+
+    scf.for %m = %c0 to %seq step %c1 {{
+      // Pass 1: sum of squares in f64
+      %sum_sq = scf.for %h = %c0 to %hidden step %c1
+                    iter_args(%acc = %c0_f64) -> (f64) {{
+        %val = memref.load %input[%c0, %m, %h] : memref<1x?x{hidden}xf32>
+        %val_f64 = arith.extf %val : f32 to f64
+        %sq = arith.mulf %val_f64, %val_f64 : f64
+        %new_acc = arith.addf %acc, %sq : f64
+        scf.yield %new_acc : f64
+      }}
+
+      // mean = sum_sq / hidden, convert to f32
+      %mean_f64 = arith.mulf %sum_sq, %inv_n : f64
+      %mean_f32 = arith.truncf %mean_f64 : f64 to f32
+
+      // scale = 1 / sqrt(mean + eps)
+      %mean_eps = arith.addf %mean_f32, %eps : f32
+      %rms = math.sqrt %mean_eps : f32
+      %c1_f32 = arith.constant 1.000000e+00 : f32
+      %scale = arith.divf %c1_f32, %rms : f32
+
+      // Pass 2: normalize and scale by weight
+      scf.for %h = %c0 to %hidden step %c1 {{
+        %val2 = memref.load %input[%c0, %m, %h] : memref<1x?x{hidden}xf32>
+        %w = memref.load %weight[%h] : memref<{hidden}xf32>
+        %normed = arith.mulf %val2, %scale : f32
+        %result = arith.mulf %normed, %w : f32
+        memref.store %result, %out[%c0, %m, %h] : memref<1x?x{hidden}xf32>
+      }}
+    }}
+    return
+  }}
+}}
+"#,
+        func_name = func_name,
+        hidden = hidden,
+        eps = eps,
+        inv_n = 1.0 / hidden as f64,
+    );
 
     Ok(KernelEmitResult {
         mlir_text,
-        num_inputs,
-        output_descs,
+        num_inputs: 2,
+        output_descs: vec![crate::runtime::OutputDesc {
+            shape: crate::shape::Shape(vec![1, dyn_val, hidden]),
+            dtype: DType::F32,
+        }],
         group_idx: kernel_idx,
         num_in: 2,
         num_out: 1,
@@ -809,12 +867,12 @@ fn emit_post_qkv_kernel(
 
     // QK-norm (Qwen3-style)
     let q_pre_rope = if let Some(w) = &q_norm_w {
-        gb.emit_rms_norm(&q_4d, w, config.rms_norm_eps as f32)
+        gb.emit_rms_norm_f64_accum(&q_4d, w, config.rms_norm_eps as f32)
     } else {
         q_4d
     };
     let k_pre_rope = if let Some(w) = &k_norm_w {
-        gb.emit_rms_norm(&k_4d, w, config.rms_norm_eps as f32)
+        gb.emit_rms_norm_f64_accum(&k_4d, w, config.rms_norm_eps as f32)
     } else {
         k_4d
     };
@@ -890,7 +948,7 @@ fn emit_attention_body_kernel(
     let scale = gb.emit_arith_constant(1.0 / (head_dim as f64).sqrt(), DType::F32);
     let scaled = gb.emit_mul(&scores, &scale);
     let masked = gb.emit_add(&scaled, &mask);
-    let attn_weights = gb.emit_softmax(&masked, -1);
+    let attn_weights = gb.emit_softmax_f64_accum(&masked, -1);
 
     // GQA-aware AV
     let attn_output = gb.emit_gqa_av(&attn_weights, &v, gqa_repeat);
@@ -920,29 +978,91 @@ fn emit_attention_body_kernel(
 ///
 /// Inputs: hidden_in [1, seq, hidden], attn_out [1, seq, hidden], post_attn_ln_w [hidden]
 /// Outputs: residual [1, seq, hidden], post_attn_normed [1, seq, hidden]
+/// Hand-coded Residual+RMSNorm kernel using quant pipeline.
+///
+/// Computes: residual = h + attn_out, normed = rms_norm(residual, weight)
+/// Two outputs: [residual, normed], both [1, seq, hidden].
 fn emit_residual_norm_kernel(
     hidden: u64,
     eps: f32,
     kernel_idx: usize,
 ) -> Result<KernelEmitResult, CompileError> {
-    let ctx = GraphContext::new();
-    let mut gb = ctx.builder();
-
-    let h = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
-    let attn_out = gb.input(&[Some(1), None, Some(hidden)], DType::F32);
-    let ln_w = gb.input(&[Some(hidden)], DType::F32);
-
-    let residual = gb.emit_add(&h, &attn_out);
-    let normed = gb.emit_rms_norm(&residual, &ln_w, eps);
-
     let func_name = format!("k{kernel_idx}");
-    let (mlir_text, num_inputs, output_descs) =
-        gb.finalize_to_mlir_named(&[&residual, &normed], TransformMode::None, &func_name)?;
+    let dyn_val = crate::shape::DIM_DYNAMIC;
+
+    let mlir_text = format!(
+        r#"// Residual+RMSNorm (f64 accum): hidden={hidden}
+module attributes {{"homura.quant_kernel"}} {{
+  func.func @{func_name}(
+      %h       : memref<1x?x{hidden}xf32>,
+      %attn_out: memref<1x?x{hidden}xf32>,
+      %ln_w    : memref<{hidden}xf32>,
+      %residual: memref<1x?x{hidden}xf32>,
+      %normed  : memref<1x?x{hidden}xf32>)
+      attributes {{llvm.emit_c_interface}} {{
+
+    %c0     = arith.constant 0 : index
+    %c1     = arith.constant 1 : index
+    %hidden = arith.constant {hidden} : index
+    %c0_f64 = arith.constant 0.000000e+00 : f64
+    %eps    = arith.constant {eps} : f32
+    %inv_n  = arith.constant {inv_n} : f64
+    %c1_f32 = arith.constant 1.000000e+00 : f32
+
+    %seq = memref.dim %h, %c1 : memref<1x?x{hidden}xf32>
+
+    scf.for %m = %c0 to %seq step %c1 {{
+      // Pass 1: compute residual = h + attn_out, and sum-of-squares in f64
+      %sum_sq = scf.for %i = %c0 to %hidden step %c1
+                    iter_args(%acc = %c0_f64) -> (f64) {{
+        %hv = memref.load %h[%c0, %m, %i] : memref<1x?x{hidden}xf32>
+        %av = memref.load %attn_out[%c0, %m, %i] : memref<1x?x{hidden}xf32>
+        %rv = arith.addf %hv, %av : f32
+        memref.store %rv, %residual[%c0, %m, %i] : memref<1x?x{hidden}xf32>
+        %rv_f64 = arith.extf %rv : f32 to f64
+        %sq = arith.mulf %rv_f64, %rv_f64 : f64
+        %new_acc = arith.addf %acc, %sq : f64
+        scf.yield %new_acc : f64
+      }}
+
+      %mean_f64 = arith.mulf %sum_sq, %inv_n : f64
+      %mean_f32 = arith.truncf %mean_f64 : f64 to f32
+      %mean_eps = arith.addf %mean_f32, %eps : f32
+      %rms = math.sqrt %mean_eps : f32
+      %scale = arith.divf %c1_f32, %rms : f32
+
+      // Pass 2: normalize
+      scf.for %i = %c0 to %hidden step %c1 {{
+        %rv2 = memref.load %residual[%c0, %m, %i] : memref<1x?x{hidden}xf32>
+        %w = memref.load %ln_w[%i] : memref<{hidden}xf32>
+        %n = arith.mulf %rv2, %scale : f32
+        %result = arith.mulf %n, %w : f32
+        memref.store %result, %normed[%c0, %m, %i] : memref<1x?x{hidden}xf32>
+      }}
+    }}
+    return
+  }}
+}}
+"#,
+        func_name = func_name,
+        hidden = hidden,
+        eps = eps,
+        inv_n = 1.0 / hidden as f64,
+    );
 
     Ok(KernelEmitResult {
         mlir_text,
-        num_inputs,
-        output_descs,
+        num_inputs: 3,
+        output_descs: vec![
+            crate::runtime::OutputDesc {
+                shape: crate::shape::Shape(vec![1, dyn_val, hidden]),
+                dtype: DType::F32,
+            },
+            crate::runtime::OutputDesc {
+                shape: crate::shape::Shape(vec![1, dyn_val, hidden]),
+                dtype: DType::F32,
+            },
+        ],
         group_idx: kernel_idx,
         num_in: 3,
         num_out: 2,
@@ -1290,7 +1410,7 @@ pub(crate) fn emit_transformer_plan_quant(
         let norm_w = gb.input(&[Some(hidden)], DType::F32);
         let lm_head_w = gb.input(&[Some(hidden), Some(vocab)], DType::F32);
 
-        let normed = gb.emit_rms_norm(&h, &norm_w, eps);
+        let normed = gb.emit_rms_norm_f64_accum(&h, &norm_w, eps);
         let logits = gb.emit_matmul(&normed, &lm_head_w);
 
         let func_name = format!("k{kernel_idx}");
