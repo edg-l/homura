@@ -849,18 +849,20 @@ pub(crate) fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
             mn[4 + i] = (scales_raw[8 + i] >> 4) | ((scales_raw[4 + i] >> 6) << 4);
         }
 
-        for sb in 0..8 {
-            let scale = d * sc[sb] as f32;
-            let min = dmin * mn[sb] as f32;
-            let base = sb * 32;
-            for j in 0..32 {
-                let byte_idx = base / 2 + j / 2;
-                let nibble = if j % 2 == 0 {
-                    qs[byte_idx] & 0x0F
-                } else {
-                    qs[byte_idx] >> 4
-                };
-                dst[b * BLOCK_SIZE + base + j] = nibble as f32 * scale - min;
+        // Match llama.cpp dequantize_row_q4_K: sub-blocks come in pairs
+        // sharing 32 qs bytes. Even sub-block = low nibbles, odd = high nibbles.
+        for pair in 0..4 {
+            let scale0 = d * sc[2 * pair] as f32;
+            let min0 = dmin * mn[2 * pair] as f32;
+            let scale1 = d * sc[2 * pair + 1] as f32;
+            let min1 = dmin * mn[2 * pair + 1] as f32;
+            let q = &qs[pair * 32..(pair + 1) * 32];
+            let base = pair * 64;
+            for l in 0..32 {
+                dst[b * BLOCK_SIZE + base + l] = (q[l] & 0x0F) as f32 * scale0 - min0;
+            }
+            for l in 0..32 {
+                dst[b * BLOCK_SIZE + base + 32 + l] = (q[l] >> 4) as f32 * scale1 - min1;
             }
         }
     }
@@ -868,6 +870,7 @@ pub(crate) fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
 
 /// Dequantize Q6_K blocks to f32.
 /// Q6_K: 256-element super-blocks (210 bytes). 16 sub-blocks of 16 elements.
+/// Matches llama.cpp dequantize_row_q6_K layout.
 pub(crate) fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 210;
@@ -876,20 +879,26 @@ pub(crate) fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
 
     for b in 0..num_blocks {
         let block = &src[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
-        let ql = &block[0..128]; // low 4 bits
-        let qh = &block[128..192]; // high 2 bits
-        let sc = &block[192..208]; // i8 sub-block scales
         let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
-        for sb in 0..16 {
-            let scale = d * (sc[sb] as i8) as f32;
-            let base = sb * 16;
-            for j in 0..16 {
-                let idx = base + j;
-                let lo = (ql[idx / 2] >> ((idx % 2) * 4)) & 0x0F;
-                let hi = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x03;
-                let q = ((lo | (hi << 4)) as i8).wrapping_sub(32);
-                dst[b * BLOCK_SIZE + idx] = q as f32 * scale;
+        // Two chunks of 128 elements: ql advances by 64, qh by 32, sc by 8.
+        for chunk in 0..2usize {
+            let ql = &block[chunk * 64..];
+            let qh = &block[128 + chunk * 32..];
+            let sc = &block[192 + chunk * 8..];
+            let base = b * BLOCK_SIZE + chunk * 128;
+
+            for l in 0..32usize {
+                let is = l / 16; // 0 for l=0..15, 1 for l=16..31
+                let q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i8 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+
+                dst[base + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                dst[base + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                dst[base + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                dst[base + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
             }
         }
     }

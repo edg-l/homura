@@ -366,40 +366,41 @@ module attributes {{"homura.quant_kernel"}} {{
             }}
 
             // ── SCALE part: integer dot per sub-block ──
-            // For each sub-block sb: isum = sum(q4_nibble[j] * q8[sb*32+j]) in i32
-            // Accumulate sc[sb] * isum across all 8 sub-blocks in i32.
+            // Sub-blocks come in pairs sharing 32 qs bytes:
+            //   even sb: low nibbles of 32 bytes × q8[sb*32 .. sb*32+31]
+            //   odd sb:  high nibbles of same 32 bytes × q8[sb*32 .. sb*32+31]
+            // Matches llama.cpp ggml_vec_dot_q4_K_q8_K layout.
             %scale_accum = scf.for %sb = %c0 to %c8 step %c1
                                iter_args(%sa_in = %c0_i32) -> (i32) {{
-              %sb_byte_base = arith.muli %sb, %c16 : index
+              // qs byte base = (sb / 2) * 32
+              %sb_half = arith.divui %sb, %c2 : index
+              %sb_byte_base = arith.muli %sb_half, %c32 : index
               %qb_base = arith.addi %qs_base, %sb_byte_base : index
               %sb_q8_base = arith.muli %sb, %c32 : index
+              // sb_is_odd = sb % 2
+              %sb_rem = arith.remui %sb, %c2 : index
+              %sb_is_odd = arith.cmpi ne, %sb_rem, %c0 : index
 
-              // Inner loop: 16 bytes = 32 elements
-              %isum = scf.for %bi = %c0 to %c16 step %c1
+              // Inner loop: 32 bytes, 1 nibble per byte = 32 elements
+              %isum = scf.for %bi = %c0 to %c32 step %c1
                           iter_args(%is_in = %c0_i32) -> (i32) {{
                 %qb_off = arith.addi %qb_base, %bi : index
                 %qb_raw = memref.load %weight[%qb_off] : memref<{twb}xi8>
                 %qb_u32 = arith.extui %qb_raw : i8 to i32
 
-                // Low nibble × q8[sb*32 + 2*bi]
+                // Even sb: low nibble; odd sb: high nibble
                 %nib_lo = arith.andi %qb_u32, %c15_i32 : i32
-                %q8_lo_idx = arith.addi %sb_q8_base, %bi : index
-                %q8_lo_idx2 = arith.addi %q8_lo_idx, %bi : index
-                %q8_lo_raw = memref.load %q8_buf[%q8_lo_idx2] : memref<256xi8>
-                %q8_lo = arith.extsi %q8_lo_raw : i8 to i32
-                %prod_lo = arith.muli %nib_lo, %q8_lo : i32
-                %is1 = arith.addi %is_in, %prod_lo : i32
+                %nib_hi_raw = arith.shrui %qb_u32, %c4_i32 : i32
+                %nib_hi = arith.andi %nib_hi_raw, %c15_i32 : i32
+                %nib = arith.select %sb_is_odd, %nib_hi, %nib_lo : i32
 
-                // High nibble × q8[sb*32 + 2*bi + 1]
-                %nib_hi = arith.shrui %qb_u32, %c4_i32 : i32
-                %nib_hi_m = arith.andi %nib_hi, %c15_i32 : i32
-                %q8_hi_idx = arith.addi %q8_lo_idx2, %c1 : index
-                %q8_hi_raw = memref.load %q8_buf[%q8_hi_idx] : memref<256xi8>
-                %q8_hi = arith.extsi %q8_hi_raw : i8 to i32
-                %prod_hi = arith.muli %nib_hi_m, %q8_hi : i32
-                %is2 = arith.addi %is1, %prod_hi : i32
+                %q8_idx = arith.addi %sb_q8_base, %bi : index
+                %q8_raw = memref.load %q8_buf[%q8_idx] : memref<256xi8>
+                %q8_val = arith.extsi %q8_raw : i8 to i32
+                %prod = arith.muli %nib, %q8_val : i32
+                %is_out = arith.addi %is_in, %prod : i32
 
-                scf.yield %is2 : i32
+                scf.yield %is_out : i32
               }}
 
               // scale_accum += sc[sb] * isum
@@ -498,7 +499,10 @@ module attributes {{"homura.quant_kernel"}} {{
     %c1        = arith.constant 1 : index
     %c2        = arith.constant 2 : index
     %c4        = arith.constant 4 : index
+    %c8        = arith.constant 8 : index
     %c16       = arith.constant 16 : index
+    %c32       = arith.constant 32 : index
+    %c64       = arith.constant 64 : index
     %c128      = arith.constant 128 : index
     %c192      = arith.constant 192 : index
     %c208      = arith.constant 208 : index
@@ -510,6 +514,7 @@ module attributes {{"homura.quant_kernel"}} {{
     %c2_i32    = arith.constant 2 : i32
     %c3_i32    = arith.constant 3 : i32
     %c4_i32    = arith.constant 4 : i32
+    %c6_i32    = arith.constant 6 : i32
     %c15_i32   = arith.constant 15 : i32
     %c32_i32   = arith.constant 32 : i32
     %c0_f32    = arith.constant 0.000000e+00 : f32
@@ -585,8 +590,13 @@ module attributes {{"homura.quant_kernel"}} {{
             %sc_base_blk = arith.addi %blk_off, %c192 : index
 
             // ── Integer dot product over 16 sub-blocks of 16 elements ──
-            // For each sub-block: isum = sum(q6_val * q8_quant) in i32
-            // Accumulate: sc_i8[sb] * isum across sub-blocks in i32
+            // Matches llama.cpp Q6_K layout: 2 chunks of 128 elements.
+            // Within each chunk, 4 groups of 32 share ql/qh bytes:
+            //   group 0: ql[l] low nib,    qh[l] bits 0-1  (elements 0-31)
+            //   group 1: ql[l+32] low nib, qh[l] bits 2-3  (elements 32-63)
+            //   group 2: ql[l] high nib,   qh[l] bits 4-5  (elements 64-95)
+            //   group 3: ql[l+32] high nib,qh[l] bits 6-7  (elements 96-127)
+            // Sub-blocks are 16 elements; within a chunk: sb_in_chunk/2 = group.
             %scale_accum = scf.for %sb = %c0 to %c16 step %c1
                                iter_args(%sa_in = %c0_i32) -> (i32) {{
 
@@ -595,44 +605,62 @@ module attributes {{"homura.quant_kernel"}} {{
               %sc_raw = memref.load %weight[%sc_off] : memref<{total_weight_bytes}xi8>
               %sc_i32 = arith.extsi %sc_raw : i8 to i32
 
-              // Bases for ql, qh within this sub-block
-              // ql base: blk_off + sb*8  (each sub-block has 16 elements, 2 per byte = 8 bytes)
-              %sb_times_8 = arith.muli %sb, %c4 : index  // sb*4 pairs... wait
-              // Actually: idx = sb*16+j, ql byte = idx/2 = sb*8 + j/2
-              %ql_sb_off = arith.muli %sb, %c4 : index
-              %ql_sb_off2 = arith.addi %ql_sb_off, %ql_sb_off : index  // sb*8
-              %ql_sb_base = arith.addi %blk_off, %ql_sb_off2 : index
-              // qh base: blk_off + 128 + sb*4  (idx/4 = sb*4 + j/4)
-              %qh_sb_off = arith.muli %sb, %c4 : index
-              %qh_sb_base = arith.addi %qh_base_blk, %qh_sb_off : index
-              // q8 base within the 256-element block: sb*16
+              // Compute chunk/group/parity from sub-block index
+              // chunk = sb / 8, sb_in_chunk = sb % 8
+              // group = sb_in_chunk / 2, parity = sb_in_chunk % 2
+              %chunk = arith.divui %sb, %c8 : index
+              %sb_in_chunk = arith.remui %sb, %c8 : index
+              %group = arith.divui %sb_in_chunk, %c2 : index
+              %parity = arith.remui %sb_in_chunk, %c2 : index
+
+              // ql_base = blk_off + chunk*64 + (group & 1)*32
+              %chunk_ql = arith.muli %chunk, %c64 : index
+              %group_odd = arith.remui %group, %c2 : index
+              %group_ql_add = arith.muli %group_odd, %c32 : index
+              %ql_base = arith.addi %blk_off, %chunk_ql : index
+              %ql_base2 = arith.addi %ql_base, %group_ql_add : index
+
+              // use_high = group >= 2
+              %group_i32 = arith.index_cast %group : index to i32
+              %use_high = arith.cmpi uge, %group, %c2 : index
+
+              // qh_base = blk_off + 128 + chunk*32
+              %chunk_qh = arith.muli %chunk, %c32 : index
+              %qh_base = arith.addi %qh_base_blk, %chunk_qh : index
+
+              // qh_shift = group * 2
+              %qh_shift_val = arith.muli %group_i32, %c2_i32 : i32
+
+              // l_offset = parity * 16 (first half or second half of 32-element group)
+              %l_offset = arith.muli %parity, %c16 : index
+
+              // q8 base: sb * 16
               %q8_sb_base = arith.muli %sb, %c16 : index
 
               // Inner loop: 16 elements per sub-block
               %isum = scf.for %j = %c0 to %c16 step %c1
                           iter_args(%is_in = %c0_i32) -> (i32) {{
 
-                // Unpack q6 value: lo | (hi << 4) - 32
-                %j_half = arith.divui %j, %c2 : index
-                %ql_off = arith.addi %ql_sb_base, %j_half : index
+                // l = parity * 16 + j
+                %l = arith.addi %l_offset, %j : index
+
+                // ql byte at ql_base2 + l; extract low or high nibble
+                %ql_off = arith.addi %ql_base2, %l : index
                 %ql_raw = memref.load %weight[%ql_off] : memref<{total_weight_bytes}xi8>
                 %ql_u32 = arith.extui %ql_raw : i8 to i32
-                %j_mod2 = arith.remui %j, %c2 : index
-                %j_mod2_i32 = arith.index_cast %j_mod2 : index to i32
-                %ql_shift = arith.muli %j_mod2_i32, %c4_i32 : i32
-                %ql_sh = arith.shrui %ql_u32, %ql_shift : i32
-                %lo = arith.andi %ql_sh, %c15_i32 : i32
+                %lo_nib = arith.andi %ql_u32, %c15_i32 : i32
+                %hi_nib_raw = arith.shrui %ql_u32, %c4_i32 : i32
+                %hi_nib = arith.andi %hi_nib_raw, %c15_i32 : i32
+                %lo = arith.select %use_high, %hi_nib, %lo_nib : i32
 
-                %j_quarter = arith.divui %j, %c4 : index
-                %qh_off = arith.addi %qh_sb_base, %j_quarter : index
+                // qh byte at qh_base + l; extract 2 bits at qh_shift
+                %qh_off = arith.addi %qh_base, %l : index
                 %qh_raw = memref.load %weight[%qh_off] : memref<{total_weight_bytes}xi8>
                 %qh_u32 = arith.extui %qh_raw : i8 to i32
-                %j_mod4 = arith.remui %j, %c4 : index
-                %j_mod4_i32 = arith.index_cast %j_mod4 : index to i32
-                %qh_shift = arith.muli %j_mod4_i32, %c2_i32 : i32
-                %qh_sh = arith.shrui %qh_u32, %qh_shift : i32
+                %qh_sh = arith.shrui %qh_u32, %qh_shift_val : i32
                 %hi = arith.andi %qh_sh, %c3_i32 : i32
 
+                // q = (lo | (hi << 4)) - 32
                 %hi_sh = arith.shli %hi, %c4_i32 : i32
                 %combined = arith.ori %lo, %hi_sh : i32
                 %q_val = arith.subi %combined, %c32_i32 : i32
