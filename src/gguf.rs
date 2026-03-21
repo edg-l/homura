@@ -346,6 +346,17 @@ impl GgufFile {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint the OS to use huge pages for the mmap'd weight data.
+        // Reduces TLB misses when threads stride across large weight buffers.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(
+                mmap.as_ptr() as *mut libc::c_void,
+                mmap.len(),
+                libc::MADV_HUGEPAGE,
+            );
+        }
+
         if mmap.len() < 16 {
             return Err("GGUF file too small".into());
         }

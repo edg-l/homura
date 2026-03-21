@@ -476,6 +476,11 @@ module attributes {{"homura.quant_kernel"}} {{
             %blk_idx = arith.addi %blk_n, %kb   : index
             %blk_off = arith.muli %blk_idx, %c144 : index
 
+            // Prefetch the next weight block (144 bytes ahead) to reduce stalls.
+            %next_off = arith.addi %blk_off, %c144 : index
+            memref.prefetch %weight[%next_off], read, locality<3>, data
+                : memref<{twb}xi8>
+
             // Load d (f16, bytes 0-1)
             %d0_i8  = memref.load %weight[%blk_off] : memref<{twb}xi8>
             %d1_off = arith.addi %blk_off, %c1 : index
