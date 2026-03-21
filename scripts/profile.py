@@ -153,6 +153,21 @@ def parse_output(output: str) -> dict:
     return {"profiles": decode_profiles, "summary": summary}
 
 
+def _infer_n_from_quant_weight(weight_bytes: int, k: int, block_sizes=(144, 210, 34)) -> int | None:
+    """Reverse-compute N from flat quantized weight buffer size.
+
+    Q4_K: 144 bytes per 256-element block
+    Q6_K: 210 bytes per 256-element block
+    Q8_0: 34 bytes per 32-element block
+    """
+    blocks_per_row_256 = k // 256
+    blocks_per_row_32 = k // 32
+    for bs, bpr in [(144, blocks_per_row_256), (210, blocks_per_row_256), (34, blocks_per_row_32)]:
+        if bpr > 0 and weight_bytes % (bpr * bs) == 0:
+            return weight_bytes // (bpr * bs)
+    return None
+
+
 def classify_kernel(kid: int, shapes: str, total_kernels: int, config: dict | None = None) -> str:
     """Classify kernel by type based on shapes and model config dimensions."""
     if kid >= 2**63:
@@ -166,38 +181,65 @@ def classify_kernel(kid: int, shapes: str, total_kernels: int, config: dict | No
         for m in re.findall(r"\d+", s):
             dims.add(int(m))
 
-    if config:
-        vocab = config.get("vocab_size", 0)
-        inter = config.get("intermediate_size", 0)
-        hidden = config.get("hidden_size", 0)
-        heads = config.get("num_attention_heads", 0)
-        kv_heads = config.get("num_key_value_heads", heads)
-        head_dim = config.get("head_dim", hidden // heads if heads else 0)
+    if not config:
+        return "Other"
 
-        # LMHead: contains vocab_size dimension
-        if vocab > 0 and vocab in dims:
-            return "LMHead"
+    vocab = config.get("vocab_size", 0)
+    inter = config.get("intermediate_size", 0)
+    hidden = config.get("hidden_size", 0)
+    heads = config.get("num_attention_heads", 0)
+    kv_heads = config.get("num_key_value_heads", heads)
+    head_dim = config.get("head_dim", hidden // heads if heads else 0)
 
-        # MLP: contains intermediate_size dimension
-        if inter > 0 and inter in dims:
-            return "MLP"
+    # For quantized kernels: shapes like "[1, 2048] × [12681216]" where
+    # the large 1D buffer is the flat quantized weight. Reverse-compute N
+    # from the byte count to classify.
+    has_1d_large = False
+    for s in shape_list:
+        m = re.match(r"^\[(\d+)\]$", s.strip())
+        if m:
+            weight_bytes = int(m.group(1))
+            if weight_bytes > 10000:
+                has_1d_large = True
+                n = _infer_n_from_quant_weight(weight_bytes, hidden)
+                if n is not None:
+                    if vocab > 0 and n == vocab:
+                        return "LMHead"
+                    if inter > 0 and n == inter:
+                        return "MLP"
+                    if n == heads * head_dim:
+                        return "QKV"
+                    if n == kv_heads * head_dim:
+                        return "QKV"
+                    # O_proj: N = hidden
+                    if n == hidden:
+                        return "Attn"
 
-        # QKV vs Attn: both have head structure. QKV has cos/sin tables
-        # (2D shapes [seq, head_dim]) and projection weights. Attn has
-        # 4D tensors [1, heads, seq, head_dim] and a mask.
-        has_4d_head = any(
-            re.search(rf"\[1, ({heads}|{kv_heads}), \d+, {head_dim}\]", s)
-            for s in shape_list
-        )
-        has_cos_sin = any(
-            re.match(rf"^\[\d+, {head_dim}\]$", s.strip())
-            for s in shape_list
-        )
+    # Standard (non-quant) classification
+    # LMHead: contains vocab_size dimension
+    if vocab > 0 and vocab in dims:
+        return "LMHead"
 
-        if has_cos_sin:
-            return "QKV"
-        if has_4d_head:
-            return "Attn"
+    # MLP: contains intermediate_size dimension
+    if inter > 0 and inter in dims:
+        return "MLP"
+
+    # QKV vs Attn: both have head structure. QKV has cos/sin tables
+    # (2D shapes [seq, head_dim]) and projection weights. Attn has
+    # 4D tensors [1, heads, seq, head_dim] and a mask.
+    has_4d_head = any(
+        re.search(rf"\[1, ({heads}|{kv_heads}), \d+, {head_dim}\]", s)
+        for s in shape_list
+    )
+    has_cos_sin = any(
+        re.match(rf"^\[\d+, {head_dim}\]$", s.strip())
+        for s in shape_list
+    )
+
+    if has_cos_sin:
+        return "QKV"
+    if has_4d_head:
+        return "Attn"
 
     return "Other"
 
@@ -205,24 +247,68 @@ def classify_kernel(kid: int, shapes: str, total_kernels: int, config: dict | No
 def get_model_config(model: str) -> dict | None:
     """Try to load model config.json from HF cache."""
     cache = Path.home() / ".cache/huggingface/hub"
-    model_dir = cache / f"models--{model.replace('/', '--')}"
-    if not model_dir.exists():
-        return None
-    for config_path in model_dir.rglob("config.json"):
+
+    # For GGUF paths like "Org/Model-GGUF/file.gguf", extract repo ID
+    parts = model.split("/")
+    if len(parts) >= 3:
+        repo_id = f"{parts[0]}/{parts[1]}"
+    else:
+        repo_id = model
+
+    # Try the repo itself, then the base repo (strip -GGUF suffix)
+    candidates = [repo_id]
+    for suffix in ("-GGUF", "-gguf"):
+        if repo_id.endswith(suffix):
+            candidates.append(repo_id[: -len(suffix)])
+            break
+
+    for candidate in candidates:
+        model_dir = cache / f"models--{candidate.replace('/', '--')}"
+        if not model_dir.exists():
+            continue
+        for config_path in model_dir.rglob("config.json"):
+            try:
+                with open(config_path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    # Fallback: fetch config.json from HF API (for GGUF models where base
+    # model config isn't cached locally)
+    for candidate in candidates:
+        if candidate.endswith(("-GGUF", "-gguf")):
+            continue  # GGUF repos don't have config.json
         try:
-            with open(config_path) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
+            import urllib.request
+            url = f"https://huggingface.co/{candidate}/resolve/main/config.json"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return json.loads(resp.read())
+        except Exception:
             continue
     return None
 
 
 def get_weight_dtype(model: str) -> str:
-    """Detect weight dtype from safetensors header. Returns 'BF16' or 'F32'."""
+    """Detect weight dtype from safetensors header or GGUF filename."""
+    # For GGUF models, infer from filename
+    model_lower = model.lower()
+    if model_lower.endswith(".gguf") or "-gguf" in model_lower:
+        if "q4_k" in model_lower:
+            return "Q4_K"
+        if "q6_k" in model_lower:
+            return "Q6_K"
+        if "q8_0" in model_lower:
+            return "Q8_0"
+        if "q5_k" in model_lower:
+            return "Q5_K"
+        return "GGUF"
+
     import struct
 
     cache = Path.home() / ".cache/huggingface/hub"
-    model_dir = cache / f"models--{model.replace('/', '--')}"
+    parts = model.split("/")
+    repo_id = f"{parts[0]}/{parts[1]}" if len(parts) >= 3 else model
+    model_dir = cache / f"models--{repo_id.replace('/', '--')}"
     if not model_dir.exists():
         return "F32"
     for st_path in model_dir.rglob("model.safetensors"):
@@ -276,7 +362,19 @@ def print_summary(data: dict, model: str, show_raw: bool = False):
     summary = data["summary"]
     config = get_model_config(model)
     weight_dtype = get_weight_dtype(model)
-    bpw = 2 if weight_dtype == "BF16" else 4
+    # Bytes per weight for bandwidth estimation
+    if weight_dtype == "BF16":
+        bpw = 2
+    elif weight_dtype.startswith("Q4_K"):
+        bpw = 0.5625  # ~4.5 bits/weight average
+    elif weight_dtype.startswith("Q6_K"):
+        bpw = 0.8125  # ~6.5 bits/weight average
+    elif weight_dtype.startswith("Q8"):
+        bpw = 1
+    elif weight_dtype.startswith("Q5_K"):
+        bpw = 0.6875  # ~5.5 bits/weight average
+    else:
+        bpw = 4
 
     if not profiles:
         print("No decode profiles found in output.")
