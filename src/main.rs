@@ -218,6 +218,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &sampling,
                     )
                 } else {
+                    // Try HF Hub for GGUF if the path looks like a GGUF repo
+                    let model_name = model.to_string_lossy().to_string();
+                    let is_gguf_hub = !model.exists()
+                        && (model_name.contains("GGUF")
+                            || model_name.contains("gguf")
+                            || model_name.ends_with(".gguf"));
+                    if is_gguf_hub {
+                        let (gguf_path, model_dir) = resolve_gguf_from_hub(&model_name)?;
+                        return cmd_generate_gguf(
+                            &gguf_path,
+                            &model_dir,
+                            &prompt_text,
+                            max_tokens,
+                            context_len,
+                            &sampling,
+                        );
+                    }
                     let weight_dtype = resolve_weight_dtype(&dtype);
                     let model_dir = resolve_model_path(&model)?;
                     let has_config = model_dir.join("config.json").exists();
