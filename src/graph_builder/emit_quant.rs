@@ -258,26 +258,25 @@ pub fn emit_dequant_matmul_q4_k(k: u64, n: u64, func_name: &str, n_tile: usize) 
                 "            %w_v_{sb} = vector.load %weight[%qb_off_{sb}] : memref<{twb}xi8>, vector<32xi8>\n\
                  %q8_v_{sb} = vector.load %q8_all[%q8_off_{sb}] : memref<{k}xi8>, vector<32xi8>\n"
             );
-            // Nibble extraction (no select -- known at emit time)
-            body += &format!(
-                "            %w_u32_{sb} = arith.extui %w_v_{sb} : vector<32xi8> to vector<32xi32>\n"
-            );
+            // Nibble extraction in i8 domain (preserves u8 type for VNNI matching)
             if !is_odd {
-                // Even: low nibble = w & 0xF
+                // Even: low nibble = w & 0xF (in i8)
                 body += &format!(
-                    "            %nib_{sb} = arith.andi %w_u32_{sb}, %mask15_v : vector<32xi32>\n"
+                    "            %nib_{sb} = arith.andi %w_v_{sb}, %mask15_i8v : vector<32xi8>\n"
                 );
             } else {
-                // Odd: high nibble = (w >> 4) & 0xF
+                // Odd: high nibble = (w >> 4) & 0xF (in i8)
                 body += &format!(
-                    "            %nib_raw_{sb} = arith.shrui %w_u32_{sb}, %shift4_v : vector<32xi32>\n\
-                     %nib_{sb} = arith.andi %nib_raw_{sb}, %mask15_v : vector<32xi32>\n"
+                    "            %nib_raw_{sb} = arith.shrui %w_v_{sb}, %shift4_i8v : vector<32xi8>\n\
+                     %nib_{sb} = arith.andi %nib_raw_{sb}, %mask15_i8v : vector<32xi8>\n"
                 );
             }
-            // Dot product
+            // Dot product: zext u8 → i32, sext i8 → i32, mul i32, reduce
+            // This is the canonical pattern LLVM matches to vpdpbusd on AVX-512 VNNI.
             body += &format!(
-                "            %q8_i32_{sb} = arith.extsi %q8_v_{sb} : vector<32xi8> to vector<32xi32>\n\
-                 %prod_{sb} = arith.muli %nib_{sb}, %q8_i32_{sb} : vector<32xi32>\n\
+                "            %nib_u32_{sb} = arith.extui %nib_{sb} : vector<32xi8> to vector<32xi32>\n\
+                 %q8_i32_{sb} = arith.extsi %q8_v_{sb} : vector<32xi8> to vector<32xi32>\n\
+                 %prod_{sb} = arith.muli %nib_u32_{sb}, %q8_i32_{sb} : vector<32xi32>\n\
                  %isum_{sb} = vector.reduction <add>, %prod_{sb} : vector<32xi32> into i32\n\
                  %scisum_{sb} = arith.muli %sc_{sb}, %isum_{sb} : i32\n"
             );
@@ -392,9 +391,9 @@ module attributes {{"homura.quant_kernel"}} {{
     %c15_i32 = arith.constant 15 : i32
     %c63_i32 = arith.constant 63 : i32
     %c127_f32 = arith.constant 127.0 : f32
-    // Vector constants for unrolled dot product
-    %mask15_v = arith.constant dense<15> : vector<32xi32>
-    %shift4_v = arith.constant dense<4> : vector<32xi32>
+    // Vector constants for unrolled dot product (i8 for VNNI-friendly nibble extraction)
+    %mask15_i8v = arith.constant dense<15> : vector<32xi8>
+    %shift4_i8v = arith.constant dense<4> : vector<32xi8>
     // Index constants for unrolled body
 {extra_consts}
     %nbpr      = arith.constant {nbpr} : index
